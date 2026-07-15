@@ -1,13 +1,16 @@
-#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
-
 //! Content-addressed blob and fenced root stores for immutable index segments.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    fs, io,
+    fmt,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
+
+use fs2::FileExt;
+use thiserror::Error;
 
 /// A content identifier for immutable blobs.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -21,12 +24,20 @@ impl BlobId {
     }
 }
 
+impl fmt::Display for BlobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Errors raised by store implementations.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum StoreError {
     /// I/O failure.
-    Io(io::Error),
+    #[error("store I/O failed: {0}")]
+    Io(#[from] io::Error),
     /// Root compare-and-swap failed because the current fence differed.
+    #[error("root CAS failed: expected {expected:?}, actual {actual:?}")]
     CasFailed {
         /// Expected root bytes supplied by the caller.
         expected: Option<Vec<u8>>,
@@ -34,28 +45,42 @@ pub enum StoreError {
         actual: Option<Vec<u8>>,
     },
     /// Blob digest did not match its content.
+    #[error("blob content did not match digest {0}")]
     CorruptBlob(BlobId),
-}
-
-impl From<io::Error> for StoreError {
-    fn from(value: io::Error) -> Self {
-        Self::Io(value)
-    }
+    /// Root name cannot be safely represented on the filesystem.
+    #[error("invalid root name {0:?}")]
+    InvalidRootName(String),
 }
 
 /// Immutable content-addressed blob storage.
 pub trait BlobStore: Send + Sync {
     /// Stores bytes and returns their content id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot persist the blob.
     fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError>;
     /// Loads bytes by id, returning `None` when missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot read or verify the blob.
     fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
 }
 
 /// Named root pointer storage with compare-and-swap fencing.
 pub trait RootStore: Send + Sync {
     /// Reads a root pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot read the root.
     fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError>;
     /// Publishes a root only if the stored pointer equals `expected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fence does not match or the backend cannot publish.
     fn cas_root(&self, name: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<(), StoreError>;
 }
 
@@ -120,6 +145,10 @@ pub struct FsStore {
 }
 impl FsStore {
     /// Opens or creates a store below `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory layout cannot be created.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("blobs"))?;
@@ -129,8 +158,21 @@ impl FsStore {
     fn blob_path(&self, id: &BlobId) -> PathBuf {
         self.root.join("blobs").join(id.as_str())
     }
-    fn root_path(&self, name: &str) -> PathBuf {
-        self.root.join("roots").join(name.replace('/', "_"))
+    fn root_path(&self, name: &str) -> Result<PathBuf, StoreError> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(StoreError::InvalidRootName(name.to_owned()));
+        }
+        Ok(self.root.join("roots").join(name))
+    }
+
+    fn root_lock(&self, name: &str) -> Result<RootLock, StoreError> {
+        let root_path = self.root_path(name)?;
+        RootLock::acquire(root_path.with_extension("lock"))
     }
 }
 impl BlobStore for FsStore {
@@ -158,21 +200,26 @@ impl BlobStore for FsStore {
 }
 impl RootStore for FsStore {
     fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        match fs::read(self.root_path(name)) {
+        match fs::read(self.root_path(name)?) {
             Ok(v) => Ok(Some(v)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
     fn cas_root(&self, name: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<(), StoreError> {
-        let actual = self.get_root(name)?;
+        let _lock = self.root_lock(name)?;
+        let path = self.root_path(name)?;
+        let actual = match fs::read(&path) {
+            Ok(v) => Some(v),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         if actual.as_deref() != expected {
             return Err(StoreError::CasFailed {
                 expected: expected.map(<[u8]>::to_vec),
                 actual,
             });
         }
-        let path = self.root_path(name);
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, new)?;
         fs::rename(tmp, path)?;
@@ -181,16 +228,32 @@ impl RootStore for FsStore {
 }
 
 fn digest(bytes: &[u8]) -> BlobId {
-    // FNV-1a based 128-bit content id: deterministic and dependency-free for M1 scaffolding.
-    let mut a = 0xcbf2_9ce4_8422_2325u64;
-    let mut b = 0x8422_2325_cbf2_9ce4u64;
-    for &byte in bytes {
-        a ^= u64::from(byte);
-        a = a.wrapping_mul(0x100_0000_01b3);
-        b ^= a.rotate_left(13);
-        b = b.wrapping_mul(0x9e37_79b1_85eb_ca87);
+    BlobId(blake3::hash(bytes).to_hex().to_string())
+}
+
+struct RootLock {
+    path: PathBuf,
+    file: File,
+}
+
+impl RootLock {
+    fn acquire(path: PathBuf) -> Result<Self, StoreError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock_exclusive()?;
+        Ok(Self { path, file })
     }
-    BlobId(format!("{a:016x}{b:016x}"))
+}
+
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Small read-through segment cache keyed by blob id.
@@ -200,6 +263,14 @@ pub struct SegmentCache {
 }
 impl SegmentCache {
     /// Returns cached bytes, loading from `store` on miss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing store cannot load the blob.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal cache lock is poisoned.
     pub fn get_or_load(
         &self,
         store: &dyn BlobStore,

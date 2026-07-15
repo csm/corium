@@ -1,8 +1,10 @@
-#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
-
 //! Immutable ordered segment trees and live indexes for datoms.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    ops::Bound::{Included, Unbounded},
+    sync::Arc,
+};
 
 use corium_core::{Datom, IndexOrder};
 
@@ -88,7 +90,10 @@ impl LiveIndex {
             entries: BTreeMap::new(),
         }
     }
-    /// Inserts or replaces one datom by its covering index key.
+    /// Inserts one datom, replacing only an identical covering index key.
+    ///
+    /// Datom keys include transaction and assertion state, so this is append-oriented
+    /// history storage rather than current-value replacement.
     pub fn insert(&mut self, datom: Datom) {
         self.entries.insert(datom.key(self.order), datom);
     }
@@ -101,7 +106,7 @@ impl LiveIndex {
         &'a self,
         key: &'a [u8],
     ) -> impl Iterator<Item = (&'a Vec<u8>, &'a Datom)> + 'a {
-        self.entries.range(key.to_vec()..)
+        self.entries.range::<[u8], _>((Included(key), Unbounded))
     }
     /// Freezes this live index into an immutable segment.
     #[must_use]
@@ -112,7 +117,9 @@ impl LiveIndex {
     }
 }
 
-/// Merges one durable segment and one live index at read time.
+/// Unions one durable segment and one live index at read time.
+///
+/// If an identical covering index key appears in both inputs, the live datom is returned.
 pub fn merged_iter<'a>(
     durable: &'a Segment,
     live: &'a LiveIndex,
@@ -157,11 +164,23 @@ mod tests {
     }
 
     #[test]
-    fn live_overrides_durable_in_merged_iterator() {
+    fn merged_iterator_unions_disjoint_keys() {
         let durable = Segment::build(IndexOrder::Eavt, [datom(1, 1, 10)]);
         let mut live = LiveIndex::new(IndexOrder::Eavt);
         live.insert(datom(2, 1, 20));
         let merged: Vec<_> = merged_iter(&durable, &live).collect();
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merged_iterator_deduplicates_identical_key() {
+        let original = datom(1, 1, 10);
+        let durable = Segment::build(IndexOrder::Eavt, [original.clone()]);
+        let mut replacement = original;
+        replacement.added = true;
+        let mut live = LiveIndex::new(IndexOrder::Eavt);
+        live.insert(replacement);
+        let merged: Vec<_> = merged_iter(&durable, &live).collect();
+        assert_eq!(merged.len(), 1);
     }
 }

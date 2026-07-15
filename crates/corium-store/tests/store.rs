@@ -43,3 +43,29 @@ fn cache_loads_blob_once_visible() {
         .expect("present");
     assert_eq!(&*loaded, b"cached");
 }
+
+#[test]
+fn filesystem_store_detects_corrupt_blob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FsStore::open(dir.path()).expect("open store");
+    let id = store.put(b"original").expect("put blob");
+    std::fs::write(dir.path().join("blobs").join(id.as_str()), b"corrupt").expect("corrupt blob");
+    assert!(store.get(&id).is_err());
+}
+
+#[test]
+fn blob_put_is_idempotent_for_same_content() {
+    let store = MemoryStore::default();
+    let first = store.put(b"same").expect("first put");
+    let second = store.put(b"same").expect("second put");
+    assert_eq!(first, second);
+    assert_eq!(store.get(&first).expect("get blob"), Some(b"same".to_vec()));
+}
+
+#[test]
+fn filesystem_roots_reject_path_traversal_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FsStore::open(dir.path()).expect("open store");
+    assert!(store.get_root("../bad").is_err());
+    assert!(store.cas_root("nested/bad", None, b"root").is_err());
+}
