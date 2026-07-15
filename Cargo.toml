@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/corium-core",
+    "crates/corium-index",
+    "crates/corium-store",
+    "crates/corium-log",
+    "crates/corium-tx",
+    "crates/corium-query",
+    "crates/corium-db",
+    "crates/corium-transactor",
+    "crates/corium-peer",
+    "crates/corium-protocol",
+    "crates/corium-cljrs",
+    "crates/corium-cli",
+    "crates/corium-sim",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

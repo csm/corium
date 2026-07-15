@@ -1,0 +1,13 @@
+[package]
+name = "corium-sim"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+corium-core = { path = "../corium-core" }
+
+[lints]
+workspace = true
