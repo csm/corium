@@ -1,0 +1,83 @@
+# Wire Protocol
+
+Control plane: gRPC (tonic/prost). Data plane values: a Corium-defined tagged
+binary encoding carried in protobuf `bytes` fields. Segments never travel over
+gRPC — peers read the blob store directly.
+
+## Value wire encoding
+
+The sortable segment encoding (data-model.md) is also the wire encoding for
+single values; composite payloads (tx-data, query args, results) use a
+length-prefixed tagged variant of the same tag space extended with container
+tags (list, vector, map, set) and an interning table per message for keywords
+and repeated strings. One `corium-protocol::codec` module owns both variants;
+round-trip and cross-variant property tests keep them honest.
+
+Rationale (ADR-0006): protobuf handles framing, streaming, auth, and
+versioning where it is strong; EDN's open value set lives in one codec we
+control, rather than being contorted into protobuf messages.
+
+## Services
+
+### TransactorService (peers → transactor)
+
+```proto
+service Transactor {
+  rpc Transact(TransactRequest) returns (TransactResponse);      // tx-data bytes → tempids, basis, tx-data
+  rpc Subscribe(SubscribeRequest) returns (stream TxReport);     // declares client basis; server backfills then streams
+  rpc Sync(SyncRequest) returns (SyncResponse);                  // wait for basis ≥ t
+  rpc Status(StatusRequest) returns (StatusResponse);            // basis, index-basis, lease info, stats
+}
+```
+
+- `Subscribe` is the peer's lifeline: tx-reports, index-basis announcements,
+  and heartbeats are multiplexed on this stream. Disconnect ⇒ peer reconnects
+  (rediscovering the lease holder via the root store) and resubscribes from
+  its basis; the transactor backfills from the log if the gap is large.
+- All requests carry the database name and a protocol version; the transactor
+  rejects mismatched `format-version` roots with a clear upgrade error.
+
+### CatalogService (admin)
+
+`CreateDatabase`, `DeleteDatabase`, `ListDatabases`, `GcDeletedDatabases` —
+thin wrappers over root-store operations plus transactor bootstrap datoms.
+
+### PeerServerService (thin clients → peer server)
+
+For languages without the peer library; queries run server-side on a hosted
+peer:
+
+```proto
+service PeerServer {
+  rpc Query(QueryRequest) returns (stream QueryResultChunk);
+  rpc Pull(PullRequest) returns (PullResponse);
+  rpc Transact(TransactRequest) returns (TransactResponse);      // proxied
+  rpc Datoms(DatomsRequest) returns (stream DatomChunk);
+  rpc TxRange(TxRangeRequest) returns (stream TxChunk);
+  rpc DbStats(DbStatsRequest) returns (DbStatsResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream TxReport);     // relayed
+}
+```
+
+Requests name a db view as `{db-name, as-of?, since?, history?}` so thin
+clients get the full time model. Result streams are chunked with a
+server-enforced fuel/deadline per query. This service definition plus the
+codec spec **is** the public thin-client protocol; a conformance doc and test
+vectors ship with it so third parties can write clients.
+
+## Security
+
+- TLS via tonic/rustls everywhere; mTLS or bearer-token auth per endpoint
+  (pluggable `Authenticator` trait; static tokens in v1).
+- Peer servers enforce per-request fuel, result-size, and concurrency limits;
+  the transactor enforces tx-size and queue limits.
+- The blob store is assumed private to the deployment (peers have direct
+  credentials to it, as in Datomic).
+
+## Embedded transport
+
+The same service traits have an in-process implementation over channels
+(`corium-peer` talks to `corium-transactor` directly). Tests and the
+simulator run the identical pipeline code both ways; only the transport
+differs. This is the mechanism that lets us build "full topology" logic from
+day one while running single-process until M4.
