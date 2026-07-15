@@ -111,6 +111,7 @@ name = "corium-store"
 version = "0.1.0"
 dependencies = [
  "corium-core",
+ "tempfile",
 ]
 
 [[package]]

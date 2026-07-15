@@ -10,3 +10,6 @@ corium-core = { path = "../corium-core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
