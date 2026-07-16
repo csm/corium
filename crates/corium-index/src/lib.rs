@@ -11,10 +11,12 @@ use corium_core::{Datom, IndexOrder};
 /// Key bytes paired with a datom in one covering index.
 pub type IndexEntry = (Vec<u8>, Datom);
 
+const LEAF_CAPACITY: usize = 64;
+
 /// An immutable sorted index segment.
 #[derive(Clone, Debug, Default)]
 pub struct Segment {
-    entries: Arc<[IndexEntry]>,
+    leaves: Arc<[Arc<[IndexEntry]>]>,
 }
 
 impl Segment {
@@ -24,23 +26,18 @@ impl Segment {
         let mut entries: Vec<_> = datoms.into_iter().map(|d| (d.key(order), d)).collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         entries.dedup_by(|left, right| left.0 == right.0);
-        Self {
-            entries: entries.into(),
-        }
+        Self::from_entries(&entries, &[])
     }
 
     /// Returns all entries in key order.
-    #[must_use]
-    pub fn entries(&self) -> &[IndexEntry] {
-        &self.entries
+    pub fn entries(&self) -> impl Iterator<Item = &IndexEntry> {
+        self.leaves.iter().flat_map(|leaf| leaf.iter())
     }
 
     /// Seeks to the first entry whose key is greater than or equal to `key`.
     pub fn seek<'a>(&'a self, key: &'a [u8]) -> impl Iterator<Item = &'a IndexEntry> + 'a {
-        let start = self
-            .entries
-            .partition_point(|entry| entry.0.as_slice() < key);
-        self.entries[start..].iter()
+        self.entries()
+            .skip_while(move |entry| entry.0.as_slice() < key)
     }
 
     /// Merges sorted segments plus new datoms into a new immutable segment.
@@ -59,19 +56,42 @@ impl Segment {
         for datom in live {
             by_key.insert(datom.key(order), datom);
         }
-        Self {
-            entries: by_key.into_iter().collect::<Vec<_>>().into(),
-        }
+        Self::from_entries(&by_key.into_iter().collect::<Vec<_>>(), segments)
     }
 
     /// Counts entries that are shared exactly with `older`.
     #[must_use]
     pub fn shared_entry_count(&self, older: &Self) -> usize {
-        let old: BTreeMap<_, _> = older.entries.iter().map(|(k, d)| (k, d)).collect();
-        self.entries
-            .iter()
+        let old: BTreeMap<_, _> = older.entries().map(|(k, d)| (k, d)).collect();
+        self.entries()
             .filter(|(k, d)| old.get(k).is_some_and(|old_d| *old_d == d))
             .count()
+    }
+
+    /// Counts leaf allocations physically shared with `older`.
+    #[must_use]
+    pub fn shared_leaf_count(&self, older: &Self) -> usize {
+        self.leaves
+            .iter()
+            .filter(|leaf| older.leaves.iter().any(|old| Arc::ptr_eq(leaf, old)))
+            .count()
+    }
+
+    fn from_entries(entries: &[IndexEntry], reusable: &[Self]) -> Self {
+        let leaves = entries
+            .chunks(LEAF_CAPACITY)
+            .map(|chunk| {
+                reusable
+                    .iter()
+                    .flat_map(|segment| segment.leaves.iter())
+                    .find(|leaf| leaf.as_ref() == chunk)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::from(chunk))
+            })
+            .collect::<Vec<_>>();
+        Self {
+            leaves: leaves.into(),
+        }
     }
 }
 
@@ -111,9 +131,7 @@ impl LiveIndex {
     /// Freezes this live index into an immutable segment.
     #[must_use]
     pub fn freeze(self) -> Segment {
-        Segment {
-            entries: self.entries.into_iter().collect::<Vec<_>>().into(),
-        }
+        Segment::from_entries(&self.entries.into_iter().collect::<Vec<_>>(), &[])
     }
 }
 
@@ -138,6 +156,7 @@ pub fn merged_iter<'a>(
 mod tests {
     use super::*;
     use corium_core::{EntityId, Value};
+    use proptest::prelude::*;
 
     fn datom(e: u64, a: u64, v: i64) -> Datom {
         Datom {
@@ -157,7 +176,7 @@ mod tests {
             std::slice::from_ref(&left),
             [datom(3, 1, 30)],
         );
-        assert_eq!(right.entries().len(), 3);
+        assert_eq!(right.entries().count(), 3);
         assert_eq!(right.shared_entry_count(&left), 2);
         let first_key = datom(2, 1, 20).key(IndexOrder::Eavt);
         assert_eq!(right.seek(&first_key).next().expect("entry").1.e.raw(), 2);
@@ -182,5 +201,59 @@ mod tests {
         live.insert(replacement);
         let merged: Vec<_> = merged_iter(&durable, &live).collect();
         assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn append_merge_reuses_all_complete_unchanged_leaves() {
+        let original = Segment::build(
+            IndexOrder::Eavt,
+            (0..LEAF_CAPACITY * 3).map(|e| {
+                let entity = u64::try_from(e).expect("test entity fits u64");
+                let value = i64::try_from(e).expect("test value fits i64");
+                datom(entity, 1, value)
+            }),
+        );
+        let merged = Segment::merge(
+            IndexOrder::Eavt,
+            std::slice::from_ref(&original),
+            [datom(1_000, 1, 1_000)],
+        );
+
+        assert_eq!(merged.shared_leaf_count(&original), 3);
+    }
+
+    proptest! {
+        #[test]
+        fn segment_operations_match_btree_model(
+            original in prop::collection::vec((0_u16..500, any::<i16>()), 0..300),
+            additions in prop::collection::vec((0_u16..500, any::<i16>()), 0..100),
+            seek_entity in 0_u16..500,
+        ) {
+            let to_datom = |(e, value)| datom(u64::from(e), 1, i64::from(value));
+            let original_datoms = original.into_iter().map(to_datom).collect::<Vec<_>>();
+            let additions = additions.into_iter().map(to_datom).collect::<Vec<_>>();
+            let segment = Segment::build(IndexOrder::Eavt, original_datoms.clone());
+            let merged = Segment::merge(
+                IndexOrder::Eavt,
+                std::slice::from_ref(&segment),
+                additions.clone(),
+            );
+
+            let mut model = BTreeMap::new();
+            for datom in original_datoms.into_iter().chain(additions) {
+                model.insert(datom.key(IndexOrder::Eavt), datom);
+            }
+            let actual = merged.entries().cloned().collect::<Vec<_>>();
+            let expected = model.into_iter().collect::<Vec<_>>();
+            prop_assert_eq!(&actual, &expected);
+
+            let seek_key = datom(u64::from(seek_entity), 0, i64::MIN).key(IndexOrder::Eavt);
+            let actual_tail = merged.seek(&seek_key).cloned().collect::<Vec<_>>();
+            let expected_tail = expected
+                .into_iter()
+                .skip_while(|entry| entry.0 < seek_key)
+                .collect::<Vec<_>>();
+            prop_assert_eq!(actual_tail, expected_tail);
+        }
     }
 }

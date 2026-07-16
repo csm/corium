@@ -1,7 +1,7 @@
 //! Content-addressed blob and fenced root stores for immutable index segments.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     fs::{self, File, OpenOptions},
     io,
@@ -47,6 +47,9 @@ pub enum StoreError {
     /// Blob digest did not match its content.
     #[error("blob content did not match digest {0}")]
     CorruptBlob(BlobId),
+    /// A live graph references a blob that is not present.
+    #[error("reachable blob is missing: {0}")]
+    MissingBlob(BlobId),
     /// Root name cannot be safely represented on the filesystem.
     #[error("invalid root name {0:?}")]
     InvalidRootName(String),
@@ -66,6 +69,26 @@ pub trait BlobStore: Send + Sync {
     ///
     /// Returns an error if the backend cannot read or verify the blob.
     fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
+    /// Reports whether a blob is present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot inspect the blob.
+    fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
+        Ok(self.get(id)?.is_some())
+    }
+    /// Deletes a blob during garbage collection. Missing blobs are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot delete the blob.
+    fn delete(&self, id: &BlobId) -> Result<(), StoreError>;
+    /// Lists all blob identifiers known to this backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot enumerate blobs.
+    fn list(&self) -> Result<Vec<BlobId>, StoreError>;
 }
 
 /// Named root pointer storage with compare-and-swap fencing.
@@ -113,6 +136,24 @@ impl BlobStore for MemoryStore {
             .blobs
             .get(id)
             .cloned())
+    }
+    fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
+        self.inner
+            .write()
+            .expect("poisoned store lock")
+            .blobs
+            .remove(id);
+        Ok(())
+    }
+    fn list(&self) -> Result<Vec<BlobId>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .expect("poisoned store lock")
+            .blobs
+            .keys()
+            .cloned()
+            .collect())
     }
 }
 impl RootStore for MemoryStore {
@@ -197,6 +238,30 @@ impl BlobStore for FsStore {
         }
         Ok(Some(bytes))
     }
+    fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
+        Ok(self.blob_path(id).is_file())
+    }
+    fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
+        match fs::remove_file(self.blob_path(id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn list(&self) -> Result<Vec<BlobId>, StoreError> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(self.root.join("blobs"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        ids.push(BlobId(name.to_owned()));
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
 }
 impl RootStore for FsStore {
     fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
@@ -229,6 +294,53 @@ impl RootStore for FsStore {
 
 fn digest(bytes: &[u8]) -> BlobId {
     BlobId(blake3::hash(bytes).to_hex().to_string())
+}
+
+/// Result counters from a mark-and-sweep garbage collection pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GcReport {
+    /// Number of blobs reachable from the supplied roots.
+    pub marked: usize,
+    /// Number of unreachable blobs deleted.
+    pub swept: usize,
+}
+
+/// Marks blobs reachable from `live_roots` and deletes every unmarked blob.
+///
+/// `children` decodes references from each present blob. Callers are responsible for
+/// supplying every currently live root and for applying any desired retention window.
+///
+/// # Errors
+///
+/// Returns an error if a blob operation or child-reference decode fails.
+pub fn mark_and_sweep(
+    store: &dyn BlobStore,
+    live_roots: impl IntoIterator<Item = BlobId>,
+    mut children: impl FnMut(&BlobId, &[u8]) -> Result<Vec<BlobId>, StoreError>,
+) -> Result<GcReport, StoreError> {
+    let mut marked = HashSet::new();
+    let mut pending = live_roots.into_iter().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        if !marked.insert(id.clone()) {
+            continue;
+        }
+        let bytes = store
+            .get(&id)?
+            .ok_or_else(|| StoreError::MissingBlob(id.clone()))?;
+        pending.extend(children(&id, &bytes)?);
+    }
+
+    let mut swept = 0;
+    for id in store.list()? {
+        if !marked.contains(&id) {
+            store.delete(&id)?;
+            swept += 1;
+        }
+    }
+    Ok(GcReport {
+        marked: marked.len(),
+        swept,
+    })
 }
 
 struct RootLock {

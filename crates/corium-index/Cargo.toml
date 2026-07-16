@@ -8,5 +8,8 @@ rust-version.workspace = true
 [dependencies]
 corium-core = { path = "../corium-core" }
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

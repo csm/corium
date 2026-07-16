@@ -1,6 +1,8 @@
 //! Store backend conformance tests.
 
-use corium_store::{BlobStore, FsStore, MemoryStore, RootStore, SegmentCache};
+use std::collections::HashMap;
+
+use corium_store::{BlobStore, FsStore, MemoryStore, RootStore, SegmentCache, mark_and_sweep};
 
 #[test]
 fn memory_store_cas_fences_roots() {
@@ -78,4 +80,74 @@ fn filesystem_roots_reject_path_traversal_names() {
     let store = FsStore::open(dir.path()).expect("open store");
     assert!(store.get_root("../bad").is_err());
     assert!(store.cas_root("nested/bad", None, b"root").is_err());
+}
+
+#[test]
+fn crash_during_publish_leaves_old_or_new_root_dereferenceable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (old, new) = {
+        let store = FsStore::open(dir.path()).expect("open store");
+        let old = store.put(b"old tree").expect("put old tree");
+        store
+            .cas_root("eavt", None, old.as_str().as_bytes())
+            .expect("publish old root");
+        let new = store.put(b"new tree").expect("upload before publish");
+        // Dropping the process-local store here simulates a crash after upload but
+        // before the root CAS.
+        (old, new)
+    };
+
+    let store = FsStore::open(dir.path()).expect("recover after pre-publish crash");
+    assert_eq!(
+        store.get_root("eavt").expect("old root after crash"),
+        Some(old.as_str().as_bytes().to_vec())
+    );
+    assert_eq!(
+        store.get(&old).expect("dereference old"),
+        Some(b"old tree".to_vec())
+    );
+
+    store
+        .cas_root(
+            "eavt",
+            Some(old.as_str().as_bytes()),
+            new.as_str().as_bytes(),
+        )
+        .expect("publish new root");
+    drop(store);
+    let store = FsStore::open(dir.path()).expect("recover after completed publish");
+    assert_eq!(
+        store.get_root("eavt").expect("new root after publish"),
+        Some(new.as_str().as_bytes().to_vec())
+    );
+    assert_eq!(
+        store.get(&new).expect("dereference new"),
+        Some(b"new tree".to_vec())
+    );
+}
+
+#[test]
+fn mark_and_sweep_preserves_every_reachable_blob() {
+    let store = MemoryStore::default();
+    let leaf_a = store.put(b"leaf a").expect("leaf a");
+    let leaf_b = store.put(b"leaf b").expect("leaf b");
+    let inner = store.put(b"inner").expect("inner");
+    let root = store.put(b"root").expect("root");
+    let garbage = store.put(b"abandoned").expect("garbage");
+    let graph = HashMap::from([
+        (root.clone(), vec![inner.clone(), leaf_b.clone()]),
+        (inner.clone(), vec![leaf_a.clone()]),
+    ]);
+
+    let report = mark_and_sweep(&store, [root.clone()], |id, _bytes| {
+        Ok(graph.get(id).cloned().unwrap_or_default())
+    })
+    .expect("collect garbage");
+
+    assert_eq!(report.marked, 4);
+    assert_eq!(report.swept, 1);
+    for reachable in [&root, &inner, &leaf_a, &leaf_b] {
+        assert!(store.contains(reachable).expect("reachable blob"));
+    }
+    assert!(!store.contains(&garbage).expect("garbage blob"));
 }
