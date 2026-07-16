@@ -172,7 +172,7 @@ impl FsStore {
 
     fn root_lock(&self, name: &str) -> Result<RootLock, StoreError> {
         let root_path = self.root_path(name)?;
-        RootLock::acquire(root_path.with_extension("lock"))
+        RootLock::acquire(&root_path.with_extension("lock"))
     }
 }
 impl BlobStore for FsStore {
@@ -232,27 +232,28 @@ fn digest(bytes: &[u8]) -> BlobId {
 }
 
 struct RootLock {
-    path: PathBuf,
     file: File,
 }
 
 impl RootLock {
-    fn acquire(path: PathBuf) -> Result<Self, StoreError> {
+    fn acquire(path: &Path) -> Result<Self, StoreError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&path)?;
+            .open(path)?;
         file.lock_exclusive()?;
-        Ok(Self { path, file })
+        Ok(Self { file })
     }
 }
 
 impl Drop for RootLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
-        let _ = fs::remove_file(&self.path);
+        // Keep the lock file in place so every contender locks the same inode.
+        // Unlinking it here would let a new opener lock a replacement file while
+        // a waiter still holds a descriptor for the unlinked original.
     }
 }
 

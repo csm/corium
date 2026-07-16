@@ -33,6 +33,16 @@ fn filesystem_store_round_trips_blobs_and_roots() {
 }
 
 #[test]
+fn filesystem_root_lock_file_remains_for_future_contenders() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FsStore::open(dir.path()).expect("open store");
+
+    store.cas_root("eavt", None, b"root").expect("publish root");
+
+    assert!(dir.path().join("roots/eavt.lock").is_file());
+}
+
+#[test]
 fn cache_loads_blob_once_visible() {
     let store = MemoryStore::default();
     let id = store.put(b"cached").expect("put blob");
