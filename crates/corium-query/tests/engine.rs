@@ -347,7 +347,10 @@ fn recursive_rules_find_transitive_friends() {
         &[QInput::Db(&db), QInput::Edn(rules)],
     )
     .expect("rules query");
-    let mut names: Vec<String> = rows(&result).iter().map(std::string::ToString::to_string).collect();
+    let mut names: Vec<String> = rows(&result)
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
     names.sort();
     assert_eq!(names.len(), 2);
     assert!(names[0].contains("bob"));
