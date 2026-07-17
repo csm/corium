@@ -119,6 +119,8 @@ name = "corium-log"
 version = "0.1.0"
 dependencies = [
  "corium-core",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -165,6 +167,13 @@ name = "corium-transactor"
 version = "0.1.0"
 dependencies = [
  "corium-core",
+ "corium-db",
+ "corium-index",
+ "corium-log",
+ "corium-store",
+ "corium-tx",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -172,6 +181,8 @@ name = "corium-tx"
 version = "0.1.0"
 dependencies = [
  "corium-core",
+ "corium-db",
+ "thiserror",
 ]
 
 [[package]]

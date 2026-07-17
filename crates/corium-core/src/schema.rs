@@ -81,4 +81,9 @@ impl Schema {
     pub fn get(&self, id: AttrId) -> Option<&Attribute> {
         self.attrs.get(&id)
     }
+
+    /// Iterates over every installed attribute in id order.
+    pub fn iter(&self) -> impl Iterator<Item = (&AttrId, &Attribute)> {
+        self.attrs.iter()
+    }
 }

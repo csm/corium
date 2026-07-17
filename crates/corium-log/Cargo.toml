@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 corium-core = { path = "../corium-core" }
+thiserror = "2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
