@@ -64,5 +64,11 @@ These were settled at project initialization and are recorded as ADRs:
 
 ## Current status
 
-Planning phase. Next step is Milestone M0 (workspace scaffolding, value
-encoding, datoms) per [docs/roadmap.md](docs/roadmap.md).
+Milestones M0–M3 are complete: core types and sortable encoding, the
+immutable segment store, the embedded transaction pipeline, and the query
+engine (Datalog, Pull, entity API, time views, planner statistics, query
+cache) with a 194-vector conformance corpus, differential model tests, and
+a recorded benchmark baseline
+([docs/benchmarks/m3-baseline.md](docs/benchmarks/m3-baseline.md)).
+Next step is Milestone M4 (distribution) per
+[docs/roadmap.md](docs/roadmap.md).

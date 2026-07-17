@@ -74,9 +74,10 @@ fn bound_attribute_never_full_scans() {
                 choice.prefix_len >= 1,
                 "bound a must not full-scan: {choice:?}"
             );
+            // VAET is only acceptable when the attribute is in its prefix.
             assert!(
-                choice.order != IndexOrder::Vaet,
-                "bound a picks an attribute-led or entity-led index"
+                choice.order != IndexOrder::Vaet || choice.prefix_len >= 2,
+                "bound a picks an index whose prefix covers it: {choice:?}"
             );
         }
         if e {

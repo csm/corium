@@ -425,7 +425,12 @@ fn eval_pattern(
             ),
             IndexOrder::Aevt => key_prefix(IndexOrder::Aevt, None, attr, None),
             IndexOrder::Avet => key_prefix(IndexOrder::Avet, None, attr, v.as_ref()),
-            IndexOrder::Vaet => key_prefix(IndexOrder::Vaet, None, None, v.as_ref()),
+            IndexOrder::Vaet => key_prefix(
+                IndexOrder::Vaet,
+                None,
+                if choice.prefix_len >= 2 { attr } else { None },
+                v.as_ref(),
+            ),
         };
         for datom in db.datoms_prefix(choice.order, &prefix) {
             ctx.spend(1)?;

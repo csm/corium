@@ -51,6 +51,14 @@ pub fn choose_index(
                 prefix_len: 2,
             };
         }
+        // References are always covered by VAET: a bound ref value plus the
+        // attribute makes a two-component reverse-index prefix.
+        if v_bound && v_is_ref {
+            return ScanChoice {
+                order: IndexOrder::Vaet,
+                prefix_len: 2,
+            };
+        }
         return ScanChoice {
             order: IndexOrder::Aevt,
             prefix_len: 1,
