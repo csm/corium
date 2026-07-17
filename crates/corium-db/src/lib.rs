@@ -95,9 +95,7 @@ impl PlannerStats {
             // Bound entity: at most the entity's datoms; refine by attribute.
             (true, Some(stats)) => (stats.count / stats.distinct_entities.max(1)).max(1),
             (true, None) => (self.total_datoms / self.entity_count.max(1)).max(1),
-            (false, Some(stats)) if v_bound => {
-                (stats.count / stats.distinct_values.max(1)).max(1)
-            }
+            (false, Some(stats)) if v_bound => (stats.count / stats.distinct_values.max(1)).max(1),
             (false, Some(stats)) => stats.count.max(1),
             // Unknown attribute constant: nothing will match.
             (false, None) if a.is_some() => 1,
@@ -594,14 +592,20 @@ mod tests {
     #[test]
     fn current_view_folds_retractions() {
         let db = sample();
-        assert_eq!(db.values(entity(1), attr(1)), vec![Value::Str("alicia".into())]);
+        assert_eq!(
+            db.values(entity(1), attr(1)),
+            vec![Value::Str("alicia".into())]
+        );
         assert_eq!(db.stats().datoms, 3);
     }
 
     #[test]
     fn as_of_reconstructs_past_basis() {
         let db = sample().as_of(1);
-        assert_eq!(db.values(entity(1), attr(1)), vec![Value::Str("alice".into())]);
+        assert_eq!(
+            db.values(entity(1), attr(1)),
+            vec![Value::Str("alice".into())]
+        );
         assert_eq!(db.stats().datoms, 2);
     }
 
@@ -610,7 +614,10 @@ mod tests {
         let db = sample().since(1);
         // The long asserted at t=1 is invisible; the renamed string is visible.
         assert_eq!(db.values(entity(1), attr(2)), Vec::<Value>::new());
-        assert_eq!(db.values(entity(1), attr(1)), vec![Value::Str("alicia".into())]);
+        assert_eq!(
+            db.values(entity(1), attr(1)),
+            vec![Value::Str("alicia".into())]
+        );
     }
 
     #[test]

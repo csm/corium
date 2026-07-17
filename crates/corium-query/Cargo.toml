@@ -7,6 +7,14 @@ rust-version.workspace = true
 
 [dependencies]
 corium-core = { path = "../corium-core" }
+corium-db = { path = "../corium-db" }
+thiserror = "2"
+
+[dev-dependencies]
+corium-log = { path = "../corium-log" }
+corium-transactor = { path = "../corium-transactor" }
+corium-tx = { path = "../corium-tx" }
+proptest = "1"
 
 [lints]
 workspace = true
