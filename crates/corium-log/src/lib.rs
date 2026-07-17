@@ -80,34 +80,42 @@ impl TransactionLog for MemoryLog {
 }
 
 /// Filesystem append log. Each append is flushed and `fsync`ed before returning.
+///
+/// A crash mid-append leaves a torn, never-acked record at the tail; `open`
+/// truncates it away so replay stops at the durability point of the last
+/// acked transaction and later appends extend a clean tail.
 pub struct FileLog {
     path: PathBuf,
-    lock: RwLock<()>,
+    next_t: RwLock<u64>,
 }
 impl FileLog {
-    /// Opens or creates a log file.
+    /// Opens or creates a log file, dropping any torn tail left by a crash.
     ///
     /// # Errors
-    /// Returns an error if the file cannot be created or existing data is corrupt.
+    /// Returns an error if the file cannot be created or a fully written
+    /// record is corrupt.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LogError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         OpenOptions::new().create(true).append(true).open(&path)?;
-        let log = Self {
+        let (records, durable_len) = read_records(&path)?;
+        if fs::metadata(&path)?.len() > durable_len {
+            let file = OpenOptions::new().write(true).open(&path)?;
+            file.set_len(durable_len)?;
+            file.sync_all()?;
+        }
+        Ok(Self {
             path,
-            lock: RwLock::new(()),
-        };
-        log.replay()?;
-        Ok(log)
+            next_t: RwLock::new(records.last().map_or(1, |r| r.t + 1)),
+        })
     }
 }
 impl TransactionLog for FileLog {
     fn append(&self, record: &TxRecord) -> Result<(), LogError> {
-        let _guard = self.lock.write().expect("poisoned log lock");
-        let existing = read_records(&self.path)?;
-        if existing.last().map_or(1, |r| r.t + 1) != record.t {
+        let mut next_t = self.next_t.write().expect("poisoned log lock");
+        if *next_t != record.t {
             return Err(LogError::Corrupt);
         }
         let payload = encode_record(record);
@@ -119,11 +127,13 @@ impl TransactionLog for FileLog {
         )?;
         file.write_all(&payload)?;
         file.sync_all()?;
+        *next_t += 1;
         Ok(())
     }
     fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
-        let _guard = self.lock.read().expect("poisoned log lock");
+        let _guard = self.next_t.read().expect("poisoned log lock");
         Ok(read_records(&self.path)?
+            .0
             .into_iter()
             .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
             .collect())
@@ -187,9 +197,15 @@ fn decode_record(mut bytes: &[u8]) -> Result<TxRecord, LogError> {
         datoms,
     })
 }
-fn read_records(path: &Path) -> Result<Vec<TxRecord>, LogError> {
+/// Reads fully written records plus the byte length of that durable prefix.
+///
+/// A record cut short by a crash mid-append (truncated length prefix or
+/// payload) ends the scan; a fully present record that fails to decode is
+/// genuine corruption and errors.
+fn read_records(path: &Path) -> Result<(Vec<TxRecord>, u64), LogError> {
     let mut file = File::open(path)?;
     let mut records = Vec::new();
+    let mut durable_len = 0_u64;
     loop {
         let mut len = [0; 8];
         match file.read_exact(&mut len) {
@@ -199,9 +215,13 @@ fn read_records(path: &Path) -> Result<Vec<TxRecord>, LogError> {
         }
         let len = usize::try_from(u64::from_be_bytes(len)).map_err(|_| LogError::Corrupt)?;
         let mut payload = vec![0; len];
-        file.read_exact(&mut payload)
-            .map_err(|_| LogError::Corrupt)?;
+        match file.read_exact(&mut payload) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
         records.push(decode_record(&payload)?);
+        durable_len += 8 + len as u64;
     }
-    Ok(records)
+    Ok((records, durable_len))
 }

@@ -168,17 +168,20 @@ pub fn prepare(
                     {
                         return Err(TxError::UniqueConflict);
                     }
+                    let current = working.values(e, a);
+                    // Re-asserting a present fact is a no-op: no datom recorded.
+                    if current.contains(&v) {
+                        continue;
+                    }
                     if attr.cardinality == Cardinality::One {
-                        for old in working.values(e, a) {
-                            if old != v {
-                                datoms.push(Datom {
-                                    e,
-                                    a,
-                                    v: old,
-                                    tx,
-                                    added: false,
-                                });
-                            }
+                        for old in current {
+                            datoms.push(Datom {
+                                e,
+                                a,
+                                v: old,
+                                tx,
+                                added: false,
+                            });
                         }
                     }
                 }
@@ -192,13 +195,17 @@ pub fn prepare(
             }
             TxOp::Retract(entity, a, v) => {
                 validate(&working, a, &v)?;
-                datoms.push(Datom {
-                    e: resolve(&entity)?,
-                    a,
-                    v,
-                    tx,
-                    added: false,
-                });
+                let e = resolve(&entity)?;
+                // Retracting an absent fact is a no-op: no datom recorded.
+                if working.values(e, a).contains(&v) {
+                    datoms.push(Datom {
+                        e,
+                        a,
+                        v,
+                        tx,
+                        added: false,
+                    });
+                }
             }
             TxOp::Cas(entity, a, old, new) => {
                 validate(&working, a, &new)?;
@@ -231,13 +238,22 @@ pub fn prepare(
                     added: true,
                 });
             }
-            TxOp::RetractEntity(entity) => retract_entity(
-                &working,
-                resolve(&entity)?,
-                tx,
-                &mut datoms,
-                &mut BTreeSet::new(),
-            ),
+            TxOp::RetractEntity(entity) => {
+                let mut facts = BTreeSet::new();
+                collect_entity_retractions(
+                    &working,
+                    resolve(&entity)?,
+                    &mut facts,
+                    &mut BTreeSet::new(),
+                );
+                datoms.extend(facts.into_iter().map(|(e, a, v)| Datom {
+                    e,
+                    a,
+                    v,
+                    tx,
+                    added: false,
+                }));
+            }
         }
         working = working.with_transaction(working.basis_t() + 1, &datoms[start..]);
     }
@@ -252,26 +268,29 @@ fn validate(db: &Db, a: EntityId, value: &Value) -> Result<(), TxError> {
     Ok(())
 }
 
-fn retract_entity(
+/// Collects the current facts removed by `:db/retractEntity` for `e`:
+/// the entity's own datoms, incoming references to it, and (recursively)
+/// its component children. Deduplicated by `(e, a, v)` because a component
+/// child's outgoing-ref datom is also an incoming reference to the child.
+fn collect_entity_retractions(
     db: &Db,
     e: EntityId,
-    tx: EntityId,
-    out: &mut Vec<Datom>,
+    facts: &mut BTreeSet<(EntityId, EntityId, Value)>,
     seen: &mut BTreeSet<EntityId>,
 ) {
     if !seen.insert(e) {
         return;
     }
-    for datom in db.datoms().into_iter().filter(|d| d.e == e) {
-        if db.schema().get(datom.a).is_some_and(|a| a.is_component) {
-            if let Value::Ref(child) = &datom.v {
-                retract_entity(db, *child, tx, out, seen);
+    for datom in db.datoms() {
+        if datom.e == e {
+            if db.schema().get(datom.a).is_some_and(|a| a.is_component) {
+                if let Value::Ref(child) = &datom.v {
+                    collect_entity_retractions(db, *child, facts, seen);
+                }
             }
+            facts.insert((datom.e, datom.a, datom.v));
+        } else if datom.v == Value::Ref(e) {
+            facts.insert((datom.e, datom.a, datom.v));
         }
-        out.push(Datom {
-            tx,
-            added: false,
-            ..datom
-        });
     }
 }

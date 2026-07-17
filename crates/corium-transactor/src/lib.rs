@@ -66,8 +66,11 @@ impl EmbeddedTransactor {
             db = db.with_transaction(record.t, &record.datoms);
             last_instant = last_instant.max(record.tx_instant);
         }
+        // Allocation must resume past every id that ever appeared in the log,
+        // not just ids with current datoms; otherwise a fully retracted
+        // entity's id would be reused after a restart.
         let next_user = db
-            .datoms()
+            .history()
             .iter()
             .filter(|d| d.e.partition() == Partition::User as u32)
             .map(|d| d.e.sequence() + 1)
@@ -158,6 +161,11 @@ impl EmbeddedTransactor {
     /// Blobs are uploaded before the root CAS. Transactions may continue while the
     /// immutable snapshot is encoded; a later run indexes any remaining log tail.
     ///
+    /// Publication is monotone in `index_basis_t`: if a root at an equal or
+    /// newer basis is already published (or wins a concurrent CAS race), this
+    /// snapshot's root is not installed and its blobs are left for garbage
+    /// collection. The freshly built root is returned either way.
+    ///
     /// # Errors
     /// Returns an error if a blob upload, root read, or fenced publication fails.
     pub fn publish_indexes(
@@ -191,9 +199,21 @@ impl EmbeddedTransactor {
             ],
         };
         let encoded = root.encode();
-        let previous = store.get_root("db")?;
-        store.cas_root("db", previous.as_deref(), &encoded)?;
-        Ok(root)
+        loop {
+            let previous = store.get_root("db")?;
+            if previous
+                .as_deref()
+                .and_then(PublishedRoot::stored_basis)
+                .is_some_and(|basis| basis >= root.index_basis_t)
+            {
+                return Ok(root);
+            }
+            match store.cas_root("db", previous.as_deref(), &encoded) {
+                Ok(()) => return Ok(root),
+                Err(StoreError::CasFailed { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 }
 
@@ -212,5 +232,14 @@ impl PublishedRoot {
             self.index_basis_t, self.roots[0], self.roots[1], self.roots[2], self.roots[3]
         )
         .into_bytes()
+    }
+    /// Extracts `index_basis_t` from encoded root bytes.
+    fn stored_basis(bytes: &[u8]) -> Option<u64> {
+        std::str::from_utf8(bytes)
+            .ok()?
+            .lines()
+            .next()?
+            .parse()
+            .ok()
     }
 }

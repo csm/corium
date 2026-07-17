@@ -107,3 +107,110 @@ fn rejects_wrong_types_and_unique_conflicts() {
     );
     assert_eq!(result, Err(TxError::UniqueConflict));
 }
+
+#[test]
+fn reasserting_present_and_retracting_absent_facts_are_no_ops() {
+    let (empty, name, _email) = fixture();
+    let e = EntityId::new(Partition::User as u32, 1_000);
+    let first = prepare(
+        &empty,
+        [TxItem::Op(TxOp::Add(
+            EntityRef::Id(e),
+            name,
+            Value::Str(Arc::from("Alice")),
+        ))],
+        EntityId::new(Partition::Tx as u32, 1),
+        1_000,
+    )
+    .expect("prepare first transaction");
+    let db = empty.with_transaction(1, &first.datoms);
+    let second = prepare(
+        &db,
+        [
+            TxItem::Op(TxOp::Add(
+                EntityRef::Id(e),
+                name,
+                Value::Str(Arc::from("Alice")),
+            )),
+            TxItem::Op(TxOp::Retract(
+                EntityRef::Id(e),
+                name,
+                Value::Str(Arc::from("Bob")),
+            )),
+        ],
+        EntityId::new(Partition::Tx as u32, 2),
+        1_001,
+    )
+    .expect("no-op transaction");
+    assert_eq!(second.datoms, vec![]);
+}
+
+#[test]
+fn retract_entity_removes_components_and_incoming_refs() {
+    let name = EntityId::new(Partition::Db as u32, 100);
+    let child = EntityId::new(Partition::Db as u32, 102);
+    let friend = EntityId::new(Partition::Db as u32, 103);
+    let mut schema = Schema::default();
+    schema.insert(attribute(100, ValueType::Str, Cardinality::One, None));
+    schema.insert(corium_core::Attribute {
+        is_component: true,
+        ..attribute(102, ValueType::Ref, Cardinality::One, None)
+    });
+    schema.insert(attribute(103, ValueType::Ref, Cardinality::One, None));
+    let empty = Db::new(schema);
+    let tx1 = EntityId::new(Partition::Tx as u32, 1);
+    let first = prepare(
+        &empty,
+        [
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp("parent".into()),
+                name,
+                Value::Str(Arc::from("parent")),
+            )),
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp("kid".into()),
+                name,
+                Value::Str(Arc::from("kid")),
+            )),
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp("other".into()),
+                name,
+                Value::Str(Arc::from("other")),
+            )),
+        ],
+        tx1,
+        1_000,
+    )
+    .expect("create entities");
+    let parent = first.tempids["parent"];
+    let kid = first.tempids["kid"];
+    let other = first.tempids["other"];
+    let db = empty.with_transaction(1, &first.datoms);
+    let second = prepare(
+        &db,
+        [
+            TxItem::Op(TxOp::Add(EntityRef::Id(parent), child, Value::Ref(kid))),
+            TxItem::Op(TxOp::Add(EntityRef::Id(other), friend, Value::Ref(kid))),
+        ],
+        EntityId::new(Partition::Tx as u32, 2),
+        1_003,
+    )
+    .expect("link entities");
+    let db = db.with_transaction(2, &second.datoms);
+    let third = prepare(
+        &db,
+        [TxItem::Op(TxOp::RetractEntity(EntityRef::Id(parent)))],
+        EntityId::new(Partition::Tx as u32, 3),
+        1_003,
+    )
+    .expect("retract parent");
+    let db = db.with_transaction(3, &third.datoms);
+    // The component child and every reference to it are gone; only the
+    // unrelated entity's own fact survives.
+    let remaining = db.datoms();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].e, other);
+    assert_eq!(remaining[0].a, name);
+    assert!(db.values(kid, name).is_empty());
+    assert!(db.values(other, friend).is_empty());
+}
