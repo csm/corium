@@ -78,7 +78,7 @@ pub fn compare(left: &Value, right: &Value) -> Result<Ordering, QueryError> {
 /// cross-type operands (they are simply unequal).
 #[must_use]
 pub fn loose_eq(left: &Value, right: &Value) -> bool {
-    compare(left, right).map(Ordering::is_eq).unwrap_or(false)
+    compare(left, right).is_ok_and(Ordering::is_eq)
 }
 
 #[allow(clippy::cast_precision_loss)]
