@@ -35,9 +35,23 @@ impl Segment {
     }
 
     /// Seeks to the first entry whose key is greater than or equal to `key`.
+    ///
+    /// Binary-searches leaf boundaries and then within the target leaf, so
+    /// positioning costs O(log n) rather than a scan of preceding entries.
     pub fn seek<'a>(&'a self, key: &'a [u8]) -> impl Iterator<Item = &'a IndexEntry> + 'a {
-        self.entries()
-            .skip_while(move |entry| entry.0.as_slice() < key)
+        let leaf_idx = self
+            .leaves
+            .partition_point(|leaf| leaf.last().is_none_or(|(last, _)| last.as_slice() < key));
+        let entry_idx = self.leaves.get(leaf_idx).map_or(0, |leaf| {
+            leaf.partition_point(|(entry_key, _)| entry_key.as_slice() < key)
+        });
+        self.leaves[leaf_idx..]
+            .iter()
+            .enumerate()
+            .flat_map(move |(offset, leaf)| {
+                let start = if offset == 0 { entry_idx } else { 0 };
+                leaf[start..].iter()
+            })
     }
 
     /// Merges sorted segments plus new datoms into a new immutable segment.
@@ -77,18 +91,41 @@ impl Segment {
             .count()
     }
 
+    /// Chunks `entries` into leaves, anchoring boundaries to reusable leaves.
+    ///
+    /// A reusable leaf whose contents appear verbatim in `entries` is shared
+    /// wherever it starts, so insertions only rebuild the leaves they touch
+    /// instead of shifting every downstream chunk boundary.
     fn from_entries(entries: &[IndexEntry], reusable: &[Self]) -> Self {
-        let leaves = entries
-            .chunks(LEAF_CAPACITY)
-            .map(|chunk| {
-                reusable
-                    .iter()
-                    .flat_map(|segment| segment.leaves.iter())
-                    .find(|leaf| leaf.as_ref() == chunk)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::from(chunk))
-            })
-            .collect::<Vec<_>>();
+        let mut candidates: BTreeMap<&[u8], Vec<&Arc<[IndexEntry]>>> = BTreeMap::new();
+        for leaf in reusable.iter().flat_map(|segment| segment.leaves.iter()) {
+            if let Some((first_key, _)) = leaf.first() {
+                candidates.entry(first_key).or_default().push(leaf);
+            }
+        }
+        let reusable_at = |start: usize| {
+            candidates
+                .get(entries[start].0.as_slice())?
+                .iter()
+                .find(|leaf| entries[start..].starts_with(leaf))
+                .copied()
+        };
+
+        let mut leaves = Vec::new();
+        let mut start = 0;
+        while start < entries.len() {
+            if let Some(leaf) = reusable_at(start) {
+                leaves.push(Arc::clone(leaf));
+                start += leaf.len();
+                continue;
+            }
+            let mut end = start + 1;
+            while end < entries.len() && end - start < LEAF_CAPACITY && reusable_at(end).is_none() {
+                end += 1;
+            }
+            leaves.push(Arc::from(&entries[start..end]));
+            start = end;
+        }
         Self {
             leaves: leaves.into(),
         }
@@ -220,6 +257,49 @@ mod tests {
         );
 
         assert_eq!(merged.shared_leaf_count(&original), 3);
+    }
+
+    #[test]
+    fn mid_keyspace_merge_reuses_untouched_leaves() {
+        // Even entities only, so odd entities land strictly inside a leaf.
+        let original = Segment::build(
+            IndexOrder::Eavt,
+            (0..LEAF_CAPACITY * 3).map(|e| {
+                let entity = u64::try_from(e * 2).expect("test entity fits u64");
+                let value = i64::try_from(e).expect("test value fits i64");
+                datom(entity, 1, value)
+            }),
+        );
+        let middle_of_second_leaf = u64::try_from(LEAF_CAPACITY * 3).expect("entity fits u64") + 1;
+        let merged = Segment::merge(
+            IndexOrder::Eavt,
+            std::slice::from_ref(&original),
+            [datom(middle_of_second_leaf, 1, -1)],
+        );
+
+        // Only the leaf containing the insertion point is rebuilt; the leaves
+        // before and after it keep their boundaries and stay shared.
+        assert_eq!(merged.shared_leaf_count(&original), 2);
+        assert_eq!(merged.entries().count(), LEAF_CAPACITY * 3 + 1);
+    }
+
+    #[test]
+    fn seek_handles_segment_bounds() {
+        assert!(Segment::default().seek(b"anything").next().is_none());
+
+        let total = LEAF_CAPACITY * 2 + 7;
+        let segment = Segment::build(
+            IndexOrder::Eavt,
+            (0..total).map(|e| {
+                let entity = u64::try_from(e).expect("test entity fits u64");
+                datom(entity, 1, 0)
+            }),
+        );
+        assert_eq!(segment.seek(&[]).count(), total);
+        let last_key =
+            datom(u64::try_from(total - 1).expect("entity fits u64"), 1, 0).key(IndexOrder::Eavt);
+        assert_eq!(segment.seek(&last_key).count(), 1);
+        assert!(segment.seek(&[0xFF; 64]).next().is_none());
     }
 
     proptest! {
