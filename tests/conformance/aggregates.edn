@@ -1,0 +1,129 @@
+; Aggregates: count, count-distinct, sum, avg, median, min/max, n-arity,
+; distinct, sample, variance/stddev, grouping, :with interaction.
+
+{:name "agg/count"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"} {:db/id "c" :p/name "Carol"}]]
+ :query [:find (count ?e) . :where [?e :p/name _]]
+ :expected 3}
+
+{:name "agg/count-deduplicates-first"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 30}]]
+ :query [:find (count ?age) . :where [_ :p/age ?age]]
+ :expected 1}
+
+{:name "agg/count-with-preserves-bag"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 30}]]
+ :query [:find (count ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected 2}
+
+{:name "agg/count-distinct"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 30} {:db/id "c" :p/age 25}]]
+ :query [:find (count-distinct ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected 2}
+
+{:name "agg/sum"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25}]]
+ :query [:find (sum ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected 55}
+
+{:name "agg/sum-of-empty-is-zero"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]]
+ :query [:find (sum ?age) :where [?e :p/age ?age] [(> ?age 100)]]
+ :expected #{}}
+
+{:name "agg/avg"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 20}]]
+ :query [:find (avg ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected 25.0}
+
+{:name "agg/median-odd-count"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 10} {:db/id "b" :p/age 30} {:db/id "c" :p/age 20}]]
+ :query [:find (median ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected 20}
+
+{:name "agg/min-max"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25} {:db/id "c" :p/age 35}]]
+ :query [:find (min ?age) (max ?age) :with ?e :where [?e :p/age ?age]]
+ :expected [[25 35]]}
+
+{:name "agg/min-max-strings"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]]
+ :query [:find (min ?n) (max ?n) :with ?e :where [?e :p/name ?n]]
+ :expected [["Alice" "Bob"]]}
+
+{:name "agg/min-n-returns-smallest"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25} {:db/id "c" :p/age 35}]]
+ :query [:find (min 2 ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected [25 30]}
+
+{:name "agg/max-n-returns-largest"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25} {:db/id "c" :p/age 35}]]
+ :query [:find (max 2 ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected [30 35]}
+
+{:name "agg/distinct-returns-set"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 30} {:db/id "c" :p/age 25}]]
+ :query [:find (distinct ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected #{25 30}}
+
+{:name "agg/sample-is-deterministic-prefix"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25} {:db/id "c" :p/age 35}]]
+ :query [:find (sample 2 ?age) . :with ?e :where [?e :p/age ?age]]
+ :expected [25 30]}
+
+{:name "agg/variance-and-stddev"
+ ; population variance over one value per entity: mean 5, variance 4, stddev 2
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 2} {:db/id "b" :p/n 4} {:db/id "c" :p/n 4} {:db/id "d" :p/n 4}
+       {:db/id "e" :p/n 5} {:db/id "f" :p/n 5} {:db/id "g" :p/n 7} {:db/id "h" :p/n 9}]]
+ :query [:find (variance ?n) (stddev ?n) :with ?e :where [?e :p/n ?n]]
+ :expected [[4.0 2.0]]}
+
+{:name "agg/grouping-by-leading-variable"
+ :schema [{:db/ident :p/city :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/city "Rome" :p/age 30}
+       {:db/id "b" :p/city "Rome" :p/age 20}
+       {:db/id "c" :p/city "Oslo" :p/age 40}]]
+ :query [:find ?city (count ?e) (avg ?age)
+         :where [?e :p/city ?city] [?e :p/age ?age]]
+ :expected #{["Rome" 2 25.0] ["Oslo" 1 40.0]}}
+
+{:name "agg/multiple-aggregates-one-group"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 20}]]
+ :query [:find (count ?e) (sum ?age) (min ?age) (max ?age)
+         :where [?e :p/age ?age]]
+ :expected [[2 50 20 30]]}
+
+{:name "agg/empty-input-empty-relation"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]]
+ :query [:find (count ?e) :where [?e :p/age 99]]
+ :expected #{}}
+
+{:name "agg/sum-mixed-long-double-promotes"
+ :schema [{:db/ident :p/n :db/valueType :db.type/double :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/n [1.5 2.5]}]]
+ :query [:find (sum ?n) . :with ?e :where [?e :p/n ?n]]
+ :expected 4.0}
+
+{:name "agg/unknown-aggregate-errors"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]]
+ :query [:find (weird ?age) . :where [_ :p/age ?age]]
+ :expect-error true}

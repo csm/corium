@@ -7,6 +7,19 @@ rust-version.workspace = true
 
 [dependencies]
 corium-core = { path = "../corium-core" }
+corium-db = { path = "../corium-db" }
+thiserror = "2"
+
+[dev-dependencies]
+corium-log = { path = "../corium-log" }
+corium-transactor = { path = "../corium-transactor" }
+corium-tx = { path = "../corium-tx" }
+criterion = "0.5"
+proptest = "1"
+
+[[bench]]
+name = "query"
+harness = false
 
 [lints]
 workspace = true

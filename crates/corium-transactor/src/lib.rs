@@ -60,7 +60,16 @@ impl EmbeddedTransactor {
     /// # Errors
     /// Returns an error when the durable log cannot be replayed.
     pub fn recover(schema: Schema, log: Arc<dyn TransactionLog>) -> Result<Self, TransactError> {
-        let mut db = Db::new(schema);
+        Self::recover_from(Db::new(schema), log)
+    }
+
+    /// Recovers from an empty base database value (schema plus naming) by
+    /// replaying the durable log exactly once.
+    ///
+    /// # Errors
+    /// Returns an error when the durable log cannot be replayed.
+    pub fn recover_from(base: Db, log: Arc<dyn TransactionLog>) -> Result<Self, TransactError> {
+        let mut db = base;
         let mut last_instant = i64::MIN;
         for record in log.replay()? {
             db = db.with_transaction(record.t, &record.datoms);
@@ -70,7 +79,7 @@ impl EmbeddedTransactor {
         // not just ids with current datoms; otherwise a fully retracted
         // entity's id would be reused after a restart.
         let next_user = db
-            .history()
+            .recorded_datoms()
             .iter()
             .filter(|d| d.e.partition() == Partition::User as u32)
             .map(|d| d.e.sequence() + 1)

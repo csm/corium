@@ -1,0 +1,106 @@
+; Predicate clauses: comparisons, numeric tests, string tests, missing?.
+
+{:name "pred/less-than"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25} {:db/id "c" :p/age 35}]]
+ :query [:find ?age :where [_ :p/age ?age] [(< ?age 31)]]
+ :expected #{[30] [25]}}
+
+{:name "pred/less-than-or-equal"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25}]]
+ :query [:find ?age :where [_ :p/age ?age] [(<= ?age 30)]]
+ :expected #{[30] [25]}}
+
+{:name "pred/greater-than"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25}]]
+ :query [:find ?age :where [_ :p/age ?age] [(> ?age 29)]]
+ :expected #{[30]}}
+
+{:name "pred/greater-than-or-equal"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25}]]
+ :query [:find ?age :where [_ :p/age ?age] [(>= ?age 30)]]
+ :expected #{[30]}}
+
+{:name "pred/equals-two-variables"
+ :schema [{:db/ident :p/x :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+          {:db/ident :p/y :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/x 1 :p/y 1} {:db/id "b" :p/x 1 :p/y 2}]]
+ :query [:find ?e :where [?e :p/x ?x] [?e :p/y ?y] [(= ?x ?y)]]
+ :expected #{[#tempid "a"]}}
+
+{:name "pred/not-equals"
+ :schema [{:db/ident :p/x :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+          {:db/ident :p/y :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/x 1 :p/y 1} {:db/id "b" :p/x 1 :p/y 2}]]
+ :query [:find ?e :where [?e :p/x ?x] [?e :p/y ?y] [(!= ?x ?y)]]
+ :expected #{[#tempid "b"]}}
+
+{:name "pred/chained-comparison"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30} {:db/id "b" :p/age 25} {:db/id "c" :p/age 35}]]
+ :query [:find ?age :where [_ :p/age ?age] [(< 26 ?age 34)]]
+ :expected #{[30]}}
+
+{:name "pred/long-and-double-compare"
+ :schema [{:db/ident :p/score :db/valueType :db.type/double :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/score 2.5} {:db/id "b" :p/score 4.5}]]
+ :query [:find ?s :where [_ :p/score ?s] [(< ?s 3)]]
+ :expected #{[2.5]}}
+
+{:name "pred/string-comparison-orders-lexicographically"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "apple"} {:db/id "b" :p/name "banana"}]]
+ :query [:find ?n :where [_ :p/name ?n] [(< ?n "b")]]
+ :expected #{["apple"]}}
+
+{:name "pred/even-and-odd"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/n [1 2 3 4]}]]
+ :query [:find ?n :where [_ :p/n ?n] [(even? ?n)]]
+ :expected #{[2] [4]}}
+
+{:name "pred/zero-pos-neg"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/n [-2 0 3]}]]
+ :query [:find ?n :where [_ :p/n ?n] [(neg? ?n)]]
+ :expected #{[-2]}}
+
+{:name "pred/starts-with"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Albert"} {:db/id "c" :p/name "Bob"}]]
+ :query [:find ?n :where [_ :p/name ?n] [(starts-with? ?n "Al")]]
+ :expected #{["Alice"] ["Albert"]}}
+
+{:name "pred/ends-with"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]]
+ :query [:find ?n :where [_ :p/name ?n] [(ends-with? ?n "e")]]
+ :expected #{["Alice"]}}
+
+{:name "pred/includes"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]]
+ :query [:find ?n :where [_ :p/name ?n] [(includes? ?n "lic")]]
+ :expected #{["Alice"]}}
+
+{:name "pred/missing-attribute"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30} {:db/id "b" :p/name "Bob"}]]
+ :query [:find ?n :where [?e :p/name ?n] [(missing? $ ?e :p/age)]]
+ :expected #{["Bob"]}}
+
+{:name "pred/comparing-string-with-long-errors"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?n :where [_ :p/name ?n] [(< ?n 3)]]
+ :expect-error true}
+
+{:name "pred/unbound-argument-errors"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?n :where [_ :p/name ?n] [(< ?nope 3)]]
+ :expect-error true}
