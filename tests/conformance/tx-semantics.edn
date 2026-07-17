@@ -1,0 +1,104 @@
+; Transaction semantics observed through queries: upsert, cardinality-one
+; replacement, no-op re-assertion, cas, retractEntity, components.
+
+{:name "tx/upsert-by-identity-attribute"
+ :schema [{:db/ident :p/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+          {:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/email "a@x.io" :p/name "Alice"}]
+      [{:db/id "a2" :p/email "a@x.io" :p/name "Alicia"}]]
+ :query [:find ?e ?n :where [?e :p/email "a@x.io"] [?e :p/name ?n]]
+ :expected #{[#tempid "a" "Alicia"]}}
+
+{:name "tx/upsert-unifies-tempids"
+ :schema [{:db/ident :p/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}]
+ :tx [[{:db/id "a" :p/email "a@x.io"}]
+      [{:db/id "same" :p/email "a@x.io"}]]
+ :query [:find (count ?e) . :where [?e :p/email _]]
+ :expected 1}
+
+{:name "tx/cardinality-one-replaces"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :query [:find ?age :where [_ :p/age ?age]]
+ :expected #{[31]}}
+
+{:name "tx/cardinality-many-accumulates"
+ :schema [{:db/ident :p/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/nick "Al"}]
+      [[:db/add #tempid "a" :p/nick "Ali"]]]
+ :query [:find ?n :where [_ :p/nick ?n]]
+ :expected #{["Al"] ["Ali"]}}
+
+{:name "tx/reassert-same-value-no-new-tx-datom"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 30]]]
+ :view :history
+ :query [:find (count ?tx) . :where [?e :p/age 30 ?tx true]]
+ :expected 1}
+
+{:name "tx/retract-specific-value"
+ :schema [{:db/ident :p/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/nick ["Al" "Ali"]}]
+      [[:db/retract #tempid "a" :p/nick "Al"]]]
+ :query [:find ?n :where [_ :p/nick ?n]]
+ :expected #{["Ali"]}}
+
+{:name "tx/cas-succeeds"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]
+      [[:db/cas #tempid "a" :p/age 30 31]]]
+ :query [:find ?age . :where [_ :p/age ?age]]
+ :expected 31}
+
+{:name "tx/cas-from-nil-asserts"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+          {:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [[:db/cas #tempid "a" :p/age nil 30]]]
+ :query [:find ?age . :where [_ :p/age ?age]]
+ :expected 30}
+
+{:name "tx/retract-entity-removes-all-datoms"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30} {:db/id "b" :p/name "Bob"}]
+      [[:db/retractEntity #tempid "a"]]]
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{["Bob"]}}
+
+{:name "tx/retract-entity-removes-incoming-refs"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]
+      [[:db/add #tempid "a" :p/friend #tempid "b"]]
+      [[:db/retractEntity #tempid "b"]]]
+ :query [:find ?f :where [_ :p/friend ?f]]
+ :expected #{}}
+
+{:name "tx/retract-entity-cascades-components"
+ :schema [{:db/ident :o/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :o/part :db/valueType :db.type/ref :db/cardinality :db.cardinality/many :db/isComponent true}]
+ :tx [[{:db/id "car" :o/name "Car"} {:db/id "engine" :o/name "Engine"}]
+      [[:db/add #tempid "car" :o/part #tempid "engine"]]
+      [[:db/retractEntity #tempid "car"]]]
+ :query [:find ?n :where [_ :o/name ?n]]
+ :expected #{}}
+
+{:name "tx/retract-entity-leaves-non-components"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]
+      [[:db/add #tempid "a" :p/friend #tempid "b"]]
+      [[:db/retractEntity #tempid "a"]]]
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{["Bob"]}}
+
+{:name "tx/history-of-cardinality-one-replacement"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :view :history
+ :query [:find ?age ?added :where [_ :p/age ?age #tx 2 ?added]]
+ :expected #{[30 false] [31 true]}}

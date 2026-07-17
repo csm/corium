@@ -1,0 +1,130 @@
+; Time model: as-of, since, history views, and tx positions in patterns.
+
+{:name "time/as-of-sees-old-value"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :view {:as-of 1}
+ :query [:find ?age . :where [[:p/name "Alice"] :p/age ?age]]
+ :expected 30}
+
+{:name "time/as-of-excludes-later-entities"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [{:db/id "b" :p/name "Bob"}]]
+ :view {:as-of 1}
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{["Alice"]}}
+
+{:name "time/as-of-sees-retracted-fact"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [[:db/retract #tempid "a" :p/name "Alice"]]]
+ :view {:as-of 1}
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{["Alice"]}}
+
+{:name "time/current-view-after-retraction"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [[:db/retract #tempid "a" :p/name "Alice"]]]
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{}}
+
+{:name "time/since-excludes-old-live-facts"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [{:db/id "b" :p/name "Bob"}]]
+ :view {:since 1}
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{["Bob"]}}
+
+{:name "time/since-includes-reasserted-after-retraction"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [[:db/retract #tempid "a" :p/name "Alice"]]
+      [[:db/add #tempid "a" :p/name "Alice"]]]
+ :view {:since 1}
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{["Alice"]}}
+
+{:name "time/since-of-latest-basis-is-empty"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :view {:since 1}
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{}}
+
+{:name "time/history-exposes-assertions-and-retractions"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :view :history
+ :query [:find ?age ?added :where [?e :p/age ?age _ ?added]]
+ :expected #{[30 true] [30 false] [31 true]}}
+
+{:name "time/history-binds-tx-per-datom"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :view :history
+ :query [:find ?age ?tx ?added :where [?e :p/age ?age ?tx ?added]]
+ :expected #{[30 #tx 1 true] [30 #tx 2 false] [31 #tx 2 true]}}
+
+{:name "time/history-added-constant-filters"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :view :history
+ :query [:find ?age :where [?e :p/age ?age _ false]]
+ :expected #{[30]}}
+
+{:name "time/no-history-attribute-absent-from-history"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/secret :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/noHistory true}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/secret "s1"}]
+      [[:db/add #tempid "a" :p/secret "s2"]]]
+ :view :history
+ :query [:find ?v :where [_ :p/secret ?v]]
+ :expected #{}}
+
+{:name "time/no-history-attribute-current-still-works"
+ :schema [{:db/ident :p/secret :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/noHistory true}]
+ :tx [[{:db/id "a" :p/secret "s1"}]
+      [[:db/add #tempid "a" :p/secret "s2"]]]
+ :query [:find ?v . :where [_ :p/secret ?v]]
+ :expected "s2"}
+
+{:name "time/tx-var-in-current-view"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [{:db/id "b" :p/name "Bob"}]]
+ :query [:find ?n ?tx :where [_ :p/name ?n ?tx]]
+ :expected #{["Alice" #tx 1] ["Bob" #tx 2]}}
+
+{:name "time/as-of-cardinality-one-replacement"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 1}]
+      [[:db/add #tempid "a" :p/age 2]]
+      [[:db/add #tempid "a" :p/age 3]]]
+ :view {:as-of 2}
+ :query [:find ?age :where [_ :p/age ?age]]
+ :expected #{[2]}}
+
+{:name "time/as-of-zero-is-empty"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :view {:as-of 0}
+ :query [:find ?n :where [_ :p/name ?n]]
+ :expected #{}}
+
+{:name "time/history-aggregate-audit-count"
+ :schema [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/age 1}]
+      [[:db/add #tempid "a" :p/age 2]]
+      [[:db/add #tempid "a" :p/age 3]]]
+ :view :history
+ :query [:find (count ?tx) . :with ?age :where [?e :p/age ?age ?tx ?added]]
+ :expected 5}

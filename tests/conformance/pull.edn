@@ -1,0 +1,169 @@
+; Pull: attribute specs, wildcard, reverse refs, nesting, options, recursion,
+; component auto-recursion, and pull inside :find.
+
+{:name "pull/basic-attributes"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}]]
+ :pull {:eid #tempid "a" :pattern [:p/name :p/age]}
+ :expected {:p/name "Alice" :p/age 30}}
+
+{:name "pull/missing-attribute-omitted"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :pull {:eid #tempid "a" :pattern [:p/name :p/age]}
+ :expected {:p/name "Alice"}}
+
+{:name "pull/db-id"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :pull {:eid #tempid "a" :pattern [:db/id :p/name]}
+ :expected {:db/id #tempid "a" :p/name "Alice"}}
+
+{:name "pull/cardinality-many-returns-vector"
+ :schema [{:db/ident :p/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/nick ["Al" "Ali"]}]]
+ :pull {:eid #tempid "a" :pattern [:p/nick]}
+ :expected {:p/nick ["Al" "Ali"]}}
+
+{:name "pull/plain-ref-returns-db-id-map"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]
+      [[:db/add #tempid "b" :p/boss #tempid "a"]]]
+ :pull {:eid #tempid "b" :pattern [:p/boss]}
+ :expected {:p/boss {:db/id #tempid "a"}}}
+
+{:name "pull/nested-map-spec"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]
+      [[:db/add #tempid "b" :p/boss #tempid "a"]]]
+ :pull {:eid #tempid "b" :pattern [:p/name {:p/boss [:p/name]}]}
+ :expected {:p/name "Bob" :p/boss {:p/name "Alice"}}}
+
+{:name "pull/wildcard-includes-db-id"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}]]
+ :pull {:eid #tempid "a" :pattern [*]}
+ :expected {:db/id #tempid "a" :p/name "Alice" :p/age 30}}
+
+{:name "pull/wildcard-plus-map-spec-overrides"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]
+      [[:db/add #tempid "b" :p/boss #tempid "a"]]]
+ :pull {:eid #tempid "b" :pattern [* {:p/boss [:p/name]}]}
+ :expected {:db/id #tempid "b" :p/name "Bob" :p/boss {:p/name "Alice"}}}
+
+{:name "pull/reverse-ref"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"} {:db/id "c" :p/name "Carol"}]
+      [[:db/add #tempid "b" :p/boss #tempid "a"]
+       [:db/add #tempid "c" :p/boss #tempid "a"]]]
+ :pull {:eid #tempid "a" :pattern [:p/_boss]}
+ :expected {:p/_boss [{:db/id #tempid "b"} {:db/id #tempid "c"}]}}
+
+{:name "pull/reverse-ref-with-subpattern"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]
+      [[:db/add #tempid "b" :p/boss #tempid "a"]]]
+ :pull {:eid #tempid "a" :pattern [{:p/_boss [:p/name]}]}
+ :expected {:p/_boss [{:p/name "Bob"}]}}
+
+{:name "pull/as-renames-key"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :pull {:eid #tempid "a" :pattern [[:p/name :as :nom]]}
+ :expected {:nom "Alice"}}
+
+{:name "pull/default-fills-missing"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :pull {:eid #tempid "a" :pattern [:p/name [:p/age :default 0]]}
+ :expected {:p/name "Alice" :p/age 0}}
+
+{:name "pull/limit-truncates"
+ :schema [{:db/ident :p/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/nick ["A" "B" "C" "D"]}]]
+ :pull {:eid #tempid "a" :pattern [[:p/nick :limit 2]]}
+ :expected {:p/nick ["A" "B"]}}
+
+{:name "pull/limit-nil-unbounded"
+ :schema [{:db/ident :p/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/nick ["A" "B" "C"]}]]
+ :pull {:eid #tempid "a" :pattern [[:p/nick :limit nil]]}
+ :expected {:p/nick ["A" "B" "C"]}}
+
+{:name "pull/bounded-recursion"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/next :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "A"} {:db/id "b" :p/name "B"} {:db/id "c" :p/name "C"}]
+      [[:db/add #tempid "a" :p/next #tempid "b"]
+       [:db/add #tempid "b" :p/next #tempid "c"]]]
+ :pull {:eid #tempid "a" :pattern [:p/name {:p/next 1}]}
+ :expected {:p/name "A" :p/next {:p/name "B" :p/next {:db/id #tempid "c"}}}}
+
+{:name "pull/unbounded-recursion"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/next :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "A"} {:db/id "b" :p/name "B"} {:db/id "c" :p/name "C"}]
+      [[:db/add #tempid "a" :p/next #tempid "b"]
+       [:db/add #tempid "b" :p/next #tempid "c"]]]
+ :pull {:eid #tempid "a" :pattern [:p/name {:p/next ...}]}
+ :expected {:p/name "A" :p/next {:p/name "B" :p/next {:p/name "C"}}}}
+
+{:name "pull/recursion-cycle-stops-at-db-id"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/next :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "A"} {:db/id "b" :p/name "B"}]
+      [[:db/add #tempid "a" :p/next #tempid "b"]
+       [:db/add #tempid "b" :p/next #tempid "a"]]]
+ :pull {:eid #tempid "a" :pattern [:p/name {:p/next ...}]}
+ :expected {:p/name "A" :p/next {:p/name "B" :p/next {:db/id #tempid "a"}}}}
+
+{:name "pull/component-auto-recursion"
+ :schema [{:db/ident :o/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :o/part :db/valueType :db.type/ref :db/cardinality :db.cardinality/many :db/isComponent true}]
+ :tx [[{:db/id "car" :o/name "Car"} {:db/id "engine" :o/name "Engine"}]
+      [[:db/add #tempid "car" :o/part #tempid "engine"]]]
+ :pull {:eid #tempid "car" :pattern [:o/name :o/part]}
+ :expected {:o/name "Car" :o/part [{:db/id #tempid "engine" :o/name "Engine"}]}}
+
+{:name "pull/reverse-component-is-scalar"
+ :schema [{:db/ident :o/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :o/part :db/valueType :db.type/ref :db/cardinality :db.cardinality/many :db/isComponent true}]
+ :tx [[{:db/id "car" :o/name "Car"} {:db/id "engine" :o/name "Engine"}]
+      [[:db/add #tempid "car" :o/part #tempid "engine"]]]
+ :pull {:eid #tempid "engine" :pattern [{:o/_part [:o/name]}]}
+ :expected {:o/_part {:o/name "Car"}}}
+
+{:name "pull/empty-entity-is-nil"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :pull {:eid 12345678 :pattern [:p/name]}
+ :expected nil}
+
+{:name "pull/inside-find"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30} {:db/id "b" :p/name "Bob" :p/age 25}]]
+ :query [:find (pull ?e [:p/name :p/age]) :where [?e :p/age 30]]
+ :expected #{[{:p/name "Alice" :p/age 30}]}}
+
+{:name "pull/find-scalar-pull"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find (pull ?e [:p/name]) . :where [?e :p/name "Alice"]]
+ :expected {:p/name "Alice"}}
+
+{:name "pull/unknown-attribute-errors"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :pull {:eid #tempid "a" :pattern [:p/missing]}
+ :expect-error true}

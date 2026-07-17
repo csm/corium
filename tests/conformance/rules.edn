@@ -1,0 +1,134 @@
+; Rules: non-recursive, recursive, mutually recursive, required bindings.
+
+{:name "rules/simple-alias"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30} {:db/id "b" :p/name "Bob" :p/age 20}]]
+ :query [:find ?n
+         :in $ %
+         :where (adult ?e) [?e :p/name ?n]]
+ :args [[[(adult ?e) [?e :p/age ?age] [(>= ?age 21)]]]]
+ :expected #{["Alice"]}}
+
+{:name "rules/two-definitions-union"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+          {:db/ident :p/vip :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}
+       {:db/id "b" :p/name "Bob" :p/age 10 :p/vip true}
+       {:db/id "c" :p/name "Carol" :p/age 15}]]
+ :query [:find ?n
+         :in $ %
+         :where (notable ?e) [?e :p/name ?n]]
+ :args [[[(notable ?e) [?e :p/age ?age] [(>= ?age 21)]]
+         [(notable ?e) [?e :p/vip true]]]]
+ :expected #{["Alice"] ["Bob"]}}
+
+{:name "rules/recursive-transitive-closure"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/parent :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/name "Ann"} {:db/id "b" :p/name "Ben"} {:db/id "c" :p/name "Cid"}]
+      [[:db/add #tempid "b" :p/parent #tempid "a"]
+       [:db/add #tempid "c" :p/parent #tempid "b"]]]
+ :query [:find ?n
+         :in $ %
+         :where (ancestor ?d ?a) [?d :p/name "Cid"] [?a :p/name ?n]]
+ :args [[[(ancestor ?d ?a) [?d :p/parent ?a]]
+         [(ancestor ?d ?a) [?d :p/parent ?x] (ancestor ?x ?a)]]]
+ :expected #{["Ben"] ["Ann"]}}
+
+{:name "rules/recursion-handles-cycles"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/next :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "A"} {:db/id "b" :p/name "B"}]
+      [[:db/add #tempid "a" :p/next #tempid "b"]
+       [:db/add #tempid "b" :p/next #tempid "a"]]]
+ :query [:find ?n
+         :in $ %
+         :where [?start :p/name "A"] (reach ?start ?e) [?e :p/name ?n]]
+ :args [[[(reach ?a ?b) [?a :p/next ?b]]
+         [(reach ?a ?b) [?a :p/next ?x] (reach ?x ?b)]]]
+ :expected #{["A"] ["B"]}}
+
+{:name "rules/mutual-recursion"
+ :schema [{:db/ident :n/val :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+          {:db/ident :n/next :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "n0" :n/val 0} {:db/id "n1" :n/val 1} {:db/id "n2" :n/val 2} {:db/id "n3" :n/val 3}]
+      [[:db/add #tempid "n0" :n/next #tempid "n1"]
+       [:db/add #tempid "n1" :n/next #tempid "n2"]
+       [:db/add #tempid "n2" :n/next #tempid "n3"]]]
+ :query [:find ?v
+         :in $ %
+         :where [?z :n/val 0] (even-step ?z ?e) [?e :n/val ?v]]
+ :args [[[(even-step ?a ?b) [(identity ?a) ?b]]
+         [(even-step ?a ?b) [?a :n/next ?x] (odd-step ?x ?b)]
+         [(odd-step ?a ?b) [?a :n/next ?x] (even-step ?x ?b)]]]
+ :expected #{[0] [2]}}
+
+{:name "rules/constants-in-invocation"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30} {:db/id "b" :p/name "Bob" :p/age 25}]]
+ :query [:find ?n
+         :in $ %
+         :where (aged ?e 25) [?e :p/name ?n]]
+ :args [[[(aged ?e ?age) [?e :p/age ?age]]]]
+ :expected #{["Bob"]}}
+
+{:name "rules/required-bindings-satisfied"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/name "Alice"} {:db/id "b" :p/name "Bob"}]
+      [[:db/add #tempid "a" :p/friend #tempid "b"]]]
+ :query [:find ?n
+         :in $ %
+         :where [?e :p/name "Alice"] (friend-of ?e ?f) [?f :p/name ?n]]
+ :args [[[(friend-of [?e] ?f) [?e :p/friend ?f]]]]
+ :expected #{["Bob"]}}
+
+{:name "rules/required-bindings-violated-errors"
+ :schema [{:db/ident :p/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}]
+ :tx [[{:db/id "a" :p/friend []}]]
+ :query [:find ?e ?f
+         :in $ %
+         :where (friend-of ?e ?f)]
+ :args [[[(friend-of [?e] ?f) [?e :p/friend ?f]]]]
+ :expect-error true}
+
+{:name "rules/unknown-rule-errors"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?e :in $ % :where (no-such-rule ?e)]
+ :args [[[(other ?e) [?e :p/name _]]]]
+ :expect-error true}
+
+{:name "rules/arity-mismatch-errors"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?e :in $ % :where (named ?e ?extra)]
+ :args [[[(named ?e) [?e :p/name _]]]]
+ :expect-error true}
+
+{:name "rules/rule-with-not"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30} {:db/id "b" :p/name "Bob"}]]
+ :query [:find ?n
+         :in $ %
+         :where (ageless ?e) [?e :p/name ?n]]
+ :args [[[(ageless ?e) [?e :p/name _] (not [?e :p/age _])]]]
+ :expected #{["Bob"]}}
+
+{:name "rules/self-join-through-rule"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/city :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/city "Rome"}
+       {:db/id "b" :p/name "Bob" :p/city "Rome"}
+       {:db/id "c" :p/name "Carol" :p/city "Oslo"}]]
+ :query [:find ?n1 ?n2
+         :in $ %
+         :where (same-city ?e1 ?e2)
+                [?e1 :p/name ?n1] [?e2 :p/name ?n2]
+                [(< ?n1 ?n2)]]
+ :args [[[(same-city ?a ?b) [?a :p/city ?c] [?b :p/city ?c]]]]
+ :expected #{["Alice" "Bob"]}}

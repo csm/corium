@@ -182,7 +182,8 @@ fn parse_attr_spec(db: &Db, form: &Edn, sub: SubSelect) -> Result<PullSpec, Quer
 /// Returns [`QueryError`] for malformed patterns or unknown attribute idents.
 pub fn pull(db: &Db, pattern: &Edn, eid: EntityId) -> Result<Edn, QueryError> {
     let parsed = parse_pattern(db, pattern)?;
-    let mut path = BTreeSet::new();
+    // The root is on the recursion path: a cycle back to it stops.
+    let mut path = BTreeSet::from([eid]);
     pull_entity(db, &parsed, eid, &mut path)
 }
 
@@ -195,7 +196,7 @@ pub fn pull_many(db: &Db, pattern: &Edn, eids: &[EntityId]) -> Result<Edn, Query
     let results = eids
         .iter()
         .map(|eid| {
-            let mut path = BTreeSet::new();
+            let mut path = BTreeSet::from([*eid]);
             pull_entity(db, &parsed, *eid, &mut path)
         })
         .collect::<Result<Vec<_>, _>>()?;

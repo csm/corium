@@ -1,0 +1,65 @@
+; :find specifications: relation, collection, tuple, scalar, :with.
+
+{:name "find/relation-default"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice"} {:db/id "b" :person/name "Bob"}]]
+ :query [:find ?name :where [_ :person/name ?name]]
+ :expected #{["Alice"] ["Bob"]}}
+
+{:name "find/relation-deduplicates"
+ :schema [{:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/age 30} {:db/id "b" :person/age 30}]]
+ :query [:find ?age :where [_ :person/age ?age]]
+ :expected #{[30]}}
+
+{:name "find/collection"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice"} {:db/id "b" :person/name "Bob"}]]
+ :query [:find [?name ...] :where [_ :person/name ?name]]
+ :expected ["Alice" "Bob"]}
+
+{:name "find/scalar"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice" :person/age 30}]]
+ :query [:find ?age . :where [?e :person/name "Alice"] [?e :person/age ?age]]
+ :expected 30}
+
+{:name "find/scalar-empty-is-nil"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice"}]]
+ :query [:find ?e . :where [?e :person/name "Nobody"]]
+ :expected nil}
+
+{:name "find/single-tuple"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice" :person/age 30}]]
+ :query [:find [?name ?age] :where [?e :person/name ?name] [?e :person/age ?age]]
+ :expected ["Alice" 30]}
+
+{:name "find/tuple-empty-is-nil"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice"}]]
+ :query [:find [?e ?name] :where [?e :person/name "Nobody"] [?e :person/name ?name]]
+ :expected nil}
+
+{:name "find/with-keeps-duplicate-contributions"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice" :person/age 30}
+       {:db/id "b" :person/name "Bob" :person/age 30}]]
+ :query [:find ?age :with ?e :where [?e :person/age ?age]]
+ :expected [[30] [30]]}
+
+{:name "find/unbound-find-variable-errors"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice"}]]
+ :query [:find ?nope :where [?e :person/name "Alice"]]
+ :expect-error true}
+
+{:name "find/map-form-query"
+ :schema [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :person/name "Alice"}]]
+ :query {:find [?name] :where [[_ :person/name ?name]]}
+ :expected #{["Alice"]}}

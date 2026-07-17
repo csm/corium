@@ -1,0 +1,52 @@
+; Multiple database sources in one query, including history alongside current.
+
+{:name "multi/current-and-history-together"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :extra-dbs [:history]
+ :query [:find ?old
+         :in $ $hist
+         :where [?e :p/name "Alice"]
+                [$hist ?e :p/age ?old _ false]]
+ :expected #{[30]}}
+
+{:name "multi/as-of-and-current-compare"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}]
+      [[:db/add #tempid "a" :p/age 31]]]
+ :extra-dbs [{:as-of 1}]
+ :query [:find ?now ?then
+         :in $ $old
+         :where [?e :p/name "Alice"]
+                [?e :p/age ?now]
+                [$old ?e :p/age ?then]]
+ :expected #{[31 30]}}
+
+{:name "multi/explicit-src-on-not"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]
+      [{:db/id "b" :p/name "Bob"}]]
+ :extra-dbs [{:as-of 1}]
+ :query [:find ?n
+         :in $ $old
+         :where [?e :p/name ?n]
+                (not [$old ?e :p/name _])]
+ :expected #{["Bob"]}}
+
+{:name "multi/same-db-twice-is-harmless"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :extra-dbs [:current]
+ :query [:find ?n
+         :in $ $two
+         :where [$two _ :p/name ?n]]
+ :expected #{["Alice"]}}
+
+{:name "multi/unbound-source-errors"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?n :where [$nope _ :p/name ?n]]
+ :expect-error true}

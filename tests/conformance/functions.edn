@@ -1,0 +1,125 @@
+; Function clauses: arithmetic, strings, ground, get-else, destructuring.
+
+{:name "fn/addition"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 4}]]
+ :query [:find ?sum . :where [_ :p/n ?n] [(+ ?n 10) ?sum]]
+ :expected 14}
+
+{:name "fn/subtraction-and-negation"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 4}]]
+ :query [:find ?v . :where [_ :p/n ?n] [(- ?n) ?v]]
+ :expected -4}
+
+{:name "fn/multiplication"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 6}]]
+ :query [:find ?v . :where [_ :p/n ?n] [(* ?n 7) ?v]]
+ :expected 42}
+
+{:name "fn/division-exact-stays-long"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 10}]]
+ :query [:find ?v . :where [_ :p/n ?n] [(/ ?n 2) ?v]]
+ :expected 5}
+
+{:name "fn/division-inexact-goes-double"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 5}]]
+ :query [:find ?v . :where [_ :p/n ?n] [(/ ?n 2) ?v]]
+ :expected 2.5}
+
+{:name "fn/quot-rem-mod"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n -7}]]
+ :query [:find ?q ?r ?m :where [_ :p/n ?n] [(quot ?n 2) ?q] [(rem ?n 2) ?r] [(mod ?n 2) ?m]]
+ :expected #{[-3 -1 1]}}
+
+{:name "fn/inc-dec"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 41}]]
+ :query [:find ?up ?down :where [_ :p/n ?n] [(inc ?n) ?up] [(dec ?n) ?down]]
+ :expected #{[42 40]}}
+
+{:name "fn/abs-min-max"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n -5}]]
+ :query [:find ?a ?mn ?mx :where [_ :p/n ?n] [(abs ?n) ?a] [(min ?n 0) ?mn] [(max ?n 0) ?mx]]
+ :expected #{[5 -5 0]}}
+
+{:name "fn/str-concatenation"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/age 30}]]
+ :query [:find ?s . :where [?e :p/name ?n] [?e :p/age ?a] [(str ?n " is " ?a) ?s]]
+ :expected "Alice is 30"}
+
+{:name "fn/count-string-length"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?len . :where [_ :p/name ?n] [(count ?n) ?len]]
+ :expected 5}
+
+{:name "fn/subs-upper-lower"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?sub ?up ?low
+         :where [_ :p/name ?n] [(subs ?n 0 2) ?sub] [(upper-case ?n) ?up] [(lower-case ?n) ?low]]
+ :expected #{["Al" "ALICE" "alice"]}}
+
+{:name "fn/ground-scalar"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?v . :where [(ground 42) ?v]]
+ :expected 42}
+
+{:name "fn/ground-collection-expands-rows"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice"}]]
+ :query [:find ?v :where [(ground [1 2 3]) [?v ...]]]
+ :expected #{[1] [2] [3]}}
+
+{:name "fn/ground-tuple-destructures"
+ :schema []
+ :tx []
+ :query [:find ?a ?b :where [(ground [1 "x"]) [?a ?b]]]
+ :expected #{[1 "x"]}}
+
+{:name "fn/ground-relation"
+ :schema []
+ :tx []
+ :query [:find ?a ?b :where [(ground [[1 "x"] [2 "y"]]) [[?a ?b]]]]
+ :expected #{[1 "x"] [2 "y"]}}
+
+{:name "fn/get-else-present-and-default"
+ :schema [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+          {:db/ident :p/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/name "Alice" :p/nick "Al"} {:db/id "b" :p/name "Bob"}]]
+ :query [:find ?name ?nick :where [?e :p/name ?name] [(get-else $ ?e :p/nick "none") ?nick]]
+ :expected #{["Alice" "Al"] ["Bob" "none"]}}
+
+{:name "fn/output-unifies-with-bound-variable"
+ :schema [{:db/ident :p/x :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+          {:db/ident :p/y :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/x 2 :p/y 3} {:db/id "b" :p/x 2 :p/y 4}]]
+ :query [:find ?e :where [?e :p/x ?x] [?e :p/y ?y] [(inc ?x) ?y]]
+ :expected #{[#tempid "a"]}}
+
+{:name "fn/identity"
+ :schema []
+ :tx []
+ :query [:find ?v . :where [(ground 7) ?x] [(identity ?x) ?v]]
+ :expected 7}
+
+{:name "fn/division-by-zero-errors"
+ :schema [{:db/ident :p/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+ :tx [[{:db/id "a" :p/n 5}]]
+ :query [:find ?v . :where [_ :p/n ?n] [(quot ?n 0) ?v]]
+ :expect-error true}
+
+{:name "fn/unknown-function-errors"
+ :schema []
+ :tx []
+ :query [:find ?v . :where [(frobnicate 1) ?v]]
+ :expect-error true}
