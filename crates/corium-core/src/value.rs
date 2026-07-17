@@ -59,3 +59,22 @@ pub enum Value {
     /// Entity reference.
     Ref(EntityId),
 }
+
+impl Value {
+    /// Returns whether this value has the requested schema type.
+    #[must_use]
+    pub const fn has_type(&self, value_type: crate::ValueType) -> bool {
+        matches!(
+            (self, value_type),
+            (Self::Bool(_), crate::ValueType::Bool)
+                | (Self::Long(_), crate::ValueType::Long)
+                | (Self::Double(_), crate::ValueType::Double)
+                | (Self::Instant(_), crate::ValueType::Instant)
+                | (Self::Uuid(_), crate::ValueType::Uuid)
+                | (Self::Keyword(_), crate::ValueType::Keyword)
+                | (Self::Str(_), crate::ValueType::Str)
+                | (Self::Bytes(_), crate::ValueType::Bytes)
+                | (Self::Ref(_), crate::ValueType::Ref)
+        )
+    }
+}
