@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Corium transaction expansion, entity resolution, and validation"
 
 [dependencies]
 corium-core = { workspace = true }

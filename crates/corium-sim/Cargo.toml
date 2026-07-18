@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Corium simulation base"
 
 [dependencies]
 corium-core = { workspace = true }
