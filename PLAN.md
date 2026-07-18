@@ -64,11 +64,19 @@ These were settled at project initialization and are recorded as ADRs:
 
 ## Current status
 
-Milestones M0–M3 are complete: core types and sortable encoding, the
-immutable segment store, the embedded transaction pipeline, and the query
+Milestones M0–M4 are complete: core types and sortable encoding, the
+immutable segment store, the embedded transaction pipeline, the query
 engine (Datalog, Pull, entity API, time views, planner statistics, query
 cache) with a 194-vector conformance corpus, differential model tests, and
 a recorded benchmark baseline
-([docs/benchmarks/m3-baseline.md](docs/benchmarks/m3-baseline.md)).
-Next step is Milestone M4 (distribution) per
-[docs/roadmap.md](docs/roadmap.md).
+([docs/benchmarks/m3-baseline.md](docs/benchmarks/m3-baseline.md)), and
+distribution: the composite wire codec, the transactor as a process
+(Transactor/Catalog gRPC services, lease acquisition with fenced root
+publication, tx-report streams with gapless backfill), the peer library
+(reconnect/resubscribe, sync, tx-report queue, direct segment reads), the
+peer server for thin clients, TLS/bearer-token auth, and the `corium` CLI
+(`transactor`, `peer-server`, `db *`, `gc`, `log`). The M4 acceptance
+battery runs real multi-process integration tests (peer convergence,
+kill -9 recovery, deposed-transactor fencing) and replays the conformance
+corpus through the thin-client protocol. Next step is Milestone M5
+(Clojurust) per [docs/roadmap.md](docs/roadmap.md).

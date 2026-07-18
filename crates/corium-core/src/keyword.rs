@@ -78,4 +78,22 @@ impl KeywordInterner {
     pub fn resolve(&self, id: KwId) -> Option<&Keyword> {
         self.by_id.get(&id)
     }
+
+    /// Iterates every interned keyword in id order. Ids are dense from zero,
+    /// so re-interning the keywords in this order reproduces the same ids.
+    pub fn iter(&self) -> impl Iterator<Item = (KwId, &Keyword)> {
+        self.by_id.iter().map(|(id, keyword)| (*id, keyword))
+    }
+
+    /// Number of interned keywords.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    /// Whether the interner is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
 }

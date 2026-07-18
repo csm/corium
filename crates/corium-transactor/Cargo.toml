@@ -10,9 +10,14 @@ corium-core = { path = "../corium-core" }
 corium-db = { path = "../corium-db" }
 corium-index = { path = "../corium-index" }
 corium-log = { path = "../corium-log" }
+corium-protocol = { path = "../corium-protocol" }
+corium-query = { path = "../corium-query" }
 corium-store = { path = "../corium-store" }
 corium-tx = { path = "../corium-tx" }
 thiserror = "2"
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1.18"
+tonic = "0.14.5"
 
 [lints]
 workspace = true

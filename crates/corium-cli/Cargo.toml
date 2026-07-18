@@ -5,8 +5,28 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "corium"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 corium-core = { path = "../corium-core" }
+corium-db = { path = "../corium-db" }
+corium-log = { path = "../corium-log" }
+corium-peer = { path = "../corium-peer" }
+corium-protocol = { path = "../corium-protocol" }
+corium-query = { path = "../corium-query" }
+corium-store = { path = "../corium-store" }
+corium-transactor = { path = "../corium-transactor" }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tonic = { version = "0.14.5", features = ["tls-ring"] }
+
+[dev-dependencies]
+proptest = "1"
+rcgen = "0.13"
+tempfile = "3"
+tokio-stream = "0.1.18"
 
 [lints]
 workspace = true

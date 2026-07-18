@@ -1,7 +1,12 @@
-//! Embedded single-writer transaction pipeline and index publisher.
+//! Embedded single-writer transaction pipeline and index publisher, plus the
+//! networked transactor process (lease, gRPC services, indexing job).
 
-use corium_core::{EntityId, IndexOrder, Partition, Schema};
-use corium_db::{Db, FIRST_USER_ID};
+pub mod lease;
+pub mod node;
+pub mod server;
+
+use corium_core::{EntityId, IndexOrder, KeywordInterner, Partition, Schema};
+use corium_db::{Db, FIRST_USER_ID, Idents};
 use corium_index::Segment;
 use corium_log::{LogError, TransactionLog, TxRecord};
 use corium_store::{BlobStore, RootStore, StoreError};
@@ -40,6 +45,12 @@ pub enum TransactError {
     /// System clock predates the Unix epoch.
     #[error("system clock is before Unix epoch")]
     Clock,
+    /// A newer lease version owns the database root; this writer is deposed.
+    #[error("deposed: database root is owned by lease version {published}")]
+    Deposed {
+        /// Lease version found on the published root.
+        published: u64,
+    },
 }
 
 struct State {
@@ -165,22 +176,36 @@ impl EmbeddedTransactor {
             .retain(|subscriber| subscriber.send(report.clone()).is_ok());
         Ok(report)
     }
+    /// Replaces the ident/keyword naming attached to the current database
+    /// value (used when the boundary interns new keywords).
+    pub fn update_naming(&self, idents: Idents, interner: KeywordInterner) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.db = state.db.clone().with_naming(idents, interner);
+    }
+
     /// Builds a consistent snapshot of all four indexes and publishes their blob ids.
     ///
     /// Blobs are uploaded before the root CAS. Transactions may continue while the
     /// immutable snapshot is encoded; a later run indexes any remaining log tail.
     ///
-    /// Publication is monotone in `index_basis_t`: if a root at an equal or
-    /// newer basis is already published (or wins a concurrent CAS race), this
-    /// snapshot's root is not installed and its blobs are left for garbage
-    /// collection. The freshly built root is returned either way.
+    /// Publication is fenced by `lease_version` and monotone in
+    /// `index_basis_t`: a root already published under a newer lease version
+    /// deposes this writer ([`TransactError::Deposed`]); a root at an equal
+    /// or newer basis (or one that wins a concurrent CAS race) leaves this
+    /// snapshot's blobs for garbage collection. The freshly built root is
+    /// returned when it, or a newer basis, is installed.
     ///
     /// # Errors
     /// Returns an error if a blob upload, root read, or fenced publication fails.
     pub fn publish_indexes(
         &self,
         store: &(impl BlobStore + RootStore),
-    ) -> Result<PublishedRoot, TransactError> {
+        root_name: &str,
+        lease_version: u64,
+    ) -> Result<DbRoot, TransactError> {
         let snapshot = self.db();
         let datoms = snapshot.datoms();
         let mut ids = Vec::new();
@@ -198,57 +223,53 @@ impl EmbeddedTransactor {
             }
             ids.push(store.put(&bytes)?);
         }
-        let root = PublishedRoot {
+        let root = DbRoot {
+            lease_version,
             index_basis_t: snapshot.basis_t(),
-            roots: [
+            roots: Some([
                 ids[0].clone(),
                 ids[1].clone(),
                 ids[2].clone(),
                 ids[3].clone(),
-            ],
+            ]),
         };
-        let encoded = root.encode();
-        loop {
-            let previous = store.get_root("db")?;
-            if previous
-                .as_deref()
-                .and_then(PublishedRoot::stored_basis)
-                .is_some_and(|basis| basis >= root.index_basis_t)
+        publish_root(store, root_name, &root)?;
+        Ok(root)
+    }
+}
+
+/// Publishes `root` under the fencing rules described on
+/// [`EmbeddedTransactor::publish_indexes`].
+///
+/// # Errors
+/// Returns [`TransactError::Deposed`] when a newer lease version owns the
+/// root, or a store error when the CAS cannot be completed.
+pub fn publish_root(
+    store: &dyn RootStore,
+    root_name: &str,
+    root: &DbRoot,
+) -> Result<(), TransactError> {
+    let encoded = root.encode();
+    loop {
+        let previous = store.get_root(root_name)?;
+        if let Some(stored) = previous.as_deref().and_then(DbRoot::decode) {
+            if stored.lease_version > root.lease_version {
+                return Err(TransactError::Deposed {
+                    published: stored.lease_version,
+                });
+            }
+            if stored.lease_version == root.lease_version
+                && stored.index_basis_t >= root.index_basis_t
             {
-                return Ok(root);
+                return Ok(());
             }
-            match store.cas_root("db", previous.as_deref(), &encoded) {
-                Ok(()) => return Ok(root),
-                Err(StoreError::CasFailed { .. }) => {}
-                Err(error) => return Err(error.into()),
-            }
+        }
+        match store.cas_root(root_name, previous.as_deref(), &encoded) {
+            Ok(()) => return Ok(()),
+            Err(StoreError::CasFailed { .. }) => {}
+            Err(error) => return Err(error.into()),
         }
     }
 }
 
-/// Published durable index root metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublishedRoot {
-    /// Highest indexed transaction.
-    pub index_basis_t: u64,
-    /// EAVT, AEVT, AVET, and VAET blob ids.
-    pub roots: [corium_store::BlobId; 4],
-}
-impl PublishedRoot {
-    fn encode(&self) -> Vec<u8> {
-        format!(
-            "{}\n{}\n{}\n{}\n{}\n",
-            self.index_basis_t, self.roots[0], self.roots[1], self.roots[2], self.roots[3]
-        )
-        .into_bytes()
-    }
-    /// Extracts `index_basis_t` from encoded root bytes.
-    fn stored_basis(bytes: &[u8]) -> Option<u64> {
-        std::str::from_utf8(bytes)
-            .ok()?
-            .lines()
-            .next()?
-            .parse()
-            .ok()
-    }
-}
+pub use corium_store::{DbRoot, db_root_name};
