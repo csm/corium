@@ -103,6 +103,13 @@ message StatusResponse {
   uint64 datom_count = 6;
   uint64 entity_count = 7;
   uint64 attribute_count = 8;
+  uint64 transaction_count = 9;
+  uint64 transaction_failure_count = 10;
+  uint64 transaction_queue_depth = 11;
+  uint64 index_lag = 12;
+  uint64 indexing_runs = 13;
+  uint64 gc_runs = 14;
+  uint64 gc_swept_blobs = 15;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +152,10 @@ message ListDatabasesResponse {
   repeated string dbs = 1;
 }
 
-message GcDeletedDatabasesRequest {}
+message GcDeletedDatabasesRequest {
+  // Minimum age of unreachable blobs before deletion; 0 uses server default.
+  uint64 retention_seconds = 1;
+}
 
 message GcDeletedDatabasesResponse {
   uint64 swept_blobs = 1;

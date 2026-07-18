@@ -1,8 +1,12 @@
 //! Store backend conformance tests.
 
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
-use corium_store::{BlobStore, FsStore, MemoryStore, RootStore, SegmentCache, mark_and_sweep};
+use corium_store::{
+    BlobStore, FsStore, MemoryStore, RootStore, SegmentCache, mark_and_sweep,
+    mark_and_sweep_retained,
+};
 
 #[test]
 fn memory_store_cas_fences_roots() {
@@ -150,4 +154,34 @@ fn mark_and_sweep_preserves_every_reachable_blob() {
         assert!(store.contains(reachable).expect("reachable blob"));
     }
     assert!(!store.contains(&garbage).expect("garbage blob"));
+}
+
+#[test]
+fn retention_window_keeps_new_unreachable_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FsStore::open(dir.path()).expect("store");
+    let garbage = store.put(b"new garbage").expect("blob");
+
+    let report = mark_and_sweep_retained(
+        &store,
+        [],
+        |_, _| Ok(Vec::new()),
+        Duration::from_secs(60),
+        SystemTime::now(),
+    )
+    .expect("retained collection");
+    assert_eq!(report.swept, 0);
+    assert_eq!(report.retained, 1);
+    assert!(store.contains(&garbage).expect("retained blob"));
+
+    let report = mark_and_sweep_retained(
+        &store,
+        [],
+        |_, _| Ok(Vec::new()),
+        Duration::ZERO,
+        SystemTime::now(),
+    )
+    .expect("zero-window collection");
+    assert_eq!(report.swept, 1);
+    assert!(!store.contains(&garbage).expect("swept blob"));
 }

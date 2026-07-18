@@ -21,6 +21,9 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |
 | [docs/design/clojurust-integration.md](docs/design/clojurust-integration.md) | Boundary conversion, sandboxed database functions, cljrs client API |
 | [docs/design/clients-and-ops.md](docs/design/clients-and-ops.md) | CLI, query console, backup/restore, metrics |
+| [docs/getting-started.md](docs/getting-started.md) | Build and first local database walkthrough |
+| [docs/operations.md](docs/operations.md) | Process, console, backup/restore, metrics, GC, recovery runbook |
+| [docs/thin-client-protocol.md](docs/thin-client-protocol.md) | Public v1 thin-client interoperability contract |
 | [docs/design/testing-strategy.md](docs/design/testing-strategy.md) | Property tests, deterministic simulation, conformance suite |
 | [docs/roadmap.md](docs/roadmap.md) | Milestones M0–M7 with acceptance criteria |
 | [docs/adr/](docs/adr/) | Architecture Decision Records for the choices below |
@@ -64,7 +67,7 @@ These were settled at project initialization and are recorded as ADRs:
 
 ## Current status
 
-Milestones M0–M5 are complete: core types and sortable encoding, the
+Milestones M0–M6 are complete: core types and sortable encoding, the
 immutable segment store, the embedded transaction pipeline, the query
 engine (Datalog, Pull, entity API, time views, planner statistics, query
 cache) with a 194-vector conformance corpus, differential model tests, and
@@ -92,5 +95,18 @@ acceptance battery re-runs the full conformance corpus driven from cljrs
 through a live transactor with identical results, exercises cas-like/
 invariant/recursive database functions with clean aborts on fuel and
 deadline exhaustion, and verifies that sandbox escape attempts (I/O,
-interop, namespace manipulation, unbounded loops) all fail safely. Next
-step is Milestone M6 (Operations) per [docs/roadmap.md](docs/roadmap.md).
+interop, namespace manipulation, unbounded loops) all fail safely. M6 adds
+the operations surface: an interactive `corium console` with
+as-of/since/history views, schema/stats/basis inspection, timing, and live
+tx-report watch; full and hash-incremental offline backup plus guarded
+restore-as-clone with format-version checks; human/JSON tracing,
+Prometheus endpoints on transactor and peer server, and expanded Status/db
+stats counters; retention-aware GC as both a scheduled transactor duty and
+a manual online/offline operation; and getting-started, operations, console
+demo, and public thin-client protocol documentation. The M6 acceptance
+battery verifies basis/datom preservation across backup and clone restore,
+measures both a no-change incremental copying zero segments and a delta
+incremental copying only newly addressed segments,
+exercises every console time view, and covers scheduled GC retention. Next
+step is Milestone M7 (High availability) per
+[docs/roadmap.md](docs/roadmap.md).

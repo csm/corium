@@ -7,6 +7,7 @@
 //! block on the transactor. On disconnect it reconnects and resubscribes
 //! from its basis, and the server backfills the gap from the durable log.
 
+pub mod metrics;
 pub mod segment;
 pub mod server;
 
@@ -623,9 +624,22 @@ impl Admin {
     /// # Errors
     /// Returns [`PeerError`] on transport failure.
     pub async fn gc_deleted_databases(&mut self) -> Result<u64, PeerError> {
+        self.gc_deleted_databases_with_retention(None).await
+    }
+
+    /// Sweeps unreachable blobs with an optional minimum retention window.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure.
+    pub async fn gc_deleted_databases_with_retention(
+        &mut self,
+        retention: Option<Duration>,
+    ) -> Result<u64, PeerError> {
         let response = self
             .client
-            .gc_deleted_databases(pb::GcDeletedDatabasesRequest {})
+            .gc_deleted_databases(pb::GcDeletedDatabasesRequest {
+                retention_seconds: retention.map_or(0, |duration| duration.as_secs()),
+            })
             .await?;
         Ok(response.into_inner().swept_blobs)
     }

@@ -1,7 +1,9 @@
 //! Embedded single-writer transaction pipeline and index publisher, plus the
 //! networked transactor process (lease, gRPC services, indexing job).
 
+pub mod backup;
 pub mod lease;
+pub mod metrics;
 pub mod node;
 pub mod server;
 
@@ -224,6 +226,7 @@ impl EmbeddedTransactor {
             ids.push(store.put(&bytes)?);
         }
         let root = DbRoot {
+            format_version: corium_store::FORMAT_VERSION,
             lease_version,
             index_basis_t: snapshot.basis_t(),
             roots: Some([

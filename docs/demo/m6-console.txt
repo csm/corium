@@ -1,0 +1,15 @@
+;; Paste into `corium console <db>` after the getting-started data is loaded.
+:basis
+[:find ?name ?age :where [?e :person/name ?name] [?e :person/age ?age]]
+:as-of 1
+[:find ?name ?age :where [?e :person/name ?name] [?e :person/age ?age]]
+:since 1
+[:find ?name ?age :where [?e :person/name ?name] [?e :person/age ?age]]
+:history on
+[:find ?name ?age :where [?e :person/name ?name] [?e :person/age ?age]]
+:history off
+:stats
+:schema person/age
+:timing on
+[:find (count ?e) :where [?e :person/name]]
+:quit

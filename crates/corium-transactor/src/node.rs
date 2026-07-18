@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corium_core::{KeywordInterner, Schema};
 use corium_db::{Db, Idents};
@@ -15,11 +15,13 @@ use corium_protocol::pb;
 use corium_protocol::schemaform::{SchemaFormError, schema_from_edn};
 use corium_protocol::txforms::{TxFormError, tx_items_from_edn};
 use corium_query::edn::Edn;
-use corium_store::{FsStore, RootStore, StoreError, mark_and_sweep};
+use corium_store::{FsStore, RootStore, StoreError, mark_and_sweep_retained};
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
+use tracing::Instrument;
 
 use crate::lease::{self, Lease, LeaseError};
+use crate::metrics::Metrics;
 use crate::{DbRoot, EmbeddedTransactor, TransactError, db_root_name, publish_root};
 
 /// Expands user database-function invocations in boundary EDN transaction
@@ -51,6 +53,10 @@ pub struct NodeConfig {
     pub index_interval: Duration,
     /// Interval between heartbeats on subscription streams.
     pub heartbeat_interval: Duration,
+    /// Interval between scheduled garbage-collection duties; `None` disables it.
+    pub gc_interval: Option<Duration>,
+    /// Minimum age of an unreachable blob before scheduled/manual online GC.
+    pub gc_retention: Duration,
     /// Optional database-function expander (`:db/fn` support).
     pub tx_fn_expander: Option<Arc<dyn TxFnExpander>>,
 }
@@ -64,6 +70,8 @@ impl std::fmt::Debug for NodeConfig {
             .field("lease_wait_ms", &self.lease_wait_ms)
             .field("index_interval", &self.index_interval)
             .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("gc_interval", &self.gc_interval)
+            .field("gc_retention", &self.gc_retention)
             .field("tx_fn_expander", &self.tx_fn_expander.is_some())
             .finish()
     }
@@ -83,6 +91,8 @@ impl NodeConfig {
             lease_wait_ms: 15_000,
             index_interval: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(10),
+            gc_interval: Some(Duration::from_secs(60 * 60)),
+            gc_retention: Duration::from_secs(72 * 60 * 60),
             tx_fn_expander: None,
         }
     }
@@ -97,6 +107,14 @@ pub enum NodeError {
     /// Database name is not storable.
     #[error("invalid database name {0:?}")]
     InvalidName(String),
+    /// Database root uses a storage format newer than this binary.
+    #[error("storage format {found} is newer than supported format {supported}")]
+    UnsupportedFormat {
+        /// Version found in the root.
+        found: u32,
+        /// Newest version understood by this binary.
+        supported: u32,
+    },
     /// This node no longer holds the write lease.
     #[error("deposed: write lease for {0:?} is held elsewhere")]
     Deposed(String),
@@ -216,11 +234,22 @@ impl DbState {
         let held = self.lease();
         let stored = store.get_root(&lease::lease_root(&self.name))?;
         if stored.as_deref() == Some(held.encode().as_slice()) {
-            Ok(held)
-        } else {
-            self.deposed.store(true, Ordering::Release);
-            Err(NodeError::Deposed(self.name.clone()))
+            return Ok(held);
         }
+        // Renewal publishes the new expiry before updating `held_lease`.
+        // A transaction can land in that tiny interval; matching owner and
+        // fence version is still the same lease, so adopt the newer record.
+        if let Some(stored) = stored.as_deref().and_then(Lease::decode) {
+            if stored.owner == held.owner && stored.version == held.version {
+                *self
+                    .held_lease
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = stored.clone();
+                return Ok(stored);
+            }
+        }
+        self.deposed.store(true, Ordering::Release);
+        Err(NodeError::Deposed(self.name.clone()))
     }
 }
 
@@ -230,6 +259,7 @@ pub struct TransactorNode {
     store: Arc<FsStore>,
     dbs: std::sync::RwLock<HashMap<String, Arc<DbState>>>,
     gc_lock: tokio::sync::Mutex<()>,
+    metrics: Metrics,
     shutdown: watch::Sender<Option<String>>,
 }
 
@@ -303,6 +333,7 @@ impl TransactorNode {
             store,
             dbs: std::sync::RwLock::new(HashMap::new()),
             gc_lock: tokio::sync::Mutex::new(()),
+            metrics: Metrics::default(),
             shutdown: watch::channel(None).0,
         });
         let names: Vec<String> = node
@@ -318,6 +349,7 @@ impl TransactorNode {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(name, state);
         }
+        node.spawn_scheduled_gc();
         Ok(node)
     }
 
@@ -331,6 +363,36 @@ impl TransactorNode {
     #[must_use]
     pub fn config(&self) -> &NodeConfig {
         &self.config
+    }
+
+    /// Process observability counters.
+    #[must_use]
+    pub const fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    fn spawn_scheduled_gc(self: &Arc<Self>) {
+        let Some(interval) = self.config.gc_interval else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // Embedded callers may construct an empty catalog before they
+            // enter a runtime. Process wiring opens nodes inside Tokio.
+            return;
+        };
+        let node = Arc::clone(self);
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // `interval` ticks immediately; scheduled duties should wait a full interval.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if let Err(error) = node.gc_deleted().await {
+                    tracing::warn!(%error, "scheduled garbage collection failed");
+                }
+            }
+        });
     }
 
     /// Watch channel that reports a shutdown reason when the node deposes.
@@ -378,15 +440,23 @@ impl TransactorNode {
             .get_root(&meta_root_name(name))?
             .ok_or_else(|| NodeError::UnknownDb(name.to_owned()))?;
         let (schema, idents, interner) = decode_meta(&meta)?;
-        let held = self.acquire_with_wait(name)?;
-        // Fence bump: ensure the db root carries our lease version so any
-        // deposed writer's pending CAS fails and observes the new version.
         let root_name = db_root_name(name);
         let current = self
             .store
             .get_root(&root_name)?
             .as_deref()
             .and_then(DbRoot::decode);
+        if let Some(root) = &current {
+            if root.format_version > corium_store::FORMAT_VERSION {
+                return Err(NodeError::UnsupportedFormat {
+                    found: root.format_version,
+                    supported: corium_store::FORMAT_VERSION,
+                });
+            }
+        }
+        let held = self.acquire_with_wait(name)?;
+        // Fence bump: ensure the db root carries our lease version so any
+        // deposed writer's pending CAS fails and observes the new version.
         if current
             .as_ref()
             .is_none_or(|root| root.lease_version < held.version)
@@ -395,6 +465,7 @@ impl TransactorNode {
                 self.store.as_ref(),
                 &root_name,
                 &DbRoot {
+                    format_version: corium_store::FORMAT_VERSION,
                     lease_version: held.version,
                     index_basis_t: current.as_ref().map_or(0, |root| root.index_basis_t),
                     roots: current.and_then(|root| root.roots),
@@ -485,14 +556,17 @@ impl TransactorNode {
                 let version = db.lease().version;
                 let root_name = db_root_name(&db.name);
                 let worker = Arc::clone(&db);
+                let started = Instant::now();
                 let published = tokio::task::spawn_blocking(move || {
                     worker
                         .transactor
                         .publish_indexes(store.as_ref(), &root_name, version)
                 })
                 .await;
+                node.metrics.record_index(started.elapsed());
                 match published {
                     Ok(Ok(root)) => {
+                        tracing::debug!(db = %db.name, index_basis_t = root.index_basis_t, "published indexes");
                         db.index_basis.store(root.index_basis_t, Ordering::Release);
                         let _ = db.broadcast.send(pb::subscribe_item::Item::IndexBasis(
                             pb::IndexBasis {
@@ -629,27 +703,50 @@ impl TransactorNode {
     /// # Errors
     /// Returns an error when the store cannot be enumerated or swept.
     pub async fn gc_deleted(&self) -> Result<u64, NodeError> {
+        self.gc_deleted_with_retention(self.config.gc_retention)
+            .await
+    }
+
+    /// Sweeps unreachable blobs older than the caller-supplied retention.
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot be enumerated or swept.
+    pub async fn gc_deleted_with_retention(&self, retention: Duration) -> Result<u64, NodeError> {
         let _gc = self.gc_lock.lock().await;
         let store = Arc::clone(&self.store);
-        let swept = tokio::task::spawn_blocking(move || -> Result<u64, NodeError> {
-            let mut live = Vec::new();
-            for root_name in store.list_roots("db:")? {
-                if let Some(root) = store
-                    .get_root(&root_name)?
-                    .as_deref()
-                    .and_then(DbRoot::decode)
-                {
-                    if let Some(roots) = root.roots {
-                        live.extend(roots);
+        let report =
+            tokio::task::spawn_blocking(move || -> Result<corium_store::GcReport, NodeError> {
+                let mut live = Vec::new();
+                for root_name in store.list_roots("db:")? {
+                    if let Some(root) = store
+                        .get_root(&root_name)?
+                        .as_deref()
+                        .and_then(DbRoot::decode)
+                    {
+                        if let Some(roots) = root.roots {
+                            live.extend(roots);
+                        }
                     }
                 }
-            }
-            let report = mark_and_sweep(store.as_ref(), live, |_, _| Ok(Vec::new()))?;
-            Ok(report.swept as u64)
-        })
-        .await
-        .map_err(|error| NodeError::BadRequest(format!("gc task failed: {error}")))??;
-        Ok(swept)
+                Ok(mark_and_sweep_retained(
+                    store.as_ref(),
+                    live,
+                    |_, _| Ok(Vec::new()),
+                    retention,
+                    SystemTime::now(),
+                )?)
+            })
+            .await
+            .map_err(|error| NodeError::BadRequest(format!("gc task failed: {error}")))??;
+        self.metrics
+            .record_gc(report.swept as u64, report.retained as u64);
+        tracing::info!(
+            marked = report.marked,
+            swept = report.swept,
+            retained = report.retained,
+            "garbage collection completed"
+        );
+        Ok(report.swept as u64)
     }
 
     /// Validates, appends, applies, and reports one transaction supplied as
@@ -663,13 +760,33 @@ impl TransactorNode {
         name: &str,
         tx_data: &[u8],
     ) -> Result<pb::TransactResponse, NodeError> {
+        let started = Instant::now();
+        let result = self
+            .transact_inner(name, tx_data)
+            .instrument(tracing::info_span!("transact", db = name))
+            .await;
+        self.metrics.record_tx(started.elapsed(), result.is_ok());
+        if let Err(error) = &result {
+            tracing::warn!(%error, "transaction failed");
+        }
+        result
+    }
+
+    async fn transact_inner(
+        &self,
+        name: &str,
+        tx_data: &[u8],
+    ) -> Result<pb::TransactResponse, NodeError> {
         let state = self.db_state(name)?;
         let decoded = codec::decode_edn(tx_data)?;
         let forms = decoded
             .as_seq()
             .ok_or_else(|| NodeError::BadRequest("tx-data must be a vector".into()))?
             .to_vec();
-        let _commit = state.commit.lock().await;
+        self.metrics.queue_enter();
+        let commit = state.commit.lock().await;
+        self.metrics.queue_leave();
+        let _commit = commit;
         state.check_lease(self.store.as_ref())?;
         // Expand user database-function invocations against the
         // db-in-transaction (the value under the commit lock) before native
@@ -764,6 +881,7 @@ impl TransactorNode {
         let db = state.db();
         let counts = db.stats();
         let held = state.lease();
+        let metrics = self.metrics.snapshot();
         Ok(pb::StatusResponse {
             basis_t: db.basis_t(),
             index_basis_t: state.index_basis(),
@@ -773,6 +891,13 @@ impl TransactorNode {
             datom_count: counts.datoms as u64,
             entity_count: counts.entities as u64,
             attribute_count: counts.attributes as u64,
+            transaction_count: metrics.tx_total,
+            transaction_failure_count: metrics.tx_failed,
+            transaction_queue_depth: metrics.queue_depth,
+            index_lag: db.basis_t().saturating_sub(state.index_basis()),
+            indexing_runs: metrics.index_runs,
+            gc_runs: metrics.gc_runs,
+            gc_swept_blobs: metrics.gc_swept,
         })
     }
 
