@@ -21,6 +21,7 @@ edition = "2024"
 version = "0.1.0"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.85"
+homepage = "https://github.com/csm/corium"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
