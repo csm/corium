@@ -69,10 +69,12 @@ Datomic.
 
 Predicate/function clauses resolve in this order: (1) built-in native set
 (comparisons, arithmetic, `get-else`, `ground`, `missing?`, `tuple`/`untuple`,
-string ops…), (2) — post-v1 — user cljrs functions via the sandbox host, under
-the same fuel limits as database functions. v1 ships the native set only,
-which covers the overwhelming majority of real queries; the resolution seam is
-in from the start.
+string ops…), (2) cljrs functions via the sandbox host, under the same fuel
+limits as database functions. The seam is the `ExternCall` hook on
+`ExecOptions` (wired to the sandbox by `corium-cljrs::query` at M5, with
+explicit registration); resolving fn clauses to user code stored in the
+database remains post-v1. The native set covers the overwhelming majority of
+real queries.
 
 ## Performance posture (v1 targets, not promises)
 

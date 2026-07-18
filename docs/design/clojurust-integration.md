@@ -79,10 +79,24 @@ transactor (`corium-cljrs::sandbox`):
   primitives are native Rust in `corium-tx`, not sandboxed code.
 
 The sandbox needs cljrs to support a restricted environment (custom namespace
-resolution + step-limited interpretation). **Open item for M5**: verify
-`cljrs-interp` exposes fuel/step hooks; if not, contribute that upstream or
-run the interpreter on a watchdog thread with namespace restriction only —
-tracked as a risk in the roadmap.
+resolution + step-limited interpretation). **Resolved at M5**: `cljrs-interp`
+does not expose a per-step fuel hook, but `GlobalEnv` takes a pluggable
+`call_cljrs_fn` dispatch hook that every function application (user fns,
+builtin higher-order iteration, recursion) routes through. The sandbox
+installs a hook charging one fuel unit per application and enforcing the
+allocation cap (isolate-heap counter), a call-depth cap (the tree-walker
+consumes real stack per frame), and the wall-clock deadline. Special-form-only
+loops (`loop`/`recur` with no function application) never cross the hook, so
+the worker thread doubles as the watchdog: the caller waits on the reply
+channel with a timeout and abandons/replaces the worker on expiry — the
+fallback the roadmap sanctioned. Namespace restriction prunes I/O, time,
+randomness, mutable state, and namespace/var escape from `clojure.core`; a
+compile-time form guard rejects `def`/`set!`/`ns`/`require`/`new`/interop
+forms outside quoted data. cljrs isolates own per-thread GC heaps, so each
+sandbox lives on one worker thread and requests/results cross as boundary
+EDN.
 
-Query predicate/function clauses reuse the same sandbox host post-v1
-(query-engine.md), with read-only db access and the same fuel discipline.
+Query predicate/function clauses reuse the same sandbox host through the
+`ExternCall` seam in `corium-query` (wired at M5; registration is explicit —
+`:db/fn`-style user query fns remain post-v1), with the same fuel
+discipline.

@@ -77,11 +77,31 @@ pub struct ExecReport {
     pub datoms_scanned: usize,
 }
 
+/// Resolution hook for predicate/function clause names outside the native
+/// set: given the name and evaluated arguments, returns `Some(result)` when
+/// the extern resolves the call, `None` to fall through to the canonical
+/// unsupported-name error. This is the seam the sandboxed cljrs host wires
+/// into (`docs/design/query-engine.md`, resolution step 2).
+pub type ExternCall = std::sync::Arc<
+    dyn Fn(&str, &[Value]) -> Option<Result<builtins::CallResult, QueryError>> + Send + Sync,
+>;
+
 /// Options bounding a query execution.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ExecOptions {
     /// Maximum datoms the execution may touch (fuel).
     pub fuel: Option<u64>,
+    /// Optional resolver for non-native call clause names.
+    pub extern_call: Option<ExternCall>,
+}
+
+impl std::fmt::Debug for ExecOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecOptions")
+            .field("fuel", &self.fuel)
+            .field("extern_call", &self.extern_call.is_some())
+            .finish()
+    }
 }
 
 /// Runs a query given as an EDN form.
@@ -106,7 +126,7 @@ pub fn q_str(text: &str, inputs: &[QInput<'_>]) -> Result<Edn, QueryError> {
 ///
 /// # Errors
 /// Returns [`QueryError`] for execution failures.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn run(
     query: &Query,
     inputs: &[QInput<'_>],
@@ -210,9 +230,12 @@ pub fn run(
         }
     }
 
-    let ctx = ExecCtx::new(dbs, rules);
+    let mut ctx = ExecCtx::new(dbs, rules);
     if let Some(fuel) = options.fuel {
         ctx.set_fuel(fuel);
+    }
+    if let Some(extern_call) = options.extern_call.clone() {
+        ctx.set_extern_call(extern_call);
     }
     let frames = exec::eval_clauses(&ctx, &query.wheres, frames, &mut Vec::new())?;
 

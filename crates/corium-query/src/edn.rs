@@ -1,10 +1,12 @@
 //! Minimal EDN reader/printer for the query boundary.
 //!
-//! This is the seam where `cljrs-reader` plugs in at M5; until then the
-//! engine carries a small self-contained reader covering the subset used by
-//! queries, transaction forms, and the conformance corpus: collections,
-//! keywords, symbols, strings, numbers, booleans, `nil`, sets, comments,
-//! `#_` discards, and tagged elements.
+//! The engine carries this small self-contained reader covering the subset
+//! used by queries, transaction forms, and the conformance corpus:
+//! collections, keywords, symbols, strings, numbers, booleans, `nil`, sets,
+//! comments, `#_` discards, and tagged elements. Text arriving through a
+//! cljrs boundary is read by `cljrs-reader` instead and bridged onto this
+//! representation (`corium_cljrs::convert::read_edn`, M5), keeping one EDN
+//! implementation at the boundary while the engine core stays dependency-free.
 
 use std::fmt;
 

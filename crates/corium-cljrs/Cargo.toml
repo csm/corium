@@ -7,6 +7,27 @@ rust-version.workspace = true
 
 [dependencies]
 corium-core = { path = "../corium-core" }
+corium-db = { path = "../corium-db" }
+corium-peer = { path = "../corium-peer" }
+corium-query = { path = "../corium-query" }
+corium-transactor = { path = "../corium-transactor" }
+cljrs-builtins = "0.1.224"
+cljrs-env = "0.1.224"
+cljrs-gc = "0.1.224"
+cljrs-interop = "0.1.224"
+cljrs-interp = "0.1.224"
+cljrs-reader = "0.1.224"
+cljrs-value = "0.1.224"
+thiserror = "2"
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+corium-log = { path = "../corium-log" }
+corium-protocol = { path = "../corium-protocol" }
+corium-store = { path = "../corium-store" }
+corium-tx = { path = "../corium-tx" }
+tempfile = "3"
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]
 workspace = true

@@ -40,6 +40,7 @@ pub struct ExecCtx<'a> {
     scanned: Cell<usize>,
     fuel: Cell<u64>,
     rule_state: RefCell<RuleState>,
+    extern_call: Option<crate::ExternCall>,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -56,12 +57,32 @@ impl<'a> ExecCtx<'a> {
             scanned: Cell::new(0),
             fuel: Cell::new(u64::MAX),
             rule_state: RefCell::new(RuleState::default()),
+            extern_call: None,
         }
     }
 
     /// Limits the number of datoms the execution may touch.
     pub fn set_fuel(&self, fuel: u64) {
         self.fuel.set(fuel);
+    }
+
+    /// Installs the resolver consulted for non-native call clause names.
+    pub fn set_extern_call(&mut self, extern_call: crate::ExternCall) {
+        self.extern_call = Some(extern_call);
+    }
+
+    /// Evaluates a call clause: the native set first, then the extern
+    /// resolver seam for names outside it.
+    fn call(&self, name: &str, values: &[Value]) -> Result<CallResult, QueryError> {
+        if builtins::is_native(name) {
+            return builtins::call(name, values);
+        }
+        if let Some(extern_call) = &self.extern_call {
+            if let Some(result) = extern_call(name, values) {
+                return result;
+            }
+        }
+        builtins::call(name, values)
     }
 
     /// Datoms touched by pattern scans so far.
@@ -505,9 +526,9 @@ fn eval_pred(
     let mut out = Vec::new();
     for frame in frames {
         let values = call_args(ctx, &frame, args)?;
-        match builtins::call(name, &values)? {
-            CallResult::Test(true) => out.push(frame),
-            CallResult::Test(false) => {}
+        match ctx.call(name, &values)? {
+            CallResult::Test(true) | CallResult::Scalar(Value::Bool(true)) => out.push(frame),
+            CallResult::Test(false) | CallResult::Scalar(Value::Bool(false)) => {}
             _ => {
                 return Err(QueryError::Type(format!("{name} is not a predicate")));
             }
@@ -532,7 +553,10 @@ fn eval_fn(
     let mut out = Vec::new();
     for frame in frames {
         let values = call_args(ctx, &frame, args)?;
-        let result = builtins::call(name, &values)?;
+        let result = match ctx.call(name, &values)? {
+            CallResult::Test(truth) => CallResult::Scalar(Value::Bool(truth)),
+            other => other,
+        };
         bind_result(&frame, binding, result, &mut out)?;
     }
     Ok(out)

@@ -64,19 +64,33 @@ These were settled at project initialization and are recorded as ADRs:
 
 ## Current status
 
-Milestones M0–M4 are complete: core types and sortable encoding, the
+Milestones M0–M5 are complete: core types and sortable encoding, the
 immutable segment store, the embedded transaction pipeline, the query
 engine (Datalog, Pull, entity API, time views, planner statistics, query
 cache) with a 194-vector conformance corpus, differential model tests, and
 a recorded benchmark baseline
-([docs/benchmarks/m3-baseline.md](docs/benchmarks/m3-baseline.md)), and
+([docs/benchmarks/m3-baseline.md](docs/benchmarks/m3-baseline.md)),
 distribution: the composite wire codec, the transactor as a process
 (Transactor/Catalog gRPC services, lease acquisition with fenced root
 publication, tx-report streams with gapless backfill), the peer library
 (reconnect/resubscribe, sync, tx-report queue, direct segment reads), the
 peer server for thin clients, TLS/bearer-token auth, and the `corium` CLI
-(`transactor`, `peer-server`, `db *`, `gc`, `log`). The M4 acceptance
-battery runs real multi-process integration tests (peer convergence,
-kill -9 recovery, deposed-transactor fencing) and replays the conformance
-corpus through the thin-client protocol. Next step is Milestone M5
-(Clojurust) per [docs/roadmap.md](docs/roadmap.md).
+(`transactor`, `peer-server`, `db *`, `gc`, `log`) — with an M4 acceptance
+battery of real multi-process integration tests (peer convergence,
+kill -9 recovery, deposed-transactor fencing) and a thin-client replay of
+the conformance corpus — and Clojurust integration (`corium-cljrs`):
+bidirectional value conversion (plus a `cljrs-reader` text bridge), the
+`corium.api` namespace (connect/transact/q/pull/entity/datoms/as-of/
+since/history/tx-range/tx-report-queue/sync) bound to `corium-peer`,
+sandboxed `:db/fn` database functions on the transactor (allowlisted
+environment, fuel/allocation/call-depth budgets, watchdog deadline —
+risk checkpoint resolved via the interpreter's pluggable call hook with
+the worker-thread watchdog as backstop, see
+[docs/design/clojurust-integration.md](docs/design/clojurust-integration.md)),
+and the query fn/pred resolution seam wired to the sandbox. The M5
+acceptance battery re-runs the full conformance corpus driven from cljrs
+through a live transactor with identical results, exercises cas-like/
+invariant/recursive database functions with clean aborts on fuel and
+deadline exhaustion, and verifies that sandbox escape attempts (I/O,
+interop, namespace manipulation, unbounded loops) all fail safely. Next
+step is Milestone M6 (Operations) per [docs/roadmap.md](docs/roadmap.md).

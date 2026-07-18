@@ -1,7 +1,8 @@
 //! The native predicate/function set for query call clauses.
 //!
-//! This is resolution step (1) from `docs/design/query-engine.md`; the
-//! sandboxed cljrs resolution seam (step 2) plugs in post-v1. `tuple` and
+//! This is resolution step (1) from `docs/design/query-engine.md`; names
+//! outside it fall through to the sandboxed cljrs resolution seam (step 2,
+//! the [`crate::ExternCall`] hook wired by `corium-cljrs`). `tuple` and
 //! `untuple` are deliberately absent until tuple value types land
 //! (deferred by ADR-0009).
 
