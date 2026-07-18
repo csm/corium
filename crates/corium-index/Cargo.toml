@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-corium-core = { path = "../corium-core" }
+corium-core = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

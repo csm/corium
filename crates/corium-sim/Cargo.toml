@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-corium-core = { path = "../corium-core" }
+corium-core = { workspace = true }
 
 [lints]
 workspace = true

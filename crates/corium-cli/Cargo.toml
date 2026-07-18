@@ -11,15 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-corium-cljrs = { path = "../corium-cljrs" }
-corium-core = { path = "../corium-core" }
-corium-db = { path = "../corium-db" }
-corium-log = { path = "../corium-log" }
-corium-peer = { path = "../corium-peer" }
-corium-protocol = { path = "../corium-protocol" }
-corium-query = { path = "../corium-query" }
-corium-store = { path = "../corium-store" }
-corium-transactor = { path = "../corium-transactor" }
+corium-cljrs = { workspace = true }
+corium-core = { workspace = true }
+corium-db = { workspace = true }
+corium-log = { workspace = true }
+corium-peer = { workspace = true }
+corium-protocol = { workspace = true }
+corium-query = { workspace = true }
+corium-store = { workspace = true }
+corium-transactor = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tonic = { version = "0.14.5", features = ["tls-ring"] }

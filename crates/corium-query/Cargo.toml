@@ -6,14 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-corium-core = { path = "../corium-core" }
-corium-db = { path = "../corium-db" }
+corium-core = { workspace = true }
+corium-db = { workspace = true }
 thiserror = "2"
 
 [dev-dependencies]
-corium-log = { path = "../corium-log" }
-corium-transactor = { path = "../corium-transactor" }
-corium-tx = { path = "../corium-tx" }
+corium-log = { workspace = true }
+corium-transactor = { workspace = true }
+corium-tx = { workspace = true }
 criterion = "0.5"
 proptest = "1"
 

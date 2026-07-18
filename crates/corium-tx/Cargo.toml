@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-corium-core = { path = "../corium-core" }
-corium-db = { path = "../corium-db" }
+corium-core = { workspace = true }
+corium-db = { workspace = true }
 thiserror = "2"
 
 [lints]
