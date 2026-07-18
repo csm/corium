@@ -1,0 +1,91 @@
+name: publish.yml
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  BASE_VERSION: "0.1"
+
+jobs:
+  ci:
+    name: "Build & Test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  publish:
+    name: "Publish to crates.io"
+    runs-on: ubuntu-latest
+    needs: ci
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-release
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release
+
+      - name: Set crate versions
+        run: |
+          VERSION="${BASE_VERSION}.${{ github.run_number }}"
+          echo "Publishing version: $VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          cargo release version "$VERSION" --execute --no-confirm
+          echo "--- Workspace Cargo.toml ---"
+          cat Cargo.toml
+          echo ""
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          # Always commit the version bump so cargo publish sees a clean tree.
+          # On a fresh re-run the files are re-edited from 0.1.0, so there will
+          # always be staged changes to commit.
+          git diff --cached --quiet || git commit -m "chore: release $VERSION"
+          # Only create and push the tag if it doesn't already exist on the remote,
+          # making retries safe after a partial publish failure.
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists on remote — skipping tag push"
+          else
+            git tag "v$VERSION"
+            git push origin "v$VERSION"
+          fi
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Build --exclude list for packages already live at this version.
+          # Makes the step idempotent so a retry after a partial failure is safe.
+          EXCLUDE=()
+          while IFS= read -r pkg; do
+            name="${pkg%%@*}"
+            ver="${pkg##*@}"
+            if curl -sf "https://crates.io/api/v1/crates/${name}/${ver}" \
+                 -H "User-Agent: corium-publish/1.0" | grep -q '"num"'; then
+              echo "Already published: ${name}@${ver} — skipping"
+              EXCLUDE+=(--exclude "${name}")
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 \
+                     | jq -r '.packages[] | "\(.name)@\(.version)"')
+
+          cargo publish --workspace \
+            --no-verify \
+            "${EXCLUDE[@]}"
