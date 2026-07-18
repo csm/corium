@@ -1,6 +1,6 @@
 //! Datomic-semantics conformance suite.
 //!
-//! Runs every vector in `tests/conformance/*.edn` (repo root). Each vector
+//! Runs every vector in `tests/conformance/*.edn` (repository root). Each vector
 //! is a map: `:name`, `:schema` (Datomic-style attribute maps), `:tx`
 //! (a vector of transactions, each a vector of list/map forms), optional
 //! `:view` (`:history`, `{:as-of t}`, `{:since t}`), then either `:query`
