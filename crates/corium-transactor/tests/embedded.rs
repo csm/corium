@@ -39,10 +39,12 @@ fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {
             .expect("concurrent transaction")
         })
     };
-    let published = tx.publish_indexes(&*store).expect("publish indexes");
+    let published = tx
+        .publish_indexes(&*store, "db:main", 1)
+        .expect("publish indexes");
     writer.join().expect("writer");
     assert!(published.index_basis_t == 1 || published.index_basis_t == 2);
-    for root in &published.roots {
+    for root in &published.roots.clone().expect("roots published") {
         assert!(store.contains(root).expect("root blob exists"));
     }
     drop(tx);
@@ -114,7 +116,9 @@ fn stale_publisher_cannot_regress_published_root() {
             ))])
             .expect("transact");
     }
-    let published = fresh.publish_indexes(&store).expect("publish fresh");
+    let published = fresh
+        .publish_indexes(&store, "db:main", 1)
+        .expect("publish fresh");
     assert_eq!(published.index_basis_t, 2);
     let stale = EmbeddedTransactor::recover(
         schema,
@@ -129,11 +133,48 @@ fn stale_publisher_cannot_regress_published_root() {
         ))])
         .expect("transact");
     stale
-        .publish_indexes(&store)
+        .publish_indexes(&store, "db:main", 1)
         .expect("stale publish is a no-op");
-    let root = store.get_root("db").expect("read root").expect("root set");
-    assert!(
-        root.starts_with(b"2\n"),
+    let root = store
+        .get_root("db:main")
+        .expect("read root")
+        .expect("root set");
+    let decoded = corium_transactor::DbRoot::decode(&root).expect("decodable root");
+    assert_eq!(
+        decoded.index_basis_t, 2,
         "stale publisher regressed the root to an older basis"
     );
+}
+
+#[test]
+fn deposed_lease_version_cannot_publish() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let store = FsStore::open(dir.path().join("store")).expect("store");
+    let tx = EmbeddedTransactor::recover(
+        schema,
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log")),
+    )
+    .expect("recover");
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp("e".into()),
+        a,
+        Value::Long(1),
+    ))])
+    .expect("transact");
+    tx.publish_indexes(&store, "db:main", 2)
+        .expect("current lease publishes");
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp("f".into()),
+        a,
+        Value::Long(2),
+    ))])
+    .expect("transact again");
+    let error = tx
+        .publish_indexes(&store, "db:main", 1)
+        .expect_err("deposed lease version must not publish");
+    assert!(matches!(
+        error,
+        corium_transactor::TransactError::Deposed { published: 2 }
+    ));
 }

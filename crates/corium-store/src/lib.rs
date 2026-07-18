@@ -22,6 +22,13 @@ impl BlobId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Parses a stored 64-character hexadecimal digest.
+    #[must_use]
+    pub fn from_hex(text: &str) -> Option<Self> {
+        (text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| Self(text.to_owned()))
+    }
 }
 
 impl fmt::Display for BlobId {
@@ -105,6 +112,18 @@ pub trait RootStore: Send + Sync {
     ///
     /// Returns an error if the fence does not match or the backend cannot publish.
     fn cas_root(&self, name: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<(), StoreError>;
+    /// Removes a root pointer. Missing roots are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot delete the root.
+    fn delete_root(&self, name: &str) -> Result<(), StoreError>;
+    /// Lists root names beginning with `prefix`, in sorted order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot enumerate roots.
+    fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
 }
 
 /// In-memory blob and root store for tests and embedded use.
@@ -177,6 +196,25 @@ impl RootStore for MemoryStore {
         }
         inner.roots.insert(name.to_owned(), new.to_vec());
         Ok(())
+    }
+    fn delete_root(&self, name: &str) -> Result<(), StoreError> {
+        self.inner
+            .write()
+            .expect("poisoned store lock")
+            .roots
+            .remove(name);
+        Ok(())
+    }
+    fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .expect("poisoned store lock")
+            .roots
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect())
     }
 }
 
@@ -290,10 +328,102 @@ impl RootStore for FsStore {
         fs::rename(tmp, path)?;
         Ok(())
     }
+    fn delete_root(&self, name: &str) -> Result<(), StoreError> {
+        let _lock = self.root_lock(name)?;
+        match fs::remove_file(self.root_path(name)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.root.join("roots"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                let auxiliary = Path::new(name).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("lock") || ext.eq_ignore_ascii_case("tmp")
+                });
+                if name.starts_with(prefix) && !auxiliary {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 fn digest(bytes: &[u8]) -> BlobId {
     BlobId(blake3::hash(bytes).to_hex().to_string())
+}
+
+/// Root-store key for a database's published index root.
+#[must_use]
+pub fn db_root_name(db: &str) -> String {
+    format!("db:{db}")
+}
+
+/// Published durable index-root metadata, fenced by lease version
+/// (see `docs/design/log-and-transactor.md`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DbRoot {
+    /// Lease version of the writer that published this root.
+    pub lease_version: u64,
+    /// Highest indexed transaction.
+    pub index_basis_t: u64,
+    /// EAVT, AEVT, AVET, and VAET blob ids; `None` before the first index
+    /// publication (a bare fence bump).
+    pub roots: Option<[BlobId; 4]>,
+}
+
+impl DbRoot {
+    /// Encodes the root for the root store.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = format!("{}\n{}\n", self.lease_version, self.index_basis_t);
+        match &self.roots {
+            Some(roots) => {
+                for root in roots {
+                    out.push_str(root.as_str());
+                    out.push('\n');
+                }
+            }
+            None => out.push_str("-\n-\n-\n-\n"),
+        }
+        out.into_bytes()
+    }
+
+    /// Decodes stored root bytes.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let mut lines = text.lines();
+        let lease_version = lines.next()?.parse().ok()?;
+        let index_basis_t = lines.next()?.parse().ok()?;
+        let ids: Vec<&str> = lines.take(4).collect();
+        if ids.len() != 4 {
+            return None;
+        }
+        let roots = if ids.iter().all(|id| *id == "-") {
+            None
+        } else {
+            Some([
+                BlobId::from_hex(ids[0])?,
+                BlobId::from_hex(ids[1])?,
+                BlobId::from_hex(ids[2])?,
+                BlobId::from_hex(ids[3])?,
+            ])
+        };
+        Some(Self {
+            lease_version,
+            index_basis_t,
+            roots,
+        })
+    }
 }
 
 /// Result counters from a mark-and-sweep garbage collection pass.
