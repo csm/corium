@@ -1007,7 +1007,6 @@ dependencies = [
  "corium-core",
  "corium-db",
  "corium-log",
- "corium-transactor",
  "corium-tx",
  "criterion",
  "proptest",
