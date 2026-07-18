@@ -6,11 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-corium-core = { path = "../corium-core" }
-corium-db = { path = "../corium-db" }
-corium-log = { path = "../corium-log" }
-corium-query = { path = "../corium-query" }
-corium-tx = { path = "../corium-tx" }
+corium-core = { workspace = true }
+corium-db = { workspace = true }
+corium-log = { workspace = true }
+corium-query = { workspace = true }
+corium-tx = { workspace = true }
 prost = "0.14.4"
 thiserror = "2.0.18"
 tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread", "sync", "time"] }

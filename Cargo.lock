@@ -638,9 +638,9 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cljrs-builtins"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc6f4cd679b81c0ba4473cce359d27c274c2674031bcd38704498b66a0c2942a"
+checksum = "15727665a3c834a979f1d20393e148e4ae79bdab1f947ed2c11f4a2898047b0f"
 dependencies = [
  "bigdecimal",
  "cljrs-env",
@@ -659,9 +659,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-deps"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0583a83cd3851aaa1acc0107ecfdc90404038d786802fb36a744f379563e265"
+checksum = "6a514d70d6853309733c62e03ff1dfbcdf4147b5288dce2991f300b82d0dcb83"
 dependencies = [
  "cljrs-gc",
  "cljrs-reader",
@@ -671,9 +671,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-env"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9062e25df4791602422d00f63d895d011b00bd5570b8591beb3e90327cab308a"
+checksum = "afffd79b48be808cf76bc1a551b7f5831f4486fc7b7b8dff238d1a1ba724bff7"
 dependencies = [
  "cljrs-deps",
  "cljrs-gc",
@@ -688,9 +688,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-export-macro"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ecb684d85da27b05159115b1dbbb2ad1d90e2a27d0beb46fa2ac2962aee4b88"
+checksum = "519d318c0e75a96dea26939528c146e7006c5e6673bd4d9cef257b83ec8d2630"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -699,9 +699,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-gc"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b47d301e1d65e88c58120d90c96e497238c735f8734b46f87efc56fa9305ac1f"
+checksum = "c65280b08e3f724ed6ee772305edf29638d71685fdea8c925a6282c006a4a5d0"
 dependencies = [
  "bigdecimal",
  "cljrs-logging",
@@ -713,9 +713,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-interop"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4de9193620fd05b5c2909cd62331e519d41a2e4336dab4e4d71c6519e9c8ffe2"
+checksum = "acc2e74bd572a235fa04c63816b305a7b0d9edcaec55e844ee2b77e8e6220164"
 dependencies = [
  "cljrs-env",
  "cljrs-export-macro",
@@ -728,9 +728,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-interp"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d246ca6ab4484d216e8f46221d64dcb717d5fcf4f9cb974861937a092024df80"
+checksum = "05c368e6d3801f3e9ce147a4236c9022eb0d2ceecc53e81de40ebeb88a6b07df"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -745,15 +745,15 @@ dependencies = [
 
 [[package]]
 name = "cljrs-logging"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21893709ed1dc39edcbc5835ecc85116c9c6bc1d5887789348a3c005379dd021"
+checksum = "6143ca16089afb751304c93aa2838852e80b05a9d1a513bc58a86f9857457868"
 
 [[package]]
 name = "cljrs-reader"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fa15dbd19e393b0465cca8614fd17650030fad075bdc58b391cebfa7ae64762"
+checksum = "c5bc7d703581fdf41c9d0dddfe303e25048f1edd7ede22d0feb17ecd13470c75"
 dependencies = [
  "cljrs-types",
  "miette",
@@ -761,9 +761,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-types"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "229f3f363acd5511e2835c70bfdae9b0b1e89aec46d8f7682a545cf4356f5a65"
+checksum = "32f30e091e6688b00ebcd4e7b42f86801cdf5f1f02e0e2255e0af4ae95400c4c"
 dependencies = [
  "miette",
  "serde",
@@ -772,9 +772,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-value"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d0744c52a7b1ad1cddb2725dceeb1178e1828afa2a0053cf42b0f063b0d3931"
+checksum = "fb9edcf376a6491005fcc5ea23e5f1acbc898f04cda5a0d9febdbe10885e9f15"
 dependencies = [
  "arc-swap",
  "bigdecimal",
@@ -792,9 +792,9 @@ dependencies = [
 
 [[package]]
 name = "cljrs-vcs"
-version = "0.1.224"
+version = "0.1.225"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4b28cb0e4007ae97ef9c62c55f1f412bcf160ff730b6b9952707000f01704da"
+checksum = "0676ff59907ccdd6584147bbc0052c974ba7ca4998f31b18fde856e8b6adf466"
 dependencies = [
  "gix",
  "pgp",

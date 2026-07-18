@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 blake3 = "1"
-corium-core = { path = "../corium-core" }
+corium-core = { workspace = true }
 fs2 = "0.4"
 thiserror = "2"
 
