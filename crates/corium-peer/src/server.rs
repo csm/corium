@@ -184,8 +184,15 @@ impl PeerServer for PeerServerSvc {
         } else {
             request.fuel.min(self.config.max_fuel)
         };
-        let (result, _) = corium_query::run(&parsed, &inputs, ExecOptions { fuel: Some(fuel) })
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (result, _) = corium_query::run(
+            &parsed,
+            &inputs,
+            ExecOptions {
+                fuel: Some(fuel),
+                ..ExecOptions::default()
+            },
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let (shape, rows) = match (&parsed.find, result) {
             (ast::FindSpec::Rel(_), Edn::Vector(rows)) => (pb::ResultShape::Relation, rows),
             (ast::FindSpec::Coll(_), Edn::Vector(rows)) => (pb::ResultShape::Collection, rows),

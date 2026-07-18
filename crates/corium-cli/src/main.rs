@@ -107,6 +107,12 @@ enum Command {
         /// Interval between subscription heartbeats (ms).
         #[arg(long, default_value_t = 10_000)]
         heartbeat_ms: u64,
+        /// Fuel budget per database-function invocation (function applications).
+        #[arg(long, default_value_t = 1_000_000)]
+        db_fn_fuel: u64,
+        /// Wall-clock deadline per database-function invocation (ms).
+        #[arg(long, default_value_t = 5_000)]
+        db_fn_deadline_ms: u64,
         #[command(flatten)]
         serve: ServeFlags,
     },
@@ -199,6 +205,11 @@ enum DbCommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The binary links two rustls crypto backends (`ring` via tonic, and
+    // `aws-lc-rs` transitively through the cljrs runtime), so rustls cannot
+    // auto-select a process-level provider; pin `ring` explicitly before any
+    // TLS setup.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -219,6 +230,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             lease_wait_ms,
             index_interval_ms,
             heartbeat_ms,
+            db_fn_fuel,
+            db_fn_deadline_ms,
             serve,
         } => {
             let mut config = NodeConfig::new(data_dir);
@@ -229,6 +242,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             config.lease_wait_ms = lease_wait_ms;
             config.index_interval = Duration::from_millis(index_interval_ms);
             config.heartbeat_interval = Duration::from_millis(heartbeat_ms);
+            config.tx_fn_expander = Some(Arc::new(corium_cljrs::dbfn::DbFnExpander::new(
+                corium_cljrs::sandbox::SandboxBudget {
+                    fuel: db_fn_fuel,
+                    deadline: Duration::from_millis(db_fn_deadline_ms),
+                    ..corium_cljrs::sandbox::SandboxBudget::default()
+                },
+            )));
             let tls = serve.tls()?;
             let authenticator = serve.authenticator();
             let node = TransactorNode::open(config)

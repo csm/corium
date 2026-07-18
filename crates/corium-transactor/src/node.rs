@@ -22,8 +22,22 @@ use tokio::sync::{broadcast, watch};
 use crate::lease::{self, Lease, LeaseError};
 use crate::{DbRoot, EmbeddedTransactor, TransactError, db_root_name, publish_root};
 
+/// Expands user database-function invocations in boundary EDN transaction
+/// forms before native conversion. Implemented by `corium-cljrs` (the
+/// sandboxed Clojurust host, ADR-0008) and injected by the process wiring;
+/// the transactor itself stays free of cljrs dependencies.
+pub trait TxFnExpander: Send + Sync {
+    /// Rewrites `forms` with every `[:my/fn arg…]` invocation replaced by
+    /// the function's returned tx-data (recursively).
+    ///
+    /// # Errors
+    /// Returns a display message when a function is missing, rejected by
+    /// the sandbox, fails, or exceeds its budget; the transaction aborts.
+    fn expand(&self, db: &Db, forms: Vec<Edn>) -> Result<Vec<Edn>, String>;
+}
+
 /// Node process configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NodeConfig {
     /// Data directory holding the blob/root store and transaction logs.
     pub data_dir: PathBuf,
@@ -37,6 +51,22 @@ pub struct NodeConfig {
     pub index_interval: Duration,
     /// Interval between heartbeats on subscription streams.
     pub heartbeat_interval: Duration,
+    /// Optional database-function expander (`:db/fn` support).
+    pub tx_fn_expander: Option<Arc<dyn TxFnExpander>>,
+}
+
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeConfig")
+            .field("data_dir", &self.data_dir)
+            .field("owner", &self.owner)
+            .field("lease_ttl_ms", &self.lease_ttl_ms)
+            .field("lease_wait_ms", &self.lease_wait_ms)
+            .field("index_interval", &self.index_interval)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("tx_fn_expander", &self.tx_fn_expander.is_some())
+            .finish()
+    }
 }
 
 impl NodeConfig {
@@ -53,6 +83,7 @@ impl NodeConfig {
             lease_wait_ms: 15_000,
             index_interval: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(10),
+            tx_fn_expander: None,
         }
     }
 }
@@ -640,6 +671,20 @@ impl TransactorNode {
             .to_vec();
         let _commit = state.commit.lock().await;
         state.check_lease(self.store.as_ref())?;
+        // Expand user database-function invocations against the
+        // db-in-transaction (the value under the commit lock) before native
+        // conversion. The expander blocks up to its budget deadline, so it
+        // runs off the async workers.
+        let forms = if let Some(expander) = &self.config.tx_fn_expander {
+            let expander = Arc::clone(expander);
+            let db = state.transactor.db();
+            tokio::task::spawn_blocking(move || expander.expand(&db, forms))
+                .await
+                .map_err(|error| NodeError::BadRequest(format!("expander task failed: {error}")))?
+                .map_err(NodeError::BadRequest)?
+        } else {
+            forms
+        };
         // Convert forms, interning any new keyword values.
         let (items, naming_changed, idents, interner, schema) = {
             let mut naming = state

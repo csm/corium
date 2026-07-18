@@ -126,6 +126,13 @@ fn fuel_bounds_runaway_scans() {
     let db = skewed_db();
     let query = parse_query(&read_one("[:find ?e ?v :where [?e :t/common ?v]]").expect("edn"))
         .expect("parse");
-    let result = run(&query, &[QInput::Db(&db)], ExecOptions { fuel: Some(10) });
+    let result = run(
+        &query,
+        &[QInput::Db(&db)],
+        ExecOptions {
+            fuel: Some(10),
+            ..ExecOptions::default()
+        },
+    );
     assert_eq!(result.unwrap_err(), QueryError::FuelExhausted);
 }
