@@ -1036,7 +1036,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corium-cli"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "clap",
  "corium-cljrs",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "corium-cljrs"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "corium-core"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "proptest",
  "thiserror",
@@ -1095,14 +1095,14 @@ dependencies = [
 
 [[package]]
 name = "corium-db"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
 ]
 
 [[package]]
 name = "corium-index"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
  "proptest",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "corium-log"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
  "tempfile",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "corium-mbrainz"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "clap",
  "cljrs-env",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "corium-peer"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
  "corium-db",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "corium-protocol"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
  "corium-db",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "corium-query"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
  "corium-db",
@@ -1188,14 +1188,14 @@ dependencies = [
 
 [[package]]
 name = "corium-sim"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
 ]
 
 [[package]]
 name = "corium-store"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "corium-transactor"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "corium-core",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "corium-tx"
-version = "0.1.0"
+version = "0.1.10"
 dependencies = [
  "corium-core",
  "corium-db",
