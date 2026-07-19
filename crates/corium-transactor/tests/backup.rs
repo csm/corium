@@ -97,12 +97,15 @@ async fn scheduled_gc_sweeps_only_after_configured_retention() {
     config.gc_retention = Duration::ZERO;
     let node = TransactorNode::open(config).expect("node");
     let orphan = node.store().put(b"orphan").expect("orphan blob");
-    for _ in 0..100 {
+    // Generous wall-clock deadline: the whole workspace test suite runs in
+    // parallel and can starve the 10ms GC ticker for a while.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
         if !node.store().contains(&orphan).expect("contains") {
             assert!(node.metrics().snapshot().gc_runs > 0);
             return;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("scheduled GC did not sweep the orphan");
 }

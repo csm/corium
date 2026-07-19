@@ -40,7 +40,9 @@ enum LogFormat {
 /// Client-side connection flags (endpoint, auth, TLS).
 #[derive(Args, Clone)]
 struct ClientFlags {
-    /// Transactor endpoint, e.g. `http://127.0.0.1:4334`.
+    /// Transactor endpoint, e.g. `http://127.0.0.1:4334`. With an HA pair,
+    /// pass a comma-separated preference list (active first); connections
+    /// fail over across it. Admin commands use the first endpoint.
     #[arg(long, default_value = "http://127.0.0.1:4334")]
     transactor: String,
     /// Bearer token for the transactor.
@@ -55,6 +57,23 @@ struct ClientFlags {
 }
 
 impl ClientFlags {
+    /// Endpoint preference list parsed from the comma-separated flag.
+    fn endpoints(&self) -> Vec<String> {
+        self.transactor
+            .split(',')
+            .map(|endpoint| endpoint.trim().to_owned())
+            .filter(|endpoint| !endpoint.is_empty())
+            .collect()
+    }
+
+    /// First endpoint (admin commands talk to one transactor).
+    fn primary(&self) -> String {
+        self.endpoints()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| self.transactor.clone())
+    }
+
     fn tls(&self) -> Result<Option<tonic::transport::ClientTlsConfig>, String> {
         if self.ca.is_none() && self.tls_domain.is_none() {
             return Ok(None);
@@ -113,6 +132,15 @@ enum Command {
         /// How long to wait for a held lease before giving up (ms).
         #[arg(long, default_value_t = 15_000)]
         lease_wait_ms: i64,
+        /// High-availability mode: stand by (and take over on lease expiry)
+        /// when another transactor holds a database's lease, instead of
+        /// failing startup; on depose, return to standby instead of exiting.
+        #[arg(long)]
+        ha: bool,
+        /// Client endpoint advertised to peers for lease-holder discovery,
+        /// e.g. `http://transactor-a:4334`.
+        #[arg(long)]
+        advertise: Option<String>,
         /// Interval between background index publications (ms).
         #[arg(long, default_value_t = 5_000)]
         index_interval_ms: u64,
@@ -285,6 +313,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             owner,
             lease_ttl_ms,
             lease_wait_ms,
+            ha,
+            advertise,
             index_interval_ms,
             heartbeat_ms,
             metrics_listen,
@@ -300,6 +330,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             config.lease_ttl_ms = lease_ttl_ms;
             config.lease_wait_ms = lease_wait_ms;
+            config.ha = ha;
+            config.advertise = advertise;
             config.index_interval = Duration::from_millis(index_interval_ms);
             config.heartbeat_interval = Duration::from_millis(heartbeat_ms);
             config.gc_interval = if gc_interval == "off" {
@@ -332,10 +364,16 @@ async fn run(cli: Cli) -> Result<(), String> {
                 None
             };
             let mut shutdown = node.shutdown_watch();
-            tracing::info!(%listen, databases = ?node.list_dbs(), "transactor serving");
+            tracing::info!(
+                %listen,
+                databases = ?node.list_dbs(),
+                standby = ?node.standby_dbs(),
+                "transactor serving"
+            );
             eprintln!(
-                "corium transactor: serving {:?} on {listen}",
-                node.list_dbs()
+                "corium transactor: serving {:?} (standby for {:?}) on {listen}",
+                node.list_dbs(),
+                node.standby_dbs()
             );
             let server = corium_transactor::server::serve(
                 Arc::clone(&node),
@@ -350,6 +388,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                 },
             );
             server.await.map_err(|error| error.to_string())?;
+            // Graceful stop: expire held leases so a standby takes over
+            // immediately instead of waiting out the TTL.
+            node.release_leases();
             if let Some(reason) = node.shutdown_watch().borrow().clone() {
                 return Err(format!("shut down: {reason}"));
             }
@@ -365,7 +406,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => {
             let tls = serve.tls()?;
             let authenticator = serve.authenticator();
-            let mut config = ConnectConfig::new(client.transactor.clone(), db);
+            let mut config = ConnectConfig::with_failover(client.endpoints(), db);
             config.token = client.token.clone();
             config.tls = client.tls()?;
             let connection = Arc::new(
@@ -441,10 +482,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                     ca,
                     tls_domain,
                 };
-                let mut admin =
-                    Admin::connect(&flags.transactor, flags.token.clone(), flags.tls()?)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                let mut admin = Admin::connect(&flags.primary(), flags.token.clone(), flags.tls()?)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 let swept = admin
                     .gc_deleted_databases_with_retention(Some(parse_duration(&window)?))
                     .await
@@ -486,7 +526,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Console { db, client } => {
             let tls = client.tls()?;
-            let mut config = ConnectConfig::new(client.transactor, db);
+            let mut config = ConnectConfig::with_failover(client.endpoints(), db);
             config.token = client.token;
             config.tls = tls;
             let connection = Connection::connect(config)
@@ -567,7 +607,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
                 }
                 None => Vec::new(),
             };
-            let mut admin = Admin::connect(&client.transactor, client.token.clone(), client.tls()?)
+            let mut admin = Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
                 .await
                 .map_err(|error| error.to_string())?;
             let created = admin
@@ -578,7 +618,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             Ok(())
         }
         DbCommand::Delete { name, client } => {
-            let mut admin = Admin::connect(&client.transactor, client.token.clone(), client.tls()?)
+            let mut admin = Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
                 .await
                 .map_err(|error| error.to_string())?;
             let deleted = admin
@@ -589,7 +629,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             Ok(())
         }
         DbCommand::List { client } => {
-            let mut admin = Admin::connect(&client.transactor, client.token.clone(), client.tls()?)
+            let mut admin = Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
                 .await
                 .map_err(|error| error.to_string())?;
             for db in admin
@@ -602,7 +642,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             Ok(())
         }
         DbCommand::Stats { name, client } => {
-            let mut config = ConnectConfig::new(client.transactor.clone(), name);
+            let mut config = ConnectConfig::with_failover(client.endpoints(), name);
             config.token = client.token.clone();
             config.tls = client.tls()?;
             let connection = Connection::connect(config)
@@ -635,7 +675,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
 
 fn run_log(data_dir: &std::path::Path, db: &str, from: u64, to: u64) -> Result<(), String> {
     use corium_log::TransactionLog;
-    let log = corium_log::FileLog::open(data_dir.join("logs").join(format!("{db}.log")))
+    let log = corium_log::VersionedLog::open_read_only(data_dir.join("logs"), db)
         .map_err(|error| format!("cannot open log: {error}"))?;
     // Naming from the meta root makes keyword values readable.
     let interner = FsStore::open(data_dir.join("store"))

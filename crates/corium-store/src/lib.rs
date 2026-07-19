@@ -385,21 +385,57 @@ pub fn db_root_name(db: &str) -> String {
 }
 
 /// Storage format written by this release.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// Format 2 (M7) folds the write lease into the root record so lease
+/// ownership and index publication are fenced by one atomic CAS; format 1
+/// roots (separate `lease:` record) decode with an unowned lease.
+pub const FORMAT_VERSION: u32 = 2;
 
-/// Published durable index-root metadata, fenced by lease version
+/// Published durable index-root metadata carrying the write lease
 /// (see `docs/design/log-and-transactor.md`).
+///
+/// The lease fields and the index fields live in one record on purpose:
+/// every mutation — lease acquisition, renewal, release, index publication —
+/// is a CAS on these bytes, so a writer whose ownership has changed hands
+/// always fails its next CAS and can never install a root. No cross-record
+/// atomicity is required of the store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DbRoot {
     /// On-disk format version. Readers reject roots from newer formats.
     pub format_version: u32,
-    /// Lease version of the writer that published this root.
+    /// Fencing version; increments on every change of lease ownership.
     pub lease_version: u64,
+    /// Owning transactor id; empty when the lease has never been acquired
+    /// under format 2.
+    pub owner: String,
+    /// Lease expiry as Unix milliseconds; `0` when released/never held.
+    pub lease_expires_unix_ms: i64,
+    /// Client endpoint advertised by the owner (for peer lease-holder
+    /// rediscovery); empty when the owner does not advertise one.
+    pub owner_endpoint: String,
     /// Highest indexed transaction.
     pub index_basis_t: u64,
     /// EAVT, AEVT, AVET, and VAET blob ids; `None` before the first index
     /// publication (a bare fence bump).
     pub roots: Option<[BlobId; 4]>,
+}
+
+/// Encodes a possibly empty single-line field.
+fn field_line(out: &mut String, value: &str) {
+    if value.is_empty() {
+        out.push('-');
+    } else {
+        out.push_str(value);
+    }
+    out.push('\n');
+}
+
+fn parse_field(line: &str) -> String {
+    if line == "-" {
+        String::new()
+    } else {
+        line.to_owned()
+    }
 }
 
 impl DbRoot {
@@ -419,10 +455,16 @@ impl DbRoot {
             }
             None => out.push_str("-\n-\n-\n-\n"),
         }
+        field_line(&mut out, &self.owner);
+        out.push_str(&self.lease_expires_unix_ms.to_string());
+        out.push('\n');
+        field_line(&mut out, &self.owner_endpoint);
         out.into_bytes()
     }
 
-    /// Decodes stored root bytes.
+    /// Decodes stored root bytes (any format up to [`FORMAT_VERSION`];
+    /// newer formats still yield their fence fields so old binaries fence
+    /// correctly, and callers reject them via `format_version`).
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
@@ -436,10 +478,10 @@ impl DbRoot {
             } else {
                 // M1-M5 roots had no header. Keep them readable as format v1 so
                 // an existing database can be upgraded in place.
-                (FORMAT_VERSION, first.parse().ok()?)
+                (1, first.parse().ok()?)
             };
         let index_basis_t = lines.next()?.parse().ok()?;
-        let ids: Vec<&str> = lines.take(4).collect();
+        let ids: Vec<&str> = lines.by_ref().take(4).collect();
         if ids.len() != 4 {
             return None;
         }
@@ -453,9 +495,16 @@ impl DbRoot {
                 BlobId::from_hex(ids[3])?,
             ])
         };
+        // Lease fields; absent in format-1 roots.
+        let owner = lines.next().map(parse_field).unwrap_or_default();
+        let lease_expires_unix_ms = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
+        let owner_endpoint = lines.next().map(parse_field).unwrap_or_default();
         Some(Self {
             format_version,
             lease_version,
+            owner,
+            lease_expires_unix_ms,
+            owner_endpoint,
             index_basis_t,
             roots,
         })

@@ -55,8 +55,14 @@ DbRoot {
   schema-rev,
   gc-epoch,
   format-version,
+  lease,                   // {owner, lease-version, expiry, advertised endpoint}
 }
 ```
+
+Since M7 the write lease is part of this record rather than a sibling root:
+every lease acquisition/renewal and every index publication CAS the same
+bytes, which is what makes the HA fencing rule a single atomic operation
+(see log-and-transactor.md).
 
 The current db value seen by any reader = `index trees at index-basis-t`
 merged with `log tail (index-basis-t, basis-t]` replayed into an in-memory
