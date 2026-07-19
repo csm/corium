@@ -7,6 +7,10 @@ rust-version.workspace = true
 homepage.workspace = true
 description = "Corium transactor"
 
+[features]
+default = []
+turso = ["corium-store/turso"]
+
 [dependencies]
 corium-core = { workspace = true }
 corium-db = { workspace = true }
@@ -16,6 +20,7 @@ corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
 corium-tx = { workspace = true }
+async-trait = "0.1"
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -26,5 +31,4 @@ tonic = "0.14.5"
 workspace = true
 
 [dev-dependencies]
-async-trait = "0.1"
 tempfile = "3"

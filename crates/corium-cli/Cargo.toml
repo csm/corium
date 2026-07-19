@@ -11,6 +11,11 @@ description = "Corium CLI"
 name = "corium"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enables the Turso storage backend for `corium transactor --store turso`.
+turso = ["corium-transactor/turso"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 corium-cljrs = { workspace = true }

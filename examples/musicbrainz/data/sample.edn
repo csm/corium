@@ -1,0 +1,145 @@
+;; A tiny MusicBrainz dataset for the corium example, shaped like the output
+;; of `mbrainz-load`. Each top-level vector is one atomic transaction; the
+;; loader applies them in order. Entities are linked with lookup refs on the
+;; unique :*/gid attributes, so every referenced entity is committed by an
+;; earlier transaction than the one that points at it:
+;;   artists + labels  →  tracks  →  media  →  releases.
+;;
+;; UUIDs are 32 hex digits, no dashes (corium's #uuid literal form).
+
+;; ── Transaction 1: artists and labels ───────────────────────────────────
+[{:db/id "bob"
+  :artist/gid #uuid "00000000000000000000000000000001"
+  :artist/name "Bob Dylan"
+  :artist/sortName "Dylan, Bob"
+  :artist/type :artist.type/person
+  :artist/gender :artist.gender/male
+  :artist/country :country/US
+  :artist/startYear 1941}
+ {:db/id "beatles"
+  :artist/gid #uuid "00000000000000000000000000000002"
+  :artist/name "The Beatles"
+  :artist/sortName "Beatles, The"
+  :artist/type :artist.type/group
+  :artist/country :country/GB
+  :artist/startYear 1960
+  :artist/endYear 1970}
+ {:db/id "radiohead"
+  :artist/gid #uuid "00000000000000000000000000000003"
+  :artist/name "Radiohead"
+  :artist/sortName "Radiohead"
+  :artist/type :artist.type/group
+  :artist/country :country/GB
+  :artist/startYear 1985}
+ {:db/id "columbia"
+  :label/gid #uuid "00000000000000000000000000001001"
+  :label/name "Columbia Records"
+  :label/type :label.type/originalProduction
+  :label/country :country/US
+  :label/startYear 1889}
+ {:db/id "parlophone"
+  :label/gid #uuid "00000000000000000000000000001002"
+  :label/name "Parlophone"
+  :label/type :label.type/originalProduction
+  :label/country :country/GB
+  :label/startYear 1896}]
+
+;; ── Transaction 2: tracks (reference artists by gid) ────────────────────
+[{:db/id "t-rolling-stone"
+  :track/gid #uuid "00000000000000000000000000002001"
+  :track/name "Like a Rolling Stone"
+  :track/position 1
+  :track/duration 369000
+  :track/artists [[:artist/gid #uuid "00000000000000000000000000000001"]]
+  :track/artistCredit "Bob Dylan"}
+ {:db/id "t-highway-61"
+  :track/gid #uuid "00000000000000000000000000002002"
+  :track/name "Highway 61 Revisited"
+  :track/position 6
+  :track/duration 211000
+  :track/artists [[:artist/gid #uuid "00000000000000000000000000000001"]]}
+ {:db/id "t-come-together"
+  :track/gid #uuid "00000000000000000000000000002003"
+  :track/name "Come Together"
+  :track/position 1
+  :track/duration 259000
+  :track/artists [[:artist/gid #uuid "00000000000000000000000000000002"]]}
+ {:db/id "t-something"
+  :track/gid #uuid "00000000000000000000000000002004"
+  :track/name "Something"
+  :track/position 2
+  :track/duration 182000
+  :track/artists [[:artist/gid #uuid "00000000000000000000000000000002"]]}
+ {:db/id "t-airbag"
+  :track/gid #uuid "00000000000000000000000000002005"
+  :track/name "Airbag"
+  :track/position 1
+  :track/duration 284000
+  :track/artists [[:artist/gid #uuid "00000000000000000000000000000003"]]}
+ {:db/id "t-karma-police"
+  :track/gid #uuid "00000000000000000000000000002006"
+  :track/name "Karma Police"
+  :track/position 6
+  :track/duration 261000
+  :track/artists [[:artist/gid #uuid "00000000000000000000000000000003"]]}]
+
+;; ── Transaction 3: media (reference tracks by gid) ──────────────────────
+[{:db/id "m-highway-61"
+  :medium/gid #uuid "00000000000000000000000000003001"
+  :medium/format :medium.format/vinyl
+  :medium/position 1
+  :medium/trackCount 2
+  :medium/tracks [[:track/gid #uuid "00000000000000000000000000002001"]
+                  [:track/gid #uuid "00000000000000000000000000002002"]]}
+ {:db/id "m-abbey-road"
+  :medium/gid #uuid "00000000000000000000000000003002"
+  :medium/format :medium.format/vinyl
+  :medium/position 1
+  :medium/trackCount 2
+  :medium/tracks [[:track/gid #uuid "00000000000000000000000000002003"]
+                  [:track/gid #uuid "00000000000000000000000000002004"]]}
+ {:db/id "m-ok-computer"
+  :medium/gid #uuid "00000000000000000000000000003003"
+  :medium/format :medium.format/cd
+  :medium/position 1
+  :medium/trackCount 2
+  :medium/tracks [[:track/gid #uuid "00000000000000000000000000002005"]
+                  [:track/gid #uuid "00000000000000000000000000002006"]]}]
+
+;; ── Transaction 4: releases (reference artists, labels, media by gid) ───
+[{:db/id "r-highway-61"
+  :release/gid #uuid "00000000000000000000000000004001"
+  :release/name "Highway 61 Revisited"
+  :release/artistCredit "Bob Dylan"
+  :release/artists [[:artist/gid #uuid "00000000000000000000000000000001"]]
+  :release/labels [[:label/gid #uuid "00000000000000000000000000001001"]]
+  :release/media [[:medium/gid #uuid "00000000000000000000000000003001"]]
+  :release/status :release.status/official
+  :release/type :release.type/album
+  :release/country :country/US
+  :release/language :language/eng
+  :release/year 1965}
+ {:db/id "r-abbey-road"
+  :release/gid #uuid "00000000000000000000000000004002"
+  :release/name "Abbey Road"
+  :release/artistCredit "The Beatles"
+  :release/artists [[:artist/gid #uuid "00000000000000000000000000000002"]]
+  :release/labels [[:label/gid #uuid "00000000000000000000000000001002"]]
+  :release/media [[:medium/gid #uuid "00000000000000000000000000003002"]]
+  :release/status :release.status/official
+  :release/type :release.type/album
+  :release/country :country/GB
+  :release/language :language/eng
+  :release/year 1969}
+ {:db/id "r-ok-computer"
+  :release/gid #uuid "00000000000000000000000000004003"
+  :release/name "OK Computer"
+  :release/artistCredit "Radiohead"
+  :release/artists [[:artist/gid #uuid "00000000000000000000000000000003"]]
+  :release/labels [[:label/gid #uuid "00000000000000000000000000001002"]]
+  :release/media [[:medium/gid #uuid "00000000000000000000000000003003"]]
+  :release/status :release.status/official
+  :release/type :release.type/album
+  :release/country :country/GB
+  :release/language :language/eng
+  :release/year 1997}]

@@ -1,11 +1,14 @@
 //! Embedded single-writer transaction pipeline and index publisher, plus the
 //! networked transactor process (lease, gRPC services, indexing job).
 
+pub mod backend;
 pub mod backup;
 pub mod lease;
 pub mod metrics;
 pub mod node;
 pub mod server;
+
+pub use backend::{LogBackend, NodeStore, StoreSpec};
 
 use corium_core::{EntityId, IndexOrder, KeywordInterner, Partition, Schema};
 use corium_db::{Db, FIRST_USER_ID, Idents};

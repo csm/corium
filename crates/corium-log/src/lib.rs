@@ -5,10 +5,11 @@ use corium_core::{
     encoding::{decode_value, encode_value},
 };
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 use thiserror::Error;
 
@@ -254,6 +255,157 @@ impl TransactionLog for VersionedLog {
     }
 }
 
+/// Applies the takeover cutoff rule to per-version record lists, in the same
+/// way [`read_merged`] does for on-disk files: a record in an older version
+/// dies once any later version begins at or below its `t`, dropping only the
+/// never-acked stale appends of a deposed writer.
+fn merge_versions(mut per_version: Vec<Vec<TxRecord>>) -> Vec<TxRecord> {
+    let mut cutoff = u64::MAX;
+    for records in per_version.iter_mut().rev() {
+        let first = records.first().map(|r| r.t);
+        records.retain(|r| r.t < cutoff);
+        if let Some(first) = first {
+            cutoff = cutoff.min(first);
+        }
+    }
+    per_version.into_iter().flatten().collect()
+}
+
+/// Shared store of one log's records, each tagged with the lease version it
+/// was appended under.
+type VersionedRecords = Arc<Mutex<Vec<(u64, TxRecord)>>>;
+
+/// Process-shared registry of in-memory transaction logs, keyed by database
+/// name. It plays the role the log directory plays for [`VersionedLog`]:
+/// opening the same name (under any lease version) reaches the same records,
+/// so a mem-backed transactor recovers state across `open`/`create` calls
+/// within one process. Cloning a registry shares its storage.
+#[derive(Clone, Default)]
+pub struct MemLogRegistry {
+    logs: Arc<Mutex<HashMap<String, VersionedRecords>>>,
+}
+
+impl MemLogRegistry {
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn entry(&self, name: &str) -> VersionedRecords {
+        Arc::clone(
+            self.logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(name.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Opens the named log for writing under `write_version`, mirroring
+    /// [`VersionedLog::open`] with in-memory storage.
+    #[must_use]
+    pub fn open(&self, name: &str, write_version: u64) -> MemVersionedLog {
+        let records = self.entry(name);
+        let next_t = {
+            let guard = records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            MemVersionedLog::merged(&guard)
+                .last()
+                .map_or(1, |r| r.t + 1)
+        };
+        MemVersionedLog {
+            records,
+            write_version,
+            next_t: Mutex::new(next_t),
+        }
+    }
+
+    /// Reports whether any records exist for the named log.
+    #[must_use]
+    pub fn exists(&self, name: &str) -> bool {
+        self.logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .is_some_and(|entry| {
+                !entry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            })
+    }
+
+    /// Discards every record for the named log.
+    pub fn delete_all(&self, name: &str) {
+        self.logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+    }
+}
+
+/// An in-memory transaction log with the same per-lease-version merge
+/// semantics as [`VersionedLog`], obtained from a [`MemLogRegistry`]. Used by
+/// the mem-backed transactor: fully ephemeral, confined to one process.
+pub struct MemVersionedLog {
+    records: VersionedRecords,
+    write_version: u64,
+    /// The next `t` this writer will accept, tracked per opened instance
+    /// exactly as [`VersionedLog`] does — a deposed writer keeps appending
+    /// under its own stale count, and the merge cutoff discards those records.
+    next_t: Mutex<u64>,
+}
+
+impl MemVersionedLog {
+    fn merged(records: &[(u64, TxRecord)]) -> Vec<TxRecord> {
+        let mut versions: Vec<u64> = records.iter().map(|(version, _)| *version).collect();
+        versions.sort_unstable();
+        versions.dedup();
+        let per_version = versions
+            .into_iter()
+            .map(|version| {
+                records
+                    .iter()
+                    .filter(|(record_version, _)| *record_version == version)
+                    .map(|(_, record)| record.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        merge_versions(per_version)
+    }
+}
+
+impl TransactionLog for MemVersionedLog {
+    fn append(&self, record: &TxRecord) -> Result<(), LogError> {
+        let mut next_t = self
+            .next_t
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *next_t != record.t {
+            return Err(LogError::Corrupt);
+        }
+        self.records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((self.write_version, record.clone()));
+        *next_t += 1;
+        Ok(())
+    }
+
+    fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
+        let records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(Self::merged(&records)
+            .into_iter()
+            .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
+            .collect())
+    }
+}
+
 fn version_path(dir: &Path, name: &str, version: u64) -> PathBuf {
     if version == 0 {
         dir.join(format!("{name}.log"))
@@ -303,15 +455,7 @@ fn read_merged(dir: &Path, name: &str) -> Result<Vec<TxRecord>, LogError> {
     // below its t: every record acked under version v precedes the first
     // record of every later version (the successor replayed it before
     // choosing its own first t), so only never-acked stale appends die.
-    let mut cutoff = u64::MAX;
-    for records in per_file.iter_mut().rev() {
-        let first = records.first().map(|r| r.t);
-        records.retain(|r| r.t < cutoff);
-        if let Some(first) = first {
-            cutoff = cutoff.min(first);
-        }
-    }
-    let merged: Vec<TxRecord> = per_file.into_iter().flatten().collect();
+    let merged = merge_versions(per_file);
     for pair in merged.windows(2) {
         if pair[1].t != pair[0].t + 1 {
             return Err(LogError::Corrupt);

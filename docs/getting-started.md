@@ -16,6 +16,19 @@ cargo run -p corium-cli -- transactor \
   --metrics-listen 127.0.0.1:9464
 ```
 
+The transactor keeps its blobs and root pointers in one of three stores,
+chosen with `--store`: `fs` (the default, under `--data-dir`), `mem` (fully
+in-memory and ephemeral — handy for demos and tests), or `turso` (an
+embeddable-SQLite database; build with `--features turso` and pass
+`--turso-path`). The transaction log stays on the local filesystem for `fs`
+and `turso`, and in memory for `mem`.
+
+```sh
+cargo run -p corium-cli -- transactor --store mem --data-dir ./corium-data
+cargo run -p corium-cli --features turso -- \
+  transactor --store turso --data-dir ./corium-data
+```
+
 Create a schema file named `schema.edn`:
 
 ```clojure
@@ -51,3 +64,7 @@ Transactions can be submitted from the Rust peer API or from the
 [Clojurust integration](design/clojurust-integration.md) for the boundary API
 and [Operations](operations.md) for production process flags, backup, metrics,
 and recovery.
+
+For a fuller worked example — a MusicBrainz schema, a streaming data loader,
+a Clojurust query REPL, and one-command scripts for every store type — see
+[`examples/musicbrainz`](../examples/musicbrainz/README.md).

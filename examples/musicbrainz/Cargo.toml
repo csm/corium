@@ -1,0 +1,35 @@
+[package]
+name = "corium-mbrainz"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "MusicBrainz example for corium: schema/data loader and a Clojurust query REPL"
+publish = false
+
+[[bin]]
+name = "mbrainz-load"
+path = "src/bin/load.rs"
+
+[[bin]]
+name = "mbrainz-repl"
+path = "src/bin/repl.rs"
+
+[dependencies]
+corium-cljrs = { workspace = true }
+corium-peer = { workspace = true }
+corium-protocol = { workspace = true }
+corium-query = { workspace = true }
+cljrs-env = { workspace = true }
+cljrs-gc = { workspace = true }
+cljrs-interp = { workspace = true }
+cljrs-reader = { workspace = true }
+cljrs-value = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustyline = "15"
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+
+[lints]
+workspace = true

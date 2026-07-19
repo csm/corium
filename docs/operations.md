@@ -6,6 +6,18 @@
 `corium peer-server` hosts peer-local queries for thin clients. Both accept
 TLS and bearer-token flags documented by `corium <command> --help`.
 
+The transactor's blob and root storage is selected with `--store`: `fs` (the
+default, under `--data-dir`), `mem` (in-memory and ephemeral — a single
+process, everything lost on exit; for demos and tests, not production), or
+`turso` (blobs and roots in an embeddable-SQLite Turso database at
+`--turso-path`, requiring a build `--features turso`). The transaction log is
+appended synchronously by the commit pipeline, so it stays on the local
+filesystem under `--data-dir` for `fs` and `turso`, and in memory for `mem` —
+which is why a durable `turso` transactor still needs a writable data
+directory for its logs. Backup, restore, and offline GC operate on the
+filesystem data directory and therefore apply to `fs` (and a `turso`
+transactor's logs).
+
 Tracing is human-readable by default. Use `--log-format json` for structured
 logs and `RUST_LOG` for filtering:
 

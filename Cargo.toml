@@ -13,6 +13,7 @@ members = [
     "crates/corium-cljrs",
     "crates/corium-cli",
     "crates/corium-sim",
+    "examples/musicbrainz",
 ]
 resolver = "3"
 
