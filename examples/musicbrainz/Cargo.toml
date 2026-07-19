@@ -16,6 +16,10 @@ path = "src/bin/load.rs"
 name = "mbrainz-repl"
 path = "src/bin/repl.rs"
 
+[[bin]]
+name = "mbrainz-import-json"
+path = "src/bin/import_json.rs"
+
 [dependencies]
 corium-cljrs = { workspace = true }
 corium-peer = { workspace = true }
@@ -29,7 +33,13 @@ cljrs-value = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustyline = "15"
+serde_json = "1"
+tar = { version = "0.4", default-features = false }
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
+xz2 = "0.1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
