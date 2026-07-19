@@ -19,20 +19,26 @@
 //!   installed roots never regress in (lease version, index basis);
 //! - the merged durable log stays contiguous and duplicate-free.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use corium_core::{Cardinality, EntityId, Partition, Schema, Value, ValueType};
 use corium_db::{Db, attribute};
 use corium_log::{TransactionLog, VersionedLog};
-use corium_store::{BlobId, BlobStore, DbRoot, MemoryStore, RootStore, StoreError, db_root_name};
+use corium_store::{
+    BlobId, BlobIdStream, BlobStore, DbRoot, MemoryStore, RootStore, StoreError, db_root_name,
+};
 use corium_transactor::lease::{self, Lease, LeaseError};
 use corium_transactor::{EmbeddedTransactor, TransactError};
 use corium_tx::{EntityRef, TxItem, TxOp};
 
 const DB: &str = "sim";
 const TTL_MS: i64 = 5_000;
+type TakeoverFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type Takeover = Box<dyn FnOnce() -> TakeoverFuture + Send>;
 
 fn schema() -> (Schema, EntityId) {
     let a = EntityId::new(Partition::Db as u32, 100);
@@ -68,7 +74,7 @@ struct Script {
     /// Root-op/append boundaries of A remaining before the takeover fires.
     ops_before_takeover: usize,
     fired: bool,
-    takeover: Option<Box<dyn FnOnce() + Send>>,
+    takeover: Option<Takeover>,
     installs: Vec<Install>,
 }
 
@@ -85,7 +91,7 @@ impl World {
 
     /// One protocol boundary of the active writer: fires the scheduled
     /// takeover when its op count is reached.
-    fn tick(&self) {
+    async fn tick(&self) {
         let takeover = {
             let mut script = self.script.lock().expect("script lock");
             if script.fired || script.ops_before_takeover > 0 {
@@ -97,7 +103,7 @@ impl World {
             }
         };
         if let Some(takeover) = takeover {
-            takeover();
+            takeover().await;
         }
     }
 
@@ -106,14 +112,14 @@ impl World {
     }
 
     /// Runs the takeover immediately if the schedule never reached it.
-    fn force_fire(&self) {
+    async fn force_fire(&self) {
         let takeover = {
             let mut script = self.script.lock().expect("script lock");
             script.fired = true;
             script.takeover.take()
         };
         if let Some(takeover) = takeover {
-            takeover();
+            takeover().await;
         }
     }
 }
@@ -126,33 +132,40 @@ struct ScriptedStore {
     counted: bool,
 }
 
+#[async_trait::async_trait]
 impl BlobStore for ScriptedStore {
-    fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
-        self.world.raw.put(bytes)
+    async fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
+        self.world.raw.put(bytes).await
     }
-    fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
-        self.world.raw.get(id)
+    async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.world.raw.get(id).await
     }
-    fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
-        self.world.raw.delete(id)
+    async fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
+        self.world.raw.delete(id).await
     }
-    fn list(&self) -> Result<Vec<BlobId>, StoreError> {
-        self.world.raw.list()
+    async fn list(&self) -> Result<BlobIdStream, StoreError> {
+        self.world.raw.list().await
     }
 }
 
+#[async_trait::async_trait]
 impl RootStore for ScriptedStore {
-    fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
         if self.counted {
-            self.world.tick();
+            self.world.tick().await;
         }
-        self.world.raw.get_root(name)
+        self.world.raw.get_root(name).await
     }
-    fn cas_root(&self, name: &str, expected: Option<&[u8]>, new: &[u8]) -> Result<(), StoreError> {
+    async fn cas_root(
+        &self,
+        name: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
         if self.counted {
-            self.world.tick();
+            self.world.tick().await;
         }
-        let result = self.world.raw.cas_root(name, expected, new);
+        let result = self.world.raw.cas_root(name, expected, new).await;
         if result.is_ok() && name == db_root_name(DB) {
             if let Some(root) = DbRoot::decode(new) {
                 let mut script = self.world.script.lock().expect("script lock");
@@ -166,11 +179,11 @@ impl RootStore for ScriptedStore {
         }
         result
     }
-    fn delete_root(&self, name: &str) -> Result<(), StoreError> {
-        self.world.raw.delete_root(name)
+    async fn delete_root(&self, name: &str) -> Result<(), StoreError> {
+        self.world.raw.delete_root(name).await
     }
-    fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
-        self.world.raw.list_roots(prefix)
+    async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.world.raw.list_roots(prefix).await
     }
 }
 
@@ -201,9 +214,9 @@ struct Writer {
 }
 
 impl Writer {
-    fn start(store: ScriptedStore, logs: &Path, owner: &str) -> Result<Self, LeaseError> {
+    async fn start(store: ScriptedStore, logs: &Path, owner: &str) -> Result<Self, LeaseError> {
         let now = store.world.now();
-        let held = lease::acquire(&store, DB, owner, "", TTL_MS, now)?;
+        let held = lease::acquire(&store, DB, owner, "", TTL_MS, now).await?;
         let log: Arc<dyn TransactionLog> =
             Arc::new(VersionedLog::open(logs, DB, held.version).expect("open log"));
         let (schema, attr) = schema();
@@ -220,13 +233,13 @@ impl Writer {
 
     /// The node's commit protocol: pre-check, durable append (with the
     /// takeover boundary between them), post-append fence, ack.
-    fn commit(&mut self, value: i64) -> Commit {
-        if lease::verify(&self.store, DB, &self.lease).is_err() {
+    async fn commit(&mut self, value: i64) -> Commit {
+        if lease::verify(&self.store, DB, &self.lease).await.is_err() {
             return Commit::RefusedPre;
         }
         // A takeover can land between the ownership check and the append.
         if self.store.counted {
-            self.store.world.tick();
+            self.store.world.tick().await;
         }
         self.transactor
             .transact([TxItem::Op(TxOp::Add(
@@ -235,7 +248,7 @@ impl Writer {
                 Value::Long(value),
             ))])
             .expect("append to own version file");
-        if lease::verify(&self.store, DB, &self.lease).is_err() {
+        if lease::verify(&self.store, DB, &self.lease).await.is_err() {
             self.refused_appended.push(value);
             return Commit::RefusedPost;
         }
@@ -243,14 +256,15 @@ impl Writer {
         Commit::Acked
     }
 
-    fn publish(&self) -> Result<DbRoot, TransactError> {
+    async fn publish(&self) -> Result<DbRoot, TransactError> {
         self.transactor
             .publish_indexes(&self.store, &db_root_name(DB), self.lease.version)
+            .await
     }
 
-    fn renew(&mut self) -> Result<(), LeaseError> {
+    async fn renew(&mut self) -> Result<(), LeaseError> {
         let now = self.store.world.now();
-        self.lease = lease::renew(&self.store, DB, &self.lease, TTL_MS, now)?;
+        self.lease = lease::renew(&self.store, DB, &self.lease, TTL_MS, now).await?;
         Ok(())
     }
 }
@@ -283,7 +297,7 @@ struct Coverage {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
+async fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
     let logs_dir = tempfile::tempdir().expect("tempdir");
     let logs: PathBuf = logs_dir.path().to_path_buf();
     let world = Arc::new(World {
@@ -309,53 +323,56 @@ fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
         let takeover_failed = Arc::clone(&takeover_failed);
         let logs = logs.clone();
         let hook = move || {
-            let store = ScriptedStore {
-                world: Arc::clone(&hook_world),
-                counted: false,
-            };
-            let expiry = store
-                .world
-                .raw
-                .get_root(&db_root_name(DB))
-                .expect("read root")
-                .as_deref()
-                .and_then(DbRoot::decode)
-                .map_or(0, |root| root.lease_expires_unix_ms);
-            hook_world.clock.fetch_max(expiry + 1, Ordering::SeqCst);
-            let mut b = match Writer::start(store, &logs, "owner-b") {
-                Ok(b) => b,
-                Err(error) => {
-                    eprintln!("takeover failed: {error}");
-                    takeover_failed.store(true, Ordering::SeqCst);
-                    return;
+            Box::pin(async move {
+                let store = ScriptedStore {
+                    world: Arc::clone(&hook_world),
+                    counted: false,
+                };
+                let expiry = store
+                    .world
+                    .raw
+                    .get_root(&db_root_name(DB))
+                    .await
+                    .expect("read root")
+                    .as_deref()
+                    .and_then(DbRoot::decode)
+                    .map_or(0, |root| root.lease_expires_unix_ms);
+                hook_world.clock.fetch_max(expiry + 1, Ordering::SeqCst);
+                let mut b = match Writer::start(store, &logs, "owner-b").await {
+                    Ok(b) => b,
+                    Err(error) => {
+                        eprintln!("takeover failed: {error}");
+                        takeover_failed.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                let recovered = long_values(&b.transactor.db());
+                {
+                    // Zero acked-transaction loss at the takeover instant.
+                    let mirror = mirror.lock().expect("mirror lock");
+                    for value in &mirror.acked {
+                        assert!(
+                            recovered.contains(value),
+                            "takeover lost acked value {value} (recovered {recovered:?})"
+                        );
+                    }
+                    // And nothing beyond acked + the single in-flight append.
+                    for value in &recovered {
+                        assert!(
+                            mirror.acked.contains(value) || mirror.in_flight == Some(*value),
+                            "takeover invented value {value}"
+                        );
+                    }
                 }
-            };
-            let recovered = long_values(&b.transactor.db());
-            {
-                // Zero acked-transaction loss at the takeover instant.
-                let mirror = mirror.lock().expect("mirror lock");
-                for value in &mirror.acked {
-                    assert!(
-                        recovered.contains(value),
-                        "takeover lost acked value {value} (recovered {recovered:?})"
-                    );
-                }
-                // And nothing beyond acked + the single in-flight append.
-                for value in &recovered {
-                    assert!(
-                        mirror.acked.contains(value) || mirror.in_flight == Some(*value),
-                        "takeover invented value {value}"
-                    );
-                }
-            }
-            assert_eq!(b.commit(100), Commit::Acked, "standby serves writes");
-            assert_eq!(b.commit(101), Commit::Acked);
-            b.publish().expect("standby publishes");
-            *takeover_result.lock().expect("result lock") = Some(TakeoverResult {
-                recovered,
-                acked: b.acked.clone(),
-                lease_version: b.lease.version,
-            });
+                assert_eq!(b.commit(100).await, Commit::Acked, "standby serves writes");
+                assert_eq!(b.commit(101).await, Commit::Acked);
+                b.publish().await.expect("standby publishes");
+                *takeover_result.lock().expect("result lock") = Some(TakeoverResult {
+                    recovered,
+                    acked: b.acked.clone(),
+                    lease_version: b.lease.version,
+                });
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
         };
         world.script.lock().expect("script lock").takeover = Some(Box::new(hook));
     }
@@ -364,7 +381,7 @@ fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
         world: Arc::clone(&world),
         counted: true,
     };
-    let mut a = match Writer::start(store_a, &logs, "owner-a") {
+    let mut a = match Writer::start(store_a, &logs, "owner-a").await {
         Ok(a) => a,
         Err(LeaseError::Held { .. }) if world.fired() => {
             // The takeover fired inside A's own acquisition: B owns the
@@ -393,7 +410,7 @@ fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
         match step {
             Step::Commit(value) => {
                 mirror.lock().expect("mirror lock").in_flight = Some(value);
-                let outcome = a.commit(value);
+                let outcome = a.commit(value).await;
                 let mut mirror = mirror.lock().expect("mirror lock");
                 mirror.in_flight = None;
                 if outcome == Commit::Acked {
@@ -403,7 +420,7 @@ fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
             }
             Step::Publish => {
                 // Pre-takeover publishes succeed; post-takeover must fail.
-                let result = a.publish();
+                let result = a.publish().await;
                 if world.fired() {
                     assert!(
                         result.is_err(),
@@ -412,7 +429,7 @@ fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
                 }
             }
             Step::Renew => {
-                let result = a.renew();
+                let result = a.renew().await;
                 if world.fired() {
                     assert!(result.is_err(), "A renewed a lost lease");
                 }
@@ -423,7 +440,7 @@ fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
     // If the schedule outlived A's workload, the takeover happens now
     // (models A stalling after its last operation).
     if !world.fired() {
-        world.force_fire();
+        world.force_fire().await;
     }
     assert!(
         !takeover_failed.load(Ordering::SeqCst),
@@ -433,10 +450,13 @@ fn run_scenario(pause_at: usize, resume: bool) -> Coverage {
     if resume {
         // The partitioned A wakes and tries everything once more; nothing
         // may ack or install.
-        let outcome = a.commit(99);
+        let outcome = a.commit(99).await;
         assert_ne!(outcome, Commit::Acked, "deposed A acked a transaction");
-        assert!(a.publish().is_err(), "deposed A published an index root");
-        assert!(a.renew().is_err(), "deposed A renewed the lease");
+        assert!(
+            a.publish().await.is_err(),
+            "deposed A published an index root"
+        );
+        assert!(a.renew().await.is_err(), "deposed A renewed the lease");
     }
     let coverage = Coverage {
         refused_post: !a.refused_appended.is_empty(),
@@ -534,12 +554,12 @@ fn a_could_have_appended(value: i64) -> bool {
 /// coverage.
 const MAX_BOUNDARIES: usize = 40;
 
-#[test]
-fn takeover_at_every_boundary_preserves_acked_and_never_double_publishes() {
+#[tokio::test]
+async fn takeover_at_every_boundary_preserves_acked_and_never_double_publishes() {
     let mut fence_exercised = false;
     for pause_at in 0..MAX_BOUNDARIES {
         for resume in [false, true] {
-            fence_exercised |= run_scenario(pause_at, resume).refused_post;
+            fence_exercised |= run_scenario(pause_at, resume).await.refused_post;
         }
     }
     assert!(
@@ -549,8 +569,8 @@ fn takeover_at_every_boundary_preserves_acked_and_never_double_publishes() {
     );
 }
 
-#[test]
-fn workload_fits_within_enumerated_boundaries() {
+#[tokio::test]
+async fn workload_fits_within_enumerated_boundaries() {
     // With the takeover scheduled beyond every boundary the workload can
     // generate, it must not fire during the workload — proving
     // MAX_BOUNDARIES covers the whole protocol.
@@ -569,16 +589,18 @@ fn workload_fits_within_enumerated_boundaries() {
         world: Arc::clone(&world),
         counted: true,
     };
-    let mut a = Writer::start(store, logs_dir.path(), "owner-a").expect("start");
+    let mut a = Writer::start(store, logs_dir.path(), "owner-a")
+        .await
+        .expect("start");
     for value in [1, 2] {
-        assert_eq!(a.commit(value), Commit::Acked);
+        assert_eq!(a.commit(value).await, Commit::Acked);
     }
-    a.publish().expect("publish");
-    a.renew().expect("renew");
+    a.publish().await.expect("publish");
+    a.renew().await.expect("renew");
     for value in [3, 4] {
-        assert_eq!(a.commit(value), Commit::Acked);
+        assert_eq!(a.commit(value).await, Commit::Acked);
     }
-    a.publish().expect("publish");
+    a.publish().await.expect("publish");
     assert!(
         world
             .script

@@ -203,7 +203,7 @@ async fn n_peers_converge_and_reconnect_backfills_gaplessly() {
         FsStore::open(data.join("store")).expect("open store"),
     ));
     let root = loop {
-        if let Some(root) = source.index_root("converge").expect("root") {
+        if let Some(root) = source.index_root("converge").await.expect("root") {
             if root.roots.is_some() && root.index_basis_t >= 40 {
                 break root;
             }
@@ -213,6 +213,7 @@ async fn n_peers_converge_and_reconnect_backfills_gaplessly() {
     };
     let segment = source
         .segment(&root, IndexOrder::Eavt)
+        .await
         .expect("segment loads")
         .expect("segment present");
     let keys = SegmentSource::<FsStore>::segment_keys(&segment).expect("keys decode");
@@ -354,6 +355,7 @@ async fn deposed_transactor_cannot_publish_or_commit() {
     let fenced_root = loop {
         let root = store
             .get_root(&corium_store::db_root_name("fenced"))
+            .await
             .expect("read root")
             .as_deref()
             .and_then(DbRoot::decode)
@@ -380,6 +382,7 @@ async fn deposed_transactor_cannot_publish_or_commit() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let root_after = store
         .get_root(&corium_store::db_root_name("fenced"))
+        .await
         .expect("read root")
         .as_deref()
         .and_then(DbRoot::decode)
@@ -551,7 +554,7 @@ async fn cli_admin_commands_round_trip() {
     // An explicit zero retention reaches the online GC path as an immediate
     // sweep rather than being confused with the omitted/default window.
     let store = FsStore::open(data.join("store")).expect("open store");
-    let orphan = store.put(b"online-gc-orphan").expect("put orphan");
+    let orphan = store.put(b"online-gc-orphan").await.expect("put orphan");
     let swept = run(vec![
         "gc".into(),
         "--transactor".into(),
@@ -560,5 +563,5 @@ async fn cli_admin_commands_round_trip() {
         "0".into(),
     ]);
     assert!(swept.contains(":swept"), "{swept}");
-    assert!(!store.contains(&orphan).expect("orphan swept"));
+    assert!(!store.contains(&orphan).await.expect("orphan swept"));
 }

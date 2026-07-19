@@ -97,7 +97,7 @@ fn holder(root: Option<&DbRoot>, legacy: Option<&(String, u64, i64)>) -> (String
 ///
 /// # Errors
 /// Returns [`LeaseError::Held`] while another owner's lease is unexpired.
-pub fn acquire(
+pub async fn acquire(
     store: &dyn RootStore,
     db: &str,
     owner: &str,
@@ -108,10 +108,11 @@ pub fn acquire(
     let name = db_root_name(db);
     let legacy_name = lease_root(db);
     loop {
-        let current_bytes = store.get_root(&name)?;
+        let current_bytes = store.get_root(&name).await?;
         let current = current_bytes.as_deref().and_then(DbRoot::decode);
         let legacy = store
-            .get_root(&legacy_name)?
+            .get_root(&legacy_name)
+            .await?
             .as_deref()
             .and_then(decode_legacy);
         let (cur_owner, cur_version, cur_expiry) = holder(current.as_ref(), legacy.as_ref());
@@ -134,11 +135,14 @@ pub fn acquire(
             index_basis_t: current.as_ref().map_or(0, |root| root.index_basis_t),
             roots: current.as_ref().and_then(|root| root.roots.clone()),
         };
-        match store.cas_root(&name, current_bytes.as_deref(), &next.encode()) {
+        match store
+            .cas_root(&name, current_bytes.as_deref(), &next.encode())
+            .await
+        {
             Ok(()) => {
                 if legacy.is_some() {
                     // Folded into the root; fencing now lives there alone.
-                    let _ = store.delete_root(&legacy_name);
+                    let _ = store.delete_root(&legacy_name).await;
                 }
                 return Ok(Lease {
                     owner: owner.to_owned(),
@@ -159,7 +163,7 @@ pub fn acquire(
 ///
 /// # Errors
 /// Returns [`LeaseError::Lost`] on any ownership change.
-pub fn renew(
+pub async fn renew(
     store: &dyn RootStore,
     db: &str,
     held: &Lease,
@@ -168,7 +172,7 @@ pub fn renew(
 ) -> Result<Lease, LeaseError> {
     let name = db_root_name(db);
     loop {
-        let current_bytes = store.get_root(&name)?;
+        let current_bytes = store.get_root(&name).await?;
         let Some(root) = current_bytes.as_deref().and_then(DbRoot::decode) else {
             return Err(LeaseError::Lost);
         };
@@ -180,7 +184,10 @@ pub fn renew(
             owner_endpoint: held.endpoint.clone(),
             ..root
         };
-        match store.cas_root(&name, current_bytes.as_deref(), &next.encode()) {
+        match store
+            .cas_root(&name, current_bytes.as_deref(), &next.encode())
+            .await
+        {
             Ok(()) => {
                 return Ok(Lease {
                     expires_unix_ms: next.lease_expires_unix_ms,
@@ -204,9 +211,10 @@ pub fn renew(
 ///
 /// # Errors
 /// Returns [`LeaseError::Lost`] when ownership has changed hands.
-pub fn verify(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), LeaseError> {
+pub async fn verify(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), LeaseError> {
     let root = store
-        .get_root(&db_root_name(db))?
+        .get_root(&db_root_name(db))
+        .await?
         .as_deref()
         .and_then(DbRoot::decode);
     match root {
@@ -220,10 +228,10 @@ pub fn verify(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), Lease
 ///
 /// # Errors
 /// Returns [`LeaseError::Lost`] when the lease is no longer held.
-pub fn release(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), LeaseError> {
+pub async fn release(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), LeaseError> {
     let name = db_root_name(db);
     loop {
-        let current_bytes = store.get_root(&name)?;
+        let current_bytes = store.get_root(&name).await?;
         let Some(root) = current_bytes.as_deref().and_then(DbRoot::decode) else {
             return Err(LeaseError::Lost);
         };
@@ -234,7 +242,10 @@ pub fn release(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), Leas
             lease_expires_unix_ms: 0,
             ..root
         };
-        match store.cas_root(&name, current_bytes.as_deref(), &next.encode()) {
+        match store
+            .cas_root(&name, current_bytes.as_deref(), &next.encode())
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(StoreError::CasFailed { .. }) => {}
             Err(error) => return Err(error.into()),

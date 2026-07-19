@@ -145,13 +145,13 @@ fn log_path(data_dir: &Path, db: &str) -> PathBuf {
     data_dir.join("logs").join(format!("{db}.log"))
 }
 
-fn put_root(store: &dyn RootStore, name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+async fn put_root(store: &dyn RootStore, name: &str, bytes: &[u8]) -> Result<(), StoreError> {
     loop {
-        let previous = store.get_root(name)?;
+        let previous = store.get_root(name).await?;
         if previous.as_deref() == Some(bytes) {
             return Ok(());
         }
-        match store.cas_root(name, previous.as_deref(), bytes) {
+        match store.cas_root(name, previous.as_deref(), bytes).await {
             Ok(()) => return Ok(()),
             Err(StoreError::CasFailed { .. }) => {}
             Err(error) => return Err(error),
@@ -187,7 +187,7 @@ fn write_log_atomically(records: &[TxRecord], target: &Path) -> Result<(), Backu
     Ok(())
 }
 
-fn copy_root_blobs(
+async fn copy_root_blobs(
     source: &dyn BlobStore,
     target: &dyn BlobStore,
     root: &DbRoot,
@@ -198,14 +198,15 @@ fn copy_root_blobs(
     let mut copied = 0;
     let mut reused = 0;
     for id in root.roots.iter().flatten() {
-        if target.contains(id)? {
+        if target.contains(id).await? {
             reused += 1;
             continue;
         }
         let bytes = source
-            .get(id)?
+            .get(id)
+            .await?
             .ok_or_else(|| BackupError::Invalid(format!("root references missing blob {id}")))?;
-        let copied_id = target.put(&bytes)?;
+        let copied_id = target.put(&bytes).await?;
         if copied_id != *id {
             return Err(BackupError::Invalid(format!(
                 "blob digest changed while copying {id}"
@@ -225,7 +226,7 @@ fn copy_root_blobs(
 /// # Errors
 /// Returns an error if the database is missing, the snapshot is inconsistent,
 /// or files cannot be read/written.
-pub fn backup(
+pub async fn backup(
     source_data_dir: impl AsRef<Path>,
     db: &str,
     destination: impl AsRef<Path>,
@@ -239,10 +240,12 @@ pub fn backup(
     let db_name = db_root_name(db);
     let meta_name = meta_root_name(db);
     let db_bytes = source
-        .get_root(&db_name)?
+        .get_root(&db_name)
+        .await?
         .ok_or_else(|| BackupError::MissingDatabase(db.to_owned()))?;
     let meta = source
-        .get_root(&meta_name)?
+        .get_root(&meta_name)
+        .await?
         .ok_or_else(|| BackupError::MissingDatabase(db.to_owned()))?;
     let root = DbRoot::decode(&db_bytes)
         .ok_or_else(|| BackupError::Invalid("database root cannot be decoded".into()))?;
@@ -270,9 +273,9 @@ pub fn backup(
 
     fs::create_dir_all(destination)?;
     let target = FsStore::open(destination.join("store"))?;
-    let (copied_blobs, reused_blobs) = copy_root_blobs(&source, &target, &root)?;
-    put_root(&target, &db_name, &db_bytes)?;
-    put_root(&target, &meta_name, &meta)?;
+    let (copied_blobs, reused_blobs) = copy_root_blobs(&source, &target, &root).await?;
+    put_root(&target, &db_name, &db_bytes).await?;
+    put_root(&target, &meta_name, &meta).await?;
     write_log_atomically(&records, &log_path(destination, db))?;
     let manifest = Manifest {
         source_db: db.to_owned(),
@@ -300,7 +303,7 @@ pub fn backup(
 /// # Errors
 /// Returns an error for malformed/incomplete backups, unsupported formats,
 /// existing targets, or I/O failures.
-pub fn restore(
+pub async fn restore(
     source: impl AsRef<Path>,
     target_data_dir: impl AsRef<Path>,
     target_db: &str,
@@ -317,10 +320,12 @@ pub fn restore(
     let source_db_name = db_root_name(&manifest.source_db);
     let source_meta_name = meta_root_name(&manifest.source_db);
     let db_bytes = source_store
-        .get_root(&source_db_name)?
+        .get_root(&source_db_name)
+        .await?
         .ok_or_else(|| BackupError::Invalid("database root is missing".into()))?;
     let meta = source_store
-        .get_root(&source_meta_name)?
+        .get_root(&source_meta_name)
+        .await?
         .ok_or_else(|| BackupError::Invalid("metadata root is missing".into()))?;
     let root = DbRoot::decode(&db_bytes)
         .ok_or_else(|| BackupError::Invalid("database root cannot be decoded".into()))?;
@@ -347,23 +352,27 @@ pub fn restore(
     let target_store = FsStore::open(target_data_dir.join("store"))?;
     let target_db_name = db_root_name(target_db);
     let target_meta_name = meta_root_name(target_db);
-    if target_store.get_root(&target_db_name)?.is_some()
-        || target_store.get_root(&target_meta_name)?.is_some()
+    if target_store.get_root(&target_db_name).await?.is_some()
+        || target_store.get_root(&target_meta_name).await?.is_some()
         || log_path(target_data_dir, target_db).exists()
     {
         return Err(BackupError::TargetExists(target_db.to_owned()));
     }
-    let (copied_blobs, reused_blobs) = copy_root_blobs(&source_store, &target_store, &root)?;
+    let (copied_blobs, reused_blobs) = copy_root_blobs(&source_store, &target_store, &root).await?;
     let target_log = log_path(target_data_dir, target_db);
     copy_file_atomically(&source_log, &target_log)?;
     // Metadata is the catalog entry, so publish it last. A node can never
     // discover a partially restored database.
-    if let Err(error) = target_store
+    let publish = match target_store
         .cas_root(&target_db_name, None, &db_bytes)
-        .and_then(|()| target_store.cas_root(&target_meta_name, None, &meta))
+        .await
     {
-        let _ = target_store.delete_root(&target_db_name);
-        let _ = target_store.delete_root(&target_meta_name);
+        Ok(()) => target_store.cas_root(&target_meta_name, None, &meta).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = publish {
+        let _ = target_store.delete_root(&target_db_name).await;
+        let _ = target_store.delete_root(&target_meta_name).await;
         let _ = fs::remove_file(&target_log);
         return Err(error.into());
     }

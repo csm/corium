@@ -13,8 +13,8 @@ fn schema() -> (Schema, EntityId) {
     schema.insert(attribute(100, ValueType::Long, Cardinality::One, None));
     (schema, a)
 }
-#[test]
-fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {
+#[tokio::test]
+async fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (schema, a) = schema();
     let log = Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
@@ -41,11 +41,12 @@ fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {
     };
     let published = tx
         .publish_indexes(&*store, "db:main", 1)
+        .await
         .expect("publish indexes");
     writer.join().expect("writer");
     assert!(published.index_basis_t == 1 || published.index_basis_t == 2);
     for root in &published.roots.clone().expect("roots published") {
-        assert!(store.contains(root).expect("root blob exists"));
+        assert!(store.contains(root).await.expect("root blob exists"));
     }
     drop(tx);
     let recovered = EmbeddedTransactor::recover(
@@ -97,8 +98,8 @@ fn recovery_never_reuses_retracted_entity_ids() {
     );
 }
 
-#[test]
-fn stale_publisher_cannot_regress_published_root() {
+#[tokio::test]
+async fn stale_publisher_cannot_regress_published_root() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (schema, a) = schema();
     let store = FsStore::open(dir.path().join("store")).expect("store");
@@ -118,6 +119,7 @@ fn stale_publisher_cannot_regress_published_root() {
     }
     let published = fresh
         .publish_indexes(&store, "db:main", 1)
+        .await
         .expect("publish fresh");
     assert_eq!(published.index_basis_t, 2);
     let stale = EmbeddedTransactor::recover(
@@ -134,9 +136,11 @@ fn stale_publisher_cannot_regress_published_root() {
         .expect("transact");
     stale
         .publish_indexes(&store, "db:main", 1)
+        .await
         .expect("stale publish is a no-op");
     let root = store
         .get_root("db:main")
+        .await
         .expect("read root")
         .expect("root set");
     let decoded = corium_transactor::DbRoot::decode(&root).expect("decodable root");
@@ -146,8 +150,8 @@ fn stale_publisher_cannot_regress_published_root() {
     );
 }
 
-#[test]
-fn deposed_lease_version_cannot_publish() {
+#[tokio::test]
+async fn deposed_lease_version_cannot_publish() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (schema, a) = schema();
     let store = FsStore::open(dir.path().join("store")).expect("store");
@@ -163,6 +167,7 @@ fn deposed_lease_version_cannot_publish() {
     ))])
     .expect("transact");
     tx.publish_indexes(&store, "db:main", 2)
+        .await
         .expect("current lease publishes");
     tx.transact([TxItem::Op(TxOp::Add(
         EntityRef::Temp("f".into()),
@@ -172,6 +177,7 @@ fn deposed_lease_version_cannot_publish() {
     .expect("transact again");
     let error = tx
         .publish_indexes(&store, "db:main", 1)
+        .await
         .expect_err("deposed lease version must not publish");
     assert!(matches!(
         error,

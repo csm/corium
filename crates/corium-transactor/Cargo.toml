@@ -26,4 +26,5 @@ tonic = "0.14.5"
 workspace = true
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"

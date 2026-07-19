@@ -122,10 +122,11 @@ fn long_values(db: &corium_db::Db) -> Vec<i64> {
         .collect()
 }
 
-fn read_root(data: &Path, db: &str) -> DbRoot {
+async fn read_root(data: &Path, db: &str) -> DbRoot {
     FsStore::open(data.join("store"))
         .expect("open store")
         .get_root(&db_root_name(db))
+        .await
         .expect("read root")
         .as_deref()
         .and_then(DbRoot::decode)
@@ -200,7 +201,7 @@ async fn standby_serves_writes_after_kill9_with_zero_acked_loss() {
     }
 
     // The root record names the active as lease holder (peer rediscovery).
-    let root = read_root(&data, "ha");
+    let root = read_root(&data, "ha").await;
     assert_eq!(root.owner, "owner-a");
     assert_eq!(root.owner_endpoint, active.endpoint());
 
@@ -271,12 +272,12 @@ async fn standby_serves_writes_after_kill9_with_zero_acked_loss() {
     assert_eq!(reader_values, values, "reader diverged across failover");
 
     // Lease-holder rediscovery: the root record now names the standby.
-    let root = read_root(&data, "ha");
+    let root = read_root(&data, "ha").await;
     assert_eq!(root.owner, "owner-b", "standby never took the lease over");
     assert_eq!(root.owner_endpoint, standby.endpoint());
 
     // The new active keeps publishing indexes under its own lease version.
-    let published = read_root(&data, "ha");
+    let published = read_root(&data, "ha").await;
     assert!(published.lease_version >= 2);
 }
 
@@ -313,7 +314,7 @@ async fn ha_pair_survives_repeated_failover() {
     for value in 10..20 {
         ensure_committed(&peer, value).await;
     }
-    assert_eq!(read_root(&data, "gens").owner, "owner-b");
+    assert_eq!(read_root(&data, "gens").await.owner, "owner-b");
 
     // A rejoins as standby, then B dies: A takes over again.
     let node_a = TransactorProc::spawn_ha(&data, port_a, "owner-a");
@@ -323,7 +324,7 @@ async fn ha_pair_survives_repeated_failover() {
     for value in 20..30 {
         ensure_committed(&peer, value).await;
     }
-    let root = read_root(&data, "gens");
+    let root = read_root(&data, "gens").await;
     assert_eq!(root.owner, "owner-a", "restarted node never took over");
     assert!(root.lease_version >= 3, "each takeover bumps the fence");
 

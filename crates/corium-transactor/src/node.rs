@@ -252,12 +252,12 @@ impl DbState {
 
     /// Verifies this node still owns the write lease (identity check on
     /// the root record; expiry changes from renewals do not matter).
-    fn check_lease(&self, store: &dyn RootStore) -> Result<Lease, NodeError> {
+    async fn check_lease(&self, store: &dyn RootStore) -> Result<Lease, NodeError> {
         if self.deposed.load(Ordering::Acquire) {
             return Err(NodeError::Deposed(self.name.clone()));
         }
         let held = self.lease();
-        match lease::verify(store, &self.name, &held) {
+        match lease::verify(store, &self.name, &held).await {
             Ok(()) => Ok(held),
             Err(LeaseError::Lost) => {
                 self.deposed.store(true, Ordering::Release);
@@ -344,7 +344,7 @@ impl TransactorNode {
     /// # Errors
     /// Returns an error when the store cannot be opened or a database cannot
     /// be recovered.
-    pub fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
+    pub async fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
         let store = Arc::new(FsStore::open(config.data_dir.join("store"))?);
         let node = Arc::new(Self {
             config,
@@ -357,12 +357,13 @@ impl TransactorNode {
         });
         let names: Vec<String> = node
             .store
-            .list_roots("meta:")?
+            .list_roots("meta:")
+            .await?
             .into_iter()
             .filter_map(|root| root.strip_prefix("meta:").map(str::to_owned))
             .collect();
         for name in names {
-            match node.open_db(&name) {
+            match node.open_db(&name).await {
                 Ok(state) => {
                     node.dbs
                         .write()
@@ -461,7 +462,7 @@ impl TransactorNode {
     /// Acquires the lease for `name`. In HA mode a held lease surfaces
     /// immediately (the caller stands by); otherwise startup waits it out
     /// up to the configured bound.
-    fn acquire_lease(&self, name: &str) -> Result<Lease, NodeError> {
+    async fn acquire_lease(&self, name: &str) -> Result<Lease, NodeError> {
         let deadline = now_unix_ms() + self.config.lease_wait_ms;
         loop {
             match lease::acquire(
@@ -471,26 +472,30 @@ impl TransactorNode {
                 self.advertised(),
                 self.config.lease_ttl_ms,
                 now_unix_ms(),
-            ) {
+            )
+            .await
+            {
                 Ok(held) => return Ok(held),
                 Err(LeaseError::Held { .. }) if !self.config.ha && now_unix_ms() < deadline => {
-                    std::thread::sleep(Duration::from_millis(200));
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
     }
 
-    fn open_db(self: &Arc<Self>, name: &str) -> Result<Arc<DbState>, NodeError> {
+    async fn open_db(self: &Arc<Self>, name: &str) -> Result<Arc<DbState>, NodeError> {
         let meta = self
             .store
-            .get_root(&meta_root_name(name))?
+            .get_root(&meta_root_name(name))
+            .await?
             .ok_or_else(|| NodeError::UnknownDb(name.to_owned()))?;
         let (schema, idents, interner) = decode_meta(&meta)?;
         let root_name = db_root_name(name);
         let current = self
             .store
-            .get_root(&root_name)?
+            .get_root(&root_name)
+            .await?
             .as_deref()
             .and_then(DbRoot::decode);
         if let Some(root) = &current {
@@ -504,7 +509,7 @@ impl TransactorNode {
         // Acquisition rewrites the root record under our lease version, so
         // it doubles as the fence bump: a deposed writer's pending root CAS
         // now has stale expected bytes and must fail.
-        let held = self.acquire_lease(name)?;
+        let held = self.acquire_lease(name).await?;
         // The log tail replay below happens strictly after the fence, so it
         // observes every record a previous owner could ever have acked.
         let log = Arc::new(VersionedLog::open(
@@ -517,7 +522,8 @@ impl TransactorNode {
         let basis_t = transactor.db().basis_t();
         let index_basis = self
             .store
-            .get_root(&root_name)?
+            .get_root(&root_name)
+            .await?
             .as_deref()
             .and_then(DbRoot::decode)
             .map_or(0, |root| root.index_basis_t);
@@ -561,9 +567,7 @@ impl TransactorNode {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let worker = Arc::clone(&node);
-                let result = tokio::task::spawn_blocking(move || worker.standby_scan()).await;
-                if let Ok(Err(error)) = result {
+                if let Err(error) = node.standby_scan().await {
                     tracing::warn!(%error, "standby scan failed");
                 }
             }
@@ -572,10 +576,11 @@ impl TransactorNode {
 
     /// One standby pass: refresh the standby set from the catalog and try
     /// to take over lapsed leases.
-    fn standby_scan(self: &Arc<Self>) -> Result<(), NodeError> {
+    async fn standby_scan(self: &Arc<Self>) -> Result<(), NodeError> {
         let names: Vec<String> = self
             .store
-            .list_roots("meta:")?
+            .list_roots("meta:")
+            .await?
             .into_iter()
             .filter_map(|root| root.strip_prefix("meta:").map(str::to_owned))
             .collect();
@@ -595,7 +600,7 @@ impl TransactorNode {
             {
                 continue;
             }
-            match self.open_db(&name) {
+            match self.open_db(&name).await {
                 Ok(state) => {
                     tracing::info!(db = %name, owner = %self.config.owner, "standby took over write lease");
                     self.standby
@@ -635,24 +640,25 @@ impl TransactorNode {
                 if db.deposed.load(Ordering::Acquire) {
                     return;
                 }
+                // Serialize the root update and local held-lease update with
+                // transaction lease checks so they cannot observe different
+                // renewal generations and falsely depose this node.
+                let _commit = db.commit.lock().await;
                 let held = db.lease();
-                let store = Arc::clone(&node.store);
                 let name = db.name.clone();
-                let renewed = tokio::task::spawn_blocking(move || {
-                    lease::renew(store.as_ref(), &name, &held, ttl, now_unix_ms())
-                })
-                .await;
+                let renewed =
+                    lease::renew(node.store.as_ref(), &name, &held, ttl, now_unix_ms()).await;
                 match renewed {
-                    Ok(Ok(renewed)) => {
+                    Ok(renewed) => {
                         *db.held_lease
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = renewed;
                     }
-                    Ok(Err(LeaseError::Lost)) => {
+                    Err(LeaseError::Lost) => {
                         node.depose(&db, "write lease lost");
                         return;
                     }
-                    Ok(Err(_)) | Err(_) => {}
+                    Err(_) => {}
                 }
             }
         });
@@ -671,20 +677,16 @@ impl TransactorNode {
                     continue;
                 }
                 let _gc = node.gc_lock.lock().await;
-                let store = Arc::clone(&node.store);
                 let version = db.lease().version;
                 let root_name = db_root_name(&db.name);
-                let worker = Arc::clone(&db);
                 let started = Instant::now();
-                let published = tokio::task::spawn_blocking(move || {
-                    worker
-                        .transactor
-                        .publish_indexes(store.as_ref(), &root_name, version)
-                })
-                .await;
+                let published = db
+                    .transactor
+                    .publish_indexes(node.store.as_ref(), &root_name, version)
+                    .await;
                 node.metrics.record_index(started.elapsed());
                 match published {
-                    Ok(Ok(root)) => {
+                    Ok(root) => {
                         tracing::debug!(db = %db.name, index_basis_t = root.index_basis_t, "published indexes");
                         db.index_basis.store(root.index_basis_t, Ordering::Release);
                         let _ = db.broadcast.send(pb::subscribe_item::Item::IndexBasis(
@@ -693,11 +695,11 @@ impl TransactorNode {
                             },
                         ));
                     }
-                    Ok(Err(TransactError::Deposed { .. })) => {
+                    Err(TransactError::Deposed { .. }) => {
                         node.depose(&db, "database root fenced by a newer lease");
                         return;
                     }
-                    Ok(Err(_)) | Err(_) => {}
+                    Err(_) => {}
                 }
             }
         });
@@ -726,7 +728,7 @@ impl TransactorNode {
     /// # Errors
     /// Returns [`NodeError::Standby`] when this HA node is standing by for
     /// the database, [`NodeError::UnknownDb`] when absent.
-    pub fn db_state(&self, name: &str) -> Result<Arc<DbState>, NodeError> {
+    pub async fn db_state(&self, name: &str) -> Result<Arc<DbState>, NodeError> {
         if let Some(state) = self
             .dbs
             .read()
@@ -745,7 +747,8 @@ impl TransactorNode {
         {
             let root = self
                 .store
-                .get_root(&db_root_name(name))?
+                .get_root(&db_root_name(name))
+                .await?
                 .as_deref()
                 .and_then(DbRoot::decode);
             return Err(NodeError::Standby {
@@ -773,7 +776,11 @@ impl TransactorNode {
     ///
     /// # Errors
     /// Returns an error for invalid names/schema or store failures.
-    pub fn create_db(self: &Arc<Self>, name: &str, schema_edn: &[u8]) -> Result<bool, NodeError> {
+    pub async fn create_db(
+        self: &Arc<Self>,
+        name: &str,
+        schema_edn: &[u8],
+    ) -> Result<bool, NodeError> {
         if !valid_db_name(name) {
             return Err(NodeError::InvalidName(name.to_owned()));
         }
@@ -796,12 +803,16 @@ impl TransactorNode {
         };
         let (schema, idents) = schema_from_edn(&forms)?;
         let meta = encode_meta(&schema, &idents, &KeywordInterner::default());
-        match self.store.cas_root(&meta_root_name(name), None, &meta) {
+        match self
+            .store
+            .cas_root(&meta_root_name(name), None, &meta)
+            .await
+        {
             Ok(()) => {}
             Err(StoreError::CasFailed { .. }) => return Ok(false),
             Err(error) => return Err(error.into()),
         }
-        let state = self.open_db(name)?;
+        let state = self.open_db(name).await?;
         self.dbs
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -814,7 +825,7 @@ impl TransactorNode {
     ///
     /// # Errors
     /// Returns an error when roots or the log cannot be removed.
-    pub fn delete_db(&self, name: &str) -> Result<bool, NodeError> {
+    pub async fn delete_db(&self, name: &str) -> Result<bool, NodeError> {
         let Some(state) = self
             .dbs
             .write()
@@ -828,9 +839,8 @@ impl TransactorNode {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(name);
-        self.store.delete_root(&db_root_name(name))?;
-        self.store.delete_root(&meta_root_name(name))?;
-        self.store.delete_root(&lease::lease_root(name))?;
+        self.store.delete_root(&db_root_name(name)).await?;
+        self.store.delete_root(&meta_root_name(name)).await?;
         VersionedLog::delete_all(self.config.data_dir.join("logs"), name)?;
         Ok(true)
     }
@@ -865,31 +875,28 @@ impl TransactorNode {
     /// Returns an error when the store cannot be enumerated or swept.
     pub async fn gc_deleted_with_retention(&self, retention: Duration) -> Result<u64, NodeError> {
         let _gc = self.gc_lock.lock().await;
-        let store = Arc::clone(&self.store);
-        let report =
-            tokio::task::spawn_blocking(move || -> Result<corium_store::GcReport, NodeError> {
-                let mut live = Vec::new();
-                for root_name in store.list_roots("db:")? {
-                    if let Some(root) = store
-                        .get_root(&root_name)?
-                        .as_deref()
-                        .and_then(DbRoot::decode)
-                    {
-                        if let Some(roots) = root.roots {
-                            live.extend(roots);
-                        }
-                    }
+        let mut live = Vec::new();
+        for root_name in self.store.list_roots("db:").await? {
+            if let Some(root) = self
+                .store
+                .get_root(&root_name)
+                .await?
+                .as_deref()
+                .and_then(DbRoot::decode)
+            {
+                if let Some(roots) = root.roots {
+                    live.extend(roots);
                 }
-                Ok(mark_and_sweep_retained(
-                    store.as_ref(),
-                    live,
-                    |_, _| Ok(Vec::new()),
-                    retention,
-                    SystemTime::now(),
-                )?)
-            })
-            .await
-            .map_err(|error| NodeError::BadRequest(format!("gc task failed: {error}")))??;
+            }
+        }
+        let report = mark_and_sweep_retained(
+            self.store.as_ref(),
+            live,
+            |_, _| Ok(Vec::new()),
+            retention,
+            SystemTime::now(),
+        )
+        .await?;
         self.metrics
             .record_gc(report.swept as u64, report.retained as u64);
         tracing::info!(
@@ -929,7 +936,7 @@ impl TransactorNode {
         name: &str,
         tx_data: &[u8],
     ) -> Result<pb::TransactResponse, NodeError> {
-        let state = self.db_state(name)?;
+        let state = self.db_state(name).await?;
         let decoded = codec::decode_edn(tx_data)?;
         let forms = decoded
             .as_seq()
@@ -939,7 +946,7 @@ impl TransactorNode {
         let commit = state.commit.lock().await;
         drop(queued);
         let _commit = commit;
-        state.check_lease(self.store.as_ref())?;
+        state.check_lease(self.store.as_ref()).await?;
         // Expand user database-function invocations against the
         // db-in-transaction (the value under the commit lock) before native
         // conversion. The expander blocks up to its budget deadline, so it
@@ -976,10 +983,11 @@ impl TransactorNode {
             // reference them; recovery decodes the log against this meta.
             let meta = encode_meta(&schema, &idents, &interner);
             loop {
-                let current = self.store.get_root(&meta_root_name(name))?;
+                let current = self.store.get_root(&meta_root_name(name)).await?;
                 match self
                     .store
                     .cas_root(&meta_root_name(name), current.as_deref(), &meta)
+                    .await
                 {
                     Ok(()) => break,
                     Err(StoreError::CasFailed { .. }) => {}
@@ -998,7 +1006,7 @@ impl TransactorNode {
         // record we acked here is provably in the successor's replay, and a
         // record we refuse here lands in our version's log file where the
         // successor's cutoff discards it (see log-and-transactor.md).
-        if let Err(error) = state.check_lease(self.store.as_ref()) {
+        if let Err(error) = state.check_lease(self.store.as_ref()).await {
             if matches!(error, NodeError::Deposed(_)) {
                 self.depose(&state, "write lease lost after durable append");
             }
@@ -1043,8 +1051,8 @@ impl TransactorNode {
     ///
     /// # Errors
     /// Returns [`NodeError::UnknownDb`] when absent.
-    pub fn status(&self, name: &str) -> Result<pb::StatusResponse, NodeError> {
-        let state = self.db_state(name)?;
+    pub async fn status(&self, name: &str) -> Result<pb::StatusResponse, NodeError> {
+        let state = self.db_state(name).await?;
         let db = state.db();
         let counts = db.stats();
         let held = state.lease();
@@ -1073,7 +1081,7 @@ impl TransactorNode {
     /// expired in place so a standby's next poll takes over immediately
     /// instead of waiting out the TTL. Hosted databases stop accepting
     /// work first, so nothing commits after its lease is gone.
-    pub fn release_leases(&self) {
+    pub async fn release_leases(&self) {
         let states: Vec<Arc<DbState>> = self
             .dbs
             .write()
@@ -1083,7 +1091,9 @@ impl TransactorNode {
             .collect();
         for state in states {
             state.deposed.store(true, Ordering::Release);
-            if let Err(error) = lease::release(self.store.as_ref(), &state.name, &state.lease()) {
+            if let Err(error) =
+                lease::release(self.store.as_ref(), &state.name, &state.lease()).await
+            {
                 tracing::warn!(db = %state.name, %error, "lease release failed at shutdown");
             }
         }
@@ -1094,7 +1104,7 @@ impl TransactorNode {
     /// # Errors
     /// Returns [`NodeError::UnknownDb`] when absent.
     pub async fn sync(&self, name: &str, t: u64) -> Result<u64, NodeError> {
-        let state = self.db_state(name)?;
+        let state = self.db_state(name).await?;
         let mut basis = state.basis_watch();
         let target = if t == 0 { *basis.borrow() } else { t };
         loop {

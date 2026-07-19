@@ -175,6 +175,7 @@ impl Transactor for TransactorSvc {
         let state = self
             .0
             .db_state(&request.db)
+            .await
             .map_err(|error| to_status(&error))?;
         let heartbeat_interval_ms =
             u64::try_from(self.0.config().heartbeat_interval.as_millis()).unwrap_or(0);
@@ -205,6 +206,7 @@ impl Transactor for TransactorSvc {
         let request = request.into_inner();
         self.0
             .status(&request.db)
+            .await
             .map(Response::new)
             .map_err(|error| to_status(&error))
     }
@@ -231,12 +233,11 @@ impl Catalog for CatalogSvc {
         request: Request<pb::CreateDatabaseRequest>,
     ) -> Result<Response<pb::CreateDatabaseResponse>, Status> {
         let request = request.into_inner();
-        let node = Arc::clone(&self.0);
-        let created =
-            tokio::task::spawn_blocking(move || node.create_db(&request.db, &request.schema))
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?
-                .map_err(|error| to_status(&error))?;
+        let created = self
+            .0
+            .create_db(&request.db, &request.schema)
+            .await
+            .map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::CreateDatabaseResponse { created }))
     }
 
@@ -245,10 +246,10 @@ impl Catalog for CatalogSvc {
         request: Request<pb::DeleteDatabaseRequest>,
     ) -> Result<Response<pb::DeleteDatabaseResponse>, Status> {
         let request = request.into_inner();
-        let node = Arc::clone(&self.0);
-        let deleted = tokio::task::spawn_blocking(move || node.delete_db(&request.db))
+        let deleted = self
+            .0
+            .delete_db(&request.db)
             .await
-            .map_err(|error| Status::internal(error.to_string()))?
             .map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::DeleteDatabaseResponse { deleted }))
     }

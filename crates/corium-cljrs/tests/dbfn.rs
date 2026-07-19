@@ -271,11 +271,14 @@ async fn node_expands_db_functions() {
     config.index_interval = Duration::from_secs(600);
     config.heartbeat_interval = Duration::from_secs(600);
     config.tx_fn_expander = Some(Arc::new(DbFnExpander::new(budget()).with_max_depth(4)));
-    let node = corium_transactor::node::TransactorNode::open(config).expect("open node");
+    let node = corium_transactor::node::TransactorNode::open(config)
+        .await
+        .expect("open node");
 
     let encode =
         |text: &str| corium_protocol::codec::encode_edn(&read_one(text).expect("edn vector"));
     node.create_db("accounts", &encode(SCHEMA))
+        .await
         .expect("create db");
     node.transact(
         "accounts",
@@ -300,7 +303,7 @@ async fn node_expands_db_functions() {
         .await
         .expect_err("stale cas through the node");
     assert!(error.to_string().contains("balance changed"), "got {error}");
-    let db = node.db_state("accounts").expect("db state").db();
+    let db = node.db_state("accounts").await.expect("db state").db();
     let name_attr = db
         .idents()
         .entid(&corium_core::Keyword::parse("acct/name"))

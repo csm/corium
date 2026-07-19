@@ -350,6 +350,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let tls = serve.tls()?;
             let authenticator = serve.authenticator();
             let node = TransactorNode::open(config)
+                .await
                 .map_err(|error| format!("cannot open node: {error}"))?;
             let _metrics = if let Some(address) = metrics_listen {
                 let metrics_node = Arc::clone(&node);
@@ -390,7 +391,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             server.await.map_err(|error| error.to_string())?;
             // Graceful stop: expire held leases so a standby takes over
             // immediately instead of waiting out the TTL.
-            node.release_leases();
+            node.release_leases().await;
             if let Some(reason) = node.shutdown_watch().borrow().clone() {
                 return Err(format!("shut down: {reason}"));
             }
@@ -451,9 +452,14 @@ async fn run(cli: Cli) -> Result<(), String> {
                 let store = FsStore::open(data_dir.join("store"))
                     .map_err(|error| format!("cannot open store: {error}"))?;
                 let mut live = Vec::new();
-                for root_name in store.list_roots("db:").map_err(|error| error.to_string())? {
+                for root_name in store
+                    .list_roots("db:")
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
                     if let Some(root) = store
                         .get_root(&root_name)
+                        .await
                         .map_err(|error| error.to_string())?
                         .as_deref()
                         .and_then(DbRoot::decode)
@@ -468,6 +474,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     parse_duration(&window)?,
                     std::time::SystemTime::now(),
                 )
+                .await
                 .map_err(|error| error.to_string())?;
                 println!(
                     "{{:marked {} :swept {} :retained {}}}",
@@ -500,6 +507,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             destination,
         } => {
             let report = corium_transactor::backup::backup(data_dir, &db, destination)
+                .await
                 .map_err(|error| error.to_string())?;
             println!(
                 "{{:db {db:?} :basis-t {} :index-basis-t {} :copied-blobs {} :reused-blobs {}}}",
@@ -513,6 +521,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             as_db,
         } => {
             let report = corium_transactor::backup::restore(source, data_dir, &as_db)
+                .await
                 .map_err(|error| error.to_string())?;
             println!(
                 "{{:source-db {:?} :db {:?} :basis-t {} :copied-blobs {} :reused-blobs {}}}",
@@ -539,7 +548,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             db,
             from,
             to,
-        } => run_log(&data_dir, &db, from, to),
+        } => run_log(&data_dir, &db, from, to).await,
     }
 }
 
@@ -673,16 +682,21 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
     }
 }
 
-fn run_log(data_dir: &std::path::Path, db: &str, from: u64, to: u64) -> Result<(), String> {
+async fn run_log(data_dir: &std::path::Path, db: &str, from: u64, to: u64) -> Result<(), String> {
     use corium_log::TransactionLog;
     let log = corium_log::VersionedLog::open_read_only(data_dir.join("logs"), db)
         .map_err(|error| format!("cannot open log: {error}"))?;
     // Naming from the meta root makes keyword values readable.
-    let interner = FsStore::open(data_dir.join("store"))
-        .ok()
-        .and_then(|store| store.get_root(&format!("meta:{db}")).ok().flatten())
-        .and_then(|meta| decode_meta_interner(&meta))
-        .unwrap_or_default();
+    let interner = match FsStore::open(data_dir.join("store")) {
+        Ok(store) => store
+            .get_root(&format!("meta:{db}"))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|meta| decode_meta_interner(&meta))
+            .unwrap_or_default(),
+        Err(_) => KeywordInterner::default(),
+    };
     let end = if to == 0 { None } else { Some(to) };
     for record in log
         .tx_range(from, end)

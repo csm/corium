@@ -73,17 +73,18 @@ reader replays the tail from storage.
 
 ```rust
 pub trait BlobStore: Send + Sync {
-    fn get(&self, hash: &Hash) -> Result<Option<Bytes>>;
-    fn put(&self, hash: &Hash, bytes: Bytes) -> Result<()>;   // idempotent
-    fn delete(&self, hash: &Hash) -> Result<()>;              // GC only
-    fn contains(&self, hash: &Hash) -> Result<bool>;
+    async fn get(&self, hash: &Hash) -> Result<Option<Bytes>>;
+    async fn put(&self, hash: &Hash, bytes: Bytes) -> Result<()>; // idempotent
+    async fn delete(&self, hash: &Hash) -> Result<()>;            // GC only
+    async fn contains(&self, hash: &Hash) -> Result<bool>;
+    async fn list(&self) -> Result<BlobStream>;
 }
 
 pub trait RootStore: Send + Sync {
-    fn get(&self, key: &str) -> Result<Option<(Bytes, Version)>>;
-    fn compare_and_set(&self, key: &str, expected: Option<Version>, value: Bytes)
+    async fn get(&self, key: &str) -> Result<Option<(Bytes, Version)>>;
+    async fn compare_and_set(&self, key: &str, expected: Option<Version>, value: Bytes)
         -> Result<CasOutcome>;                                // roots + lease
-    fn list(&self) -> Result<Vec<String>>;                    // database catalog
+    async fn list(&self) -> Result<Vec<String>>;              // database catalog
 }
 ```
 
@@ -96,8 +97,11 @@ Design constraints on the traits (so future backends fit without change):
 - All coordination (root publication, transactor lease) funnels through
   `RootStore::compare_and_set`, the single primitive that must be strongly
   consistent. S3 conditional writes, Postgres, DynamoDB, etcd all provide it.
-- Traits are synchronous in the pure crates; `corium-store` provides an async
-  facade where the drivers are async. v1 impls:
+- Traits are asynchronous and support dynamic dispatch. Blocking v1 backends
+  execute their synchronous bodies on the async runtime's blocking pool; future
+  networked backends can implement the same traits with native async drivers.
+  Blob enumeration is streamed so garbage collection does not require a full
+  identifier vector in memory. v1 impls:
   - **MemoryStore** — `DashMap`, for tests and the simulator.
   - **FileStore** — segments as `objects/ab/cdef…` files (write-temp +
     rename), roots as files updated by lock-file-guarded atomic rename.

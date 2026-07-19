@@ -1037,17 +1037,21 @@ dependencies = [
 name = "corium-store"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "corium-core",
  "fs2",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
 name = "corium-transactor"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "corium-core",
  "corium-db",
  "corium-index",
