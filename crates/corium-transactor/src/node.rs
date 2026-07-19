@@ -1,7 +1,8 @@
 //! The transactor as a process: multi-database state, durable naming,
-//! lease acquisition/renewal, background indexing, and tx-report fan-out.
+//! lease acquisition/renewal, background indexing, tx-report fan-out, and
+//! high-availability standby takeover.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corium_core::{KeywordInterner, Schema};
 use corium_db::{Db, Idents};
-use corium_log::{FileLog, LogError, TransactionLog, TxRecord};
+use corium_log::{LogError, TransactionLog, TxRecord, VersionedLog};
 use corium_protocol::codec::{self, CodecError};
 use corium_protocol::pb;
 use corium_protocol::schemaform::{SchemaFormError, schema_from_edn};
@@ -22,7 +23,7 @@ use tracing::Instrument;
 
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
-use crate::{DbRoot, EmbeddedTransactor, TransactError, db_root_name, publish_root};
+use crate::{DbRoot, EmbeddedTransactor, TransactError, db_root_name};
 
 /// Expands user database-function invocations in boundary EDN transaction
 /// forms before native conversion. Implemented by `corium-cljrs` (the
@@ -49,6 +50,13 @@ pub struct NodeConfig {
     pub lease_ttl_ms: i64,
     /// How long to wait for a held lease to expire before giving up.
     pub lease_wait_ms: i64,
+    /// High-availability mode: when another owner holds a database's lease,
+    /// stand by and take over on expiry instead of failing startup, and on
+    /// depose return to standby instead of shutting the process down.
+    pub ha: bool,
+    /// Client endpoint advertised in the lease for peer lease-holder
+    /// rediscovery (e.g. `http://transactor-a:4334`).
+    pub advertise: Option<String>,
     /// Interval between background index publications.
     pub index_interval: Duration,
     /// Interval between heartbeats on subscription streams.
@@ -68,6 +76,8 @@ impl std::fmt::Debug for NodeConfig {
             .field("owner", &self.owner)
             .field("lease_ttl_ms", &self.lease_ttl_ms)
             .field("lease_wait_ms", &self.lease_wait_ms)
+            .field("ha", &self.ha)
+            .field("advertise", &self.advertise)
             .field("index_interval", &self.index_interval)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("gc_interval", &self.gc_interval)
@@ -89,6 +99,8 @@ impl NodeConfig {
             ),
             lease_ttl_ms: 5_000,
             lease_wait_ms: 15_000,
+            ha: false,
+            advertise: None,
             index_interval: Duration::from_secs(5),
             heartbeat_interval: Duration::from_secs(10),
             gc_interval: Some(Duration::from_secs(60 * 60)),
@@ -118,6 +130,17 @@ pub enum NodeError {
     /// This node no longer holds the write lease.
     #[error("deposed: write lease for {0:?} is held elsewhere")]
     Deposed(String),
+    /// This node is a warm standby for the database; the lease holder
+    /// serves it.
+    #[error("standby for {db:?}: lease held by {owner} at {endpoint:?}")]
+    Standby {
+        /// Database name.
+        db: String,
+        /// Current lease owner id (empty when unknown).
+        owner: String,
+        /// Owner's advertised client endpoint (empty when unadvertised).
+        endpoint: String,
+    },
     /// Payload failed to decode.
     #[error(transparent)]
     Codec(#[from] CodecError),
@@ -154,7 +177,7 @@ struct Naming {
 pub struct DbState {
     name: String,
     transactor: EmbeddedTransactor,
-    log: Arc<FileLog>,
+    log: Arc<VersionedLog>,
     naming: Mutex<Naming>,
     commit: tokio::sync::Mutex<()>,
     broadcast: broadcast::Sender<pb::subscribe_item::Item>,
@@ -227,29 +250,21 @@ impl DbState {
         Ok(self.log.tx_range(start, end)?)
     }
 
+    /// Verifies this node still owns the write lease (identity check on
+    /// the root record; expiry changes from renewals do not matter).
     fn check_lease(&self, store: &dyn RootStore) -> Result<Lease, NodeError> {
         if self.deposed.load(Ordering::Acquire) {
             return Err(NodeError::Deposed(self.name.clone()));
         }
         let held = self.lease();
-        let stored = store.get_root(&lease::lease_root(&self.name))?;
-        if stored.as_deref() == Some(held.encode().as_slice()) {
-            return Ok(held);
-        }
-        // Renewal publishes the new expiry before updating `held_lease`.
-        // A transaction can land in that tiny interval; matching owner and
-        // fence version is still the same lease, so adopt the newer record.
-        if let Some(stored) = stored.as_deref().and_then(Lease::decode) {
-            if stored.owner == held.owner && stored.version == held.version {
-                *self
-                    .held_lease
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = stored.clone();
-                return Ok(stored);
+        match lease::verify(store, &self.name, &held) {
+            Ok(()) => Ok(held),
+            Err(LeaseError::Lost) => {
+                self.deposed.store(true, Ordering::Release);
+                Err(NodeError::Deposed(self.name.clone()))
             }
+            Err(error) => Err(error.into()),
         }
-        self.deposed.store(true, Ordering::Release);
-        Err(NodeError::Deposed(self.name.clone()))
     }
 }
 
@@ -258,6 +273,9 @@ pub struct TransactorNode {
     config: NodeConfig,
     store: Arc<FsStore>,
     dbs: std::sync::RwLock<HashMap<String, Arc<DbState>>>,
+    /// Databases this node is standing by for (HA mode): the lease is held
+    /// elsewhere and the standby poller attempts takeover on expiry.
+    standby: std::sync::RwLock<BTreeSet<String>>,
     gc_lock: tokio::sync::Mutex<()>,
     metrics: Metrics,
     shutdown: watch::Sender<Option<String>>,
@@ -332,6 +350,7 @@ impl TransactorNode {
             config,
             store,
             dbs: std::sync::RwLock::new(HashMap::new()),
+            standby: std::sync::RwLock::new(BTreeSet::new()),
             gc_lock: tokio::sync::Mutex::new(()),
             metrics: Metrics::default(),
             shutdown: watch::channel(None).0,
@@ -343,12 +362,24 @@ impl TransactorNode {
             .filter_map(|root| root.strip_prefix("meta:").map(str::to_owned))
             .collect();
         for name in names {
-            let state = node.open_db(&name)?;
-            node.dbs
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(name, state);
+            match node.open_db(&name) {
+                Ok(state) => {
+                    node.dbs
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(name, state);
+                }
+                Err(NodeError::Lease(LeaseError::Held { owner, .. })) if node.config.ha => {
+                    tracing::info!(db = %name, %owner, "standing by; lease held elsewhere");
+                    node.standby
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(name);
+                }
+                Err(error) => return Err(error),
+            }
         }
+        node.spawn_standby_poller();
         node.spawn_scheduled_gc();
         Ok(node)
     }
@@ -401,32 +432,48 @@ impl TransactorNode {
         self.shutdown.subscribe()
     }
 
+    /// Deposes a hosted database. In HA mode the database returns to
+    /// standby (the poller re-attempts takeover); otherwise the whole
+    /// process shuts down and a supervisor restart re-acquires or waits.
     fn depose(&self, state: &DbState, reason: &str) {
         state.deposed.store(true, Ordering::Release);
-        let _ = self
-            .shutdown
-            .send(Some(format!("database {:?}: {reason}", state.name)));
+        if self.config.ha {
+            tracing::warn!(db = %state.name, reason, "deposed; returning to standby");
+            self.dbs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&state.name);
+            self.standby
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(state.name.clone());
+        } else {
+            let _ = self
+                .shutdown
+                .send(Some(format!("database {:?}: {reason}", state.name)));
+        }
     }
 
-    fn log_path(&self, name: &str) -> PathBuf {
-        self.config
-            .data_dir
-            .join("logs")
-            .join(format!("{name}.log"))
+    fn advertised(&self) -> &str {
+        self.config.advertise.as_deref().unwrap_or("")
     }
 
-    fn acquire_with_wait(&self, name: &str) -> Result<Lease, NodeError> {
+    /// Acquires the lease for `name`. In HA mode a held lease surfaces
+    /// immediately (the caller stands by); otherwise startup waits it out
+    /// up to the configured bound.
+    fn acquire_lease(&self, name: &str) -> Result<Lease, NodeError> {
         let deadline = now_unix_ms() + self.config.lease_wait_ms;
         loop {
             match lease::acquire(
                 self.store.as_ref(),
                 name,
                 &self.config.owner,
+                self.advertised(),
                 self.config.lease_ttl_ms,
                 now_unix_ms(),
             ) {
                 Ok(held) => return Ok(held),
-                Err(LeaseError::Held { .. }) if now_unix_ms() < deadline => {
+                Err(LeaseError::Held { .. }) if !self.config.ha && now_unix_ms() < deadline => {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 Err(error) => return Err(error.into()),
@@ -454,25 +501,17 @@ impl TransactorNode {
                 });
             }
         }
-        let held = self.acquire_with_wait(name)?;
-        // Fence bump: ensure the db root carries our lease version so any
-        // deposed writer's pending CAS fails and observes the new version.
-        if current
-            .as_ref()
-            .is_none_or(|root| root.lease_version < held.version)
-        {
-            publish_root(
-                self.store.as_ref(),
-                &root_name,
-                &DbRoot {
-                    format_version: corium_store::FORMAT_VERSION,
-                    lease_version: held.version,
-                    index_basis_t: current.as_ref().map_or(0, |root| root.index_basis_t),
-                    roots: current.and_then(|root| root.roots),
-                },
-            )?;
-        }
-        let log = Arc::new(FileLog::open(self.log_path(name))?);
+        // Acquisition rewrites the root record under our lease version, so
+        // it doubles as the fence bump: a deposed writer's pending root CAS
+        // now has stale expected bytes and must fail.
+        let held = self.acquire_lease(name)?;
+        // The log tail replay below happens strictly after the fence, so it
+        // observes every record a previous owner could ever have acked.
+        let log = Arc::new(VersionedLog::open(
+            self.config.data_dir.join("logs"),
+            name,
+            held.version,
+        )?);
         let base = Db::new(schema.clone()).with_naming(idents.clone(), interner.clone());
         let transactor = EmbeddedTransactor::recover_from(base, Arc::clone(&log) as _)?;
         let basis_t = transactor.db().basis_t();
@@ -500,6 +539,86 @@ impl TransactorNode {
         });
         self.spawn_maintenance(&state);
         Ok(state)
+    }
+
+    /// HA standby duty: at the lease-renewal cadence, rediscover databases
+    /// (including ones created on the active after this process started)
+    /// and attempt takeover of any whose lease has lapsed. Takeover is
+    /// ordinary startup — acquire (which fences), replay the log tail,
+    /// serve — per the crash-only design.
+    fn spawn_standby_poller(self: &Arc<Self>) {
+        if !self.config.ha {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let ttl = self.config.lease_ttl_ms;
+        let poll_every = Duration::from_millis(u64::try_from(ttl / 3).unwrap_or(1).max(50));
+        let node = Arc::clone(self);
+        runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(poll_every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let worker = Arc::clone(&node);
+                let result = tokio::task::spawn_blocking(move || worker.standby_scan()).await;
+                if let Ok(Err(error)) = result {
+                    tracing::warn!(%error, "standby scan failed");
+                }
+            }
+        });
+    }
+
+    /// One standby pass: refresh the standby set from the catalog and try
+    /// to take over lapsed leases.
+    fn standby_scan(self: &Arc<Self>) -> Result<(), NodeError> {
+        let names: Vec<String> = self
+            .store
+            .list_roots("meta:")?
+            .into_iter()
+            .filter_map(|root| root.strip_prefix("meta:").map(str::to_owned))
+            .collect();
+        {
+            let mut standby = self
+                .standby
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            standby.retain(|name| names.contains(name));
+        }
+        for name in names {
+            if self
+                .dbs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&name)
+            {
+                continue;
+            }
+            match self.open_db(&name) {
+                Ok(state) => {
+                    tracing::info!(db = %name, owner = %self.config.owner, "standby took over write lease");
+                    self.standby
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&name);
+                    self.dbs
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(name, state);
+                }
+                Err(NodeError::Lease(LeaseError::Held { .. })) => {
+                    self.standby
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(name);
+                }
+                Err(error) => {
+                    tracing::warn!(db = %name, %error, "standby takeover attempt failed");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn spawn_maintenance(self: &Arc<Self>, state: &Arc<DbState>) {
@@ -605,14 +724,48 @@ impl TransactorNode {
     /// Looks up a hosted database.
     ///
     /// # Errors
-    /// Returns [`NodeError::UnknownDb`] when absent.
+    /// Returns [`NodeError::Standby`] when this HA node is standing by for
+    /// the database, [`NodeError::UnknownDb`] when absent.
     pub fn db_state(&self, name: &str) -> Result<Arc<DbState>, NodeError> {
-        self.dbs
+        if let Some(state) = self
+            .dbs
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(name)
             .cloned()
-            .ok_or_else(|| NodeError::UnknownDb(name.to_owned()))
+        {
+            return Ok(state);
+        }
+        if self.config.ha
+            && self
+                .standby
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(name)
+        {
+            let root = self
+                .store
+                .get_root(&db_root_name(name))?
+                .as_deref()
+                .and_then(DbRoot::decode);
+            return Err(NodeError::Standby {
+                db: name.to_owned(),
+                owner: root.as_ref().map(|r| r.owner.clone()).unwrap_or_default(),
+                endpoint: root.map(|r| r.owner_endpoint).unwrap_or_default(),
+            });
+        }
+        Err(NodeError::UnknownDb(name.to_owned()))
+    }
+
+    /// Databases this node currently stands by for (HA mode).
+    #[must_use]
+    pub fn standby_dbs(&self) -> Vec<String> {
+        self.standby
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Creates a database with the supplied EDN schema forms; returns
@@ -671,15 +824,14 @@ impl TransactorNode {
             return Ok(false);
         };
         state.deposed.store(true, Ordering::Release);
-        let _ = lease::release(self.store.as_ref(), name, &state.lease());
+        self.standby
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
         self.store.delete_root(&db_root_name(name))?;
         self.store.delete_root(&meta_root_name(name))?;
         self.store.delete_root(&lease::lease_root(name))?;
-        match std::fs::remove_file(self.log_path(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(NodeError::Store(StoreError::Io(error))),
-        }
+        VersionedLog::delete_all(self.config.data_dir.join("logs"), name)?;
         Ok(true)
     }
 
@@ -840,6 +992,21 @@ impl TransactorNode {
         let report = tokio::task::spawn_blocking(move || worker.transactor.transact(items))
             .await
             .map_err(|error| NodeError::BadRequest(format!("transact task failed: {error}")))??;
+        // Post-append fence: acknowledge only if ownership was intact after
+        // the record became durable. A takeover that raced the append will
+        // have replayed the log *after* rewriting the root record, so a
+        // record we acked here is provably in the successor's replay, and a
+        // record we refuse here lands in our version's log file where the
+        // successor's cutoff discards it (see log-and-transactor.md).
+        if let Err(error) = state.check_lease(self.store.as_ref()) {
+            if matches!(error, NodeError::Deposed(_)) {
+                self.depose(&state, "write lease lost after durable append");
+            }
+            // Either way the transaction is not acknowledged; a transient
+            // store failure here is ambiguous to the caller, exactly like a
+            // crash between append and reply.
+            return Err(error);
+        }
         let t = report.db_after.basis_t();
         let datoms = codec::encode_datoms(&report.tx.datoms, &interner)?;
         let tempids = codec::encode_edn(&Edn::Map(
@@ -898,6 +1065,7 @@ impl TransactorNode {
             indexing_runs: metrics.index_runs,
             gc_runs: metrics.gc_runs,
             gc_swept_blobs: metrics.gc_swept,
+            lease_owner_endpoint: held.endpoint,
         })
     }
 

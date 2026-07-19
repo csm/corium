@@ -52,6 +52,10 @@ message Handshake {
   uint64 index_basis_t = 2;
   // Composite-encoded schema attributes and ident registry.
   bytes schema = 3;
+  // Interval between server heartbeats on this stream, in milliseconds.
+  // Peers treat silence for a few multiples of this as a dead transactor
+  // and fail over; 0 (older servers) disables the timeout.
+  uint64 heartbeat_interval_ms = 4;
 }
 
 message TxReport {
@@ -110,6 +114,8 @@ message StatusResponse {
   uint64 indexing_runs = 13;
   uint64 gc_runs = 14;
   uint64 gc_swept_blobs = 15;
+  // Client endpoint advertised by the lease owner (HA discovery).
+  string lease_owner_endpoint = 16;
 }
 
 // ---------------------------------------------------------------------------

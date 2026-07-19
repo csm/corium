@@ -204,3 +204,39 @@ fn retention_keeps_blobs_when_backend_has_no_timestamps() {
     assert_eq!(report.retained, 1);
     assert!(store.contains(&garbage).expect("retained blob"));
 }
+
+#[test]
+fn db_root_round_trips_lease_fields() {
+    use corium_store::{DbRoot, FORMAT_VERSION};
+    let root = DbRoot {
+        format_version: FORMAT_VERSION,
+        lease_version: 7,
+        owner: "transactor-a".into(),
+        lease_expires_unix_ms: 123_456,
+        owner_endpoint: "http://transactor-a:4334".into(),
+        index_basis_t: 42,
+        roots: None,
+    };
+    assert_eq!(DbRoot::decode(&root.encode()), Some(root.clone()));
+    let released = DbRoot {
+        owner_endpoint: String::new(),
+        lease_expires_unix_ms: 0,
+        ..root
+    };
+    assert_eq!(DbRoot::decode(&released.encode()), Some(released));
+}
+
+#[test]
+fn format_one_roots_decode_with_an_unowned_lease() {
+    use corium_store::DbRoot;
+    // A pre-M7 root: header, lease version, index basis, four id slots,
+    // no lease fields.
+    let legacy = b"corium-root-v1\n3\n17\n-\n-\n-\n-\n";
+    let decoded = DbRoot::decode(legacy).expect("legacy decodes");
+    assert_eq!(decoded.format_version, 1);
+    assert_eq!(decoded.lease_version, 3);
+    assert_eq!(decoded.index_basis_t, 17);
+    assert!(decoded.owner.is_empty());
+    assert_eq!(decoded.lease_expires_unix_ms, 0);
+    assert!(decoded.owner_endpoint.is_empty());
+}

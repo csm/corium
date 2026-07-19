@@ -24,7 +24,7 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::Codec(_)
         | NodeError::TxForm(_)
         | NodeError::SchemaForm(_) => Status::invalid_argument(error.to_string()),
-        NodeError::Deposed(_) | NodeError::UnsupportedFormat { .. } => {
+        NodeError::Deposed(_) | NodeError::Standby { .. } | NodeError::UnsupportedFormat { .. } => {
             Status::failed_precondition(error.to_string())
         }
         NodeError::Transact(inner) => match inner {
@@ -45,7 +45,11 @@ type ItemStream = Pin<Box<dyn Stream<Item = Result<pb::SubscribeItem, Status>> +
 /// The broadcast receiver is registered before the basis snapshot is taken,
 /// and live reports at or below the last backfilled `t` are dropped, so no
 /// transaction can fall between backfill and the live stream.
-pub(crate) fn subscription_stream(state: &Arc<DbState>, from_basis_t: u64) -> ItemStream {
+pub(crate) fn subscription_stream(
+    state: &Arc<DbState>,
+    from_basis_t: u64,
+    heartbeat_interval_ms: u64,
+) -> ItemStream {
     let mut live = state.stream_items();
     let (schema, interner) = state.handshake_snapshot();
     let basis = state.db().basis_t();
@@ -65,6 +69,7 @@ pub(crate) fn subscription_stream(state: &Arc<DbState>, from_basis_t: u64) -> It
             basis_t: basis,
             index_basis_t: index_basis,
             schema,
+            heartbeat_interval_ms,
         }))
         .await
         {
@@ -171,9 +176,12 @@ impl Transactor for TransactorSvc {
             .0
             .db_state(&request.db)
             .map_err(|error| to_status(&error))?;
+        let heartbeat_interval_ms =
+            u64::try_from(self.0.config().heartbeat_interval.as_millis()).unwrap_or(0);
         Ok(Response::new(subscription_stream(
             &state,
             request.from_basis_t,
+            heartbeat_interval_ms,
         )))
     }
 

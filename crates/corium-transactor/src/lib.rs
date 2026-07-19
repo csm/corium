@@ -228,6 +228,9 @@ impl EmbeddedTransactor {
         let root = DbRoot {
             format_version: corium_store::FORMAT_VERSION,
             lease_version,
+            owner: String::new(),
+            lease_expires_unix_ms: 0,
+            owner_endpoint: String::new(),
             index_basis_t: snapshot.basis_t(),
             roots: Some([
                 ids[0].clone(),
@@ -252,10 +255,11 @@ pub fn publish_root(
     root_name: &str,
     root: &DbRoot,
 ) -> Result<(), TransactError> {
-    let encoded = root.encode();
     loop {
         let previous = store.get_root(root_name)?;
-        if let Some(stored) = previous.as_deref().and_then(DbRoot::decode) {
+        let stored = previous.as_deref().and_then(DbRoot::decode);
+        let mut next = root.clone();
+        if let Some(stored) = stored {
             if stored.lease_version > root.lease_version {
                 return Err(TransactError::Deposed {
                     published: stored.lease_version,
@@ -266,8 +270,15 @@ pub fn publish_root(
             {
                 return Ok(());
             }
+            // The stored record carries the live lease fields (renewals CAS
+            // the same key); publication must not clobber them.
+            if stored.lease_version == root.lease_version {
+                next.owner = stored.owner;
+                next.lease_expires_unix_ms = stored.lease_expires_unix_ms;
+                next.owner_endpoint = stored.owner_endpoint;
+            }
         }
-        match store.cas_root(root_name, previous.as_deref(), &encoded) {
+        match store.cas_root(root_name, previous.as_deref(), &next.encode()) {
             Ok(()) => return Ok(()),
             Err(StoreError::CasFailed { .. }) => {}
             Err(error) => return Err(error.into()),

@@ -140,6 +140,186 @@ impl TransactionLog for FileLog {
     }
 }
 
+/// A transaction log split into per-lease-version files for HA append
+/// isolation (see `docs/design/log-and-transactor.md`).
+///
+/// The active writer under lease version `V` appends only to
+/// `{name}.v{V}.log` (the pre-HA `{name}.log` reads as version 0). Readers
+/// merge the files in version order and drop any record in an older file
+/// whose `t` is at or past the first record of a later file: such records
+/// were appended by a deposed writer after a takeover and were never
+/// acknowledged, because acknowledgement re-verifies lease ownership after
+/// the durable append. A deposed writer therefore cannot corrupt or fork
+/// the log — its stale appends land in a file nobody considers current.
+pub struct VersionedLog {
+    dir: PathBuf,
+    name: String,
+    write_path: PathBuf,
+    next_t: RwLock<u64>,
+}
+
+impl VersionedLog {
+    /// Opens the log for writing under `write_version`, creating the
+    /// version file if needed and dropping any torn tail it carries.
+    /// Files of other versions are never modified.
+    ///
+    /// # Errors
+    /// Returns an error if files cannot be read/created or a fully written
+    /// record is corrupt.
+    pub fn open(dir: impl AsRef<Path>, name: &str, write_version: u64) -> Result<Self, LogError> {
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir)?;
+        let write_path = version_path(&dir, name, write_version);
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&write_path)?;
+        let (_, durable_len) = read_records(&write_path)?;
+        if fs::metadata(&write_path)?.len() > durable_len {
+            let file = OpenOptions::new().write(true).open(&write_path)?;
+            file.set_len(durable_len)?;
+            file.sync_all()?;
+        }
+        let records = read_merged(&dir, name)?;
+        Ok(Self {
+            dir,
+            name: name.to_owned(),
+            write_path,
+            next_t: RwLock::new(records.last().map_or(1, |r| r.t + 1)),
+        })
+    }
+
+    /// Opens the log read-only (offline inspection, backup); appends fail.
+    ///
+    /// # Errors
+    /// Returns an error when the directory cannot be read or a fully
+    /// written record is corrupt.
+    pub fn open_read_only(dir: impl AsRef<Path>, name: &str) -> Result<Self, LogError> {
+        let dir = dir.as_ref().to_path_buf();
+        Ok(Self {
+            write_path: PathBuf::new(),
+            name: name.to_owned(),
+            next_t: RwLock::new(u64::MAX),
+            dir,
+        })
+    }
+
+    /// Reports whether any log file exists for this database.
+    #[must_use]
+    pub fn exists(dir: impl AsRef<Path>, name: &str) -> bool {
+        !version_files(dir.as_ref(), name).is_empty()
+    }
+
+    /// Deletes every version file for this database.
+    ///
+    /// # Errors
+    /// Returns an error when a file cannot be removed.
+    pub fn delete_all(dir: impl AsRef<Path>, name: &str) -> Result<(), LogError> {
+        for (_, path) in version_files(dir.as_ref(), name) {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TransactionLog for VersionedLog {
+    fn append(&self, record: &TxRecord) -> Result<(), LogError> {
+        let mut next_t = self.next_t.write().expect("poisoned log lock");
+        if *next_t != record.t {
+            return Err(LogError::Corrupt);
+        }
+        let payload = encode_record(record);
+        let mut file = OpenOptions::new().append(true).open(&self.write_path)?;
+        file.write_all(
+            &u64::try_from(payload.len())
+                .map_err(|_| LogError::Corrupt)?
+                .to_be_bytes(),
+        )?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        *next_t += 1;
+        Ok(())
+    }
+
+    fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
+        let _guard = self.next_t.read().expect("poisoned log lock");
+        Ok(read_merged(&self.dir, &self.name)?
+            .into_iter()
+            .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
+            .collect())
+    }
+}
+
+fn version_path(dir: &Path, name: &str, version: u64) -> PathBuf {
+    if version == 0 {
+        dir.join(format!("{name}.log"))
+    } else {
+        dir.join(format!("{name}.v{version}.log"))
+    }
+}
+
+/// Existing version files for `name`, sorted by version.
+fn version_files(dir: &Path, name: &str) -> Vec<(u64, PathBuf)> {
+    let mut files = Vec::new();
+    let legacy = version_path(dir, name, 0);
+    if legacy.is_file() {
+        files.push((0, legacy));
+    }
+    let prefix = format!("{name}.v");
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(text) = file_name.to_str() else {
+                continue;
+            };
+            if let Some(version) = text
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".log"))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                if version > 0 {
+                    files.push((version, entry.path()));
+                }
+            }
+        }
+    }
+    files.sort_by_key(|(version, _)| *version);
+    files
+}
+
+/// Merges every version file, applying the takeover cutoff rule, and
+/// verifies the surviving sequence is contiguous.
+fn read_merged(dir: &Path, name: &str) -> Result<Vec<TxRecord>, LogError> {
+    let files = version_files(dir, name);
+    let mut per_file: Vec<Vec<TxRecord>> = Vec::with_capacity(files.len());
+    for (_, path) in &files {
+        per_file.push(read_records(path)?.0);
+    }
+    // A record in an older file is dead once any later file starts at or
+    // below its t: every record acked under version v precedes the first
+    // record of every later version (the successor replayed it before
+    // choosing its own first t), so only never-acked stale appends die.
+    let mut cutoff = u64::MAX;
+    for records in per_file.iter_mut().rev() {
+        let first = records.first().map(|r| r.t);
+        records.retain(|r| r.t < cutoff);
+        if let Some(first) = first {
+            cutoff = cutoff.min(first);
+        }
+    }
+    let merged: Vec<TxRecord> = per_file.into_iter().flatten().collect();
+    for pair in merged.windows(2) {
+        if pair[1].t != pair[0].t + 1 {
+            return Err(LogError::Corrupt);
+        }
+    }
+    Ok(merged)
+}
+
 fn encode_record(record: &TxRecord) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&record.t.to_be_bytes());

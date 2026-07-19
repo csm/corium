@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use corium_log::{FileLog, LogError, TransactionLog};
+use corium_log::{FileLog, LogError, TransactionLog, TxRecord, VersionedLog};
 use corium_store::{
     BlobStore, DbRoot, FORMAT_VERSION, FsStore, RootStore, StoreError, db_root_name,
 };
@@ -168,6 +168,25 @@ fn copy_file_atomically(source: &Path, target: &Path) -> Result<(), io::Error> {
     fs::rename(temporary, target)
 }
 
+/// Writes `records` as a single consolidated log file, atomically.
+fn write_log_atomically(records: &[TxRecord], target: &Path) -> Result<(), BackupError> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = target.with_extension("tmp");
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let log = FileLog::open(&temporary)?;
+    for record in records {
+        log.append(record)?;
+    }
+    fs::rename(temporary, target)?;
+    Ok(())
+}
+
 fn copy_root_blobs(
     source: &dyn BlobStore,
     target: &dyn BlobStore,
@@ -233,12 +252,15 @@ pub fn backup(
             supported: FORMAT_VERSION,
         });
     }
-    let source_log_path = log_path(source_data_dir, db);
-    if !source_log_path.is_file() {
+    let source_logs = source_data_dir.join("logs");
+    if !VersionedLog::exists(&source_logs, db) {
         return Err(BackupError::Invalid("transaction log is missing".into()));
     }
-    let log = FileLog::open(&source_log_path)?;
-    let basis_t = log.replay()?.last().map_or(0, |record| record.t);
+    // Consolidate the (possibly lease-versioned) log into one clean file:
+    // the merged read applies the HA takeover cutoffs, so the backup never
+    // carries a deposed writer's stale appends.
+    let records = VersionedLog::open_read_only(&source_logs, db)?.replay()?;
+    let basis_t = records.last().map_or(0, |record| record.t);
     if root.index_basis_t > basis_t {
         return Err(BackupError::Invalid(format!(
             "index basis {} is ahead of log basis {basis_t}",
@@ -251,7 +273,7 @@ pub fn backup(
     let (copied_blobs, reused_blobs) = copy_root_blobs(&source, &target, &root)?;
     put_root(&target, &db_name, &db_bytes)?;
     put_root(&target, &meta_name, &meta)?;
-    copy_file_atomically(&source_log_path, &log_path(destination, db))?;
+    write_log_atomically(&records, &log_path(destination, db))?;
     let manifest = Manifest {
         source_db: db.to_owned(),
         basis_t,
