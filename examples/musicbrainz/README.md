@@ -29,7 +29,17 @@ Then, at the `mbrainz=>` prompt:
               [?a :artist/name ?name]
               [?a :artist/startYear ?year]] db)
 ;; => [["The Beatles" 1960] ["Radiohead" 1985]]
+
+(d/q '[:find ?name ?year
+       :where [?a :artist/name ?name]
+              [(starts-with? ?name "Bob")]
+              [?a :artist/startYear ?year]] db)
+;; => [["Bob Dylan" 1941]]
 ```
+
+Query predicates such as `starts-with?` are Corium Datalog built-ins. Use
+their unqualified names rather than Clojure namespace-qualified names such as
+`clojure.string/starts-with?`.
 
 Type `:help` in the REPL for more example queries, `:quit` to exit.
 
@@ -111,6 +121,37 @@ cargo run -p corium-mbrainz --bin mbrainz-load -- \
   --schema examples/musicbrainz/schema.edn --data /path/to/mbrainz.edn --batch 2000
 ```
 
+### Streaming a filtered official JSON dump
+
+`mbrainz-import-json` reads the newline-delimited release records directly
+from the `mbdump/release` member of MusicBrainz's `release.tar.xz`. It never
+extracts the archive and keeps only one source record, two bounded import
+batches, and a set of already-seen artist IDs in memory.
+
+Because xz data is a sequential stream, a complete filtered import still
+decompresses and scans the archive once; filtering reduces database size and
+write volume, not scan time. `--limit` can stop a trial run early.
+
+For example, import releases dated from 1990 through 1999 (inclusive):
+
+```sh
+cargo run -p corium-mbrainz --bin mbrainz-import-json -- \
+  --releases /path/to/release.tar.xz \
+  --from-year 1990 --to-year 1999 --batch 1000
+```
+
+Use `--limit 1000` for a small trial import. Pass `--skip-create` when loading
+into an existing database, and use the same `--transactor`, `--db`, and
+`--token` options as `mbrainz-load` when needed.
+
+The importer filters on the year at the start of each release's top-level
+MusicBrainz `date`. Releases with missing dates are skipped. To keep the
+result practical on a laptop, it imports release-level name, date, country,
+language, status, type, artist credit, and the credited artists embedded in
+each release record. It deliberately skips the much larger media, track,
+recording, label, relationship, alias, tag, and genre trees. Artists are
+committed before each release batch so the release lookup refs resolve.
+
 ### Modeling notes (differences from Datomic)
 
 Corium's v1 schema scope ([ADR-0009](../../docs/adr/0009-schema-scope.md))
@@ -138,6 +179,7 @@ examples/musicbrainz/
 │   ├── lib.rs          streaming EDN form reader + endpoint helpers
 │   └── bin/
 │       ├── load.rs     mbrainz-load
+│       ├── import_json.rs  mbrainz-import-json
 │       └── repl.rs     mbrainz-repl
 └── scripts/            transactor.sh, load.sh, repl.sh, console.sh, demo.sh
 ```

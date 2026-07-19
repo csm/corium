@@ -37,4 +37,4 @@ case "$STORE" in
 esac
 
 echo "starting $STORE transactor on $LISTEN (data-dir: $DATA_DIR)" >&2
-exec cargo run -q -p corium-cli "${FEATURES[@]}" --bin corium -- "${ARGS[@]}"
+exec cargo run -q -p corium-cli ${FEATURES[@]+"${FEATURES[@]}"} --bin corium -- "${ARGS[@]}"

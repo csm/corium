@@ -27,9 +27,9 @@ cleanup() {
 trap cleanup EXIT
 
 echo "building…"
-cargo build -q -p corium-cli "${FEATURES[@]}" -p corium-mbrainz
+cargo build -q -p corium-cli ${FEATURES[@]+"${FEATURES[@]}"} -p corium-mbrainz
 
-echo "starting $STORE transactor on $LISTEN…"
+echo "starting $STORE transactor on ${LISTEN}…"
 LISTEN="$LISTEN" "$SCRIPTS/transactor.sh" "$STORE" "$DATA_DIR" &
 TX_PID=$!
 
