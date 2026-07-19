@@ -136,7 +136,7 @@ fn help() {
 ;; Artists named "Bob Dylan" with their start year:
 (d/q '[:find ?name ?year
        :where [?a :artist/name ?name]
-              [(clojure.string/starts-with? ?name "Bob")]
+              [(starts-with? ?name "Bob")]
               [?a :artist/startYear ?year]] db)
 ;;
 ;; Pull a release and its media/tracks by gid lookup ref:

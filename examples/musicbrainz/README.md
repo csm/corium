@@ -29,7 +29,17 @@ Then, at the `mbrainz=>` prompt:
               [?a :artist/name ?name]
               [?a :artist/startYear ?year]] db)
 ;; => [["The Beatles" 1960] ["Radiohead" 1985]]
+
+(d/q '[:find ?name ?year
+       :where [?a :artist/name ?name]
+              [(starts-with? ?name "Bob")]
+              [?a :artist/startYear ?year]] db)
+;; => [["Bob Dylan" 1941]]
 ```
+
+Query predicates such as `starts-with?` are Corium Datalog built-ins. Use
+their unqualified names rather than Clojure namespace-qualified names such as
+`clojure.string/starts-with?`.
 
 Type `:help` in the REPL for more example queries, `:quit` to exit.
 
