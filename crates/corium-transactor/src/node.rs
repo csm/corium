@@ -1069,6 +1069,26 @@ impl TransactorNode {
         })
     }
 
+    /// Releases every held write lease (graceful shutdown): the record is
+    /// expired in place so a standby's next poll takes over immediately
+    /// instead of waiting out the TTL. Hosted databases stop accepting
+    /// work first, so nothing commits after its lease is gone.
+    pub fn release_leases(&self) {
+        let states: Vec<Arc<DbState>> = self
+            .dbs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, state)| state)
+            .collect();
+        for state in states {
+            state.deposed.store(true, Ordering::Release);
+            if let Err(error) = lease::release(self.store.as_ref(), &state.name, &state.lease()) {
+                tracing::warn!(db = %state.name, %error, "lease release failed at shutdown");
+            }
+        }
+    }
+
     /// Waits until the database basis reaches `t`, returning the basis seen.
     ///
     /// # Errors

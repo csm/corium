@@ -59,8 +59,11 @@ the serving peer before it responds.
 
 `Subscribe.from_basis_t` is exclusive. The first item is a handshake, then
 the server backfills every `t > from_basis_t` without gaps and continues with
-live reports, index announcements, and heartbeats. After reconnect, send the
-last fully applied basis and deduplicate by transaction number.
+live reports, index announcements, and heartbeats. The handshake's
+`heartbeat_interval_ms` (0 from older servers) is the server's heartbeat
+cadence; treat silence for a few multiples of it as a dead upstream and
+reconnect. After reconnect, send the last fully applied basis and
+deduplicate by transaction number.
 
 ## Conformance
 

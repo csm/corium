@@ -107,6 +107,24 @@ demo, and public thin-client protocol documentation. The M6 acceptance
 battery verifies basis/datom preservation across backup and clone restore,
 measures both a no-change incremental copying zero segments and a delta
 incremental copying only newly addressed segments,
-exercises every console time view, and covers scheduled GC retention. Next
-step is Milestone M7 (High availability) per
-[docs/roadmap.md](docs/roadmap.md).
+exercises every console time view, and covers scheduled GC retention.
+
+Milestone M7 (High availability) completes the roadmap: the write lease is
+folded into the CAS-fenced database root record (storage format 2), so
+acquisition, renewal, and index publication are all fenced by one atomic
+operation; the transaction log is split into per-lease-version files whose
+merged replay discards a deposed writer's stale appends; and the commit
+pipeline re-verifies ownership after the durable append and before every
+acknowledgement. On top of that fencing: transactor `--ha` standby mode
+(lease polling, takeover-as-crash-recovery, catalog rediscovery,
+depose-to-standby, lease release on graceful shutdown, `--advertise`d
+endpoints), peer failover (endpoint preference lists for subscriptions and
+transactions, safe pre-commit retries, heartbeat-silence detection from the
+handshake-advertised interval, lease-holder rediscovery from the root
+record), and an HA runbook in [docs/operations.md](docs/operations.md).
+The M7 acceptance suite is a deterministic simulation that injects a full
+standby takeover at every boundary of the commit/publish/renew protocol —
+asserting zero acked-transaction loss, no duplicates, and no post-takeover
+publishes — plus a process-level battery that kill -9s the active under
+load and verifies the standby serves writes within the lease-expiry bound
+while peers fail over without losing their subscriptions.

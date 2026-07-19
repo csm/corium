@@ -388,6 +388,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                 },
             );
             server.await.map_err(|error| error.to_string())?;
+            // Graceful stop: expire held leases so a standby takes over
+            // immediately instead of waiting out the TTL.
+            node.release_leases();
             if let Some(reason) = node.shutdown_watch().borrow().clone() {
                 return Err(format!("shut down: {reason}"));
             }

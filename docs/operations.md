@@ -54,6 +54,109 @@ Console commands are:
 `:watch` tails live transaction reports until Ctrl-C. The reproducible M6
 smoke script is [m6-console.txt](demo/m6-console.txt).
 
+## High availability (active/standby)
+
+One transactor holds the write lease per database; a warm standby polls the
+lease and takes over when it lapses. Start both members identically with
+`--ha`, pointing at the same (shared) data directory, each advertising its
+own client endpoint:
+
+```sh
+corium transactor --data-dir /srv/corium --ha \
+  --owner txor-a --advertise http://txor-a:4334 --listen 0.0.0.0:4334
+corium transactor --data-dir /srv/corium --ha \
+  --owner txor-b --advertise http://txor-b:4334 --listen 0.0.0.0:4334
+```
+
+Whichever starts first becomes active; the other stands by, rescans the
+catalog every lease-renewal interval (so databases created on the active are
+picked up), and rejects client work with a `standby` FAILED_PRECONDITION
+naming the current lease holder. Give `--owner` a stable identity per
+member: a restarted member re-acquires its own unexpired lease immediately.
+
+Peers list both endpoints and fail over automatically:
+
+```sh
+corium peer-server --db people \
+  --transactor http://txor-a:4334,http://txor-b:4334
+```
+
+Library peers pass the same list via `ConnectConfig::with_failover`; peers
+with storage credentials can also rediscover the current holder's advertised
+endpoint from the database root (`corium db stats` prints it, and
+`SegmentSource::lease_holder_endpoint` reads it directly).
+
+### Failover behavior and guarantees
+
+- Takeover is ordinary crash recovery: the standby acquires the lapsed
+  lease (which atomically fences the deposed writer), replays the log tail,
+  and serves. No acknowledged transaction is ever lost or duplicated, and a
+  deposed transactor can never publish — these properties are enforced by a
+  post-append ownership check before every acknowledgement and exercised by
+  the M7 simulation and integration batteries.
+- Writes are unavailable from the crash until takeover: at worst one lease
+  TTL (the active's last renewal has to expire) plus one standby poll
+  interval (TTL/3) plus reconnect backoff.
+- Peer subscriptions reconnect and backfill gaplessly. `transact` calls
+  that fail before reaching the commit point (standby rejection, connection
+  refused) are retried transparently within `failover_timeout`. A call whose
+  connection died mid-request is ambiguous — the transaction may or may not
+  have committed — and surfaces an error, exactly like a transactor crash
+  between durability and reply; on such an error, `sync` and check before
+  resubmitting.
+- A deposed member (GC pause, partition) refuses further work and returns
+  to standby on its own; no operator action is needed.
+
+### Tuning
+
+| Knob | Default | Effect |
+|---|---|---|
+| `--lease-ttl-ms` | 5000 | Failover detection bound; renewals run at TTL/3. Lower = faster takeover, more root-store traffic, less tolerance for GC/IO pauses on the active. |
+| `--heartbeat-ms` | 10000 | Subscription heartbeats; peers presume the transactor dead after 3 missed intervals and fail over even when TCP has not noticed (partitions). Keep at or below the lease TTL for prompt peer failover. |
+| Peer `reconnect_min`/`reconnect_max` | 100ms/5s | Reconnect backoff while rotating endpoints. |
+| Peer `failover_timeout` | 30s | How long safe-to-retry transact failures ride out a takeover. |
+
+The lease lives in the same CAS-fenced root record as the published
+indexes, so the root store is the single arbiter; clock skew between members
+only shifts detection latency, never safety. The transaction log is written
+as per-lease-version files (`<db>.v<N>.log`); readers merge them and old
+files are inert history — never edit or delete them by hand.
+
+### HA runbook
+
+Planned failover (maintenance on the active):
+1. Stop the active gracefully (Ctrl-C). It releases its leases on the way
+   out, so the standby takes over on its next poll (within TTL/3) with no
+   expiry wait.
+2. Watch the standby's log for `standby took over write lease`, or poll
+   `corium db stats` until `:lease-owner` names the standby.
+3. Do the maintenance; restart the member with the same `--owner` and
+   `--ha`. It rejoins as standby.
+
+Crashed active:
+1. Nothing is required for service: the standby takes over within
+   TTL + TTL/3. Confirm via `:lease-owner`/`:lease-owner-endpoint` in
+   `corium db stats` and basis progress.
+2. Restart the crashed member under its supervisor with `--ha`; it rejoins
+   as standby. Investigate the crash afterwards, not before.
+
+Split brain suspicion (both members claim ownership in their logs):
+- Not possible for durable state: the root record is owned by exactly one
+  lease version and every publish/ack is fenced by it. A member logging
+  `deposed` messages is the loser and will stand down; trust
+  `corium db stats` (which reads the root record), not process logs.
+
+Both members down:
+1. Start either member (prefer the one with newest data-directory mtimes if
+   storage is not shared). It waits out any unexpired lease (up to
+   `--lease-wait-ms` without `--ha`, indefinitely with it) and recovers by
+   log replay.
+2. Start the second member; it becomes standby.
+
+Storage requirements: both members must see the same blob/root store and
+log directory (shared filesystem in v1). The store is the source of truth;
+never run members against diverged copies of a data directory.
+
 ## Backup and restore
 
 Backup and restore are offline in v1: stop the transactor that owns the data

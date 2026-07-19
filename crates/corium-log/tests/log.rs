@@ -2,6 +2,7 @@
 
 use corium_core::{Datom, EntityId, Value};
 use corium_log::{FileLog, TransactionLog, TxRecord, VersionedLog};
+use std::io::Write;
 fn record(t: u64) -> TxRecord {
     let signed_t = i64::try_from(t).expect("test transaction fits i64");
     TxRecord {
@@ -67,7 +68,8 @@ fn versioned_log_merges_files_in_lease_version_order() {
     v1.append(&record(1)).expect("append 1");
     v1.append(&record(2)).expect("append 2");
     let v2 = VersionedLog::open(dir.path(), "db", 2).expect("open v2");
-    v2.append(&record(3)).expect("append continues past replayed tail");
+    v2.append(&record(3))
+        .expect("append continues past replayed tail");
     assert_eq!(
         v2.replay().expect("replay"),
         vec![record(1), record(2), record(3)]
@@ -87,7 +89,8 @@ fn takeover_cutoff_discards_a_deposed_writers_stale_append() {
     // with the same t; readers must prefer the newer lease's record.
     let mut stale = record(2);
     stale.tx_instant = 999;
-    old.append(&stale).expect("stale append is durable but dead");
+    old.append(&stale)
+        .expect("stale append is durable but dead");
     let merged = VersionedLog::open_read_only(dir.path(), "db")
         .expect("read only")
         .replay()
@@ -112,13 +115,11 @@ fn versioned_log_survives_torn_tail_in_an_older_version_file() {
     let old = VersionedLog::open(dir.path(), "db", 1).expect("open v1");
     old.append(&record(1)).expect("append");
     // Crash mid-append: a torn record at the old file's tail.
-    use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(dir.path().join("db.v1.log"))
         .expect("open raw");
-    file.write_all(&[0, 0, 0, 0, 0, 0, 0, 99, 1, 2, 3])
-        .expect("torn bytes");
+    Write::write_all(&mut file, &[0, 0, 0, 0, 0, 0, 0, 99, 1, 2, 3]).expect("torn bytes");
     drop(file);
     let new = VersionedLog::open(dir.path(), "db", 2).expect("takeover open");
     assert_eq!(new.replay().expect("replay"), vec![record(1)]);
