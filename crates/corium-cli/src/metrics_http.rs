@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -22,7 +23,9 @@ pub async fn spawn(
             let render = Arc::clone(&render);
             tokio::spawn(async move {
                 let mut request = [0_u8; 2048];
-                let Ok(read) = socket.read(&mut request).await else {
+                let Ok(Ok(read)) =
+                    tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request)).await
+                else {
                     return;
                 };
                 let request = String::from_utf8_lossy(&request[..read]);

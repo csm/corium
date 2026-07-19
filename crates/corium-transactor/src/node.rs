@@ -783,9 +783,9 @@ impl TransactorNode {
             .as_seq()
             .ok_or_else(|| NodeError::BadRequest("tx-data must be a vector".into()))?
             .to_vec();
-        self.metrics.queue_enter();
+        let queued = self.metrics.queue_waiter();
         let commit = state.commit.lock().await;
-        self.metrics.queue_leave();
+        drop(queued);
         let _commit = commit;
         state.check_lease(self.store.as_ref())?;
         // Expand user database-function invocations against the

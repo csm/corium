@@ -153,8 +153,9 @@ message ListDatabasesResponse {
 }
 
 message GcDeletedDatabasesRequest {
-  // Minimum age of unreachable blobs before deletion; 0 uses server default.
-  uint64 retention_seconds = 1;
+  // Minimum age of unreachable blobs before deletion. Omitted uses the
+  // server default; an explicit 0 requests an immediate sweep.
+  optional uint64 retention_millis = 1;
 }
 
 message GcDeletedDatabasesResponse {

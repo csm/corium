@@ -7,7 +7,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 
 use fs2::FileExt;
@@ -98,12 +98,13 @@ pub trait BlobStore: Send + Sync {
     /// Returns an error if the backend cannot enumerate blobs.
     fn list(&self) -> Result<Vec<BlobId>, StoreError>;
     /// Returns the blob's creation/last-modification time when available.
-    /// Backends without timestamps conservatively report the Unix epoch.
+    /// Backends without timestamps return `None`, which conservatively keeps
+    /// the blob whenever a non-zero retention window is active.
     ///
     /// # Errors
     /// Returns an error if the backend cannot inspect blob metadata.
-    fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
-        Ok(self.contains(id)?.then_some(UNIX_EPOCH))
+    fn modified_at(&self, _id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
+        Ok(None)
     }
 }
 
@@ -522,9 +523,13 @@ pub fn mark_and_sweep_retained(
     let mut retained = 0;
     for id in store.list()? {
         if !marked.contains(&id) {
-            let old_enough = store.modified_at(&id)?.is_some_and(|modified| {
-                now.duration_since(modified).unwrap_or_default() >= retention
-            });
+            // A zero window is the explicit immediate-sweep escape hatch and
+            // does not require backend timestamp support. Otherwise, unknown
+            // timestamps fail safe by retaining the blob.
+            let old_enough = retention.is_zero()
+                || store.modified_at(&id)?.is_some_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() >= retention
+                });
             if old_enough {
                 store.delete(&id)?;
                 swept += 1;

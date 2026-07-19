@@ -185,3 +185,22 @@ fn retention_window_keeps_new_unreachable_files() {
     assert_eq!(report.swept, 1);
     assert!(!store.contains(&garbage).expect("swept blob"));
 }
+
+#[test]
+fn retention_keeps_blobs_when_backend_has_no_timestamps() {
+    let store = MemoryStore::default();
+    let garbage = store.put(b"unknown age").expect("blob");
+
+    let report = mark_and_sweep_retained(
+        &store,
+        [],
+        |_, _| Ok(Vec::new()),
+        Duration::from_secs(60),
+        SystemTime::now(),
+    )
+    .expect("retained collection");
+
+    assert_eq!(report.swept, 0);
+    assert_eq!(report.retained, 1);
+    assert!(store.contains(&garbage).expect("retained blob"));
+}

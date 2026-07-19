@@ -17,6 +17,17 @@ pub struct Metrics {
     gc_retained: AtomicU64,
 }
 
+/// Decrements the transaction queue gauge even if a waiting future is cancelled.
+pub(crate) struct QueueDepthGuard<'a> {
+    depth: &'a AtomicU64,
+}
+
+impl Drop for QueueDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Point-in-time counters used by the Status RPC.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Snapshot {
@@ -48,12 +59,11 @@ impl Metrics {
         }
     }
 
-    pub(crate) fn queue_enter(&self) {
+    pub(crate) fn queue_waiter(&self) -> QueueDepthGuard<'_> {
         self.tx_queue_depth.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn queue_leave(&self) {
-        self.tx_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        QueueDepthGuard {
+            depth: &self.tx_queue_depth,
+        }
     }
 
     pub(crate) fn record_tx(&self, elapsed: Duration, success: bool) {
@@ -114,5 +124,19 @@ corium_transactor_gc_runs_total {gc_runs}\n\
 corium_transactor_gc_swept_blobs_total {gc_swept}\n\
 corium_transactor_gc_retained_blobs_total {gc_retained}\n",
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_guard_restores_depth_when_dropped() {
+        let metrics = Metrics::default();
+        let waiter = metrics.queue_waiter();
+        assert_eq!(metrics.snapshot().queue_depth, 1);
+        drop(waiter);
+        assert_eq!(metrics.snapshot().queue_depth, 0);
     }
 }

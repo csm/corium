@@ -258,19 +258,21 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::GcDeletedDatabasesRequest>,
     ) -> Result<Response<pb::GcDeletedDatabasesResponse>, Status> {
-        let retention_seconds = request.into_inner().retention_seconds;
-        let swept = if retention_seconds == 0 {
-            self.0.gc_deleted().await
-        } else {
-            self.0
-                .gc_deleted_with_retention(std::time::Duration::from_secs(retention_seconds))
-                .await
+        let swept = match requested_gc_retention(request.into_inner()) {
+            None => self.0.gc_deleted().await,
+            Some(retention) => self.0.gc_deleted_with_retention(retention).await,
         };
         let swept_blobs = swept.map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::GcDeletedDatabasesResponse {
             swept_blobs,
         }))
     }
+}
+
+fn requested_gc_retention(request: pb::GcDeletedDatabasesRequest) -> Option<std::time::Duration> {
+    request
+        .retention_millis
+        .map(std::time::Duration::from_millis)
 }
 
 /// Serves the transactor and catalog services until `shutdown` resolves.
@@ -300,4 +302,32 @@ pub async fn serve(
         ))
         .serve_with_shutdown(addr, shutdown)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_retention_distinguishes_default_zero_and_subsecond() {
+        let default = pb::GcDeletedDatabasesRequest {
+            retention_millis: None,
+        };
+        let immediate = pb::GcDeletedDatabasesRequest {
+            retention_millis: Some(0),
+        };
+        let subsecond = pb::GcDeletedDatabasesRequest {
+            retention_millis: Some(500),
+        };
+
+        assert_eq!(requested_gc_retention(default), None);
+        assert_eq!(
+            requested_gc_retention(immediate),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            requested_gc_retention(subsecond),
+            Some(std::time::Duration::from_millis(500))
+        );
+    }
 }

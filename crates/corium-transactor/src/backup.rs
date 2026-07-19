@@ -173,6 +173,9 @@ fn copy_root_blobs(
     target: &dyn BlobStore,
     root: &DbRoot,
 ) -> Result<(usize, usize), BackupError> {
+    // v1 index publications store each covering index as one flat blob. When
+    // index roots become tree nodes, this must share the recursive child walk
+    // used by GC so backup and reachability cannot diverge.
     let mut copied = 0;
     let mut reused = 0;
     for id in root.roots.iter().flatten() {

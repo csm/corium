@@ -638,9 +638,24 @@ impl Admin {
         let response = self
             .client
             .gc_deleted_databases(pb::GcDeletedDatabasesRequest {
-                retention_seconds: retention.map_or(0, |duration| duration.as_secs()),
+                retention_millis: retention.map(duration_millis),
             })
             .await?;
         Ok(response.into_inner().swept_blobs)
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_retention_wire_value_preserves_zero_and_subseconds() {
+        assert_eq!(duration_millis(Duration::ZERO), 0);
+        assert_eq!(duration_millis(Duration::from_millis(500)), 500);
     }
 }
