@@ -7,6 +7,7 @@
 //! block on the transactor. On disconnect it reconnects and resubscribes
 //! from its basis, and the server backfills the gap from the durable log.
 
+pub mod metrics;
 pub mod segment;
 pub mod server;
 
@@ -623,10 +624,38 @@ impl Admin {
     /// # Errors
     /// Returns [`PeerError`] on transport failure.
     pub async fn gc_deleted_databases(&mut self) -> Result<u64, PeerError> {
+        self.gc_deleted_databases_with_retention(None).await
+    }
+
+    /// Sweeps unreachable blobs with an optional minimum retention window.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure.
+    pub async fn gc_deleted_databases_with_retention(
+        &mut self,
+        retention: Option<Duration>,
+    ) -> Result<u64, PeerError> {
         let response = self
             .client
-            .gc_deleted_databases(pb::GcDeletedDatabasesRequest {})
+            .gc_deleted_databases(pb::GcDeletedDatabasesRequest {
+                retention_millis: retention.map(duration_millis),
+            })
             .await?;
         Ok(response.into_inner().swept_blobs)
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_retention_wire_value_preserves_zero_and_subseconds() {
+        assert_eq!(duration_millis(Duration::ZERO), 0);
+        assert_eq!(duration_millis(Duration::from_millis(500)), 500);
     }
 }

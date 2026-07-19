@@ -7,6 +7,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    time::{Duration, SystemTime},
 };
 
 use fs2::FileExt;
@@ -96,6 +97,15 @@ pub trait BlobStore: Send + Sync {
     ///
     /// Returns an error if the backend cannot enumerate blobs.
     fn list(&self) -> Result<Vec<BlobId>, StoreError>;
+    /// Returns the blob's creation/last-modification time when available.
+    /// Backends without timestamps return `None`, which conservatively keeps
+    /// the blob whenever a non-zero retention window is active.
+    ///
+    /// # Errors
+    /// Returns an error if the backend cannot inspect blob metadata.
+    fn modified_at(&self, _id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
+        Ok(None)
+    }
 }
 
 /// Named root pointer storage with compare-and-swap fencing.
@@ -300,6 +310,13 @@ impl BlobStore for FsStore {
         }
         Ok(ids)
     }
+    fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
+        match fs::metadata(self.blob_path(id)) {
+            Ok(metadata) => Ok(Some(metadata.modified()?)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 impl RootStore for FsStore {
     fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
@@ -367,10 +384,15 @@ pub fn db_root_name(db: &str) -> String {
     format!("db:{db}")
 }
 
+/// Storage format written by this release.
+pub const FORMAT_VERSION: u32 = 1;
+
 /// Published durable index-root metadata, fenced by lease version
 /// (see `docs/design/log-and-transactor.md`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DbRoot {
+    /// On-disk format version. Readers reject roots from newer formats.
+    pub format_version: u32,
     /// Lease version of the writer that published this root.
     pub lease_version: u64,
     /// Highest indexed transaction.
@@ -384,7 +406,10 @@ impl DbRoot {
     /// Encodes the root for the root store.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = format!("{}\n{}\n", self.lease_version, self.index_basis_t);
+        let mut out = format!(
+            "corium-root-v{}\n{}\n{}\n",
+            self.format_version, self.lease_version, self.index_basis_t
+        );
         match &self.roots {
             Some(roots) => {
                 for root in roots {
@@ -402,7 +427,17 @@ impl DbRoot {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
         let mut lines = text.lines();
-        let lease_version = lines.next()?.parse().ok()?;
+        let first = lines.next()?;
+        let (format_version, lease_version) =
+            if let Some(version) = first.strip_prefix("corium-root-v") {
+                let format_version = version.parse().ok()?;
+                let lease_version = lines.next()?.parse().ok()?;
+                (format_version, lease_version)
+            } else {
+                // M1-M5 roots had no header. Keep them readable as format v1 so
+                // an existing database can be upgraded in place.
+                (FORMAT_VERSION, first.parse().ok()?)
+            };
         let index_basis_t = lines.next()?.parse().ok()?;
         let ids: Vec<&str> = lines.take(4).collect();
         if ids.len() != 4 {
@@ -419,6 +454,7 @@ impl DbRoot {
             ])
         };
         Some(Self {
+            format_version,
             lease_version,
             index_basis_t,
             roots,
@@ -433,6 +469,8 @@ pub struct GcReport {
     pub marked: usize,
     /// Number of unreachable blobs deleted.
     pub swept: usize,
+    /// Number of unreachable blobs kept because they are inside retention.
+    pub retained: usize,
 }
 
 /// Marks blobs reachable from `live_roots` and deletes every unmarked blob.
@@ -448,6 +486,27 @@ pub fn mark_and_sweep(
     live_roots: impl IntoIterator<Item = BlobId>,
     mut children: impl FnMut(&BlobId, &[u8]) -> Result<Vec<BlobId>, StoreError>,
 ) -> Result<GcReport, StoreError> {
+    mark_and_sweep_retained(
+        store,
+        live_roots,
+        &mut children,
+        Duration::ZERO,
+        SystemTime::now(),
+    )
+}
+
+/// Marks reachable blobs and deletes only unreachable blobs older than
+/// `retention` relative to `now`.
+///
+/// # Errors
+/// Returns an error if a blob operation or child-reference decode fails.
+pub fn mark_and_sweep_retained(
+    store: &dyn BlobStore,
+    live_roots: impl IntoIterator<Item = BlobId>,
+    mut children: impl FnMut(&BlobId, &[u8]) -> Result<Vec<BlobId>, StoreError>,
+    retention: Duration,
+    now: SystemTime,
+) -> Result<GcReport, StoreError> {
     let mut marked = HashSet::new();
     let mut pending = live_roots.into_iter().collect::<Vec<_>>();
     while let Some(id) = pending.pop() {
@@ -461,15 +520,28 @@ pub fn mark_and_sweep(
     }
 
     let mut swept = 0;
+    let mut retained = 0;
     for id in store.list()? {
         if !marked.contains(&id) {
-            store.delete(&id)?;
-            swept += 1;
+            // A zero window is the explicit immediate-sweep escape hatch and
+            // does not require backend timestamp support. Otherwise, unknown
+            // timestamps fail safe by retaining the blob.
+            let old_enough = retention.is_zero()
+                || store.modified_at(&id)?.is_some_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() >= retention
+                });
+            if old_enough {
+                store.delete(&id)?;
+                swept += 1;
+            } else {
+                retained += 1;
+            }
         }
     }
     Ok(GcReport {
         marked: marked.len(),
         swept,
+        retained,
     })
 }
 

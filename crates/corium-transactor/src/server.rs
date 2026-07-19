@@ -24,7 +24,9 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::Codec(_)
         | NodeError::TxForm(_)
         | NodeError::SchemaForm(_) => Status::invalid_argument(error.to_string()),
-        NodeError::Deposed(_) => Status::failed_precondition(error.to_string()),
+        NodeError::Deposed(_) | NodeError::UnsupportedFormat { .. } => {
+            Status::failed_precondition(error.to_string())
+        }
         NodeError::Transact(inner) => match inner {
             crate::TransactError::Tx(_) => Status::invalid_argument(inner.to_string()),
             crate::TransactError::Deposed { .. } => Status::failed_precondition(inner.to_string()),
@@ -254,17 +256,23 @@ impl Catalog for CatalogSvc {
 
     async fn gc_deleted_databases(
         &self,
-        _request: Request<pb::GcDeletedDatabasesRequest>,
+        request: Request<pb::GcDeletedDatabasesRequest>,
     ) -> Result<Response<pb::GcDeletedDatabasesResponse>, Status> {
-        let swept_blobs = self
-            .0
-            .gc_deleted()
-            .await
-            .map_err(|error| to_status(&error))?;
+        let swept = match requested_gc_retention(request.into_inner()) {
+            None => self.0.gc_deleted().await,
+            Some(retention) => self.0.gc_deleted_with_retention(retention).await,
+        };
+        let swept_blobs = swept.map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::GcDeletedDatabasesResponse {
             swept_blobs,
         }))
     }
+}
+
+fn requested_gc_retention(request: pb::GcDeletedDatabasesRequest) -> Option<std::time::Duration> {
+    request
+        .retention_millis
+        .map(std::time::Duration::from_millis)
 }
 
 /// Serves the transactor and catalog services until `shutdown` resolves.
@@ -294,4 +302,32 @@ pub async fn serve(
         ))
         .serve_with_shutdown(addr, shutdown)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_retention_distinguishes_default_zero_and_subsecond() {
+        let default = pb::GcDeletedDatabasesRequest {
+            retention_millis: None,
+        };
+        let immediate = pb::GcDeletedDatabasesRequest {
+            retention_millis: Some(0),
+        };
+        let subsecond = pb::GcDeletedDatabasesRequest {
+            retention_millis: Some(500),
+        };
+
+        assert_eq!(requested_gc_retention(default), None);
+        assert_eq!(
+            requested_gc_retention(immediate),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            requested_gc_retention(subsecond),
+            Some(std::time::Duration::from_millis(500))
+        );
+    }
 }

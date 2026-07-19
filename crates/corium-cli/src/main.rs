@@ -1,5 +1,8 @@
 //! `corium` — launchers and admin commands for the distributed topology:
-//! `transactor`, `peer-server`, `db *`, `gc`, and `log`.
+//! `transactor`, `peer-server`, `db *`, `console`, backup/restore, `gc`, and `log`.
+
+mod console;
+mod metrics_http;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,22 +10,31 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_core::KeywordInterner;
 use corium_peer::server::PeerServerConfig;
 use corium_peer::{Admin, ConnectConfig, Connection};
 use corium_protocol::auth::{StaticToken, client_tls, server_tls};
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
-use corium_store::{DbRoot, FsStore, RootStore, mark_and_sweep};
+use corium_store::{DbRoot, FsStore, RootStore};
 use corium_transactor::node::{NodeConfig, TransactorNode};
 
 /// Corium database system command line.
 #[derive(Parser)]
 #[command(name = "corium", version, about)]
 struct Cli {
+    /// Log rendering for tracing events.
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Human)]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LogFormat {
+    Human,
+    Json,
 }
 
 /// Client-side connection flags (endpoint, auth, TLS).
@@ -107,6 +119,15 @@ enum Command {
         /// Interval between subscription heartbeats (ms).
         #[arg(long, default_value_t = 10_000)]
         heartbeat_ms: u64,
+        /// Prometheus HTTP listen address (`/metrics`); disabled when omitted.
+        #[arg(long)]
+        metrics_listen: Option<SocketAddr>,
+        /// Scheduled GC interval (for example `1h`); `off` disables it.
+        #[arg(long, default_value = "1h")]
+        gc_interval: String,
+        /// Retain unreachable blobs for at least this long.
+        #[arg(long, default_value = "72h")]
+        gc_window: String,
         /// Fuel budget per database-function invocation (function applications).
         #[arg(long, default_value_t = 1_000_000)]
         db_fn_fuel: u64,
@@ -127,6 +148,9 @@ enum Command {
         /// Fuel ceiling per query (datoms touched).
         #[arg(long, default_value_t = 10_000_000)]
         max_fuel: u64,
+        /// Prometheus HTTP listen address (`/metrics`); disabled when omitted.
+        #[arg(long)]
+        metrics_listen: Option<SocketAddr>,
         #[command(flatten)]
         client: ClientFlags,
         #[command(flatten)]
@@ -152,6 +176,37 @@ enum Command {
         /// Domain name expected on the server certificate.
         #[arg(long)]
         tls_domain: Option<String>,
+        /// Retain unreachable blobs newer than this window (offline and online).
+        #[arg(long, default_value = "72h")]
+        window: String,
+    },
+    /// Create or incrementally refresh an offline database backup.
+    Backup {
+        /// Source transactor data directory (transactor must be stopped).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Database name.
+        db: String,
+        /// Backup directory; reusing it performs an incremental backup.
+        destination: PathBuf,
+    },
+    /// Restore a backup, optionally under a new database name (clone).
+    Restore {
+        /// Backup directory.
+        source: PathBuf,
+        /// Target transactor data directory (transactor must be stopped).
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Target database name; may differ from the backed-up source name.
+        #[arg(long)]
+        as_db: String,
+    },
+    /// Open an interactive peer-local Datalog console.
+    Console {
+        /// Database name.
+        db: String,
+        #[command(flatten)]
+        client: ClientFlags,
     },
     /// Print committed transactions from a data directory's log.
     Log {
@@ -210,7 +265,9 @@ async fn main() -> ExitCode {
     // auto-select a process-level provider; pin `ring` explicitly before any
     // TLS setup.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    match run(Cli::parse()).await {
+    let cli = Cli::parse();
+    init_logging(cli.log_format);
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("corium: {message}");
@@ -230,6 +287,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             lease_wait_ms,
             index_interval_ms,
             heartbeat_ms,
+            metrics_listen,
+            gc_interval,
+            gc_window,
             db_fn_fuel,
             db_fn_deadline_ms,
             serve,
@@ -242,6 +302,12 @@ async fn run(cli: Cli) -> Result<(), String> {
             config.lease_wait_ms = lease_wait_ms;
             config.index_interval = Duration::from_millis(index_interval_ms);
             config.heartbeat_interval = Duration::from_millis(heartbeat_ms);
+            config.gc_interval = if gc_interval == "off" {
+                None
+            } else {
+                Some(parse_duration(&gc_interval)?)
+            };
+            config.gc_retention = parse_duration(&gc_window)?;
             config.tx_fn_expander = Some(Arc::new(corium_cljrs::dbfn::DbFnExpander::new(
                 corium_cljrs::sandbox::SandboxBudget {
                     fuel: db_fn_fuel,
@@ -253,7 +319,20 @@ async fn run(cli: Cli) -> Result<(), String> {
             let authenticator = serve.authenticator();
             let node = TransactorNode::open(config)
                 .map_err(|error| format!("cannot open node: {error}"))?;
+            let _metrics = if let Some(address) = metrics_listen {
+                let metrics_node = Arc::clone(&node);
+                Some(
+                    metrics_http::spawn(
+                        address,
+                        Arc::new(move || metrics_node.metrics().prometheus()),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
             let mut shutdown = node.shutdown_watch();
+            tracing::info!(%listen, databases = ?node.list_dbs(), "transactor serving");
             eprintln!(
                 "corium transactor: serving {:?} on {listen}",
                 node.list_dbs()
@@ -280,6 +359,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             db,
             listen,
             max_fuel,
+            metrics_listen,
             client,
             serve,
         } => {
@@ -297,19 +377,23 @@ async fn run(cli: Cli) -> Result<(), String> {
                 "corium peer-server: hosting {:?} on {listen}",
                 connection.db_name()
             );
-            corium_peer::server::serve(
+            let service = corium_peer::server::PeerServerSvc::new(
                 connection,
-                listen,
-                authenticator,
-                tls,
                 PeerServerConfig {
                     max_fuel,
                     ..PeerServerConfig::default()
                 },
-                async {
-                    let _ = tokio::signal::ctrl_c().await;
-                },
-            )
+            );
+            let metrics = service.metrics();
+            let _metrics = if let Some(address) = metrics_listen {
+                Some(metrics_http::spawn(address, Arc::new(move || metrics.prometheus())).await?)
+            } else {
+                None
+            };
+            tracing::info!(%listen, "peer server serving");
+            corium_peer::server::serve_service(service, listen, authenticator, tls, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
             .await
             .map_err(|error| error.to_string())
         }
@@ -320,6 +404,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             token,
             ca,
             tls_domain,
+            window,
         } => match (data_dir, transactor) {
             (Some(data_dir), None) => {
                 let store = FsStore::open(data_dir.join("store"))
@@ -335,9 +420,18 @@ async fn run(cli: Cli) -> Result<(), String> {
                         live.extend(root.roots.into_iter().flatten());
                     }
                 }
-                let report = mark_and_sweep(&store, live, |_, _| Ok(Vec::new()))
-                    .map_err(|error| error.to_string())?;
-                println!("{{:marked {} :swept {}}}", report.marked, report.swept);
+                let report = corium_store::mark_and_sweep_retained(
+                    &store,
+                    live,
+                    |_, _| Ok(Vec::new()),
+                    parse_duration(&window)?,
+                    std::time::SystemTime::now(),
+                )
+                .map_err(|error| error.to_string())?;
+                println!(
+                    "{{:marked {} :swept {} :retained {}}}",
+                    report.marked, report.swept, report.retained
+                );
                 Ok(())
             }
             (None, Some(endpoint)) => {
@@ -352,7 +446,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                         .await
                         .map_err(|error| error.to_string())?;
                 let swept = admin
-                    .gc_deleted_databases()
+                    .gc_deleted_databases_with_retention(Some(parse_duration(&window)?))
                     .await
                     .map_err(|error| error.to_string())?;
                 println!("{{:swept {swept}}}");
@@ -360,6 +454,46 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             _ => Err("pass exactly one of --data-dir (offline) or --transactor".into()),
         },
+        Command::Backup {
+            data_dir,
+            db,
+            destination,
+        } => {
+            let report = corium_transactor::backup::backup(data_dir, &db, destination)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{{:db {db:?} :basis-t {} :index-basis-t {} :copied-blobs {} :reused-blobs {}}}",
+                report.basis_t, report.index_basis_t, report.copied_blobs, report.reused_blobs
+            );
+            Ok(())
+        }
+        Command::Restore {
+            source,
+            data_dir,
+            as_db,
+        } => {
+            let report = corium_transactor::backup::restore(source, data_dir, &as_db)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{{:source-db {:?} :db {:?} :basis-t {} :copied-blobs {} :reused-blobs {}}}",
+                report.source_db,
+                report.target_db,
+                report.basis_t,
+                report.copied_blobs,
+                report.reused_blobs
+            );
+            Ok(())
+        }
+        Command::Console { db, client } => {
+            let tls = client.tls()?;
+            let mut config = ConnectConfig::new(client.transactor, db);
+            config.token = client.token;
+            config.tls = tls;
+            let connection = Connection::connect(config)
+                .await
+                .map_err(|error| format!("cannot connect to transactor: {error}"))?;
+            console::run(&connection).await
+        }
         Command::Log {
             data_dir,
             db,
@@ -367,6 +501,45 @@ async fn run(cli: Cli) -> Result<(), String> {
             to,
         } => run_log(&data_dir, &db, from, to),
     }
+}
+
+fn init_logging(format: LogFormat) {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    match format {
+        LogFormat::Human => {
+            let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        }
+        LogFormat::Json => {
+            let _ = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .try_init();
+        }
+    }
+}
+
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let split = text
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(text.len());
+    let amount: u64 = text[..split]
+        .parse()
+        .map_err(|_| format!("invalid duration {text:?}"))?;
+    let unit = &text[split..];
+    let seconds = match unit {
+        "ms" => return Ok(Duration::from_millis(amount)),
+        "s" | "" => amount,
+        "m" => amount.saturating_mul(60),
+        "h" => amount.saturating_mul(60 * 60),
+        "d" => amount.saturating_mul(24 * 60 * 60),
+        _ => {
+            return Err(format!(
+                "invalid duration unit in {text:?}; use ms, s, m, h, or d"
+            ));
+        }
+    };
+    Ok(Duration::from_secs(seconds))
 }
 
 async fn run_db(command: DbCommand) -> Result<(), String> {
@@ -437,13 +610,23 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             let db = connection.sync().await.map_err(|error| error.to_string())?;
             let stats = db.stats();
+            let status_response = connection
+                .status()
+                .await
+                .map_err(|error| error.to_string())?;
             println!(
-                "{{:basis-t {} :index-basis-t {} :datoms {} :entities {} :attributes {}}}",
+                "{{:basis-t {} :index-basis-t {} :datoms {} :entities {} :attributes {} :index-lag {} :tx-count {} :tx-failures {} :tx-queue-depth {} :gc-runs {} :gc-swept-blobs {}}}",
                 db.basis_t(),
                 connection.index_basis_t(),
                 stats.datoms,
                 stats.entities,
-                stats.attributes
+                stats.attributes,
+                status_response.index_lag,
+                status_response.transaction_count,
+                status_response.transaction_failure_count,
+                status_response.transaction_queue_depth,
+                status_response.gc_runs,
+                status_response.gc_swept_blobs,
             );
             Ok(())
         }
