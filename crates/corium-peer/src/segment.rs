@@ -30,10 +30,11 @@ impl<S: BlobStore + RootStore> SegmentSource<S> {
     ///
     /// # Errors
     /// Returns an error when the root store cannot be read.
-    pub fn index_root(&self, db: &str) -> Result<Option<DbRoot>, StoreError> {
+    pub async fn index_root(&self, db: &str) -> Result<Option<DbRoot>, StoreError> {
         Ok(self
             .store
-            .get_root(&db_root_name(db))?
+            .get_root(&db_root_name(db))
+            .await?
             .as_deref()
             .and_then(DbRoot::decode))
     }
@@ -43,7 +44,7 @@ impl<S: BlobStore + RootStore> SegmentSource<S> {
     ///
     /// # Errors
     /// Returns an error when the blob cannot be loaded.
-    pub fn segment(
+    pub async fn segment(
         &self,
         root: &DbRoot,
         order: IndexOrder,
@@ -57,7 +58,9 @@ impl<S: BlobStore + RootStore> SegmentSource<S> {
             IndexOrder::Avet => 2,
             IndexOrder::Vaet => 3,
         };
-        self.cache.get_or_load(self.store.as_ref(), &roots[slot])
+        self.cache
+            .get_or_load(self.store.as_ref(), &roots[slot])
+            .await
     }
 
     /// Decodes a segment's length-prefixed key entries.

@@ -221,12 +221,11 @@ impl Catalog for CatalogSvc {
         request: Request<pb::CreateDatabaseRequest>,
     ) -> Result<Response<pb::CreateDatabaseResponse>, Status> {
         let request = request.into_inner();
-        let node = Arc::clone(&self.0);
-        let created =
-            tokio::task::spawn_blocking(move || node.create_db(&request.db, &request.schema))
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?
-                .map_err(|error| to_status(&error))?;
+        let created = self
+            .0
+            .create_db(&request.db, &request.schema)
+            .await
+            .map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::CreateDatabaseResponse { created }))
     }
 
@@ -235,10 +234,10 @@ impl Catalog for CatalogSvc {
         request: Request<pb::DeleteDatabaseRequest>,
     ) -> Result<Response<pb::DeleteDatabaseResponse>, Status> {
         let request = request.into_inner();
-        let node = Arc::clone(&self.0);
-        let deleted = tokio::task::spawn_blocking(move || node.delete_db(&request.db))
+        let deleted = self
+            .0
+            .delete_db(&request.db)
             .await
-            .map_err(|error| Status::internal(error.to_string()))?
             .map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::DeleteDatabaseResponse { deleted }))
     }

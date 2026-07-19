@@ -57,7 +57,9 @@ fn api_surface_from_cljrs() {
     config.lease_ttl_ms = 600_000;
     config.index_interval = Duration::from_secs(600);
     config.heartbeat_interval = Duration::from_secs(600);
-    let node = TransactorNode::open(config).expect("open node");
+    let node = runtime
+        .block_on(TransactorNode::open(config))
+        .expect("open node");
     let port = TcpListener::bind("127.0.0.1:0")
         .expect("bind")
         .local_addr()

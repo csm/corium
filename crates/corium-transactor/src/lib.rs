@@ -45,6 +45,9 @@ pub enum TransactError {
     /// System clock predates the Unix epoch.
     #[error("system clock is before Unix epoch")]
     Clock,
+    /// An index-building worker failed before returning its result.
+    #[error("index task failed: {0}")]
+    IndexTask(String),
     /// A newer lease version owns the database root; this writer is deposed.
     #[error("deposed: database root is owned by lease version {published}")]
     Deposed {
@@ -200,7 +203,7 @@ impl EmbeddedTransactor {
     ///
     /// # Errors
     /// Returns an error if a blob upload, root read, or fenced publication fails.
-    pub fn publish_indexes(
+    pub async fn publish_indexes(
         &self,
         store: &(impl BlobStore + RootStore),
         root_name: &str,
@@ -208,20 +211,30 @@ impl EmbeddedTransactor {
     ) -> Result<DbRoot, TransactError> {
         let snapshot = self.db();
         let datoms = snapshot.datoms();
+        let segments = tokio::task::spawn_blocking(move || {
+            [
+                IndexOrder::Eavt,
+                IndexOrder::Aevt,
+                IndexOrder::Avet,
+                IndexOrder::Vaet,
+            ]
+            .into_iter()
+            .map(|order| {
+                let segment = Segment::build(order, datoms.clone());
+                let mut bytes = Vec::new();
+                for (key, _) in segment.entries() {
+                    bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
+                    bytes.extend_from_slice(key);
+                }
+                bytes
+            })
+            .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|error| TransactError::IndexTask(error.to_string()))?;
         let mut ids = Vec::new();
-        for order in [
-            IndexOrder::Eavt,
-            IndexOrder::Aevt,
-            IndexOrder::Avet,
-            IndexOrder::Vaet,
-        ] {
-            let segment = Segment::build(order, datoms.clone());
-            let mut bytes = Vec::new();
-            for (key, _) in segment.entries() {
-                bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
-                bytes.extend_from_slice(key);
-            }
-            ids.push(store.put(&bytes)?);
+        for bytes in segments {
+            ids.push(store.put(&bytes).await?);
         }
         let root = DbRoot {
             lease_version,
@@ -233,7 +246,7 @@ impl EmbeddedTransactor {
                 ids[3].clone(),
             ]),
         };
-        publish_root(store, root_name, &root)?;
+        publish_root(store, root_name, &root).await?;
         Ok(root)
     }
 }
@@ -244,14 +257,14 @@ impl EmbeddedTransactor {
 /// # Errors
 /// Returns [`TransactError::Deposed`] when a newer lease version owns the
 /// root, or a store error when the CAS cannot be completed.
-pub fn publish_root(
+pub async fn publish_root(
     store: &dyn RootStore,
     root_name: &str,
     root: &DbRoot,
 ) -> Result<(), TransactError> {
     let encoded = root.encode();
     loop {
-        let previous = store.get_root(root_name)?;
+        let previous = store.get_root(root_name).await?;
         if let Some(stored) = previous.as_deref().and_then(DbRoot::decode) {
             if stored.lease_version > root.lease_version {
                 return Err(TransactError::Deposed {
@@ -264,7 +277,10 @@ pub fn publish_root(
                 return Ok(());
             }
         }
-        match store.cas_root(root_name, previous.as_deref(), &encoded) {
+        match store
+            .cas_root(root_name, previous.as_deref(), &encoded)
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(StoreError::CasFailed { .. }) => {}
             Err(error) => return Err(error.into()),

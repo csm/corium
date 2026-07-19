@@ -78,7 +78,7 @@ pub enum LeaseError {
 ///
 /// # Errors
 /// Returns [`LeaseError::Held`] while another owner's lease is unexpired.
-pub fn acquire(
+pub async fn acquire(
     store: &dyn RootStore,
     db: &str,
     owner: &str,
@@ -87,7 +87,7 @@ pub fn acquire(
 ) -> Result<Lease, LeaseError> {
     let name = lease_root(db);
     loop {
-        let current = store.get_root(&name)?;
+        let current = store.get_root(&name).await?;
         let decoded = current.as_deref().and_then(Lease::decode);
         let version = match &decoded {
             Some(lease) if lease.owner == owner => lease.version,
@@ -105,7 +105,10 @@ pub fn acquire(
             version,
             expires_unix_ms: now_unix_ms + ttl_ms,
         };
-        match store.cas_root(&name, current.as_deref(), &next.encode()) {
+        match store
+            .cas_root(&name, current.as_deref(), &next.encode())
+            .await
+        {
             Ok(()) => return Ok(next),
             Err(StoreError::CasFailed { .. }) => {}
             Err(error) => return Err(error.into()),
@@ -118,7 +121,7 @@ pub fn acquire(
 ///
 /// # Errors
 /// Returns [`LeaseError::Lost`] on any ownership change.
-pub fn renew(
+pub async fn renew(
     store: &dyn RootStore,
     db: &str,
     held: &Lease,
@@ -126,7 +129,7 @@ pub fn renew(
     now_unix_ms: i64,
 ) -> Result<Lease, LeaseError> {
     let name = lease_root(db);
-    let current = store.get_root(&name)?;
+    let current = store.get_root(&name).await?;
     if current.as_deref() != Some(held.encode().as_slice()) {
         return Err(LeaseError::Lost);
     }
@@ -135,7 +138,10 @@ pub fn renew(
         version: held.version,
         expires_unix_ms: now_unix_ms + ttl_ms,
     };
-    match store.cas_root(&name, current.as_deref(), &next.encode()) {
+    match store
+        .cas_root(&name, current.as_deref(), &next.encode())
+        .await
+    {
         Ok(()) => Ok(next),
         Err(StoreError::CasFailed { .. }) => Err(LeaseError::Lost),
         Err(error) => Err(error.into()),
@@ -147,9 +153,9 @@ pub fn renew(
 ///
 /// # Errors
 /// Returns [`LeaseError::Lost`] when the lease is no longer held.
-pub fn release(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), LeaseError> {
+pub async fn release(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), LeaseError> {
     let name = lease_root(db);
-    let current = store.get_root(&name)?;
+    let current = store.get_root(&name).await?;
     if current.as_deref() != Some(held.encode().as_slice()) {
         return Err(LeaseError::Lost);
     }
@@ -157,7 +163,10 @@ pub fn release(store: &dyn RootStore, db: &str, held: &Lease) -> Result<(), Leas
         expires_unix_ms: 0,
         ..held.clone()
     };
-    match store.cas_root(&name, current.as_deref(), &expired.encode()) {
+    match store
+        .cas_root(&name, current.as_deref(), &expired.encode())
+        .await
+    {
         Ok(()) => Ok(()),
         Err(StoreError::CasFailed { .. }) => Err(LeaseError::Lost),
         Err(error) => Err(error.into()),

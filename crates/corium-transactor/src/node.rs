@@ -209,12 +209,12 @@ impl DbState {
         Ok(self.log.tx_range(start, end)?)
     }
 
-    fn check_lease(&self, store: &dyn RootStore) -> Result<Lease, NodeError> {
+    async fn check_lease(&self, store: &dyn RootStore) -> Result<Lease, NodeError> {
         if self.deposed.load(Ordering::Acquire) {
             return Err(NodeError::Deposed(self.name.clone()));
         }
         let held = self.lease();
-        let stored = store.get_root(&lease::lease_root(&self.name))?;
+        let stored = store.get_root(&lease::lease_root(&self.name)).await?;
         if stored.as_deref() == Some(held.encode().as_slice()) {
             Ok(held)
         } else {
@@ -296,7 +296,7 @@ impl TransactorNode {
     /// # Errors
     /// Returns an error when the store cannot be opened or a database cannot
     /// be recovered.
-    pub fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
+    pub async fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
         let store = Arc::new(FsStore::open(config.data_dir.join("store"))?);
         let node = Arc::new(Self {
             config,
@@ -307,12 +307,13 @@ impl TransactorNode {
         });
         let names: Vec<String> = node
             .store
-            .list_roots("meta:")?
+            .list_roots("meta:")
+            .await?
             .into_iter()
             .filter_map(|root| root.strip_prefix("meta:").map(str::to_owned))
             .collect();
         for name in names {
-            let state = node.open_db(&name)?;
+            let state = node.open_db(&name).await?;
             node.dbs
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -353,7 +354,7 @@ impl TransactorNode {
             .join(format!("{name}.log"))
     }
 
-    fn acquire_with_wait(&self, name: &str) -> Result<Lease, NodeError> {
+    async fn acquire_with_wait(&self, name: &str) -> Result<Lease, NodeError> {
         let deadline = now_unix_ms() + self.config.lease_wait_ms;
         loop {
             match lease::acquire(
@@ -362,29 +363,33 @@ impl TransactorNode {
                 &self.config.owner,
                 self.config.lease_ttl_ms,
                 now_unix_ms(),
-            ) {
+            )
+            .await
+            {
                 Ok(held) => return Ok(held),
                 Err(LeaseError::Held { .. }) if now_unix_ms() < deadline => {
-                    std::thread::sleep(Duration::from_millis(200));
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
     }
 
-    fn open_db(self: &Arc<Self>, name: &str) -> Result<Arc<DbState>, NodeError> {
+    async fn open_db(self: &Arc<Self>, name: &str) -> Result<Arc<DbState>, NodeError> {
         let meta = self
             .store
-            .get_root(&meta_root_name(name))?
+            .get_root(&meta_root_name(name))
+            .await?
             .ok_or_else(|| NodeError::UnknownDb(name.to_owned()))?;
         let (schema, idents, interner) = decode_meta(&meta)?;
-        let held = self.acquire_with_wait(name)?;
+        let held = self.acquire_with_wait(name).await?;
         // Fence bump: ensure the db root carries our lease version so any
         // deposed writer's pending CAS fails and observes the new version.
         let root_name = db_root_name(name);
         let current = self
             .store
-            .get_root(&root_name)?
+            .get_root(&root_name)
+            .await?
             .as_deref()
             .and_then(DbRoot::decode);
         if current
@@ -399,7 +404,8 @@ impl TransactorNode {
                     index_basis_t: current.as_ref().map_or(0, |root| root.index_basis_t),
                     roots: current.and_then(|root| root.roots),
                 },
-            )?;
+            )
+            .await?;
         }
         let log = Arc::new(FileLog::open(self.log_path(name))?);
         let base = Db::new(schema.clone()).with_naming(idents.clone(), interner.clone());
@@ -407,7 +413,8 @@ impl TransactorNode {
         let basis_t = transactor.db().basis_t();
         let index_basis = self
             .store
-            .get_root(&root_name)?
+            .get_root(&root_name)
+            .await?
             .as_deref()
             .and_then(DbRoot::decode)
             .map_or(0, |root| root.index_basis_t);
@@ -445,24 +452,25 @@ impl TransactorNode {
                 if db.deposed.load(Ordering::Acquire) {
                     return;
                 }
+                // Serialize the root update and local held-lease update with
+                // transaction lease checks so they cannot observe different
+                // renewal generations and falsely depose this node.
+                let _commit = db.commit.lock().await;
                 let held = db.lease();
-                let store = Arc::clone(&node.store);
                 let name = db.name.clone();
-                let renewed = tokio::task::spawn_blocking(move || {
-                    lease::renew(store.as_ref(), &name, &held, ttl, now_unix_ms())
-                })
-                .await;
+                let renewed =
+                    lease::renew(node.store.as_ref(), &name, &held, ttl, now_unix_ms()).await;
                 match renewed {
-                    Ok(Ok(renewed)) => {
+                    Ok(renewed) => {
                         *db.held_lease
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = renewed;
                     }
-                    Ok(Err(LeaseError::Lost)) => {
+                    Err(LeaseError::Lost) => {
                         node.depose(&db, "write lease lost");
                         return;
                     }
-                    Ok(Err(_)) | Err(_) => {}
+                    Err(_) => {}
                 }
             }
         });
@@ -481,18 +489,14 @@ impl TransactorNode {
                     continue;
                 }
                 let _gc = node.gc_lock.lock().await;
-                let store = Arc::clone(&node.store);
                 let version = db.lease().version;
                 let root_name = db_root_name(&db.name);
-                let worker = Arc::clone(&db);
-                let published = tokio::task::spawn_blocking(move || {
-                    worker
-                        .transactor
-                        .publish_indexes(store.as_ref(), &root_name, version)
-                })
-                .await;
+                let published = db
+                    .transactor
+                    .publish_indexes(node.store.as_ref(), &root_name, version)
+                    .await;
                 match published {
-                    Ok(Ok(root)) => {
+                    Ok(root) => {
                         db.index_basis.store(root.index_basis_t, Ordering::Release);
                         let _ = db.broadcast.send(pb::subscribe_item::Item::IndexBasis(
                             pb::IndexBasis {
@@ -500,11 +504,11 @@ impl TransactorNode {
                             },
                         ));
                     }
-                    Ok(Err(TransactError::Deposed { .. })) => {
+                    Err(TransactError::Deposed { .. }) => {
                         node.depose(&db, "database root fenced by a newer lease");
                         return;
                     }
-                    Ok(Err(_)) | Err(_) => {}
+                    Err(_) => {}
                 }
             }
         });
@@ -546,7 +550,11 @@ impl TransactorNode {
     ///
     /// # Errors
     /// Returns an error for invalid names/schema or store failures.
-    pub fn create_db(self: &Arc<Self>, name: &str, schema_edn: &[u8]) -> Result<bool, NodeError> {
+    pub async fn create_db(
+        self: &Arc<Self>,
+        name: &str,
+        schema_edn: &[u8],
+    ) -> Result<bool, NodeError> {
         if !valid_db_name(name) {
             return Err(NodeError::InvalidName(name.to_owned()));
         }
@@ -569,12 +577,16 @@ impl TransactorNode {
         };
         let (schema, idents) = schema_from_edn(&forms)?;
         let meta = encode_meta(&schema, &idents, &KeywordInterner::default());
-        match self.store.cas_root(&meta_root_name(name), None, &meta) {
+        match self
+            .store
+            .cas_root(&meta_root_name(name), None, &meta)
+            .await
+        {
             Ok(()) => {}
             Err(StoreError::CasFailed { .. }) => return Ok(false),
             Err(error) => return Err(error.into()),
         }
-        let state = self.open_db(name)?;
+        let state = self.open_db(name).await?;
         self.dbs
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -587,7 +599,7 @@ impl TransactorNode {
     ///
     /// # Errors
     /// Returns an error when roots or the log cannot be removed.
-    pub fn delete_db(&self, name: &str) -> Result<bool, NodeError> {
+    pub async fn delete_db(&self, name: &str) -> Result<bool, NodeError> {
         let Some(state) = self
             .dbs
             .write()
@@ -597,10 +609,11 @@ impl TransactorNode {
             return Ok(false);
         };
         state.deposed.store(true, Ordering::Release);
-        let _ = lease::release(self.store.as_ref(), name, &state.lease());
-        self.store.delete_root(&db_root_name(name))?;
-        self.store.delete_root(&meta_root_name(name))?;
-        self.store.delete_root(&lease::lease_root(name))?;
+        let held = state.lease();
+        let _ = lease::release(self.store.as_ref(), name, &held).await;
+        self.store.delete_root(&db_root_name(name)).await?;
+        self.store.delete_root(&meta_root_name(name)).await?;
+        self.store.delete_root(&lease::lease_root(name)).await?;
         match std::fs::remove_file(self.log_path(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -630,26 +643,22 @@ impl TransactorNode {
     /// Returns an error when the store cannot be enumerated or swept.
     pub async fn gc_deleted(&self) -> Result<u64, NodeError> {
         let _gc = self.gc_lock.lock().await;
-        let store = Arc::clone(&self.store);
-        let swept = tokio::task::spawn_blocking(move || -> Result<u64, NodeError> {
-            let mut live = Vec::new();
-            for root_name in store.list_roots("db:")? {
-                if let Some(root) = store
-                    .get_root(&root_name)?
-                    .as_deref()
-                    .and_then(DbRoot::decode)
-                {
-                    if let Some(roots) = root.roots {
-                        live.extend(roots);
-                    }
+        let mut live = Vec::new();
+        for root_name in self.store.list_roots("db:").await? {
+            if let Some(root) = self
+                .store
+                .get_root(&root_name)
+                .await?
+                .as_deref()
+                .and_then(DbRoot::decode)
+            {
+                if let Some(roots) = root.roots {
+                    live.extend(roots);
                 }
             }
-            let report = mark_and_sweep(store.as_ref(), live, |_, _| Ok(Vec::new()))?;
-            Ok(report.swept as u64)
-        })
-        .await
-        .map_err(|error| NodeError::BadRequest(format!("gc task failed: {error}")))??;
-        Ok(swept)
+        }
+        let report = mark_and_sweep(self.store.as_ref(), live, |_, _| Ok(Vec::new())).await?;
+        Ok(report.swept as u64)
     }
 
     /// Validates, appends, applies, and reports one transaction supplied as
@@ -670,7 +679,7 @@ impl TransactorNode {
             .ok_or_else(|| NodeError::BadRequest("tx-data must be a vector".into()))?
             .to_vec();
         let _commit = state.commit.lock().await;
-        state.check_lease(self.store.as_ref())?;
+        state.check_lease(self.store.as_ref()).await?;
         // Expand user database-function invocations against the
         // db-in-transaction (the value under the commit lock) before native
         // conversion. The expander blocks up to its budget deadline, so it
@@ -707,10 +716,11 @@ impl TransactorNode {
             // reference them; recovery decodes the log against this meta.
             let meta = encode_meta(&schema, &idents, &interner);
             loop {
-                let current = self.store.get_root(&meta_root_name(name))?;
+                let current = self.store.get_root(&meta_root_name(name)).await?;
                 match self
                     .store
                     .cas_root(&meta_root_name(name), current.as_deref(), &meta)
+                    .await
                 {
                     Ok(()) => break,
                     Err(StoreError::CasFailed { .. }) => {}
