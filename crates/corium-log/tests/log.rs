@@ -1,7 +1,7 @@
 //! Durable log conformance tests.
 
 use corium_core::{Datom, EntityId, Value};
-use corium_log::{FileLog, TransactionLog, TxRecord, VersionedLog};
+use corium_log::{FileLog, MemLogRegistry, TransactionLog, TxRecord, VersionedLog};
 use std::io::Write;
 fn record(t: u64) -> TxRecord {
     let signed_t = i64::try_from(t).expect("test transaction fits i64");
@@ -58,6 +58,47 @@ fn torn_tail_from_crash_is_dropped_and_log_stays_appendable() {
         log.replay().expect("replay"),
         vec![record(1), record(2), record(3)]
     );
+}
+
+#[test]
+fn mem_registry_shares_records_across_reopens_and_ranges() {
+    let registry = MemLogRegistry::new();
+    assert!(!registry.exists("db"));
+    let log = registry.open("db", 1);
+    log.append(&record(1)).expect("append 1");
+    log.append(&record(2)).expect("append 2");
+    assert!(registry.exists("db"));
+
+    // Reopening the same name reaches the same records (recovery within a
+    // process), and appends continue past the replayed tail.
+    let reopened = registry.open("db", 1);
+    assert_eq!(
+        reopened.replay().expect("replay"),
+        vec![record(1), record(2)]
+    );
+    reopened.append(&record(3)).expect("append 3");
+    assert_eq!(log.tx_range(2, Some(3)).expect("range"), vec![record(2)]);
+
+    // A clone of the registry shares storage; delete_all clears it.
+    let shared = registry.clone();
+    shared.delete_all("db");
+    assert!(!registry.exists("db"));
+    assert!(registry.open("db", 1).replay().expect("empty").is_empty());
+}
+
+#[test]
+fn mem_versioned_log_applies_the_takeover_cutoff() {
+    let registry = MemLogRegistry::new();
+    let old = registry.open("db", 1);
+    old.append(&record(1)).expect("append 1");
+    // Takeover under version 2 replays t=1 and commits its own t=2.
+    let new = registry.open("db", 2);
+    new.append(&record(2)).expect("new owner's t=2");
+    // The deposed writer's stale append under the older version must lose.
+    let mut stale = record(2);
+    stale.tx_instant = 999;
+    old.append(&stale).expect("stale append is dead");
+    assert_eq!(new.replay().expect("replay"), vec![record(1), record(2)]);
 }
 
 #[test]

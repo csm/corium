@@ -18,6 +18,7 @@ use corium_protocol::auth::{StaticToken, client_tls, server_tls};
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
 use corium_store::{DbRoot, FsStore, RootStore};
+use corium_transactor::StoreSpec;
 use corium_transactor::node::{NodeConfig, TransactorNode};
 
 /// Corium database system command line.
@@ -35,6 +36,20 @@ struct Cli {
 enum LogFormat {
     Human,
     Json,
+}
+
+/// Storage-service backend for a transactor's blobs and roots.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum StoreKind {
+    /// In-memory, ephemeral (single process); the whole database is lost on
+    /// exit. Useful for demos and tests.
+    Mem,
+    /// Filesystem under `--data-dir` (blobs, roots, and logs).
+    #[default]
+    Fs,
+    /// Turso (embeddable `SQLite`) for blobs and roots; the log stays on the
+    /// local filesystem under `--data-dir`. Requires the `turso` feature.
+    Turso,
 }
 
 /// Client-side connection flags (endpoint, auth, TLS).
@@ -117,7 +132,14 @@ impl ServeFlags {
 enum Command {
     /// Run a transactor process over a data directory.
     Transactor {
-        /// Data directory (store, logs).
+        /// Storage-service backend for blobs and roots.
+        #[arg(long, value_enum, default_value_t = StoreKind::Fs)]
+        store: StoreKind,
+        /// Turso database path for `--store turso` (defaults to
+        /// `{data_dir}/store.db`).
+        #[arg(long)]
+        turso_path: Option<PathBuf>,
+        /// Data directory (filesystem store, logs). Ignored by `--store mem`.
         #[arg(long)]
         data_dir: PathBuf,
         /// Listen address.
@@ -308,6 +330,8 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Transactor {
+            store,
+            turso_path,
             data_dir,
             listen,
             owner,
@@ -324,7 +348,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             db_fn_deadline_ms,
             serve,
         } => {
+            let store_spec = store_spec(store, &data_dir, turso_path)?;
             let mut config = NodeConfig::new(data_dir);
+            config.store = store_spec;
             if let Some(owner) = owner {
                 config.owner = owner;
             }
@@ -566,6 +592,40 @@ fn init_logging(format: LogFormat) {
                 .try_init();
         }
     }
+}
+
+/// Resolves the `--store` flag (and its Turso path) into a [`StoreSpec`].
+fn store_spec(
+    store: StoreKind,
+    data_dir: &std::path::Path,
+    turso_path: Option<PathBuf>,
+) -> Result<StoreSpec, String> {
+    match store {
+        StoreKind::Mem => Ok(StoreSpec::Memory),
+        StoreKind::Fs => Ok(StoreSpec::Fs),
+        StoreKind::Turso => turso_spec(data_dir, turso_path),
+    }
+}
+
+#[cfg(feature = "turso")]
+fn turso_spec(
+    data_dir: &std::path::Path,
+    turso_path: Option<PathBuf>,
+) -> Result<StoreSpec, String> {
+    let path = turso_path.unwrap_or_else(|| data_dir.join("store.db"));
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("turso path is not valid UTF-8: {}", path.display()))?
+        .to_owned();
+    Ok(StoreSpec::Turso { path })
+}
+
+#[cfg(not(feature = "turso"))]
+fn turso_spec(
+    _data_dir: &std::path::Path,
+    _turso_path: Option<PathBuf>,
+) -> Result<StoreSpec, String> {
+    Err("this build lacks the Turso backend; rebuild corium-cli with --features turso".into())
 }
 
 fn parse_duration(text: &str) -> Result<Duration, String> {

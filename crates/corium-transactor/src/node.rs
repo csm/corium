@@ -10,17 +10,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corium_core::{KeywordInterner, Schema};
 use corium_db::{Db, Idents};
-use corium_log::{LogError, TransactionLog, TxRecord, VersionedLog};
+use corium_log::{LogError, TransactionLog, TxRecord};
 use corium_protocol::codec::{self, CodecError};
 use corium_protocol::pb;
 use corium_protocol::schemaform::{SchemaFormError, schema_from_edn};
 use corium_protocol::txforms::{TxFormError, tx_items_from_edn};
 use corium_query::edn::Edn;
-use corium_store::{FsStore, RootStore, StoreError, mark_and_sweep_retained};
+use corium_store::{RootStore, StoreError, mark_and_sweep_retained};
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use tracing::Instrument;
 
+use crate::backend::{LogBackend, NodeStore, StoreSpec};
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
 use crate::{DbRoot, EmbeddedTransactor, TransactError, db_root_name};
@@ -42,7 +43,10 @@ pub trait TxFnExpander: Send + Sync {
 /// Node process configuration.
 #[derive(Clone)]
 pub struct NodeConfig {
-    /// Data directory holding the blob/root store and transaction logs.
+    /// Storage-service backend for blobs and roots (`mem`, `fs`, or Turso).
+    pub store: StoreSpec,
+    /// Data directory holding the filesystem blob/root store (for the `fs`
+    /// backend) and the transaction logs (for every non-`mem` backend).
     pub data_dir: PathBuf,
     /// Stable owner identity for lease records.
     pub owner: String,
@@ -72,6 +76,7 @@ pub struct NodeConfig {
 impl std::fmt::Debug for NodeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeConfig")
+            .field("store", &self.store)
             .field("data_dir", &self.data_dir)
             .field("owner", &self.owner)
             .field("lease_ttl_ms", &self.lease_ttl_ms)
@@ -92,6 +97,7 @@ impl NodeConfig {
     #[must_use]
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
+            store: StoreSpec::Fs,
             data_dir,
             owner: format!(
                 "transactor-{}",
@@ -177,7 +183,7 @@ struct Naming {
 pub struct DbState {
     name: String,
     transactor: EmbeddedTransactor,
-    log: Arc<VersionedLog>,
+    log: Arc<dyn TransactionLog>,
     naming: Mutex<Naming>,
     commit: tokio::sync::Mutex<()>,
     broadcast: broadcast::Sender<pb::subscribe_item::Item>,
@@ -271,7 +277,8 @@ impl DbState {
 /// A running transactor node hosting every database under one data directory.
 pub struct TransactorNode {
     config: NodeConfig,
-    store: Arc<FsStore>,
+    store: Arc<NodeStore>,
+    log_backend: LogBackend,
     dbs: std::sync::RwLock<HashMap<String, Arc<DbState>>>,
     /// Databases this node is standing by for (HA mode): the lease is held
     /// elsewhere and the standby poller attempts takeover on expiry.
@@ -345,10 +352,12 @@ impl TransactorNode {
     /// Returns an error when the store cannot be opened or a database cannot
     /// be recovered.
     pub async fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
-        let store = Arc::new(FsStore::open(config.data_dir.join("store"))?);
+        let store = Arc::new(NodeStore::open(&config.store, &config.data_dir).await?);
+        let log_backend = LogBackend::for_spec(&config.store, &config.data_dir);
         let node = Arc::new(Self {
             config,
             store,
+            log_backend,
             dbs: std::sync::RwLock::new(HashMap::new()),
             standby: std::sync::RwLock::new(BTreeSet::new()),
             gc_lock: tokio::sync::Mutex::new(()),
@@ -385,9 +394,9 @@ impl TransactorNode {
         Ok(node)
     }
 
-    /// The node's data-directory store.
+    /// The node's storage-service backend (blobs + roots).
     #[must_use]
-    pub fn store(&self) -> &Arc<FsStore> {
+    pub fn store(&self) -> &Arc<NodeStore> {
         &self.store
     }
 
@@ -512,13 +521,9 @@ impl TransactorNode {
         let held = self.acquire_lease(name).await?;
         // The log tail replay below happens strictly after the fence, so it
         // observes every record a previous owner could ever have acked.
-        let log = Arc::new(VersionedLog::open(
-            self.config.data_dir.join("logs"),
-            name,
-            held.version,
-        )?);
+        let log = self.log_backend.open(name, held.version)?;
         let base = Db::new(schema.clone()).with_naming(idents.clone(), interner.clone());
-        let transactor = EmbeddedTransactor::recover_from(base, Arc::clone(&log) as _)?;
+        let transactor = EmbeddedTransactor::recover_from(base, Arc::clone(&log))?;
         let basis_t = transactor.db().basis_t();
         let index_basis = self
             .store
@@ -841,7 +846,7 @@ impl TransactorNode {
             .remove(name);
         self.store.delete_root(&db_root_name(name)).await?;
         self.store.delete_root(&meta_root_name(name)).await?;
-        VersionedLog::delete_all(self.config.data_dir.join("logs"), name)?;
+        self.log_backend.delete_all(name)?;
         Ok(true)
     }
 

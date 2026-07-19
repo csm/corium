@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio_stream::wrappers::ReceiverStream;
 use turso::{Builder, Database};
 
-use crate::{BlobId, BlobIdStream, BlobStore, StoreError, digest};
+use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
 
 const CREATE_BLOBS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS corium_blobs (
@@ -17,10 +17,21 @@ const CREATE_BLOBS_TABLE: &str = "
     )
 ";
 
-/// Content-addressed blob storage backed by a local Turso database.
+const CREATE_ROOTS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS corium_roots (
+        name TEXT PRIMARY KEY NOT NULL,
+        data BLOB NOT NULL
+    )
+";
+
+/// Content-addressed blob and fenced-root storage backed by a Turso
+/// (embeddable `SQLite`) database.
 ///
-/// Constructing a store creates the `corium_blobs` table when it is absent.
-/// Blobs are immutable and duplicate writes of the same content are ignored.
+/// Constructing a store creates the `corium_blobs` and `corium_roots`
+/// tables when they are absent. Blobs are immutable and duplicate writes of
+/// the same content are ignored; roots are mutable pointers published with
+/// compare-and-swap fencing (an atomic `BEGIN IMMEDIATE` transaction), so a
+/// single Turso database can back the whole transactor storage service.
 #[derive(Clone)]
 pub struct TursoBlobStore {
     database: Database,
@@ -51,7 +62,9 @@ impl TursoBlobStore {
     ///
     /// Returns an error when the blob table cannot be initialized.
     pub async fn from_database(database: Database) -> Result<Self, StoreError> {
-        database.connect()?.execute(CREATE_BLOBS_TABLE, ()).await?;
+        let connection = database.connect()?;
+        connection.execute(CREATE_BLOBS_TABLE, ()).await?;
+        connection.execute(CREATE_ROOTS_TABLE, ()).await?;
         Ok(Self { database })
     }
 
@@ -163,5 +176,93 @@ impl BlobStore for TursoBlobStore {
                 StoreError::InvalidTursoData(format!("blob timestamp is out of range: {seconds}"))
             })?;
         Ok(Some(timestamp))
+    }
+}
+
+impl TursoBlobStore {
+    /// Reads the current bytes stored for a root name (transaction-local).
+    async fn read_root(
+        connection: &turso::Connection,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut rows = connection
+            .query("SELECT data FROM corium_roots WHERE name = ?1", [name])
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<Vec<u8>>(0)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+#[async_trait]
+impl RootStore for TursoBlobStore {
+    async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Self::read_root(&self.connect()?, name).await
+    }
+
+    async fn cas_root(
+        &self,
+        name: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        let connection = self.connect()?;
+        // An immediate transaction takes the write lock up front so the
+        // read-compare-write fence is atomic against a concurrent writer.
+        connection.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = async {
+            let actual = Self::read_root(&connection, name).await?;
+            if actual.as_deref() != expected {
+                return Err(StoreError::CasFailed {
+                    expected: expected.map(<[u8]>::to_vec),
+                    actual,
+                });
+            }
+            connection
+                .execute(
+                    "INSERT INTO corium_roots (name, data) VALUES (?1, ?2)
+                     ON CONFLICT(name) DO UPDATE SET data = excluded.data",
+                    (name, new),
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            connection.execute("COMMIT", ()).await?;
+        } else {
+            // Roll back the (empty) transaction; the CAS/read error is what
+            // the caller cares about, so ignore a rollback failure.
+            let _ = connection.execute("ROLLBACK", ()).await;
+        }
+        result
+    }
+
+    async fn delete_root(&self, name: &str) -> Result<(), StoreError> {
+        self.connect()?
+            .execute("DELETE FROM corium_roots WHERE name = ?1", [name])
+            .await?;
+        Ok(())
+    }
+
+    async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let connection = self.connect()?;
+        let mut rows = connection
+            .query(
+                "SELECT name FROM corium_roots WHERE name >= ?1 ORDER BY name",
+                [prefix],
+            )
+            .await?;
+        let mut names = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(0)?;
+            if name.starts_with(prefix) {
+                names.push(name);
+            } else {
+                break;
+            }
+        }
+        Ok(names)
     }
 }

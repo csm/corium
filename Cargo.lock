@@ -1118,6 +1118,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "corium-mbrainz"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cljrs-env",
+ "cljrs-gc",
+ "cljrs-interp",
+ "cljrs-reader",
+ "cljrs-value",
+ "corium-cljrs",
+ "corium-peer",
+ "corium-protocol",
+ "corium-query",
+ "rustls",
+ "rustyline",
+ "tokio",
+]
+
+[[package]]
 name = "corium-peer"
 version = "0.1.0"
 dependencies = [

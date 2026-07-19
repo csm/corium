@@ -3,7 +3,7 @@
 
 use std::time::SystemTime;
 
-use corium_store::{BlobStore, StoreError, TursoBlobStore};
+use corium_store::{BlobStore, RootStore, StoreError, TursoBlobStore};
 use tokio_stream::StreamExt;
 
 #[tokio::test]
@@ -60,6 +60,65 @@ async fn turso_blob_store_lists_and_deletes_blobs() {
     store.delete(&first).await.expect("delete missing blob");
     assert!(!store.contains(&first).await.expect("blob was deleted"));
     assert_eq!(store.modified_at(&first).await.expect("missing time"), None);
+}
+
+#[tokio::test]
+async fn turso_root_store_fences_with_compare_and_swap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    let store = TursoBlobStore::open(&path).await.expect("open store");
+
+    assert_eq!(store.get_root("db:main").await.expect("empty root"), None);
+
+    // First publish requires an absent (None) fence.
+    store
+        .cas_root("db:main", None, b"v1")
+        .await
+        .expect("initial publish");
+    assert_eq!(
+        store.get_root("db:main").await.expect("published root"),
+        Some(b"v1".to_vec())
+    );
+
+    // A stale expectation is rejected and leaves the stored value intact.
+    let stale = store.cas_root("db:main", Some(b"wrong"), b"v2").await;
+    assert!(matches!(
+        stale,
+        Err(StoreError::CasFailed { actual: Some(actual), .. }) if actual == b"v1"
+    ));
+    assert_eq!(
+        store.get_root("db:main").await.expect("unchanged root"),
+        Some(b"v1".to_vec())
+    );
+
+    // The correct fence advances the pointer.
+    store
+        .cas_root("db:main", Some(b"v1"), b"v2")
+        .await
+        .expect("fenced update");
+
+    store
+        .cas_root("meta:main", None, b"m1")
+        .await
+        .expect("second root");
+    assert_eq!(
+        store.list_roots("db:").await.expect("prefix scan"),
+        vec!["db:main".to_owned()]
+    );
+
+    store.delete_root("db:main").await.expect("delete root");
+    assert_eq!(store.get_root("db:main").await.expect("deleted root"), None);
+
+    // Roots survive a reopen of the same database file.
+    drop(store);
+    let reopened = TursoBlobStore::open(&path).await.expect("reopen store");
+    assert_eq!(
+        reopened
+            .get_root("meta:main")
+            .await
+            .expect("persisted root"),
+        Some(b"m1".to_vec())
+    );
 }
 
 #[tokio::test]
