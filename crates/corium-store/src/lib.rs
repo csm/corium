@@ -1,4 +1,6 @@
 //! Content-addressed blob and fenced root stores for immutable index segments.
+//!
+//! Enable the `turso` Cargo feature to use [`TursoBlobStore`].
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -15,6 +17,11 @@ use async_trait::async_trait;
 use fs2::FileExt;
 use thiserror::Error;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+
+#[cfg(feature = "turso")]
+mod turso_store;
+#[cfg(feature = "turso")]
+pub use turso_store::TursoBlobStore;
 
 /// A content identifier for immutable blobs.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -67,6 +74,18 @@ pub enum StoreError {
     /// A blocking store worker failed before returning its result.
     #[error("store blocking task failed: {0}")]
     BlockingTask(String),
+    /// Turso database failure.
+    #[cfg(feature = "turso")]
+    #[error("Turso blob store failed: {0}")]
+    Turso(#[from] turso::Error),
+    /// A filesystem path cannot be passed to Turso.
+    #[cfg(feature = "turso")]
+    #[error("Turso database path is not valid UTF-8: {0:?}")]
+    InvalidTursoPath(PathBuf),
+    /// Turso returned invalid blob-store data.
+    #[cfg(feature = "turso")]
+    #[error("Turso blob store contains invalid data: {0}")]
+    InvalidTursoData(String),
 }
 
 /// Asynchronous stream of blob identifiers produced by [`BlobStore::list`].
