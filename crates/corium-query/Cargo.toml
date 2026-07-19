@@ -14,7 +14,6 @@ thiserror = "2"
 
 [dev-dependencies]
 corium-log = { workspace = true }
-corium-transactor = { workspace = true }
 corium-tx = { workspace = true }
 criterion = "0.5"
 proptest = "1"

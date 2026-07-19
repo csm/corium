@@ -7,6 +7,7 @@
 //! block on the transactor. On disconnect it reconnects and resubscribes
 //! from its basis, and the server backfills the gap from the durable log.
 
+pub mod metrics;
 pub mod segment;
 pub mod server;
 
@@ -54,8 +55,12 @@ pub enum PeerError {
 /// Connection configuration.
 #[derive(Clone, Debug)]
 pub struct ConnectConfig {
-    /// Transactor endpoint, e.g. `http://127.0.0.1:4334`.
-    pub endpoint: String,
+    /// Candidate transactor endpoints in preference order, e.g.
+    /// `http://127.0.0.1:4334`. With an HA pair, list the active and every
+    /// standby: the connection sticks to whichever endpoint accepts its
+    /// subscription and rotates through the rest on failure, so failover
+    /// needs no reconfiguration.
+    pub endpoints: Vec<String>,
     /// Database name.
     pub db: String,
     /// Optional bearer token.
@@ -66,19 +71,37 @@ pub struct ConnectConfig {
     pub reconnect_min: Duration,
     /// Maximum reconnect backoff.
     pub reconnect_max: Duration,
+    /// How long [`Connection::transact`] keeps retrying failures that are
+    /// provably pre-commit (standby/deposed rejections, connection
+    /// establishment) while a failover completes. Ambiguous failures — a
+    /// connection that died with the request in flight — are surfaced
+    /// immediately; the transaction may or may not have committed.
+    pub failover_timeout: Duration,
+    /// Heartbeat-silence timeout override. `None` derives three times the
+    /// server-advertised heartbeat interval; streams silent for longer are
+    /// dropped and the connection fails over.
+    pub heartbeat_timeout: Option<Duration>,
 }
 
 impl ConnectConfig {
     /// Plaintext connection with default backoff.
     #[must_use]
     pub fn new(endpoint: impl Into<String>, db: impl Into<String>) -> Self {
+        Self::with_failover(vec![endpoint.into()], db)
+    }
+
+    /// Plaintext connection over an ordered endpoint candidate list.
+    #[must_use]
+    pub fn with_failover(endpoints: Vec<String>, db: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            endpoints,
             db: db.into(),
             token: None,
             tls: None,
             reconnect_min: Duration::from_millis(100),
             reconnect_max: Duration::from_secs(5),
+            failover_timeout: Duration::from_secs(30),
+            heartbeat_timeout: None,
         }
     }
 }
@@ -126,6 +149,24 @@ struct Inner {
     index_basis: watch::Sender<u64>,
     reports: broadcast::Sender<PeerReport>,
     client: Mutex<Client>,
+    /// Index into `config.endpoints` of the endpoint currently serving the
+    /// subscription (and the cached client).
+    endpoint_index: std::sync::atomic::AtomicUsize,
+    /// Server-advertised heartbeat interval (ms); 0 disables the
+    /// heartbeat-silence timeout.
+    heartbeat_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Inner {
+    /// Deadline of stream silence after which the transactor is presumed
+    /// dead and the connection fails over.
+    fn heartbeat_deadline(&self) -> Option<Duration> {
+        if let Some(timeout) = self.config.heartbeat_timeout {
+            return Some(timeout);
+        }
+        let advertised = self.heartbeat_ms.load(std::sync::atomic::Ordering::Relaxed);
+        (advertised > 0).then(|| Duration::from_millis(advertised.saturating_mul(3)))
+    }
 }
 
 /// A live peer connection to a transactor-hosted database.
@@ -140,8 +181,8 @@ impl Drop for Connection {
     }
 }
 
-async fn open_channel(config: &ConnectConfig) -> Result<Channel, PeerError> {
-    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
+async fn open_channel(config: &ConnectConfig, endpoint: &str) -> Result<Channel, PeerError> {
+    let mut endpoint = Endpoint::from_shared(endpoint.to_owned())
         .map_err(|error| PeerError::Protocol(format!("bad endpoint: {error}")))?
         .connect_timeout(Duration::from_secs(10));
     if let Some(tls) = &config.tls {
@@ -156,25 +197,48 @@ fn make_client(channel: Channel, token: Option<String>) -> Client {
 
 impl Connection {
     /// Connects, subscribes from basis 0, and waits until the handshake and
-    /// its backfill have been applied locally.
+    /// its backfill have been applied locally. Candidate endpoints are
+    /// tried in order; a standby transactor rejects the subscription and
+    /// the next candidate is tried.
     ///
     /// # Errors
-    /// Returns [`PeerError`] when the endpoint is unreachable or the
-    /// subscription cannot be established.
+    /// Returns [`PeerError`] when no endpoint accepts the subscription.
     pub async fn connect(config: ConnectConfig) -> Result<Self, PeerError> {
-        let channel = open_channel(&config).await?;
-        let client = make_client(channel, config.token.clone());
+        if config.endpoints.is_empty() {
+            return Err(PeerError::Protocol("no endpoints configured".into()));
+        }
+        // Establish the first subscription before returning so `db()` is
+        // populated and connection errors surface synchronously.
+        let mut last_error = PeerError::Closed;
+        let mut first = None;
+        for (index, endpoint) in config.endpoints.iter().enumerate() {
+            match open_channel(&config, endpoint).await {
+                Ok(channel) => {
+                    let mut client = make_client(channel, config.token.clone());
+                    match subscribe_with(&mut client, &config.db, 0).await {
+                        Ok(stream) => {
+                            first = Some((index, client, stream));
+                            break;
+                        }
+                        Err(error) => last_error = error,
+                    }
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        let Some((index, client, mut stream)) = first else {
+            return Err(last_error);
+        };
         let inner = Arc::new(Inner {
-            config,
             state: RwLock::new(None),
             basis: watch::channel(0).0,
             index_basis: watch::channel(0).0,
             reports: broadcast::channel(1024).0,
-            client: Mutex::new(client.clone()),
+            client: Mutex::new(client),
+            endpoint_index: std::sync::atomic::AtomicUsize::new(index),
+            heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            config,
         });
-        // Establish the first subscription before returning so `db()` is
-        // populated and connection errors surface synchronously.
-        let mut stream = subscribe(&inner, 0).await?;
         let handshake_basis = pump_handshake(&inner, &mut stream).await?;
         drain_until(&inner, &mut stream, handshake_basis).await?;
         let task_inner = Arc::clone(&inner);
@@ -254,12 +318,29 @@ impl Connection {
     /// Submits a transaction (EDN transaction forms) and waits until it is
     /// applied locally, so a following [`Connection::db`] observes it.
     ///
+    /// Failures that are provably pre-commit — a standby or deposed
+    /// transactor rejecting the request, or a connection that could not be
+    /// established — are retried until [`ConnectConfig::failover_timeout`],
+    /// riding out an HA takeover. A connection that dies with the request
+    /// in flight is ambiguous (the transaction may or may not have
+    /// committed) and surfaces as an error, exactly like a transactor
+    /// crash between durability and reply; callers decide whether to check
+    /// and resubmit.
+    ///
     /// # Errors
     /// Returns [`PeerError`] for rejected transactions or transport failure.
     pub async fn transact(&self, forms: Vec<Edn>) -> Result<TxResult, PeerError> {
-        let response = self
-            .transact_raw(codec::encode_edn(&Edn::Vector(forms)))
-            .await?;
+        let tx_data = codec::encode_edn(&Edn::Vector(forms));
+        let deadline = tokio::time::Instant::now() + self.inner.config.failover_timeout;
+        let response = loop {
+            match self.transact_raw(tx_data.clone()).await {
+                Ok(response) => break response,
+                Err(error) if retry_is_safe(&error) && tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(self.inner.config.reconnect_min).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let tempids = decode_tempids(&response.tempids)?;
         let db_after = self.sync_to(response.basis_t).await?;
         Ok(TxResult {
@@ -371,6 +452,29 @@ impl Connection {
     }
 }
 
+/// Whether a transact failure is provably pre-commit and therefore safe to
+/// retry without risking a duplicate transaction.
+fn retry_is_safe(error: &PeerError) -> bool {
+    match error {
+        // The channel could not even be built; no request was sent.
+        PeerError::Transport(_) => true,
+        PeerError::Rpc(status) => match status.code() {
+            // A standby (not lease holder) or freshly deposed transactor
+            // refuses before reaching the commit point.
+            tonic::Code::FailedPrecondition => {
+                let message = status.message();
+                message.contains("standby") || message.contains("deposed")
+            }
+            // Unavailable with a connect-phase source means the request was
+            // never sent. Anything else (a connection that died mid-call)
+            // is ambiguous and must surface.
+            tonic::Code::Unavailable => status.message().contains("connect"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn decode_tempids(bytes: &[u8]) -> Result<BTreeMap<String, EntityId>, PeerError> {
     let Edn::Map(pairs) = codec::decode_edn(bytes)? else {
         return Err(PeerError::Protocol("tempids must be a map".into()));
@@ -386,18 +490,14 @@ fn decode_tempids(bytes: &[u8]) -> Result<BTreeMap<String, EntityId>, PeerError>
     Ok(tempids)
 }
 
-async fn subscribe(
-    inner: &Arc<Inner>,
+async fn subscribe_with(
+    client: &mut Client,
+    db: &str,
     from_basis_t: u64,
 ) -> Result<tonic::Streaming<pb::SubscribeItem>, PeerError> {
-    let mut client = inner
-        .client
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
     Ok(client
         .subscribe(pb::SubscribeRequest {
-            db: inner.config.db.clone(),
+            db: db.to_owned(),
             protocol_version: corium_protocol::PROTOCOL_VERSION,
             from_basis_t,
         })
@@ -422,6 +522,10 @@ async fn pump_handshake(
         ));
     };
     let (schema, idents) = codec::decode_schema(&handshake.schema)?;
+    inner.heartbeat_ms.store(
+        handshake.heartbeat_interval_ms,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     {
         let mut guard = inner
             .state
@@ -509,15 +613,31 @@ fn apply_item(inner: &Arc<Inner>, item: pb::subscribe_item::Item) -> Result<(), 
     Ok(())
 }
 
-/// Long-running consume/reconnect loop: on stream end or error, rebuilds
-/// the channel with exponential backoff and resubscribes from the local
-/// basis; the server backfills the gap.
+/// Long-running consume/reconnect loop: on stream end, error, or heartbeat
+/// silence past the timeout, rebuilds the channel with exponential backoff
+/// and resubscribes from the local basis; the server backfills the gap.
+/// Reconnection rotates through the candidate endpoints, so when the
+/// active transactor dies the loop lands on whichever standby takes over
+/// the lease (a standby rejects the subscription until then).
 async fn run_loop(inner: Arc<Inner>, initial: Option<tonic::Streaming<pb::SubscribeItem>>) {
     let mut stream = initial;
     let mut backoff = inner.config.reconnect_min;
+    let mut candidate = inner
+        .endpoint_index
+        .load(std::sync::atomic::Ordering::Relaxed);
     loop {
         if let Some(active) = stream.as_mut() {
-            match active.message().await {
+            let next = match inner.heartbeat_deadline() {
+                Some(deadline) => match tokio::time::timeout(deadline, active.message()).await {
+                    Ok(next) => next,
+                    // Heartbeat silence: the transactor is presumed dead
+                    // even though the transport has not noticed (partition,
+                    // stalled process); drop the stream and fail over.
+                    Err(_elapsed) => Ok(None),
+                },
+                None => active.message().await,
+            };
+            match next {
                 Ok(Some(item)) => {
                     backoff = inner.config.reconnect_min;
                     if let Some(item) = item.item {
@@ -534,20 +654,33 @@ async fn run_loop(inner: Arc<Inner>, initial: Option<tonic::Streaming<pb::Subscr
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(inner.config.reconnect_max);
-        match open_channel(&inner.config).await {
-            Ok(channel) => {
-                let client = make_client(channel, inner.config.token.clone());
-                *inner
-                    .client
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
-            }
-            Err(_) => continue,
-        }
+        let endpoints = &inner.config.endpoints;
+        let endpoint = &endpoints[candidate % endpoints.len()];
+        let Ok(channel) = open_channel(&inner.config, endpoint).await else {
+            candidate = (candidate + 1) % endpoints.len();
+            continue;
+        };
+        let mut client = make_client(channel, inner.config.token.clone());
         let from = *inner.basis.subscribe().borrow();
-        if let Ok(mut fresh) = subscribe(&inner, from).await {
-            if pump_handshake(&inner, &mut fresh).await.is_ok() {
-                stream = Some(fresh);
+        match subscribe_with(&mut client, &inner.config.db, from).await {
+            Ok(mut fresh) => {
+                if pump_handshake(&inner, &mut fresh).await.is_ok() {
+                    // Sticky success: transact/status/sync now go here too.
+                    *inner
+                        .client
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
+                    inner.endpoint_index.store(
+                        candidate % endpoints.len(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    stream = Some(fresh);
+                } else {
+                    candidate = (candidate + 1) % endpoints.len();
+                }
+            }
+            Err(_) => {
+                candidate = (candidate + 1) % endpoints.len();
             }
         }
     }
@@ -573,7 +706,7 @@ impl Admin {
             token: token.clone(),
             ..ConnectConfig::new(endpoint, "")
         };
-        let channel = open_channel(&config).await?;
+        let channel = open_channel(&config, endpoint).await?;
         Ok(Self {
             client: CatalogClient::with_interceptor(channel, TokenInterceptor::new(token)),
         })
@@ -623,10 +756,38 @@ impl Admin {
     /// # Errors
     /// Returns [`PeerError`] on transport failure.
     pub async fn gc_deleted_databases(&mut self) -> Result<u64, PeerError> {
+        self.gc_deleted_databases_with_retention(None).await
+    }
+
+    /// Sweeps unreachable blobs with an optional minimum retention window.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure.
+    pub async fn gc_deleted_databases_with_retention(
+        &mut self,
+        retention: Option<Duration>,
+    ) -> Result<u64, PeerError> {
         let response = self
             .client
-            .gc_deleted_databases(pb::GcDeletedDatabasesRequest {})
+            .gc_deleted_databases(pb::GcDeletedDatabasesRequest {
+                retention_millis: retention.map(duration_millis),
+            })
             .await?;
         Ok(response.into_inner().swept_blobs)
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gc_retention_wire_value_preserves_zero_and_subseconds() {
+        assert_eq!(duration_millis(Duration::ZERO), 0);
+        assert_eq!(duration_millis(Duration::from_millis(500)), 500);
     }
 }

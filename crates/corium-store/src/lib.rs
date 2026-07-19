@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, RwLock},
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -117,6 +118,15 @@ pub trait BlobStore: Send + Sync {
     ///
     /// Returns an error if the backend cannot enumerate blobs.
     async fn list(&self) -> Result<BlobIdStream, StoreError>;
+    /// Returns the blob's creation/last-modification time when available.
+    /// Backends without timestamps return `None`, which conservatively keeps
+    /// the blob whenever a non-zero retention window is active.
+    ///
+    /// # Errors
+    /// Returns an error if the backend cannot inspect blob metadata.
+    async fn modified_at(&self, _id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
+        Ok(None)
+    }
 }
 
 /// Named root pointer storage with compare-and-swap fencing.
@@ -410,6 +420,16 @@ impl BlobStore for FsStore {
         });
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
+    async fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
+        let store = self.clone();
+        let id = id.clone();
+        run_blocking(move || match fs::metadata(store.blob_path(&id)) {
+            Ok(metadata) => Ok(Some(metadata.modified()?)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        })
+        .await
+    }
 }
 #[async_trait]
 impl RootStore for FsStore {
@@ -500,12 +520,35 @@ pub fn db_root_name(db: &str) -> String {
     format!("db:{db}")
 }
 
-/// Published durable index-root metadata, fenced by lease version
+/// Storage format written by this release.
+///
+/// Format 2 (M7) folds the write lease into the root record so lease
+/// ownership and index publication are fenced by one atomic CAS; format 1
+/// roots (separate `lease:` record) decode with an unowned lease.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Published durable index-root metadata carrying the write lease
 /// (see `docs/design/log-and-transactor.md`).
+///
+/// The lease fields and the index fields live in one record on purpose:
+/// every mutation — lease acquisition, renewal, release, index publication —
+/// is a CAS on these bytes, so a writer whose ownership has changed hands
+/// always fails its next CAS and can never install a root. No cross-record
+/// atomicity is required of the store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DbRoot {
-    /// Lease version of the writer that published this root.
+    /// On-disk format version. Readers reject roots from newer formats.
+    pub format_version: u32,
+    /// Fencing version; increments on every change of lease ownership.
     pub lease_version: u64,
+    /// Owning transactor id; empty when the lease has never been acquired
+    /// under format 2.
+    pub owner: String,
+    /// Lease expiry as Unix milliseconds; `0` when released/never held.
+    pub lease_expires_unix_ms: i64,
+    /// Client endpoint advertised by the owner (for peer lease-holder
+    /// rediscovery); empty when the owner does not advertise one.
+    pub owner_endpoint: String,
     /// Highest indexed transaction.
     pub index_basis_t: u64,
     /// EAVT, AEVT, AVET, and VAET blob ids; `None` before the first index
@@ -513,11 +556,32 @@ pub struct DbRoot {
     pub roots: Option<[BlobId; 4]>,
 }
 
+/// Encodes a possibly empty single-line field.
+fn field_line(out: &mut String, value: &str) {
+    if value.is_empty() {
+        out.push('-');
+    } else {
+        out.push_str(value);
+    }
+    out.push('\n');
+}
+
+fn parse_field(line: &str) -> String {
+    if line == "-" {
+        String::new()
+    } else {
+        line.to_owned()
+    }
+}
+
 impl DbRoot {
     /// Encodes the root for the root store.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = format!("{}\n{}\n", self.lease_version, self.index_basis_t);
+        let mut out = format!(
+            "corium-root-v{}\n{}\n{}\n",
+            self.format_version, self.lease_version, self.index_basis_t
+        );
         match &self.roots {
             Some(roots) => {
                 for root in roots {
@@ -527,17 +591,33 @@ impl DbRoot {
             }
             None => out.push_str("-\n-\n-\n-\n"),
         }
+        field_line(&mut out, &self.owner);
+        out.push_str(&self.lease_expires_unix_ms.to_string());
+        out.push('\n');
+        field_line(&mut out, &self.owner_endpoint);
         out.into_bytes()
     }
 
-    /// Decodes stored root bytes.
+    /// Decodes stored root bytes (any format up to [`FORMAT_VERSION`];
+    /// newer formats still yield their fence fields so old binaries fence
+    /// correctly, and callers reject them via `format_version`).
     #[must_use]
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
         let mut lines = text.lines();
-        let lease_version = lines.next()?.parse().ok()?;
+        let first = lines.next()?;
+        let (format_version, lease_version) =
+            if let Some(version) = first.strip_prefix("corium-root-v") {
+                let format_version = version.parse().ok()?;
+                let lease_version = lines.next()?.parse().ok()?;
+                (format_version, lease_version)
+            } else {
+                // M1-M5 roots had no header. Keep them readable as format v1 so
+                // an existing database can be upgraded in place.
+                (1, first.parse().ok()?)
+            };
         let index_basis_t = lines.next()?.parse().ok()?;
-        let ids: Vec<&str> = lines.take(4).collect();
+        let ids: Vec<&str> = lines.by_ref().take(4).collect();
         if ids.len() != 4 {
             return None;
         }
@@ -551,8 +631,16 @@ impl DbRoot {
                 BlobId::from_hex(ids[3])?,
             ])
         };
+        // Lease fields; absent in format-1 roots.
+        let owner = lines.next().map(parse_field).unwrap_or_default();
+        let lease_expires_unix_ms = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
+        let owner_endpoint = lines.next().map(parse_field).unwrap_or_default();
         Some(Self {
+            format_version,
             lease_version,
+            owner,
+            lease_expires_unix_ms,
+            owner_endpoint,
             index_basis_t,
             roots,
         })
@@ -566,6 +654,8 @@ pub struct GcReport {
     pub marked: usize,
     /// Number of unreachable blobs deleted.
     pub swept: usize,
+    /// Number of unreachable blobs kept because they are inside retention.
+    pub retained: usize,
 }
 
 /// Marks blobs reachable from `live_roots` and deletes every unmarked blob.
@@ -581,6 +671,28 @@ pub async fn mark_and_sweep(
     live_roots: impl IntoIterator<Item = BlobId>,
     mut children: impl FnMut(&BlobId, &[u8]) -> Result<Vec<BlobId>, StoreError>,
 ) -> Result<GcReport, StoreError> {
+    mark_and_sweep_retained(
+        store,
+        live_roots,
+        &mut children,
+        Duration::ZERO,
+        SystemTime::now(),
+    )
+    .await
+}
+
+/// Marks reachable blobs and deletes only unreachable blobs older than
+/// `retention` relative to `now`.
+///
+/// # Errors
+/// Returns an error if a blob operation or child-reference decode fails.
+pub async fn mark_and_sweep_retained(
+    store: &dyn BlobStore,
+    live_roots: impl IntoIterator<Item = BlobId>,
+    mut children: impl FnMut(&BlobId, &[u8]) -> Result<Vec<BlobId>, StoreError>,
+    retention: Duration,
+    now: SystemTime,
+) -> Result<GcReport, StoreError> {
     let mut marked = HashSet::new();
     let mut pending = live_roots.into_iter().collect::<Vec<_>>();
     while let Some(id) = pending.pop() {
@@ -595,17 +707,30 @@ pub async fn mark_and_sweep(
     }
 
     let mut swept = 0;
+    let mut retained = 0;
     let mut ids = store.list().await?;
     while let Some(id) = ids.next().await {
         let id = id?;
         if !marked.contains(&id) {
-            store.delete(&id).await?;
-            swept += 1;
+            // A zero window is the explicit immediate-sweep escape hatch and
+            // does not require backend timestamp support. Otherwise, unknown
+            // timestamps fail safe by retaining the blob.
+            let old_enough = retention.is_zero()
+                || store.modified_at(&id).await?.is_some_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() >= retention
+                });
+            if old_enough {
+                store.delete(&id).await?;
+                swept += 1;
+            } else {
+                retained += 1;
+            }
         }
     }
     Ok(GcReport {
         marked: marked.len(),
         swept,
+        retained,
     })
 }
 

@@ -31,9 +31,15 @@ service Transactor {
 ```
 
 - `Subscribe` is the peer's lifeline: tx-reports, index-basis announcements,
-  and heartbeats are multiplexed on this stream. Disconnect ⇒ peer reconnects
-  (rediscovering the lease holder via the root store) and resubscribes from
-  its basis; the transactor backfills from the log if the gap is large.
+  and heartbeats are multiplexed on this stream. The handshake advertises
+  the server's heartbeat interval; a stream silent for three intervals is
+  presumed dead and dropped even when the transport has not noticed.
+  Disconnect ⇒ peer reconnects, rotating through its endpoint preference
+  list (an HA standby rejects the subscription with a `standby`
+  FAILED_PRECONDITION until it holds the lease; peers with storage
+  credentials can also rediscover the holder's advertised endpoint from the
+  root record) and resubscribes from its basis; the transactor backfills
+  from the log if the gap is large.
 - All requests carry the database name and a protocol version; the transactor
   rejects mismatched `format-version` roots with a clear upgrade error.
 

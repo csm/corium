@@ -303,7 +303,7 @@ async fn node_expands_db_functions() {
         .await
         .expect_err("stale cas through the node");
     assert!(error.to_string().contains("balance changed"), "got {error}");
-    let db = node.db_state("accounts").expect("db state").db();
+    let db = node.db_state("accounts").await.expect("db state").db();
     let name_attr = db
         .idents()
         .entid(&corium_core::Keyword::parse("acct/name"))

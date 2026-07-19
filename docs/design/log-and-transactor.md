@@ -78,23 +78,56 @@ Startup:
 Crash recovery is identical to startup — the log tail replay rebuilds exactly
 the state that existed at the durability point of the last acked transaction.
 
-## HA design (built later, designed now — ADR-0010)
+## High availability (implemented in M7 — ADR-0010)
 
-The lease is a record in the root store: `{owner-id, lease-version, expiry}`,
-renewed by CAS at interval `T/3` for expiry `T`. Fencing rule: **every DbRoot
-CAS carries the lease-version the writer believes it holds; the root store
-impl validates it in the same atomic operation.** A deposed transactor (GC
-pause, partition) that wakes and tries to publish loses the CAS and shuts
-down. This fencing check is in the v1 `RootStore` contract and both v1 impls,
-so single-transactor deployments already exercise the code path with a
+The lease `{owner-id, lease-version, expiry, advertised-endpoint}` lives
+**inside the DbRoot record** (storage format 2), renewed by CAS at interval
+`T/3` for expiry `T`. Because the lease fields and the index roots share one
+record, every mutation — acquisition, renewal, release, index publication —
+is a CAS on the same bytes: acquiring a lapsed lease with a bumped version
+*is* the fence, and a deposed transactor's next CAS necessarily carries
+stale expected bytes and fails. This realizes the design rule "every DbRoot
+CAS validates the lease in the same atomic operation" with nothing beyond
+plain single-record CAS, so no cross-record atomicity is asked of any store
+backend. Single-transactor deployments exercise the identical path with a
 never-contested lease.
 
-The later HA milestone adds: standby process that polls the lease, takes over
-on expiry (replaying the log tail exactly as in crash recovery, since the log
-in shared storage is the truth), and peer reconnect-and-resubscribe to
-whichever owner holds the lease (discovered via the root store). No consensus
-protocol is needed beyond root-store CAS; this matches Datomic's
-active/standby model.
+Two further mechanisms make takeover airtight against the races a lease
+alone cannot see:
+
+- **Post-append fence.** The pipeline re-verifies lease ownership *after*
+  the durable log append and *before* the acknowledgement. If ownership was
+  intact at that check, the append linearizes before any takeover's
+  fence CAS, and the successor's log replay (which runs strictly after its
+  fence) provably contains the record. If ownership was lost, the caller
+  gets an error and the record is never acked — the same contract as a
+  crash between durability and reply.
+- **Lease-versioned log files.** Each owner appends only to
+  `<db>.v<lease-version>.log` (pre-HA `<db>.log` reads as version 0).
+  Readers merge files in version order and discard any record in an older
+  file whose `t` is at or past the first record of a later file: those are
+  exactly a deposed writer's stale, never-acked appends, which therefore
+  cannot interleave with — or fork — the successor's history.
+
+The standby is a transactor started with the same shared storage in HA
+mode: it polls the lease at the renewal cadence, rescans the catalog for
+new databases, and on expiry performs ordinary startup — acquire (fence),
+replay the log tail, serve. Takeover is crash recovery; there is no
+separate code path. A deposed active refuses further work and returns to
+standby by itself. Peers hold an endpoint preference list, rotate on
+failure (a standby rejects subscriptions with a `standby` status), detect
+silent death via handshake-advertised heartbeat intervals, and can
+rediscover the current holder's advertised endpoint from the root record.
+No consensus protocol is needed beyond root-store CAS; this matches
+Datomic's active/standby model.
+
+The M7 acceptance suite drives this: a deterministic simulation injects a
+complete takeover at every boundary of the commit/publish/renew protocol
+(every shared-store operation plus the append) and asserts zero
+acked-transaction loss, no duplicates, and no post-takeover installs; a
+process-level battery kill -9s the active under load and asserts the
+standby serves writes within the lease-expiry bound with peers failing
+over transparently.
 
 ## Process embedding
 

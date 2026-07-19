@@ -15,6 +15,7 @@ corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
 thiserror = "2"
+tracing = "0.1"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = "0.1.18"
 tonic = { version = "0.14.5", features = ["tls-ring"] }

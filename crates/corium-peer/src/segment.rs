@@ -39,6 +39,20 @@ impl<S: BlobStore + RootStore> SegmentSource<S> {
             .and_then(DbRoot::decode))
     }
 
+    /// Rediscovers the current lease holder's advertised client endpoint
+    /// from the root record — peers with storage credentials can rebuild
+    /// their endpoint preference after an HA takeover without any static
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns an error when the root store cannot be read.
+    pub async fn lease_holder_endpoint(&self, db: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .index_root(db)
+            .await?
+            .and_then(|root| (!root.owner_endpoint.is_empty()).then_some(root.owner_endpoint)))
+    }
+
     /// Loads the segment for one index order of a published root, through
     /// the cache.
     ///

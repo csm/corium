@@ -1,6 +1,9 @@
 # ADR-0010: Single transactor now, lease-based HA designed in
 
-**Status:** Accepted (2026-07-15)
+**Status:** Accepted (2026-07-15); implemented in M7 — see
+`docs/design/log-and-transactor.md` for the realized mechanism (lease
+folded into the DbRoot record, lease-versioned log files, post-append
+fence).
 
 ## Context
 

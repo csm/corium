@@ -17,7 +17,7 @@ use corium_core::IndexOrder;
 use corium_peer::segment::SegmentSource;
 use corium_peer::{Admin, ConnectConfig, Connection};
 use corium_query::edn::{Edn, read_one};
-use corium_store::{DbRoot, FsStore, RootStore};
+use corium_store::{BlobStore, DbRoot, FsStore, RootStore};
 
 const SCHEMA: &str = r"[{:db/ident :k/v :db/valueType :db.type/long
                           :db/cardinality :db.cardinality/one}]";
@@ -551,7 +551,17 @@ async fn cli_admin_commands_round_trip() {
         endpoint.clone(),
     ]);
     assert!(deleted.contains(":deleted true"), "{deleted}");
-    // Online GC reclaims the deleted database's blobs.
-    let swept = run(vec!["gc".into(), "--transactor".into(), endpoint]);
+    // An explicit zero retention reaches the online GC path as an immediate
+    // sweep rather than being confused with the omitted/default window.
+    let store = FsStore::open(data.join("store")).expect("open store");
+    let orphan = store.put(b"online-gc-orphan").await.expect("put orphan");
+    let swept = run(vec![
+        "gc".into(),
+        "--transactor".into(),
+        endpoint,
+        "--window".into(),
+        "0".into(),
+    ]);
     assert!(swept.contains(":swept"), "{swept}");
+    assert!(!store.contains(&orphan).await.expect("orphan swept"));
 }

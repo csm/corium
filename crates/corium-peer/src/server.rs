@@ -6,6 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use corium_core::{EntityId, IndexOrder};
 use corium_db::{Db, key_prefix};
@@ -19,6 +20,7 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::Connection;
+use crate::metrics::Metrics;
 
 /// Peer-server execution limits.
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +48,7 @@ pub struct PeerServerSvc {
     connection: Arc<Connection>,
     cache: QueryCache,
     config: PeerServerConfig,
+    metrics: Arc<Metrics>,
 }
 
 impl PeerServerSvc {
@@ -56,7 +59,14 @@ impl PeerServerSvc {
             connection,
             cache: QueryCache::new(),
             config,
+            metrics: Arc::new(Metrics::default()),
         }
+    }
+
+    /// Process query metrics suitable for a Prometheus endpoint.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 
     fn view_db(&self, spec: Option<&pb::DbViewSpec>) -> Result<Db, Status> {
@@ -184,7 +194,8 @@ impl PeerServer for PeerServerSvc {
         } else {
             request.fuel.min(self.config.max_fuel)
         };
-        let (result, _) = corium_query::run(
+        let started = Instant::now();
+        let (result, report) = corium_query::run(
             &parsed,
             &inputs,
             ExecOptions {
@@ -193,6 +204,14 @@ impl PeerServer for PeerServerSvc {
             },
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.metrics
+            .record_query(started.elapsed(), report.datoms_scanned);
+        tracing::debug!(
+            db = %self.connection.db_name(),
+            datoms_scanned = report.datoms_scanned,
+            elapsed_micros = started.elapsed().as_micros(),
+            "query completed"
+        );
         let (shape, rows) = match (&parsed.find, result) {
             (ast::FindSpec::Rel(_), Edn::Vector(rows)) => (pb::ResultShape::Relation, rows),
             (ast::FindSpec::Coll(_), Edn::Vector(rows)) => (pb::ResultShape::Collection, rows),
@@ -470,13 +489,35 @@ pub async fn serve(
     config: PeerServerConfig,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
+    serve_service(
+        PeerServerSvc::new(connection, config),
+        addr,
+        authenticator,
+        tls,
+        shutdown,
+    )
+    .await
+}
+
+/// Serves a pre-built peer service, allowing process wiring to expose its
+/// metrics handle before the server future is awaited.
+///
+/// # Errors
+/// Returns an error when the listener cannot be bound or TLS is invalid.
+pub async fn serve_service(
+    service: PeerServerSvc,
+    addr: std::net::SocketAddr,
+    authenticator: Arc<dyn Authenticator>,
+    tls: Option<tonic::transport::ServerTlsConfig>,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), tonic::transport::Error> {
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
     builder
         .add_service(PeerServerServer::with_interceptor(
-            PeerServerSvc::new(connection, config),
+            service,
             AuthInterceptor::new(authenticator),
         ))
         .serve_with_shutdown(addr, shutdown)
