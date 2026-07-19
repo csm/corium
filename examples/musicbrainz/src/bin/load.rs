@@ -160,11 +160,17 @@ async fn load_data(
                 if !batch.is_empty() {
                     let forms = std::mem::take(&mut batch);
                     entities += forms.len() as u64;
-                    connection.transact(forms).await.map_err(|error| tx_error(&error))?;
+                    connection
+                        .transact(forms)
+                        .await
+                        .map_err(|error| tx_error(&error))?;
                     transactions += 1;
                 }
                 entities += items.len() as u64;
-                connection.transact(items).await.map_err(|error| tx_error(&error))?;
+                connection
+                    .transact(items)
+                    .await
+                    .map_err(|error| tx_error(&error))?;
                 transactions += 1;
             }
             map @ Edn::Map(_) => {
@@ -172,7 +178,10 @@ async fn load_data(
                 if batch.len() >= batch_size {
                     let forms = std::mem::take(&mut batch);
                     entities += forms.len() as u64;
-                    connection.transact(forms).await.map_err(|error| tx_error(&error))?;
+                    connection
+                        .transact(forms)
+                        .await
+                        .map_err(|error| tx_error(&error))?;
                     transactions += 1;
                     if transactions % 20 == 0 {
                         println!("… {transactions} transactions, {entities} entities");
@@ -184,7 +193,10 @@ async fn load_data(
     }
     if !batch.is_empty() {
         entities += batch.len() as u64;
-        connection.transact(batch).await.map_err(|error| tx_error(&error))?;
+        connection
+            .transact(batch)
+            .await
+            .map_err(|error| tx_error(&error))?;
         transactions += 1;
     }
 
