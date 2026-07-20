@@ -1,0 +1,29 @@
+[package]
+name = "corium-sql"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Read-only SQL queries over immutable Corium database values"
+
+[dependencies]
+arrow = { version = "58.3.0", default-features = false }
+async-trait = "0.1"
+corium-core = { workspace = true }
+corium-db = { workspace = true }
+datafusion = { version = "54.0.0", default-features = false, features = [
+    "datetime_expressions",
+    "nested_expressions",
+    "sql",
+    "string_expressions",
+    "unicode_expressions",
+] }
+futures = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

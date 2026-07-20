@@ -93,6 +93,7 @@ A single Cargo workspace. Dependency edges point strictly downward.
 | `corium-tx` | Transaction data expansion, tempid resolution, schema validation, built-in tx functions |
 | `corium-query` | Datalog parser/compiler/planner/executor, rules, aggregates, Pull, entity API |
 | `corium-db` | The immutable `Db` value: basis, index merge, as-of/since/history views |
+| `corium-sql` | Read-only DataFusion SQL over peer-local `Db` values; namespace projections and system relations |
 | `corium-transactor` | Transactor process: pipeline, indexing job, lease, gRPC server |
 | `corium-peer` | Peer library: connection, tx-report handling, segment cache, `Connection`/`Db` public API |
 | `corium-protocol` | protobuf definitions, wire value encoding, generated tonic stubs |
@@ -110,6 +111,7 @@ deterministic simulator.
 
 - **Rust** stable toolchain, edition 2024.
 - **tokio + tonic/prost** for the transactor, peer connection, and peer server.
+- **DataFusion + Arrow** for peer-local, read-only SQL execution.
 - **cljrs** (`cljrs-value`, `cljrs-reader`, `cljrs-interp`, `cljrs-interop`)
   for EDN at the boundary and database function execution.
 - **proptest** for property tests; the `corium-sim` harness for whole-system

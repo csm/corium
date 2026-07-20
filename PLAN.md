@@ -21,6 +21,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |
 | [docs/design/clojurust-integration.md](docs/design/clojurust-integration.md) | Boundary conversion, sandboxed database functions, cljrs client API |
 | [docs/design/clients-and-ops.md](docs/design/clients-and-ops.md) | CLI, query console, backup/restore, metrics |
+| [docs/sql.md](docs/sql.md) | SQL table projection, Rust API, shell, and engine tradeoffs |
 | [docs/getting-started.md](docs/getting-started.md) | Build and first local database walkthrough |
 | [docs/operations.md](docs/operations.md) | Process, console, backup/restore, metrics, GC, recovery runbook |
 | [docs/thin-client-protocol.md](docs/thin-client-protocol.md) | Public v1 thin-client interoperability contract |
@@ -64,6 +65,10 @@ These were settled at project initialization and are recorded as ADRs:
 10. **Single transactor now, lease-based HA designed in** — the root store,
     log, and reconnect protocol are shaped for active/standby failover, which
     lands as its own milestone. ([ADR-0010](docs/adr/0010-ha-later.md))
+11. **Peer-local, read-only SQL** — DataFusion executes over immutable database
+    views, with namespace-derived wide tables, list-valued cardinality-many
+    attributes, normalized event relations, and a Corium-owned row API.
+    ([ADR-0011](docs/adr/0011-sql-interface.md))
 
 ## Current status
 

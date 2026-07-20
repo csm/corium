@@ -6,6 +6,7 @@ members = [
     "crates/corium-log",
     "crates/corium-tx",
     "crates/corium-query",
+    "crates/corium-sql",
     "crates/corium-db",
     "crates/corium-transactor",
     "crates/corium-peer",
@@ -21,7 +22,7 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "Apache-2.0 OR MIT"
-rust-version = "1.85"
+rust-version = "1.88"
 homepage = "https://github.com/csm/corium"
 
 [workspace.lints.rust]
@@ -42,6 +43,7 @@ corium-log = { path = "crates/corium-log", version = "0.1.0" }
 corium-peer = { path = "crates/corium-peer", version = "0.1.0" }
 corium-protocol = { path = "crates/corium-protocol", version = "0.1.0" }
 corium-query = { path = "crates/corium-query", version = "0.1.0" }
+corium-sql = { path = "crates/corium-sql", version = "0.1.0" }
 corium-sim = { path = "crates/corium-sim", version = "0.1.0" }
 corium-store = { path = "crates/corium-store", version = "0.1.0" }
 corium-transactor = { path = "crates/corium-transactor", version = "0.1.0" }

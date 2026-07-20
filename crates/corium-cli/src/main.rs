@@ -3,6 +3,7 @@
 
 mod console;
 mod metrics_http;
+mod sql;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -255,6 +256,19 @@ enum Command {
     Console {
         /// Database name.
         db: String,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
+    /// Open a read-only interactive SQL shell.
+    Sql {
+        /// Database name.
+        db: String,
+        /// Execute SQL and exit.
+        #[arg(short = 'c', long, conflicts_with = "file")]
+        command: Option<String>,
+        /// Execute SQL from a file and exit.
+        #[arg(short = 'f', long, conflicts_with = "command")]
+        file: Option<PathBuf>,
         #[command(flatten)]
         client: ClientFlags,
     },
@@ -568,6 +582,21 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(|error| format!("cannot connect to transactor: {error}"))?;
             console::run(&connection).await
+        }
+        Command::Sql {
+            db,
+            command,
+            file,
+            client,
+        } => {
+            let tls = client.tls()?;
+            let mut config = ConnectConfig::with_failover(client.endpoints(), db);
+            config.token = client.token;
+            config.tls = tls;
+            let connection = Connection::connect(config)
+                .await
+                .map_err(|error| format!("cannot connect to transactor: {error}"))?;
+            sql::run(&connection, command.as_deref(), file.as_deref()).await
         }
         Command::Log {
             data_dir,
