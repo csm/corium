@@ -30,6 +30,7 @@ corium-query = { workspace = true }
 corium-sql = { workspace = true }
 corium-store = { workspace = true }
 corium-transactor = { workspace = true }
+ratatui = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustyline = "15"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }

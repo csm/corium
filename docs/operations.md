@@ -79,6 +79,35 @@ Console commands are:
 `:watch` tails live transaction reports until Ctrl-C. The reproducible M6
 smoke script is [m6-console.txt](demo/m6-console.txt).
 
+## Terminal dashboard (TUI)
+
+```sh
+corium tui people --transactor http://127.0.0.1:4334
+```
+
+A full-screen dashboard in the spirit of Datomic's web console, with four
+panels (cycle with `Tab`, or jump with `1`–`4` outside the query editor):
+
+- **Query** — an editor for EDN Datalog queries, `(pull …)` forms, and all
+  of the console `:commands` above (`:as-of`, `:history on`, `:schema`, …).
+  `Enter` runs when the form's brackets balance; otherwise it inserts a
+  newline (`Alt-Enter` always does). Relation results render as a scrollable
+  table with `:find` headers; every run reports wall-clock time, datoms
+  scanned, and the basis-t it executed against. `↑`/`↓` recall history.
+- **Metrics** — data-store statistics sampled from the transactor `Status`
+  RPC on `--refresh-ms` (default 2000): basis/index basis and lag, datom,
+  entity, and attribute counts, commit queue depth, transaction totals and
+  failure rate, indexing and GC counters, and lease ownership, plus
+  sparklines of transaction frequency, peer-observed status round-trip
+  latency, and index lag, and peer-side query latency (last/avg/max).
+- **Transactions** — a live feed from the peer's tx-report subscription
+  (`t`, commit time, datom count) with a per-transaction datom detail pane;
+  `f` toggles follow-newest.
+- **Schema** — the attribute table (ident, value type, cardinality,
+  uniqueness, index/component/history flags), filterable with `/`.
+
+Quit with `Ctrl-C` anywhere, `q` outside the query editor, or `:quit`.
+
 ## High availability (active/standby)
 
 One transactor holds the write lease per database; a warm standby polls the

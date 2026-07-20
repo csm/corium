@@ -31,20 +31,38 @@ impl View {
     }
 }
 
-enum Action {
+/// What the caller should do after a console line executes.
+pub(crate) enum Action {
+    /// Print (or display) this text.
     Output(String),
+    /// Enter the live tx-report watch.
     Watch,
+    /// Leave the console.
     Quit,
 }
 
+/// Line-oriented console state: the active time view and output options,
+/// shared by the readline console and the TUI query pane.
 #[derive(Default)]
-struct Session {
+pub(crate) struct Session {
     view: View,
     timing: bool,
 }
 
 impl Session {
-    fn execute(&mut self, base: &Db, line: &str) -> Result<Action, String> {
+    /// Applies the session's time view (`:as-of`, `:since`, `:history`) to a
+    /// base database value.
+    pub(crate) fn apply_view(&self, base: &Db) -> Db {
+        self.view.apply(base)
+    }
+
+    /// Human-readable name of the active time view.
+    pub(crate) fn view_label(&self) -> String {
+        view_name(self.view)
+    }
+
+    /// Executes one console line (a `:command`, query, or pull form).
+    pub(crate) fn execute(&mut self, base: &Db, line: &str) -> Result<Action, String> {
         let line = line.trim();
         if line.is_empty() {
             return Ok(Action::Output(String::new()));
@@ -206,7 +224,12 @@ impl Session {
     }
 }
 
-fn execute_pull(db: &Db, form: &corium_query::edn::Edn) -> Result<Option<String>, String> {
+/// Executes a top-level `(pull pattern entity)` form, returning `Ok(None)`
+/// when the form is not a pull expression.
+pub(crate) fn execute_pull(
+    db: &Db,
+    form: &corium_query::edn::Edn,
+) -> Result<Option<String>, String> {
     let corium_query::edn::Edn::List(items) = form else {
         return Ok(None);
     };

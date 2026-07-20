@@ -49,6 +49,8 @@ corium-store = { path = "crates/corium-store", version = "0.1.0" }
 corium-transactor = { path = "crates/corium-transactor", version = "0.1.0" }
 corium-tx = { path = "crates/corium-tx", version = "0.1.0" }
 
+ratatui = "0.29"
+
 cljrs-builtins = "0.1.225"
 cljrs-env = "0.1.225"
 cljrs-gc = "0.1.225"

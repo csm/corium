@@ -15,6 +15,7 @@ corium restore <src> <uri>
 corium log <uri> --from t1 --to t2         # dump tx-range as EDN
 corium console <uri>                       # interactive query console
 corium sql <uri>                           # interactive read-only SQL shell
+corium tui <uri>                           # full-screen dashboard (queries + metrics)
 ```
 
 Config files are EDN (read via cljrs-reader): storage backend + credentials,
@@ -33,6 +34,24 @@ A full cljrs REPL with `corium.api` loaded (via the cljrs nREPL/REPL tooling)
 is the richer alternative for Clojure-fluent users and costs us nothing beyond
 the M5 bindings — the console exists so the database is explorable without
 knowing Clojure.
+
+## Terminal dashboard
+
+`corium tui` embeds a peer and a ratatui full-screen interface — the moral
+equivalent of Datomic's web console for the terminal:
+
+- **Query** panel: the console's Datalog/pull/`:command` surface with an
+  inline editor, query history, and tabular relation results (headers from
+  `:find`), reporting latency and datoms scanned per run.
+- **Metrics** panel: data-store statistics from the transactor `Status` RPC
+  polled on an interval — counts, basis/index lag, queue depth, tx totals
+  and failure rate, GC, lease state — with sparklines for transaction
+  frequency, status round-trip latency, and index lag.
+- **Transactions** panel: live tx-report feed with a datom detail pane.
+- **Schema** panel: filterable attribute browser.
+
+It shares `ClientFlags` (and the console `Session`) with `corium console`,
+so time views (`:as-of`, `:since`, `:history`) work identically.
 
 ## SQL shell
 
