@@ -16,7 +16,7 @@ use corium_protocol::pb;
 use corium_protocol::schemaform::{SchemaFormError, schema_from_edn};
 use corium_protocol::txforms::{TxFormError, tx_items_from_edn};
 use corium_query::edn::Edn;
-use corium_store::{RootStore, StoreError, mark_and_sweep_retained};
+use corium_store::{RootStore, StoreError, mark_and_sweep_retained, meta_root_name};
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use tracing::Instrument;
@@ -306,43 +306,6 @@ fn valid_db_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-fn meta_root_name(db: &str) -> String {
-    format!("meta:{db}")
-}
-
-fn encode_meta(schema: &Schema, idents: &Idents, interner: &KeywordInterner) -> Vec<u8> {
-    let schema_bytes = codec::encode_schema(schema, idents);
-    let naming_bytes = codec::encode_naming(interner);
-    let mut out = Vec::with_capacity(8 + schema_bytes.len() + naming_bytes.len());
-    out.extend_from_slice(&u32::try_from(schema_bytes.len()).unwrap_or(0).to_be_bytes());
-    out.extend_from_slice(&schema_bytes);
-    out.extend_from_slice(&u32::try_from(naming_bytes.len()).unwrap_or(0).to_be_bytes());
-    out.extend_from_slice(&naming_bytes);
-    out
-}
-
-fn decode_meta(bytes: &[u8]) -> Result<(Schema, Idents, KeywordInterner), NodeError> {
-    let take = |input: &mut &[u8]| -> Result<Vec<u8>, NodeError> {
-        let len_bytes = input
-            .get(..4)
-            .ok_or(NodeError::Codec(CodecError::Truncated))?;
-        let len = usize::try_from(u32::from_be_bytes(len_bytes.try_into().unwrap_or_default()))
-            .map_err(|_| NodeError::Codec(CodecError::Length))?;
-        let payload = input
-            .get(4..4 + len)
-            .ok_or(NodeError::Codec(CodecError::Truncated))?
-            .to_vec();
-        *input = &input[4 + len..];
-        Ok(payload)
-    };
-    let mut input = bytes;
-    let schema_bytes = take(&mut input)?;
-    let naming_bytes = take(&mut input)?;
-    let (schema, idents) = codec::decode_schema(&schema_bytes)?;
-    let interner = codec::decode_naming(&naming_bytes)?;
-    Ok((schema, idents, interner))
-}
-
 impl TransactorNode {
     /// Opens a node over `config.data_dir`, recovering every database found
     /// there (acquiring its lease, waiting out held leases up to the
@@ -499,7 +462,7 @@ impl TransactorNode {
             .get_root(&meta_root_name(name))
             .await?
             .ok_or_else(|| NodeError::UnknownDb(name.to_owned()))?;
-        let (schema, idents, interner) = decode_meta(&meta)?;
+        let (schema, idents, interner) = codec::decode_metadata(&meta)?;
         let root_name = db_root_name(name);
         let current = self
             .store
@@ -807,7 +770,7 @@ impl TransactorNode {
             }
         };
         let (schema, idents) = schema_from_edn(&forms)?;
-        let meta = encode_meta(&schema, &idents, &KeywordInterner::default());
+        let meta = codec::encode_metadata(&schema, &idents, &KeywordInterner::default());
         match self
             .store
             .cas_root(&meta_root_name(name), None, &meta)
@@ -985,7 +948,7 @@ impl TransactorNode {
         if naming_changed {
             // New keyword names must be durable before the datoms that
             // reference them; recovery decodes the log against this meta.
-            let meta = encode_meta(&schema, &idents, &interner);
+            let meta = codec::encode_metadata(&schema, &idents, &interner);
             loop {
                 let current = self.store.get_root(&meta_root_name(name)).await?;
                 match self

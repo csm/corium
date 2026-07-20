@@ -187,6 +187,33 @@ impl Db {
         }
     }
 
+    /// Creates a current database value from a published EAVT snapshot.
+    ///
+    /// `datoms` must be the live facts at `basis_t`. Their original
+    /// transaction ids are retained, but transactions before `basis_t` that
+    /// no longer contribute a live fact are not reconstructed. This makes
+    /// the value suitable for current queries and for applying the log tail;
+    /// complete historical views still require replaying the full log.
+    #[must_use]
+    pub fn from_current_snapshot(
+        basis_t: u64,
+        schema: Schema,
+        idents: Idents,
+        interner: KeywordInterner,
+        datoms: Vec<Datom>,
+    ) -> Self {
+        Self {
+            basis_t,
+            schema,
+            recorded: Arc::new(datoms),
+            idents: Arc::new(idents),
+            interner: Arc::new(interner),
+            view: DbView::Current,
+            indexes: Arc::new(OnceLock::new()),
+            stats: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// Attaches ident and keyword naming registries, returning the named value.
     #[must_use]
     pub fn with_naming(mut self, idents: Idents, interner: KeywordInterner) -> Self {

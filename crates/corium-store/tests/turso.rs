@@ -27,7 +27,9 @@ async fn turso_blob_store_round_trips_and_reopens() {
     );
 
     drop(store);
-    let reopened = TursoBlobStore::open(&path).await.expect("reopen store");
+    let reopened = TursoBlobStore::open_existing(&path)
+        .await
+        .expect("reopen existing store");
     assert_eq!(
         reopened.get(&id).await.expect("get reopened blob"),
         Some(b"segment".to_vec())
@@ -111,7 +113,9 @@ async fn turso_root_store_fences_with_compare_and_swap() {
 
     // Roots survive a reopen of the same database file.
     drop(store);
-    let reopened = TursoBlobStore::open(&path).await.expect("reopen store");
+    let reopened = TursoBlobStore::open_existing(&path)
+        .await
+        .expect("reopen existing store");
     assert_eq!(
         reopened
             .get_root("meta:main")

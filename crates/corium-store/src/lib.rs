@@ -564,6 +564,12 @@ pub fn db_root_name(db: &str) -> String {
     format!("db:{db}")
 }
 
+/// Root-store key for a database's durable schema and naming metadata.
+#[must_use]
+pub fn meta_root_name(db: &str) -> String {
+    format!("meta:{db}")
+}
+
 /// Storage format written by this release.
 ///
 /// Format 2 (M7) folds the write lease into the root record so lease

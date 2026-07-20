@@ -46,6 +46,29 @@ impl PostgresBlobStore {
     /// configured, `PostgreSQL` cannot be reached, or the tables cannot be
     /// initialized.
     pub async fn connect(connection_string: impl Into<String>) -> Result<Self, StoreError> {
+        let pool = Self::create_pool(connection_string)?;
+        Self::from_pool(pool).await
+    }
+
+    /// Connects to an already initialized `PostgreSQL` store without running
+    /// schema DDL.
+    ///
+    /// This is the preferred entry point for storage-aware peers. It checks
+    /// out one connection eagerly so connection and TLS failures surface at
+    /// startup; table existence is verified by the first peer read.
+    ///
+    /// # Errors
+    /// Returns an error when TLS roots cannot be loaded, the pool cannot be
+    /// configured, or `PostgreSQL` cannot be reached.
+    pub async fn connect_existing(
+        connection_string: impl Into<String>,
+    ) -> Result<Self, StoreError> {
+        let pool = Self::create_pool(connection_string)?;
+        let _client = pool.get().await?;
+        Ok(Self { pool })
+    }
+
+    fn create_pool(connection_string: impl Into<String>) -> Result<Pool, StoreError> {
         // A host application may already have selected another rustls
         // provider. In that case its process-wide choice remains in force.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -56,8 +79,7 @@ impl PostgresBlobStore {
             url: Some(connection_string.into()),
             ..Config::default()
         };
-        let pool = config.create_pool(Some(Runtime::Tokio1), tls)?;
-        Self::from_pool(pool).await
+        Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
     }
 
     /// Creates a store from an existing `deadpool-postgres` pool.

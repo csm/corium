@@ -73,6 +73,20 @@ struct ClientFlags {
     /// Domain name expected on the server certificate.
     #[arg(long)]
     tls_domain: Option<String>,
+    /// Direct storage backend for snapshot bootstrap. Omit to replay the
+    /// transaction log from basis zero.
+    #[arg(long, value_enum)]
+    peer_store: Option<StoreKind>,
+    /// Transactor data directory for `--peer-store fs`, and the default
+    /// Turso database location.
+    #[arg(long, default_value = "./corium-data")]
+    peer_data_dir: PathBuf,
+    /// Turso database path for `--peer-store turso`.
+    #[arg(long)]
+    peer_turso_path: Option<PathBuf>,
+    /// `PostgreSQL` connection string for `--peer-store postgres`.
+    #[arg(long)]
+    peer_postgres_url: Option<String>,
 }
 
 impl ClientFlags {
@@ -100,6 +114,28 @@ impl ClientFlags {
         client_tls(self.ca.as_deref(), self.tls_domain.as_deref())
             .map(Some)
             .map_err(|error| format!("cannot load CA certificate: {error}"))
+    }
+
+    async fn connect_config(&self, db: impl Into<String>) -> Result<ConnectConfig, String> {
+        let mut config = ConnectConfig::with_failover(self.endpoints(), db);
+        config.token = self.token.clone();
+        config.tls = self.tls()?;
+        let Some(kind) = self.peer_store else {
+            return Ok(config);
+        };
+        if matches!(kind, StoreKind::Mem) {
+            return Err("--peer-store mem cannot be shared across processes".into());
+        }
+        let spec = store_spec(
+            kind,
+            &self.peer_data_dir,
+            self.peer_turso_path.clone(),
+            self.peer_postgres_url.clone(),
+        )?;
+        let storage = corium_transactor::NodeStore::open_existing(&spec, &self.peer_data_dir)
+            .await
+            .map_err(|error| format!("cannot open peer storage: {error}"))?;
+        Ok(config.with_storage(Arc::new(storage)))
     }
 }
 
@@ -454,9 +490,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => {
             let tls = serve.tls()?;
             let authenticator = serve.authenticator();
-            let mut config = ConnectConfig::with_failover(client.endpoints(), db);
-            config.token = client.token.clone();
-            config.tls = client.tls()?;
+            let config = client.connect_config(db).await?;
             let connection = Arc::new(
                 Connection::connect(config)
                     .await
@@ -535,6 +569,10 @@ async fn run(cli: Cli) -> Result<(), String> {
                     token,
                     ca,
                     tls_domain,
+                    peer_store: None,
+                    peer_data_dir: PathBuf::from("./corium-data"),
+                    peer_turso_path: None,
+                    peer_postgres_url: None,
                 };
                 let mut admin = Admin::connect(&flags.primary(), flags.token.clone(), flags.tls()?)
                     .await
@@ -581,10 +619,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Console { db, client } => {
-            let tls = client.tls()?;
-            let mut config = ConnectConfig::with_failover(client.endpoints(), db);
-            config.token = client.token;
-            config.tls = tls;
+            let config = client.connect_config(db).await?;
             let connection = Connection::connect(config)
                 .await
                 .map_err(|error| format!("cannot connect to transactor: {error}"))?;
@@ -596,10 +631,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             file,
             client,
         } => {
-            let tls = client.tls()?;
-            let mut config = ConnectConfig::with_failover(client.endpoints(), db);
-            config.token = client.token;
-            config.tls = tls;
+            let config = client.connect_config(db).await?;
             let connection = Connection::connect(config)
                 .await
                 .map_err(|error| format!("cannot connect to transactor: {error}"))?;
@@ -764,9 +796,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             Ok(())
         }
         DbCommand::Stats { name, client } => {
-            let mut config = ConnectConfig::with_failover(client.endpoints(), name);
-            config.token = client.token.clone();
-            config.tls = client.tls()?;
+            let config = client.connect_config(name).await?;
             let connection = Connection::connect(config)
                 .await
                 .map_err(|error| error.to_string())?;

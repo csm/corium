@@ -45,12 +45,36 @@ impl TursoBlobStore {
     /// Returns an error when the path is not UTF-8, the database cannot be
     /// opened, or the blob table cannot be initialized.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
+        let database = Self::open_database(path.as_ref()).await?;
+        Self::from_database(database).await
+    }
+
+    /// Opens an existing local Turso database without running schema DDL.
+    ///
+    /// This is the preferred entry point for storage-aware peers, which need
+    /// only read the tables already initialized by a transactor.
+    ///
+    /// # Errors
+    /// Returns an error when the path is not UTF-8 or the database cannot be
+    /// opened.
+    pub async fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Ok(Self {
+            database: Self::open_database(path.as_ref()).await?,
+        })
+    }
+
+    async fn open_database(path: &Path) -> Result<Database, StoreError> {
         let text = path
             .to_str()
             .ok_or_else(|| StoreError::InvalidTursoPath(path.to_path_buf()))?;
-        let database = Builder::new_local(text).build().await?;
-        Self::from_database(database).await
+        // Independent transactors and storage-aware peers open the same local
+        // database file. Turso requires its multi-process WAL coordinator for
+        // that topology; without it a second process is rejected at open.
+        let database = Builder::new_local(text)
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await?;
+        Ok(database)
     }
 
     /// Creates a blob store from an existing Turso database handle.

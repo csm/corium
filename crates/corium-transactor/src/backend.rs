@@ -103,6 +103,30 @@ impl NodeStore {
             StoreSpec::Turso { path } => Ok(Self::Turso(TursoBlobStore::open(path).await?)),
         }
     }
+
+    /// Opens an existing storage service for peer reads without running
+    /// backend schema initialization.
+    ///
+    /// # Errors
+    /// Returns an error when the backing store cannot be opened.
+    #[allow(clippy::unused_async)]
+    pub async fn open_existing(
+        spec: &StoreSpec,
+        data_dir: &std::path::Path,
+    ) -> Result<Self, StoreError> {
+        match spec {
+            StoreSpec::Memory => Ok(Self::Mem(MemoryStore::default())),
+            StoreSpec::Fs => Ok(Self::Fs(FsStore::open(data_dir.join("store"))?)),
+            #[cfg(feature = "postgres")]
+            StoreSpec::Postgres { connection_string } => Ok(Self::Postgres(
+                PostgresBlobStore::connect_existing(connection_string).await?,
+            )),
+            #[cfg(feature = "turso")]
+            StoreSpec::Turso { path } => {
+                Ok(Self::Turso(TursoBlobStore::open_existing(path).await?))
+            }
+        }
+    }
 }
 
 #[async_trait]

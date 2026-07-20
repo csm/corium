@@ -605,6 +605,45 @@ pub fn decode_naming(bytes: &[u8]) -> Result<KeywordInterner, CodecError> {
     Ok(interner)
 }
 
+/// Encodes the durable schema, ident, and keyword-interner metadata record.
+#[must_use]
+pub fn encode_metadata(schema: &Schema, idents: &Idents, interner: &KeywordInterner) -> Vec<u8> {
+    let schema_bytes = encode_schema(schema, idents);
+    let naming_bytes = encode_naming(interner);
+    let mut out = Vec::with_capacity(8 + schema_bytes.len() + naming_bytes.len());
+    out.extend_from_slice(&u32::try_from(schema_bytes.len()).unwrap_or(0).to_be_bytes());
+    out.extend_from_slice(&schema_bytes);
+    out.extend_from_slice(&u32::try_from(naming_bytes.len()).unwrap_or(0).to_be_bytes());
+    out.extend_from_slice(&naming_bytes);
+    out
+}
+
+/// Decodes a durable schema, ident, and keyword-interner metadata record.
+///
+/// # Errors
+/// Returns [`CodecError`] for malformed input.
+pub fn decode_metadata(bytes: &[u8]) -> Result<(Schema, Idents, KeywordInterner), CodecError> {
+    fn take(input: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
+        let len_bytes = input.get(..4).ok_or(CodecError::Truncated)?;
+        let len = usize::try_from(u32::from_be_bytes(len_bytes.try_into().unwrap_or_default()))
+            .map_err(|_| CodecError::Length)?;
+        let end = 4_usize.checked_add(len).ok_or(CodecError::Length)?;
+        let payload = input.get(4..end).ok_or(CodecError::Truncated)?.to_vec();
+        *input = &input[end..];
+        Ok(payload)
+    }
+
+    let mut input = bytes;
+    let schema_bytes = take(&mut input)?;
+    let naming_bytes = take(&mut input)?;
+    if !input.is_empty() {
+        return Err(CodecError::Trailing);
+    }
+    let (schema, idents) = decode_schema(&schema_bytes)?;
+    let interner = decode_naming(&naming_bytes)?;
+    Ok((schema, idents, interner))
+}
+
 const fn value_type_tag(value_type: ValueType) -> u8 {
     match value_type {
         ValueType::Bool => 0,
