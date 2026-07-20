@@ -50,8 +50,11 @@ service Transactor {
 
 ### CatalogService (admin)
 
-`CreateDatabase`, `DeleteDatabase`, `ListDatabases`, `GcDeletedDatabases` —
-thin wrappers over root-store operations plus transactor bootstrap datoms.
+`CreateDatabase`, `DeleteDatabase`, `ForkDatabase`, `ListDatabases`,
+`GcDeletedDatabases` — thin wrappers over root-store operations plus
+transactor bootstrap datoms. `ForkDatabase` creates a new database
+duplicating an existing one at a transaction basis by copying the log
+prefix; the fork replays it and publishes indexes of its own.
 
 ### PeerServerService (thin clients → peer server)
 

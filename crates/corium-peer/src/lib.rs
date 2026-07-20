@@ -791,6 +791,31 @@ impl Admin {
         Ok(response.into_inner().created)
     }
 
+    /// Forks `db` into a new database `target` duplicating it at
+    /// transaction basis `as_of_t` (`None` forks at the current basis).
+    /// Returns the fork's basis, or `None` when the target already existed.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure, an unknown source, an
+    /// invalid target name, or a basis ahead of the source's.
+    pub async fn fork_database(
+        &mut self,
+        db: &str,
+        target: &str,
+        as_of_t: Option<u64>,
+    ) -> Result<Option<u64>, PeerError> {
+        let response = self
+            .client
+            .fork_database(pb::ForkDatabaseRequest {
+                db: db.to_owned(),
+                target: target.to_owned(),
+                as_of_t: as_of_t.unwrap_or(0),
+            })
+            .await?
+            .into_inner();
+        Ok(response.created.then_some(response.basis_t))
+    }
+
     /// Deletes a database; `false` when it did not exist.
     ///
     /// # Errors

@@ -8,6 +8,7 @@ One binary (`corium-cli`) with subcommands:
 corium transactor --config corium.edn      # run a transactor
 corium peer-server --config corium.edn     # run a peer server for thin clients
 corium db create|delete|list <uri>
+corium db fork <src> <dst> [--as-of t]     # point-in-time fork (writable sandbox)
 corium db stats <uri>                      # datom counts, index sizes, basis
 corium gc <uri> [--window 72h]             # segment garbage collection
 corium backup <uri> <dest>                 # see below

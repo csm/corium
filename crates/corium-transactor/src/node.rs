@@ -397,6 +397,9 @@ pub struct TransactorNode {
     /// elsewhere and the standby poller attempts takeover on expiry.
     standby: std::sync::RwLock<BTreeSet<String>>,
     gc_lock: tokio::sync::Mutex<()>,
+    /// Serializes forks: two forks to the same target must not interleave
+    /// appends into one target log.
+    fork_lock: tokio::sync::Mutex<()>,
     metrics: Metrics,
     shutdown: watch::Sender<Option<String>>,
 }
@@ -437,6 +440,7 @@ impl TransactorNode {
             dbs: std::sync::RwLock::new(HashMap::new()),
             standby: std::sync::RwLock::new(BTreeSet::new()),
             gc_lock: tokio::sync::Mutex::new(()),
+            fork_lock: tokio::sync::Mutex::new(()),
             metrics: Metrics::default(),
             shutdown: watch::channel(None).0,
         });
@@ -978,6 +982,94 @@ impl TransactorNode {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(name.to_owned(), state);
         Ok(true)
+    }
+
+    /// Forks `source` into a new database `target` whose state duplicates
+    /// the source as of transaction `as_of_t` (`0` forks at the current
+    /// basis). Only the log prefix is copied; the target replays it and
+    /// publishes its own indexes, while blob segments dedupe by content
+    /// address. Returns the fork's basis, or `None` when `target` already
+    /// exists.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid target name, an unknown source, an
+    /// `as_of_t` ahead of the source's basis, or store/log failures.
+    pub async fn fork_db(
+        self: &Arc<Self>,
+        source: &str,
+        target: &str,
+        as_of_t: u64,
+    ) -> Result<Option<u64>, NodeError> {
+        if !valid_db_name(target) {
+            return Err(NodeError::InvalidName(target.to_owned()));
+        }
+        if source == target {
+            return Err(NodeError::BadRequest(
+                "fork target must differ from the source".into(),
+            ));
+        }
+        let state = self.db_state(source).await?;
+        let basis = state.db().basis_t();
+        let t = if as_of_t == 0 { basis } else { as_of_t };
+        if t > basis {
+            return Err(NodeError::BadRequest(format!(
+                "as-of t {t} is ahead of {source:?} basis {basis}"
+            )));
+        }
+        let _guard = self.fork_lock.lock().await;
+        if self
+            .dbs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(target)
+            || self
+                .store
+                .get_root(&meta_root_name(target))
+                .await?
+                .is_some()
+            || self.log_backend.exists(target)
+        {
+            return Ok(None);
+        }
+        // Capture the records before the metadata: meta is made durable
+        // before any record that references it, so a meta read afterwards is
+        // always a sufficient decode dictionary for the captured prefix.
+        // Transaction numbers are contiguous from 1, so the prefix through
+        // `t` is exactly the source's state at that basis.
+        let records = state.log.tx_range(0, Some(t + 1))?;
+        let meta = self
+            .store
+            .get_root(&meta_root_name(source))
+            .await?
+            .ok_or_else(|| NodeError::UnknownDb(source.to_owned()))?;
+        // Write the log under version 0 so it sorts beneath the
+        // lease-versioned file the target's first open creates, and publish
+        // meta last — it is the catalog entry, so a crash mid-fork never
+        // catalogs a target without its log.
+        let log = self.log_backend.open(target, 0)?;
+        for record in &records {
+            log.append(record)?;
+        }
+        drop(log);
+        match self
+            .store
+            .cas_root(&meta_root_name(target), None, &meta)
+            .await
+        {
+            Ok(()) => {}
+            Err(StoreError::CasFailed { .. }) => {
+                // Another node claimed the name first; discard our log copy.
+                self.log_backend.delete_all(target)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let state = self.open_db(target).await?;
+        self.dbs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target.to_owned(), state);
+        Ok(Some(t))
     }
 
     /// Deletes a database: unhosts it, releases its lease, and removes its

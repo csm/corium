@@ -254,6 +254,22 @@ impl Catalog for CatalogSvc {
         Ok(Response::new(pb::DeleteDatabaseResponse { deleted }))
     }
 
+    async fn fork_database(
+        &self,
+        request: Request<pb::ForkDatabaseRequest>,
+    ) -> Result<Response<pb::ForkDatabaseResponse>, Status> {
+        let request = request.into_inner();
+        let forked = self
+            .0
+            .fork_db(&request.db, &request.target, request.as_of_t)
+            .await
+            .map_err(|error| to_status(&error))?;
+        Ok(Response::new(pb::ForkDatabaseResponse {
+            created: forked.is_some(),
+            basis_t: forked.unwrap_or(0),
+        }))
+    }
+
     async fn list_databases(
         &self,
         _request: Request<pb::ListDatabasesRequest>,
