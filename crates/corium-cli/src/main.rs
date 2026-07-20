@@ -4,6 +4,7 @@
 mod console;
 mod metrics_http;
 mod sql;
+mod tui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -301,6 +302,17 @@ enum Command {
         #[command(flatten)]
         client: ClientFlags,
     },
+    /// Open a full-screen terminal dashboard: query workbench, store
+    /// metrics, live transaction feed, and schema browser.
+    Tui {
+        /// Database name.
+        db: String,
+        /// Metrics refresh interval in milliseconds (minimum 250).
+        #[arg(long, default_value_t = 2_000)]
+        refresh_ms: u64,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
     /// Open a read-only interactive SQL shell.
     Sql {
         /// Database name.
@@ -372,7 +384,10 @@ async fn main() -> ExitCode {
     // TLS setup.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
-    init_logging(cli.log_format);
+    // The TUI owns the terminal; stray tracing output would corrupt it.
+    if !matches!(cli.command, Command::Tui { .. }) {
+        init_logging(cli.log_format);
+    }
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -624,6 +639,21 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(|error| format!("cannot connect to transactor: {error}"))?;
             console::run(&connection).await
+        }
+        Command::Tui {
+            db,
+            refresh_ms,
+            client,
+        } => {
+            let config = client.connect_config(db).await?;
+            let connection = Connection::connect(config)
+                .await
+                .map_err(|error| format!("cannot connect to transactor: {error}"))?;
+            tui::run(
+                Arc::new(connection),
+                Duration::from_millis(refresh_ms.max(250)),
+            )
+            .await
         }
         Command::Sql {
             db,
