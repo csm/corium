@@ -183,7 +183,7 @@ async fn load_data(
                         .await
                         .map_err(|error| tx_error(&error))?;
                     transactions += 1;
-                    if transactions % 20 == 0 {
+                    if transactions.is_multiple_of(20) {
                         println!("… {transactions} transactions, {entities} entities");
                     }
                 }

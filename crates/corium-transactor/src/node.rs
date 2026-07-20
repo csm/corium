@@ -507,13 +507,13 @@ impl TransactorNode {
             .await?
             .as_deref()
             .and_then(DbRoot::decode);
-        if let Some(root) = &current {
-            if root.format_version > corium_store::FORMAT_VERSION {
-                return Err(NodeError::UnsupportedFormat {
-                    found: root.format_version,
-                    supported: corium_store::FORMAT_VERSION,
-                });
-            }
+        if let Some(root) = &current
+            && root.format_version > corium_store::FORMAT_VERSION
+        {
+            return Err(NodeError::UnsupportedFormat {
+                found: root.format_version,
+                supported: corium_store::FORMAT_VERSION,
+            });
         }
         // Acquisition rewrites the root record under our lease version, so
         // it doubles as the fence bump: a deposed writer's pending root CAS
@@ -888,10 +888,9 @@ impl TransactorNode {
                 .await?
                 .as_deref()
                 .and_then(DbRoot::decode)
+                && let Some(roots) = root.roots
             {
-                if let Some(roots) = root.roots {
-                    live.extend(roots);
-                }
+                live.extend(roots);
             }
         }
         let report = mark_and_sweep_retained(

@@ -330,10 +330,10 @@ async fn thin_client_conformance_kit() {
     let endpoint = format!("http://127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let admin = loop {
-        if let Ok(mut admin) = Admin::connect(&endpoint, None, None).await {
-            if admin.list_databases().await.is_ok() {
-                break admin;
-            }
+        if let Ok(mut admin) = Admin::connect(&endpoint, None, None).await
+            && admin.list_databases().await.is_ok()
+        {
+            break admin;
         }
         assert!(std::time::Instant::now() < deadline, "server never ready");
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -37,11 +37,10 @@ fn tag_meta(tag: &str) -> Value {
 }
 
 fn meta_tag(meta: &Value) -> Option<String> {
-    if let Value::Map(map) = meta {
-        if let Some(Value::Keyword(keyword)) = map.get(&Value::keyword(CljKeyword::parse(TAG_KEY)))
-        {
-            return Some(keyword.get().full_name());
-        }
+    if let Value::Map(map) = meta
+        && let Some(Value::Keyword(keyword)) = map.get(&Value::keyword(CljKeyword::parse(TAG_KEY)))
+    {
+        return Some(keyword.get().full_name());
     }
     None
 }
@@ -266,7 +265,7 @@ pub fn form_to_edn(form: &cljrs_reader::Form) -> Result<Edn, ConvertError> {
 }
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())

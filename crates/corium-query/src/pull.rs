@@ -313,10 +313,8 @@ fn pull_spec(
             }
             let render =
                 |value: &Value, path: &mut BTreeSet<EntityId>| -> Result<Edn, QueryError> {
-                    if is_ref {
-                        if let Value::Ref(child) = value {
-                            return render_ref(db, spec, enclosing, *child, is_component, path);
-                        }
+                    if is_ref && let Value::Ref(child) = value {
+                        return render_ref(db, spec, enclosing, *child, is_component, path);
                     }
                     Ok(value_to_edn(db, value))
                 };
@@ -420,10 +418,10 @@ fn render_ref(
             // remaining depth decremented.
             let mut sub = enclosing.clone();
             for candidate in &mut sub.specs {
-                if spec_attr(candidate) {
-                    if let SubSelect::Recur(d) = &candidate.sub {
-                        candidate.sub = SubSelect::Recur(d.map(|d| d.saturating_sub(1)));
-                    }
+                if spec_attr(candidate)
+                    && let SubSelect::Recur(d) = &candidate.sub
+                {
+                    candidate.sub = SubSelect::Recur(d.map(|d| d.saturating_sub(1)));
                 }
             }
             let result = pull_entity(db, &sub, child, path);

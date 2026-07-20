@@ -277,18 +277,17 @@ fn guard_form(form: &Form, quoted: bool) -> Result<(), SandboxError> {
     match &form.kind {
         FormKind::Var(_) if !quoted => reject("var access"),
         FormKind::List(items) => {
-            if !quoted {
-                if let Some(Form {
+            if !quoted
+                && let Some(Form {
                     kind: FormKind::Symbol(head),
                     ..
                 }) = items.first()
-                {
-                    if DENIED_HEADS.contains(&head.as_str()) {
-                        return reject(head);
-                    }
-                    if head.starts_with('.') {
-                        return reject("interop method call");
-                    }
+            {
+                if DENIED_HEADS.contains(&head.as_str()) {
+                    return reject(head);
+                }
+                if head.starts_with('.') {
+                    return reject("interop method call");
                 }
             }
             items.iter().try_for_each(|item| guard_form(item, quoted))

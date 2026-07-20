@@ -116,19 +116,19 @@ pub fn db_value(db: Db) -> Value {
 }
 
 fn db_of(value: &Value) -> ValueResult<Db> {
-    if let Value::NativeObject(obj) = value {
-        if let Some(handle) = obj.get().downcast_ref::<DbHandle>() {
-            return Ok(handle.db.clone());
-        }
+    if let Value::NativeObject(obj) = value
+        && let Some(handle) = obj.get().downcast_ref::<DbHandle>()
+    {
+        return Ok(handle.db.clone());
     }
     Err(verr("expected a database value"))
 }
 
 fn conn_of(value: &Value) -> ValueResult<(Arc<Connection>, Handle)> {
-    if let Value::NativeObject(obj) = value {
-        if let Some(handle) = obj.get().downcast_ref::<ConnHandle>() {
-            return Ok((Arc::clone(&handle.conn), handle.handle.clone()));
-        }
+    if let Value::NativeObject(obj) = value
+        && let Some(handle) = obj.get().downcast_ref::<ConnHandle>()
+    {
+        return Ok((Arc::clone(&handle.conn), handle.handle.clone()));
     }
     Err(verr("expected a connection"))
 }
