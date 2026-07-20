@@ -48,6 +48,9 @@ enum StoreKind {
     /// Filesystem under `--data-dir` (blobs, roots, and logs).
     #[default]
     Fs,
+    /// `PostgreSQL` for blobs and roots; the log stays on the local filesystem
+    /// under `--data-dir`. Requires the `postgres` feature.
+    Postgres,
     /// Turso (embeddable `SQLite`) for blobs and roots; the log stays on the
     /// local filesystem under `--data-dir`. Requires the `turso` feature.
     Turso,
@@ -140,6 +143,9 @@ enum Command {
         /// `{data_dir}/store.db`).
         #[arg(long)]
         turso_path: Option<PathBuf>,
+        /// `PostgreSQL` connection string for `--store postgres`.
+        #[arg(long)]
+        postgres_url: Option<String>,
         /// Data directory (filesystem store, logs). Ignored by `--store mem`.
         #[arg(long)]
         data_dir: PathBuf,
@@ -346,6 +352,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Transactor {
             store,
             turso_path,
+            postgres_url,
             data_dir,
             listen,
             owner,
@@ -362,7 +369,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             db_fn_deadline_ms,
             serve,
         } => {
-            let store_spec = store_spec(store, &data_dir, turso_path)?;
+            let store_spec = store_spec(store, &data_dir, turso_path, postgres_url)?;
             let mut config = NodeConfig::new(data_dir);
             config.store = store_spec;
             if let Some(owner) = owner {
@@ -623,17 +630,34 @@ fn init_logging(format: LogFormat) {
     }
 }
 
-/// Resolves the `--store` flag (and its Turso path) into a [`StoreSpec`].
+/// Resolves the `--store` flag and backend connection options into a [`StoreSpec`].
 fn store_spec(
     store: StoreKind,
     data_dir: &std::path::Path,
     turso_path: Option<PathBuf>,
+    postgres_url: Option<String>,
 ) -> Result<StoreSpec, String> {
     match store {
         StoreKind::Mem => Ok(StoreSpec::Memory),
         StoreKind::Fs => Ok(StoreSpec::Fs),
+        StoreKind::Postgres => postgres_spec(postgres_url),
         StoreKind::Turso => turso_spec(data_dir, turso_path),
     }
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_spec(postgres_url: Option<String>) -> Result<StoreSpec, String> {
+    let connection_string = postgres_url
+        .ok_or_else(|| "--postgres-url is required with --store postgres".to_owned())?;
+    Ok(StoreSpec::Postgres { connection_string })
+}
+
+#[cfg(not(feature = "postgres"))]
+fn postgres_spec(_postgres_url: Option<String>) -> Result<StoreSpec, String> {
+    Err(
+        "this build lacks the PostgreSQL backend; rebuild corium-cli with --features postgres"
+            .into(),
+    )
 }
 
 #[cfg(feature = "turso")]

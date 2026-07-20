@@ -9,16 +9,24 @@ description = "Corium content-addressable blob store"
 
 [features]
 default = []
+postgres = [
+    "dep:deadpool-postgres",
+    "dep:rustls",
+    "dep:tokio-postgres-rustls",
+]
 turso = ["dep:turso"]
 
 [dependencies]
 async-trait = "0.1"
 blake3 = "1"
 corium-core = { workspace = true }
+deadpool-postgres = { version = "0.14.1", optional = true }
 fs2 = "0.4"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 thiserror = "2"
 tokio = { version = "1.53.0", features = ["rt", "sync"] }
 tokio-stream = "0.1.18"
+tokio-postgres-rustls = { version = "0.14.0", optional = true, features = ["native-certs", "ring"] }
 turso = { version = "0.6.1", optional = true, default-features = false }
 
 [lints]

@@ -8,15 +8,28 @@ TLS and bearer-token flags documented by `corium <command> --help`.
 
 The transactor's blob and root storage is selected with `--store`: `fs` (the
 default, under `--data-dir`), `mem` (in-memory and ephemeral — a single
-process, everything lost on exit; for demos and tests, not production), or
-`turso` (blobs and roots in an embeddable-SQLite Turso database at
-`--turso-path`, requiring a build `--features turso`). The transaction log is
-appended synchronously by the commit pipeline, so it stays on the local
-filesystem under `--data-dir` for `fs` and `turso`, and in memory for `mem` —
-which is why a durable `turso` transactor still needs a writable data
-directory for its logs. Backup, restore, and offline GC operate on the
-filesystem data directory and therefore apply to `fs` (and a `turso`
-transactor's logs).
+process, everything lost on exit; for demos and tests, not production),
+`postgres` (shared PostgreSQL blobs and roots at `--postgres-url`, requiring a
+build with `--features postgres`), or `turso` (blobs and roots in an
+embeddable-SQLite Turso database at `--turso-path`, requiring a build with
+`--features turso`). The transaction log is appended synchronously by the
+commit pipeline, so it stays on the local filesystem under `--data-dir` for
+`fs`, `postgres`, and `turso`, and in memory for `mem`. A database-backed
+transactor therefore still needs a writable data directory for its logs.
+Backup, restore, and offline GC operate on the filesystem data directory and
+therefore apply to `fs` (and only the local logs of a database-backed
+transactor).
+
+The PostgreSQL backend creates `corium_blobs` and `corium_roots` in the
+connection's current schema and uses the platform certificate store for TLS.
+For example:
+
+```sh
+cargo run -p corium-cli --features postgres -- \
+  transactor --store postgres \
+  --postgres-url 'postgresql://corium@db.example/corium?sslmode=require' \
+  --data-dir /srv/corium
+```
 
 Tracing is human-readable by default. Use `--log-format json` for structured
 logs and `RUST_LOG` for filtering:
