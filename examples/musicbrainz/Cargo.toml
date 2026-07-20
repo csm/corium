@@ -8,6 +8,11 @@ homepage.workspace = true
 description = "MusicBrainz example for corium: schema/data loader and a Clojurust query REPL"
 publish = false
 
+[features]
+default = []
+postgres = ["corium-store/postgres"]
+turso = ["corium-store/turso"]
+
 [[bin]]
 name = "mbrainz-load"
 path = "src/bin/load.rs"
@@ -25,6 +30,7 @@ corium-cljrs = { workspace = true }
 corium-peer = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
+corium-store = { workspace = true }
 cljrs-env = { workspace = true }
 cljrs-gc = { workspace = true }
 cljrs-interp = { workspace = true }

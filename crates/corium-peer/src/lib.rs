@@ -30,6 +30,8 @@ use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+use crate::segment::{PeerStorage, SnapshotError, load_current_snapshot};
+
 type Client = TransactorClient<InterceptedService<Channel, TokenInterceptor>>;
 
 /// Peer failure.
@@ -44,6 +46,9 @@ pub enum PeerError {
     /// Payload failed to decode.
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// Published storage snapshot could not be loaded.
+    #[error(transparent)]
+    Snapshot(#[from] SnapshotError),
     /// Protocol contract violation.
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -53,7 +58,7 @@ pub enum PeerError {
 }
 
 /// Connection configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConnectConfig {
     /// Candidate transactor endpoints in preference order, e.g.
     /// `http://127.0.0.1:4334`. With an HA pair, list the active and every
@@ -81,6 +86,26 @@ pub struct ConnectConfig {
     /// server-advertised heartbeat interval; streams silent for longer are
     /// dropped and the connection fails over.
     pub heartbeat_timeout: Option<Duration>,
+    /// Optional direct blob/root storage used to bootstrap from the newest
+    /// published index before subscribing to the transaction-log tail.
+    storage: Option<Arc<dyn PeerStorage>>,
+}
+
+impl std::fmt::Debug for ConnectConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectConfig")
+            .field("endpoints", &self.endpoints)
+            .field("db", &self.db)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("tls", &self.tls.is_some())
+            .field("reconnect_min", &self.reconnect_min)
+            .field("reconnect_max", &self.reconnect_max)
+            .field("failover_timeout", &self.failover_timeout)
+            .field("heartbeat_timeout", &self.heartbeat_timeout)
+            .field("storage", &self.storage.is_some())
+            .finish()
+    }
 }
 
 impl ConnectConfig {
@@ -102,7 +127,25 @@ impl ConnectConfig {
             reconnect_max: Duration::from_secs(5),
             failover_timeout: Duration::from_secs(30),
             heartbeat_timeout: None,
+            storage: None,
         }
+    }
+
+    /// Gives this peer direct read access to the transactor's blob/root
+    /// storage service.
+    ///
+    /// A storage-aware connection loads the newest published EAVT snapshot
+    /// and asks the transactor only for transactions after that snapshot.
+    #[must_use]
+    pub fn with_storage(mut self, storage: Arc<dyn PeerStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Whether direct peer storage has been configured.
+    #[must_use]
+    pub fn has_storage(&self) -> bool {
+        self.storage.is_some()
     }
 }
 
@@ -196,10 +239,12 @@ fn make_client(channel: Channel, token: Option<String>) -> Client {
 }
 
 impl Connection {
-    /// Connects, subscribes from basis 0, and waits until the handshake and
-    /// its backfill have been applied locally. Candidate endpoints are
-    /// tried in order; a standby transactor rejects the subscription and
-    /// the next candidate is tried.
+    /// Connects and waits until the handshake and required log tail have
+    /// been applied locally. With direct storage configured, the peer first
+    /// loads the newest published index and subscribes from its basis;
+    /// otherwise it subscribes from basis zero. Candidate endpoints are tried
+    /// in order; a standby transactor rejects the subscription and the next
+    /// candidate is tried.
     ///
     /// # Errors
     /// Returns [`PeerError`] when no endpoint accepts the subscription.
@@ -207,6 +252,11 @@ impl Connection {
         if config.endpoints.is_empty() {
             return Err(PeerError::Protocol("no endpoints configured".into()));
         }
+        let snapshot = match &config.storage {
+            Some(storage) => load_current_snapshot(storage.as_ref(), &config.db).await?,
+            None => None,
+        };
+        let start_basis = snapshot.as_ref().map_or(0, Db::basis_t);
         // Establish the first subscription before returning so `db()` is
         // populated and connection errors surface synchronously.
         let mut last_error = PeerError::Closed;
@@ -215,7 +265,7 @@ impl Connection {
             match open_channel(&config, endpoint).await {
                 Ok(channel) => {
                     let mut client = make_client(channel, config.token.clone());
-                    match subscribe_with(&mut client, &config.db, 0).await {
+                    match subscribe_with(&mut client, &config.db, start_basis).await {
                         Ok(stream) => {
                             first = Some((index, client, stream));
                             break;
@@ -229,9 +279,16 @@ impl Connection {
         let Some((index, client, mut stream)) = first else {
             return Err(last_error);
         };
+        let initial_state = snapshot.map(|db| PeerState {
+            schema: db.schema().clone(),
+            idents: db.idents().clone(),
+            interner: db.interner().clone(),
+            db,
+            instants: BTreeMap::new(),
+        });
         let inner = Arc::new(Inner {
-            state: RwLock::new(None),
-            basis: watch::channel(0).0,
+            state: RwLock::new(initial_state),
+            basis: watch::channel(start_basis).0,
             index_basis: watch::channel(0).0,
             reports: broadcast::channel(1024).0,
             client: Mutex::new(client),
@@ -521,6 +578,13 @@ async fn pump_handshake(
             "subscription must begin with a handshake".into(),
         ));
     };
+    let local_basis = *inner.basis.subscribe().borrow();
+    if handshake.basis_t < local_basis {
+        return Err(PeerError::Protocol(format!(
+            "published snapshot basis {local_basis} is newer than transactor basis {}",
+            handshake.basis_t
+        )));
+    }
     let (schema, idents) = codec::decode_schema(&handshake.schema)?;
     inner.heartbeat_ms.store(
         handshake.heartbeat_interval_ms,

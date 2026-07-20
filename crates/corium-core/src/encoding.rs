@@ -31,6 +31,9 @@ pub enum DecodeError {
     /// UTF-8 string payload is invalid.
     #[error("invalid UTF-8 string")]
     InvalidUtf8,
+    /// A complete value was followed by unexpected bytes.
+    #[error("trailing bytes after sortable value")]
+    Trailing,
 }
 
 /// Trait for types with Corium sortable encodings.
@@ -197,6 +200,24 @@ fn array_8(bytes: &[u8]) -> [u8; 8] {
     let mut out = [0; 8];
     out.copy_from_slice(bytes);
     out
+}
+
+/// Decodes one fixed-width entity-id component.
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] when fewer than eight bytes remain.
+pub fn decode_entity_id(input: &[u8]) -> Result<(EntityId, usize), DecodeError> {
+    let bytes = input.get(..8).ok_or(DecodeError::Truncated)?;
+    Ok((EntityId::from_raw(u64::from_be_bytes(array_8(bytes))), 8))
+}
+
+/// Decodes one fixed-width unsigned integer component.
+///
+/// # Errors
+/// Returns [`DecodeError::Truncated`] when fewer than eight bytes remain.
+pub fn decode_u64(input: &[u8]) -> Result<(u64, usize), DecodeError> {
+    let bytes = input.get(..8).ok_or(DecodeError::Truncated)?;
+    Ok((u64::from_be_bytes(array_8(bytes)), 8))
 }
 
 fn array_16(bytes: &[u8]) -> [u8; 16] {

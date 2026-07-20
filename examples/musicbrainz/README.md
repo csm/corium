@@ -80,6 +80,23 @@ examples/musicbrainz/scripts/repl.sh       # cljrs REPL, corium.api preloaded
 examples/musicbrainz/scripts/console.sh    # EDN-Datalog console
 ```
 
+For a large database, give the peer the same storage connection so startup
+loads the newest published snapshot and only replays the unindexed log tail:
+
+```sh
+# Filesystem storage
+cargo run -p corium-mbrainz --bin mbrainz-repl -- \
+  --peer-store fs --data-dir ./corium-mbrainz-data
+
+# Turso 0.7 (all processes opening the file must use the multi-process WAL)
+cargo run -p corium-mbrainz --features turso --bin mbrainz-repl -- \
+  --peer-store turso --data-dir ./corium-mbrainz-data
+
+# PostgreSQL
+cargo run -p corium-mbrainz --features postgres --bin mbrainz-repl -- \
+  --peer-store postgres --postgres-url "$DATABASE_URL"
+```
+
 ## Storage backends
 
 `--store` selects where the transactor keeps blobs and root pointers:
@@ -88,7 +105,8 @@ examples/musicbrainz/scripts/console.sh    # EDN-Datalog console
 |---------|--------------------------|------------|-------|
 | `mem`   | in-memory                | in-memory  | Fully ephemeral; one process. Great for demos/tests. |
 | `fs`    | `{data-dir}/store`       | `{data-dir}/logs` | The default; survives restarts. |
-| `turso` | Turso (embeddable SQLite) | `{data-dir}/logs` | Durable index storage in Turso; the log stays local. Needs `--features turso`. |
+| `turso` | Turso 0.7 (embeddable SQLite) | `{data-dir}/logs` | Durable index storage in Turso; local multi-process WAL is experimental. Needs `--features turso`. |
+| `postgres` | PostgreSQL | `{data-dir}/logs` | Shared storage with MVCC readers. Needs `--features postgres`. |
 
 Because the transaction log is appended synchronously by the commit pipeline,
 it stays on the local filesystem for `fs` and `turso`; `mem` keeps it in a
@@ -108,6 +126,8 @@ process-shared in-memory log. See
   client environment (aliased `d`), connects, and binds `conn` and `db`. Each
   line you enter is read and evaluated; the value of the last form is printed.
   Refresh the database value after a load with `(def db (d/sync conn))`.
+  `--peer-store` enables storage-aware snapshot bootstrap; without it the
+  peer retains the compatibility path that replays the log from basis zero.
 
 ## Bringing your own (larger) dataset
 

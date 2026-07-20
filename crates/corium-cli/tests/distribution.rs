@@ -125,6 +125,29 @@ fn long_values(db: &corium_db::Db) -> Vec<i64> {
         .collect()
 }
 
+async fn assert_storage_peer_snapshot_and_tail(
+    proc: &TransactorProc,
+    data: &Path,
+    writer: &Connection,
+) {
+    let storage = Arc::new(FsStore::open(data.join("store")).expect("open peer store"));
+    let storage_peer =
+        Connection::connect(ConnectConfig::new(proc.endpoint(), "converge").with_storage(storage))
+            .await
+            .expect("storage-aware peer connects");
+    assert_eq!(storage_peer.basis_t(), 40);
+    let mut values = long_values(&storage_peer.db());
+    values.sort_unstable();
+    assert_eq!(values, (0..40).collect::<Vec<_>>());
+
+    writer.transact(add_value(40)).await.expect("tail transact");
+    let tail = storage_peer.sync().await.expect("storage peer tail sync");
+    assert_eq!(tail.basis_t(), 41);
+    let mut values = long_values(&tail);
+    values.sort_unstable();
+    assert_eq!(values, (0..41).collect::<Vec<_>>());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn n_peers_converge_and_reconnect_backfills_gaplessly() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -226,6 +249,10 @@ async fn n_peers_converge_and_reconnect_backfills_gaplessly() {
         .map(|datom| datom.key(IndexOrder::Eavt))
         .collect();
     assert_eq!(keys, expected, "published segment diverges from peer state");
+
+    // A cold storage-aware peer materializes that snapshot, then continues
+    // from the transaction stream without needing a basis-zero replay.
+    assert_storage_peer_snapshot_and_tail(&proc, &data, &writer).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

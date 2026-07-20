@@ -16,6 +16,7 @@ use cljrs_value::native_object::{NativeObject, NativeObjectBox};
 use cljrs_value::{Arity, NativeFn, Value, ValueError, ValueResult};
 use corium_core::{EntityId, IndexOrder};
 use corium_db::Db;
+use corium_peer::segment::PeerStorage;
 use corium_peer::{ConnectConfig, Connection, PeerReport};
 use corium_query::boundary::{edn_to_value, value_to_edn};
 use corium_query::edn::Edn;
@@ -382,11 +383,19 @@ fn report_edn(db: &Db, report: &PeerReport) -> Edn {
     ])
 }
 
-/// Registers the complete `corium.api` namespace (read operations plus
-/// connection management) into `globals`, driving async peer calls on
-/// `handle`'s runtime.
-#[allow(clippy::too_many_lines)]
+/// Registers the complete `corium.api` namespace using log-only peers.
 pub fn register_api(globals: &Arc<GlobalEnv>, handle: &Handle) {
+    register_api_with_storage(globals, handle, None);
+}
+
+/// Registers the complete `corium.api` namespace, optionally giving every
+/// `d/connect` peer direct access to the database's blob/root storage.
+#[allow(clippy::too_many_lines)]
+pub fn register_api_with_storage(
+    globals: &Arc<GlobalEnv>,
+    handle: &Handle,
+    storage: Option<Arc<dyn PeerStorage>>,
+) {
     register_read_api(globals);
     let h = handle.clone();
     define(
@@ -396,7 +405,10 @@ pub fn register_api(globals: &Arc<GlobalEnv>, handle: &Handle) {
             let Value::Str(url) = &args[0] else {
                 return Err(verr("connect takes a corium://host:port/db url string"));
             };
-            let config = parse_url(url.get())?;
+            let mut config = parse_url(url.get())?;
+            if let Some(storage) = &storage {
+                config = config.with_storage(Arc::clone(storage));
+            }
             let conn = h
                 .block_on(Connection::connect(config))
                 .map_err(|error| verr(error.to_string()))?;
@@ -563,8 +575,20 @@ pub fn register_api(globals: &Arc<GlobalEnv>, handle: &Handle) {
 /// Must be called on the thread that will run the cljrs program.
 #[must_use]
 pub fn client_env(handle: &Handle) -> Arc<GlobalEnv> {
+    client_env_with_storage(handle, None)
+}
+
+/// Builds a full cljrs client environment whose connections can bootstrap
+/// from direct blob/root storage before consuming the transactor log tail.
+///
+/// Must be called on the thread that will run the cljrs program.
+#[must_use]
+pub fn client_env_with_storage(
+    handle: &Handle,
+    storage: Option<Arc<dyn PeerStorage>>,
+) -> Arc<GlobalEnv> {
     let globals = cljrs_interp::standard_env_minimal(None, None, None);
-    register_api(&globals, handle);
+    register_api_with_storage(&globals, handle, storage);
     globals.add_alias("user", "d", "corium.api");
     globals
 }

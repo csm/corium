@@ -40,6 +40,11 @@ service Transactor {
   credentials can also rediscover the holder's advertised endpoint from the
   root record) and resubscribes from its basis; the transactor backfills
   from the log if the gap is large.
+- On a cold storage-aware connection, the initial subscription basis is the
+  `index-basis-t` of the immutable snapshot the peer just loaded. The root
+  selects a complete snapshot, and the subscription supplies the gap through
+  the handshake basis, so concurrent index publication does not require a
+  cross-service transaction.
 - All requests carry the database name and a protocol version; the transactor
   rejects mismatched `format-version` roots with a clear upgrade error.
 

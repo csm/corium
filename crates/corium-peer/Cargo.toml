@@ -8,6 +8,7 @@ homepage.workspace = true
 description = "Corium peer library"
 
 [dependencies]
+async-trait = "0.1"
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-log = { workspace = true }

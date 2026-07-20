@@ -9,13 +9,16 @@
 //! runs on the main thread (never a runtime worker), matching the pattern the
 //! `corium.api` bindings expect.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cljrs_env::env::Env;
 use cljrs_value::Value;
 use corium_mbrainz::endpoints;
+use corium_peer::segment::PeerStorage;
+use corium_store::FsStore;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -29,6 +32,27 @@ struct Args {
     /// Database to connect to.
     #[arg(long, default_value = "mbrainz")]
     db: String,
+    /// Optional direct storage backend. When present, the peer loads the
+    /// newest published snapshot instead of replaying from transaction zero.
+    #[arg(long, value_enum)]
+    peer_store: Option<PeerStoreKind>,
+    /// Transactor data directory for `--peer-store fs`, and the default
+    /// Turso database location (`{data-dir}/store.db`).
+    #[arg(long, default_value = "./corium-mbrainz-data")]
+    data_dir: PathBuf,
+    /// Turso database path for `--peer-store turso`.
+    #[arg(long)]
+    turso_path: Option<PathBuf>,
+    /// `PostgreSQL` connection string for `--peer-store postgres`.
+    #[arg(long)]
+    postgres_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PeerStoreKind {
+    Fs,
+    Postgres,
+    Turso,
 }
 
 fn main() -> ExitCode {
@@ -57,7 +81,8 @@ fn run(args: &Args) -> Result<(), String> {
     // mutator and keep the read/eval loop here (block_on is legal off a
     // runtime worker, which is what the `corium.api` bindings need).
     let _mutator = cljrs_gc::register_mutator();
-    let globals = corium_cljrs::api::client_env(runtime.handle());
+    let storage = open_peer_storage(args, &runtime)?;
+    let globals = corium_cljrs::api::client_env_with_storage(runtime.handle(), storage);
 
     let mut session = Session { globals };
     session
@@ -69,6 +94,69 @@ fn run(args: &Args) -> Result<(), String> {
 
     banner(&url);
     repl(&mut session)
+}
+
+fn open_peer_storage(
+    args: &Args,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<Option<Arc<dyn PeerStorage>>, String> {
+    let Some(kind) = args.peer_store else {
+        return Ok(None);
+    };
+    match kind {
+        PeerStoreKind::Fs => Ok(Some(Arc::new(
+            FsStore::open(args.data_dir.join("store"))
+                .map_err(|error| format!("cannot open peer storage: {error}"))?,
+        ))),
+        PeerStoreKind::Postgres => open_postgres_storage(args, runtime).map(Some),
+        PeerStoreKind::Turso => open_turso_storage(args, runtime).map(Some),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn open_postgres_storage(
+    args: &Args,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<Arc<dyn PeerStorage>, String> {
+    let url = args
+        .postgres_url
+        .as_deref()
+        .ok_or_else(|| "--peer-store postgres requires --postgres-url".to_owned())?;
+    let store = runtime
+        .block_on(corium_store::PostgresBlobStore::connect_existing(url))
+        .map_err(|error| format!("cannot open PostgreSQL peer storage: {error}"))?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "postgres"))]
+fn open_postgres_storage(
+    _args: &Args,
+    _runtime: &tokio::runtime::Runtime,
+) -> Result<Arc<dyn PeerStorage>, String> {
+    Err("PostgreSQL peer storage requires --features postgres".into())
+}
+
+#[cfg(feature = "turso")]
+fn open_turso_storage(
+    args: &Args,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<Arc<dyn PeerStorage>, String> {
+    let path = args
+        .turso_path
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("store.db"));
+    let store = runtime
+        .block_on(corium_store::TursoBlobStore::open_existing(path))
+        .map_err(|error| format!("cannot open Turso peer storage: {error}"))?;
+    Ok(Arc::new(store))
+}
+
+#[cfg(not(feature = "turso"))]
+fn open_turso_storage(
+    _args: &Args,
+    _runtime: &tokio::runtime::Runtime,
+) -> Result<Arc<dyn PeerStorage>, String> {
+    Err("Turso peer storage requires --features turso".into())
 }
 
 struct Session {

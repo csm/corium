@@ -69,6 +69,22 @@ merged with `log tail (index-basis-t, basis-t]` replayed into an in-memory
 live index. Peers hold the live index incrementally via tx-reports; a cold
 reader replays the tail from storage.
 
+The implemented peer bootstrap follows that rule for the current value: a
+peer initialized with a blob/root storage connection reads `meta:<db>` and
+`db:<db>`, materializes the published EAVT snapshot at `index-basis-t`, and
+subscribes to the transactor from that basis. A peer without storage
+credentials uses the compatibility path and subscribes from basis zero.
+Published v1 segments contain current facts only, so a snapshot-bootstrapped
+peer does not reconstruct transactions that ceased contributing live facts
+before the snapshot; complete pre-snapshot historical views still require
+full-log replay (or the future history roots described above).
+
+Filesystem, PostgreSQL, and Turso implement the same peer read interface.
+PostgreSQL readers use ordinary MVCC and do not contend with the root CAS
+writer. Turso 0.7 requires its experimental multi-process WAL for independent
+processes opening one local file; Corium enables it in `TursoBlobStore::open`,
+but every process touching that file must run the same coordinated mode.
+
 ## Storage traits
 
 ```rust
