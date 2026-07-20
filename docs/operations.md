@@ -47,6 +47,52 @@ depth, indexing duration, and GC. Peer metrics cover query count/latency and
 query fuel spent. `corium db stats` and the transactor `Status` RPC provide
 basis, index lag, counts, queue depth, and GC counters on demand.
 
+## Index publication pacing and bulk loading
+
+The transactor republishes its covering indexes in the background so cold
+peers can bootstrap from a snapshot instead of replaying the whole log.
+Each index is published as content-defined leaf chunks under a small
+manifest, and only chunks absent from the store are uploaded — so a
+publication writes roughly the chunks the changes landed in, not the whole
+database. Building the snapshot still costs CPU proportional to the
+database, which is what pacing bounds:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `--index-interval-ms` | 5000 | Base interval between publications. |
+| `--index-backoff` | 4 | Minimum wait before the next publication, as a multiple `n` of the previous publication's duration. Bounds indexing to at most `1/(1+n)` of wall time and storage bandwidth as publications get slower; `0` disables. |
+| `--index-tail-threshold` | 0 | Defer a due publication while fewer than this many new datoms are pending, so trickle writes coalesce instead of rewriting every index. `0` publishes any pending work. |
+| `--index-tail-deadline-ms` | 60000 | Longest a below-threshold tail defers publication. |
+
+Indexing is an optimization, never a durability requirement: the log append
+is the commit point, and the transactor serves from its in-memory value
+regardless of index lag. Deferring publication only lengthens cold-peer
+bootstrap (the log tail past the published basis is replayed) and the
+freshness of backups.
+
+All four pacing knobs can also be changed per database at runtime, without
+restarting the transactor, and read back the same way (omitted flags are
+unchanged; overrides last until the process restarts):
+
+```sh
+corium db index-policy people --interval-ms 60000 --tail-threshold 1000000
+corium db index-policy people
+```
+
+An explicit publication that bypasses pacing entirely:
+
+```sh
+corium db request-index people
+```
+
+For bulk loads, raise the tail threshold (for example to a million datoms)
+so the load coalesces publications, rely on the backoff to keep the
+indexing duty cycle bounded as the database grows, and finish with
+`request-index` if you want the snapshot current immediately. Watch
+`index_lag` in `corium db stats` or the metrics endpoint during the load;
+otherwise the final tail publishes within the tail deadline of the last
+transaction.
+
 ## Query console
 
 ```sh

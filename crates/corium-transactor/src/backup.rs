@@ -5,12 +5,14 @@
 //! incremental: immutable blobs already present are not copied.
 
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use corium_log::{FileLog, LogError, TransactionLog, TxRecord, VersionedLog};
 use corium_store::{
-    BlobStore, DbRoot, FORMAT_VERSION, FsStore, RootStore, StoreError, db_root_name,
+    BlobId, BlobStore, DbRoot, FORMAT_VERSION, FsStore, RootStore, StoreError, db_root_name,
 };
 use thiserror::Error;
 
@@ -192,29 +194,55 @@ async fn copy_root_blobs(
     target: &dyn BlobStore,
     root: &DbRoot,
 ) -> Result<(usize, usize), BackupError> {
-    // v1 index publications store each covering index as one flat blob. When
-    // index roots become tree nodes, this must share the recursive child walk
-    // used by GC so backup and reachability cannot diverge.
     let mut copied = 0;
     let mut reused = 0;
+    let mut seen = std::collections::HashSet::new();
     for id in root.roots.iter().flatten() {
+        copy_blob_tree(source, target, id, &mut seen, &mut copied, &mut reused).await?;
+    }
+    Ok((copied, reused))
+}
+
+/// Copies one blob and everything it references, children first.
+///
+/// Child references are decoded with the same helper GC's mark phase uses
+/// (`index_blob_children`), so backup and reachability cannot diverge.
+/// Post-order preserves the store invariant that a present parent's
+/// children are present too — an interrupted run never leaves a manifest
+/// whose chunks a later incremental backup would wrongly skip — and lets a
+/// blob already in the target count as reused without re-reading its tree.
+fn copy_blob_tree<'a>(
+    source: &'a dyn BlobStore,
+    target: &'a dyn BlobStore,
+    id: &'a BlobId,
+    seen: &'a mut std::collections::HashSet<BlobId>,
+    copied: &'a mut usize,
+    reused: &'a mut usize,
+) -> Pin<Box<dyn Future<Output = Result<(), BackupError>> + Send + 'a>> {
+    Box::pin(async move {
+        if !seen.insert(id.clone()) {
+            return Ok(());
+        }
         if target.contains(id).await? {
-            reused += 1;
-            continue;
+            *reused += 1;
+            return Ok(());
         }
         let bytes = source
             .get(id)
             .await?
             .ok_or_else(|| BackupError::Invalid(format!("root references missing blob {id}")))?;
+        for child in corium_store::index_blob_children(&bytes)? {
+            copy_blob_tree(source, target, &child, seen, copied, reused).await?;
+        }
         let copied_id = target.put(&bytes).await?;
         if copied_id != *id {
             return Err(BackupError::Invalid(format!(
                 "blob digest changed while copying {id}"
             )));
         }
-        copied += 1;
-    }
-    Ok((copied, reused))
+        *copied += 1;
+        Ok(())
+    })
 }
 
 /// Copies one offline database into `destination`.

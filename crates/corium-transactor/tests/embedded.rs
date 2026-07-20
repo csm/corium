@@ -2,11 +2,13 @@
 
 use corium_core::{Cardinality, EntityId, Partition, Schema, Value, ValueType};
 use corium_db::attribute;
-use corium_log::FileLog;
-use corium_store::{BlobStore, FsStore, RootStore};
+use corium_log::{FileLog, TransactionLog};
+use corium_store::{BlobId, BlobStore, FsStore, RootStore};
 use corium_transactor::EmbeddedTransactor;
 use corium_tx::{EntityRef, TxItem, TxOp};
+use std::collections::HashSet;
 use std::{sync::Arc, thread};
+use tokio_stream::StreamExt;
 fn schema() -> (Schema, EntityId) {
     let a = EntityId::new(Partition::Db as u32, 100);
     let mut schema = Schema::default();
@@ -95,6 +97,74 @@ fn recovery_never_reuses_retracted_entity_ids() {
         "id {} reused after recovery (first allocation was {})",
         second.sequence(),
         first.sequence()
+    );
+}
+
+async fn blob_ids(store: &FsStore) -> HashSet<BlobId> {
+    let mut ids = HashSet::new();
+    let mut stream = store.list().await.expect("list blobs");
+    while let Some(id) = stream.next().await {
+        ids.insert(id.expect("blob id"));
+    }
+    ids
+}
+
+#[tokio::test]
+async fn republication_uploads_only_the_chunks_a_change_touches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let store = FsStore::open(dir.path().join("store")).expect("store");
+    // Enough datoms that every covering index spans several leaf chunks
+    // (content-defined boundaries average one per ~2k keys). The load goes
+    // straight into the durable log — this test is about publication, and
+    // per-item transaction validation over a database this size would
+    // dominate its runtime.
+    let log = Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
+    let datoms: Vec<_> = (0u64..30_000)
+        .map(|n| corium_core::Datom {
+            e: EntityId::new(Partition::User as u32, corium_db::FIRST_USER_ID + n),
+            a,
+            v: Value::Long(i64::try_from(n).expect("small value")),
+            tx: EntityId::new(Partition::Tx as u32, 1),
+            added: true,
+        })
+        .collect();
+    log.append(&corium_log::TxRecord {
+        t: 1,
+        tx_instant: 1,
+        datoms,
+    })
+    .expect("bulk log append");
+    let tx = EmbeddedTransactor::recover(schema, log).expect("recover");
+    tx.publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("first publish");
+    let before = blob_ids(&store).await;
+    assert!(
+        before.len() >= 24,
+        "expected several chunks per index, found {} blobs",
+        before.len()
+    );
+
+    // One appended datom (largest entity id and value, so it lands in the
+    // tail chunk of every order) must not re-upload the settled chunks.
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp("tail".into()),
+        a,
+        Value::Long(1_000_000),
+    ))])
+    .expect("tail transact");
+    tx.publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("second publish");
+    let after = blob_ids(&store).await;
+    let fresh = after.difference(&before).count();
+    assert!(fresh >= 4, "each index publishes a new manifest");
+    assert!(
+        fresh <= 12,
+        "appending one datom re-uploaded {fresh} blobs of {} (expected only \
+         each index's manifest and tail chunk)",
+        after.len()
     );
 }
 

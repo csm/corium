@@ -64,6 +64,8 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
         .await
         .expect("incremental");
     assert_eq!(incremental.copied_blobs, 0);
+    // A reused index manifest vouches for its chunks (they were copied with
+    // it), so the unchanged root reuses exactly the four manifests.
     assert_eq!(incremental.reused_blobs, 4);
 
     node.transact("main", &encoded("[[:db/add 1000 :item/value 3]]"))
@@ -75,7 +77,9 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
         .expect("incremental delta");
     assert_eq!(delta.basis_t, 3);
     assert!(delta.copied_blobs > 0);
-    assert_eq!(delta.copied_blobs + delta.reused_blobs, 4);
+    // The new root reaches the same number of blobs (manifests plus leaf
+    // chunks); only the ones the change touched are copied again.
+    assert_eq!(delta.copied_blobs + delta.reused_blobs, first.copied_blobs);
 
     let report = restore(backup_dir.path(), restored.path(), "clone")
         .await
