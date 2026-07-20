@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_core::KeywordInterner;
 use corium_peer::server::PeerServerConfig;
-use corium_peer::{Admin, ConnectConfig, Connection};
+use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings};
 use corium_protocol::auth::{StaticToken, client_tls, server_tls};
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
@@ -385,6 +385,37 @@ enum DbCommand {
         #[command(flatten)]
         client: ClientFlags,
     },
+    /// Ask the transactor to publish the database's indexes now.
+    RequestIndex {
+        /// Database name.
+        name: String,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
+    /// Read or override the database's index-publication pacing at runtime.
+    ///
+    /// Omitted flags are left unchanged; with no flags the current policy
+    /// is printed. Overrides last until the transactor restarts.
+    IndexPolicy {
+        /// Database name.
+        name: String,
+        /// Base interval between index publications (ms).
+        #[arg(long)]
+        interval_ms: Option<u64>,
+        /// Minimum wait before the next publication, as a multiple of the
+        /// previous publication's duration (0 disables the backoff).
+        #[arg(long)]
+        backoff: Option<u32>,
+        /// Defer publication while fewer than this many new datoms are
+        /// pending (0 publishes any pending work).
+        #[arg(long)]
+        tail_threshold: Option<u64>,
+        /// Longest a below-threshold tail defers publication (ms).
+        #[arg(long)]
+        tail_deadline_ms: Option<u64>,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
 }
 
 #[tokio::main]
@@ -583,7 +614,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 let report = corium_store::mark_and_sweep_retained(
                     &store,
                     live,
-                    |_, _| Ok(Vec::new()),
+                    |_, bytes| corium_store::index_blob_children(bytes),
                     parse_duration(&window)?,
                     std::time::SystemTime::now(),
                 )
@@ -783,6 +814,12 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
+async fn admin_client(client: &ClientFlags) -> Result<Admin, String> {
+    Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn run_db(command: DbCommand) -> Result<(), String> {
     match command {
         DbCommand::Create {
@@ -808,9 +845,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
                 }
                 None => Vec::new(),
             };
-            let mut admin = Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut admin = admin_client(&client).await?;
             let created = admin
                 .create_database(&name, &forms)
                 .await
@@ -819,9 +854,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             Ok(())
         }
         DbCommand::Delete { name, client } => {
-            let mut admin = Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut admin = admin_client(&client).await?;
             let deleted = admin
                 .delete_database(&name)
                 .await
@@ -830,9 +863,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             Ok(())
         }
         DbCommand::List { client } => {
-            let mut admin = Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut admin = admin_client(&client).await?;
             for db in admin
                 .list_databases()
                 .await
@@ -842,34 +873,81 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             }
             Ok(())
         }
-        DbCommand::Stats { name, client } => {
-            let config = client.connect_config(name).await?;
-            let connection = Connection::connect(config)
+        DbCommand::Stats { name, client } => run_db_stats(name, &client).await,
+        DbCommand::RequestIndex { name, client } => {
+            let mut admin = admin_client(&client).await?;
+            let index_basis_t = admin
+                .request_index(&name)
                 .await
                 .map_err(|error| error.to_string())?;
-            let db = connection.sync().await.map_err(|error| error.to_string())?;
-            let stats = db.stats();
-            let status_response = connection
-                .status()
-                .await
-                .map_err(|error| error.to_string())?;
-            println!(
-                "{{:basis-t {} :index-basis-t {} :datoms {} :entities {} :attributes {} :index-lag {} :tx-count {} :tx-failures {} :tx-queue-depth {} :gc-runs {} :gc-swept-blobs {}}}",
-                db.basis_t(),
-                connection.index_basis_t(),
-                stats.datoms,
-                stats.entities,
-                stats.attributes,
-                status_response.index_lag,
-                status_response.transaction_count,
-                status_response.transaction_failure_count,
-                status_response.transaction_queue_depth,
-                status_response.gc_runs,
-                status_response.gc_swept_blobs,
-            );
+            println!("{{:db {name:?} :index-basis-t {index_basis_t}}}");
             Ok(())
         }
+        DbCommand::IndexPolicy {
+            name,
+            interval_ms,
+            backoff,
+            tail_threshold,
+            tail_deadline_ms,
+            client,
+        } => {
+            let update = IndexPolicySettings {
+                interval_ms,
+                backoff,
+                tail_threshold,
+                tail_deadline_ms,
+            };
+            run_db_index_policy(&name, update, &client).await
+        }
     }
+}
+
+async fn run_db_stats(name: String, client: &ClientFlags) -> Result<(), String> {
+    let config = client.connect_config(name).await?;
+    let connection = Connection::connect(config)
+        .await
+        .map_err(|error| error.to_string())?;
+    let db = connection.sync().await.map_err(|error| error.to_string())?;
+    let stats = db.stats();
+    let status_response = connection
+        .status()
+        .await
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{{:basis-t {} :index-basis-t {} :datoms {} :entities {} :attributes {} :index-lag {} :tx-count {} :tx-failures {} :tx-queue-depth {} :gc-runs {} :gc-swept-blobs {}}}",
+        db.basis_t(),
+        connection.index_basis_t(),
+        stats.datoms,
+        stats.entities,
+        stats.attributes,
+        status_response.index_lag,
+        status_response.transaction_count,
+        status_response.transaction_failure_count,
+        status_response.transaction_queue_depth,
+        status_response.gc_runs,
+        status_response.gc_swept_blobs,
+    );
+    Ok(())
+}
+
+async fn run_db_index_policy(
+    name: &str,
+    update: IndexPolicySettings,
+    client: &ClientFlags,
+) -> Result<(), String> {
+    let mut admin = admin_client(client).await?;
+    let policy = admin
+        .set_index_policy(name, update)
+        .await
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{{:db {name:?} :interval-ms {} :backoff {} :tail-threshold {} :tail-deadline-ms {}}}",
+        policy.interval_ms.unwrap_or_default(),
+        policy.backoff.unwrap_or_default(),
+        policy.tail_threshold.unwrap_or_default(),
+        policy.tail_deadline_ms.unwrap_or_default(),
+    );
+    Ok(())
 }
 
 async fn run_log(data_dir: &std::path::Path, db: &str, from: u64, to: u64) -> Result<(), String> {

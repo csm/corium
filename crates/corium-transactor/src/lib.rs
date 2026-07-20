@@ -196,6 +196,12 @@ impl EmbeddedTransactor {
 
     /// Builds a consistent snapshot of all four indexes and publishes their blob ids.
     ///
+    /// Each index is chunked into content-defined leaf blobs under a
+    /// manifest blob ([`corium_store::chunk_segment_keys`]), and only
+    /// chunks absent from the store are uploaded — consecutive publications
+    /// share every unchanged chunk, so a small change re-uploads a few
+    /// chunks instead of the whole index.
+    ///
     /// Blobs are uploaded before the root CAS. Transactions may continue while the
     /// immutable snapshot is encoded; a later run indexes any remaining log tail.
     ///
@@ -216,7 +222,7 @@ impl EmbeddedTransactor {
     ) -> Result<DbRoot, TransactError> {
         let snapshot = self.db();
         let datoms = snapshot.datoms();
-        let segments = tokio::task::spawn_blocking(move || {
+        let chunked = tokio::task::spawn_blocking(move || {
             [
                 IndexOrder::Eavt,
                 IndexOrder::Aevt,
@@ -226,20 +232,20 @@ impl EmbeddedTransactor {
             .into_iter()
             .map(|order| {
                 let segment = Segment::build(order, datoms.clone());
-                let mut bytes = Vec::new();
-                for (key, _) in segment.entries() {
-                    bytes.extend_from_slice(&(key.len() as u64).to_be_bytes());
-                    bytes.extend_from_slice(key);
-                }
-                bytes
+                corium_store::chunk_segment_keys(segment.entries().map(|(key, _)| key.as_slice()))
             })
             .collect::<Vec<_>>()
         })
         .await
         .map_err(|error| TransactError::IndexTask(error.to_string()))?;
         let mut ids = Vec::new();
-        for bytes in segments {
-            ids.push(store.put(&bytes).await?);
+        for chunks in chunked {
+            let mut children = Vec::new();
+            for chunk in chunks {
+                children.push(store.put_if_absent(&chunk).await?);
+            }
+            let manifest = corium_store::encode_index_manifest(&children);
+            ids.push(store.put_if_absent(&manifest).await?);
         }
         let root = DbRoot {
             format_version: corium_store::FORMAT_VERSION,

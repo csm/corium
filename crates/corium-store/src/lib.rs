@@ -19,6 +19,12 @@ use fs2::FileExt;
 use thiserror::Error;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
+mod snapshot;
+pub use snapshot::{
+    INDEX_MANIFEST_MAGIC, chunk_segment_keys, decode_index_manifest, encode_index_manifest,
+    index_blob_children, is_index_manifest,
+};
+
 #[cfg(feature = "postgres")]
 mod postgres_store;
 #[cfg(feature = "postgres")]
@@ -149,6 +155,20 @@ pub trait BlobStore: Send + Sync {
     /// Returns an error if the backend cannot inspect the blob.
     async fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
         Ok(self.get(id).await?.is_some())
+    }
+    /// Stores bytes only when their content id is absent, skipping the
+    /// upload for blobs the store already holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot inspect or persist the blob.
+    async fn put_if_absent(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
+        let id = digest(bytes);
+        if self.contains(&id).await? {
+            Ok(id)
+        } else {
+            self.put(bytes).await
+        }
     }
     /// Deletes a blob during garbage collection. Missing blobs are ignored.
     ///
@@ -554,7 +574,9 @@ impl RootStore for FsStore {
     }
 }
 
-fn digest(bytes: &[u8]) -> BlobId {
+/// Computes the content id [`BlobStore::put`] would assign to `bytes`.
+#[must_use]
+pub fn digest(bytes: &[u8]) -> BlobId {
     BlobId(blake3::hash(bytes).to_hex().to_string())
 }
 
@@ -575,7 +597,13 @@ pub fn meta_root_name(db: &str) -> String {
 /// Format 2 (M7) folds the write lease into the root record so lease
 /// ownership and index publication are fenced by one atomic CAS; format 1
 /// roots (separate `lease:` record) decode with an unowned lease.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// Format 3 publishes each covering index as a manifest blob naming
+/// content-defined leaf chunks (see [`snapshot`](self::snapshot)-module
+/// items such as [`chunk_segment_keys`]), so consecutive publications share
+/// unchanged chunks instead of rewriting the whole index; format-2 flat
+/// single-blob snapshots remain readable.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Published durable index-root metadata carrying the write lease
 /// (see `docs/design/log-and-transactor.md`).

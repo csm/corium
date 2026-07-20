@@ -69,6 +69,14 @@ merged with `log tail (index-basis-t, basis-t]` replayed into an in-memory
 live index. Peers hold the live index incrementally via tx-reports; a cold
 reader replays the tail from storage.
 
+The implemented publication (storage format 3) is a first cut of the
+segment-tree design: each covering index is stored as a manifest blob
+naming content-defined leaf chunks (`corium-store`'s `snapshot` module),
+and only chunks absent from the store are uploaded, so consecutive roots
+share every untouched chunk. Inner tree levels (and with them seek-without-
+full-download) are still future work; readers concatenate a manifest's
+chunks and accept pre-format-3 flat snapshots.
+
 The implemented peer bootstrap follows that rule for the current value: a
 peer initialized with a blob/root storage connection reads `meta:<db>` and
 `db:<db>`, materializes the published EAVT snapshot at `index-basis-t`, and

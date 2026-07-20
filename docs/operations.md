@@ -51,8 +51,11 @@ basis, index lag, counts, queue depth, and GC counters on demand.
 
 The transactor republishes its covering indexes in the background so cold
 peers can bootstrap from a snapshot instead of replaying the whole log.
-Publication currently rewrites every index in full, so its cost grows with
-the database; pacing is governed by:
+Each index is published as content-defined leaf chunks under a small
+manifest, and only chunks absent from the store are uploaded — so a
+publication writes roughly the chunks the changes landed in, not the whole
+database. Building the snapshot still costs CPU proportional to the
+database, which is what pacing bounds:
 
 | Knob | Default | Effect |
 |---|---|---|
@@ -67,11 +70,28 @@ regardless of index lag. Deferring publication only lengthens cold-peer
 bootstrap (the log tail past the published basis is replayed) and the
 freshness of backups.
 
-For bulk loads, raise `--index-tail-threshold` (for example to a million
-datoms) so the load coalesces publications, and rely on the backoff to keep
-the indexing duty cycle bounded as the database grows. Watch `index_lag` in
-`corium db stats` or the metrics endpoint during the load; the final tail
-publishes within the tail deadline of the last transaction.
+All four pacing knobs can also be changed per database at runtime, without
+restarting the transactor, and read back the same way (omitted flags are
+unchanged; overrides last until the process restarts):
+
+```sh
+corium db index-policy people --interval-ms 60000 --tail-threshold 1000000
+corium db index-policy people
+```
+
+An explicit publication that bypasses pacing entirely:
+
+```sh
+corium db request-index people
+```
+
+For bulk loads, raise the tail threshold (for example to a million datoms)
+so the load coalesces publications, rely on the backoff to keep the
+indexing duty cycle bounded as the database grows, and finish with
+`request-index` if you want the snapshot current immediately. Watch
+`index_lag` in `corium db stats` or the metrics endpoint during the load;
+otherwise the final tail publishes within the tail deadline of the last
+transaction.
 
 ## Query console
 

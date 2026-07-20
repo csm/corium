@@ -839,6 +839,66 @@ impl Admin {
             .await?;
         Ok(response.into_inner().swept_blobs)
     }
+
+    /// Asks the transactor to publish `db`'s covering indexes now,
+    /// bypassing its pacing policy; returns the resulting index basis.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure or an unknown database.
+    pub async fn request_index(&mut self, db: &str) -> Result<u64, PeerError> {
+        let response = self
+            .client
+            .request_index(pb::RequestIndexRequest { db: db.to_owned() })
+            .await?;
+        Ok(response.into_inner().index_basis_t)
+    }
+
+    /// Overrides `db`'s index-publication pacing at runtime; `None` fields
+    /// are left unchanged, so an all-`None` update reads the current
+    /// policy. Returns the policy now in effect.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure or an unknown database.
+    pub async fn set_index_policy(
+        &mut self,
+        db: &str,
+        update: IndexPolicySettings,
+    ) -> Result<IndexPolicySettings, PeerError> {
+        let response = self
+            .client
+            .set_index_policy(pb::SetIndexPolicyRequest {
+                db: db.to_owned(),
+                interval_ms: update.interval_ms,
+                backoff: update.backoff,
+                tail_threshold: update.tail_threshold,
+                tail_deadline_ms: update.tail_deadline_ms,
+            })
+            .await?
+            .into_inner();
+        Ok(IndexPolicySettings {
+            interval_ms: Some(response.interval_ms),
+            backoff: Some(response.backoff),
+            tail_threshold: Some(response.tail_threshold),
+            tail_deadline_ms: Some(response.tail_deadline_ms),
+        })
+    }
+}
+
+/// Index-publication pacing fields for [`Admin::set_index_policy`]: `None`
+/// in a request leaves the field unchanged; responses set every field to
+/// the effective policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IndexPolicySettings {
+    /// Base interval between publications (ms).
+    pub interval_ms: Option<u64>,
+    /// Minimum wait before the next publication, as a multiple of the
+    /// previous publication's duration (0 disables the backoff).
+    pub backoff: Option<u32>,
+    /// Pending-datom count below which a due publication is deferred
+    /// (0 publishes any pending work).
+    pub tail_threshold: Option<u64>,
+    /// Longest a below-threshold tail defers publication (ms).
+    pub tail_deadline_ms: Option<u64>,
 }
 
 fn duration_millis(duration: Duration) -> u64 {

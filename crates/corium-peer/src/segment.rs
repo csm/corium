@@ -13,7 +13,7 @@ use corium_db::Db;
 use corium_protocol::codec::{self, CodecError};
 use corium_store::{
     BlobId, BlobStore, DbRoot, FORMAT_VERSION, RootStore, SegmentCache, StoreError, db_root_name,
-    meta_root_name,
+    decode_index_manifest, is_index_manifest, meta_root_name,
 };
 use thiserror::Error;
 
@@ -101,12 +101,8 @@ pub async fn load_current_snapshot(
         return Err(SnapshotError::MissingMetadata(db.into()));
     };
     let (schema, idents, interner) = codec::decode_metadata(&metadata)?;
-    let segment_id = &roots[0];
-    let segment = store
-        .get_blob(segment_id)
+    let datoms = load_index_keys(store, &roots[0])
         .await?
-        .ok_or_else(|| StoreError::MissingBlob(segment_id.clone()))?;
-    let datoms = decode_segment_keys(&segment)?
         .into_iter()
         .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
         .collect::<Result<Vec<_>, _>>()?;
@@ -117,6 +113,27 @@ pub async fn load_current_snapshot(
         interner,
         datoms,
     )))
+}
+
+/// Loads one covering index's sorted keys: a format-3 manifest's chunks in
+/// order, or a pre-format-3 flat key stream.
+async fn load_index_keys(store: &dyn PeerStorage, id: &BlobId) -> Result<Vec<Vec<u8>>, StoreError> {
+    let blob = store
+        .get_blob(id)
+        .await?
+        .ok_or_else(|| StoreError::MissingBlob(id.clone()))?;
+    if !is_index_manifest(&blob) {
+        return decode_segment_keys(&blob);
+    }
+    let mut keys = Vec::new();
+    for child in decode_index_manifest(&blob)? {
+        let chunk = store
+            .get_blob(&child)
+            .await?
+            .ok_or_else(|| StoreError::MissingBlob(child.clone()))?;
+        keys.extend(decode_segment_keys(&chunk)?);
+    }
+    Ok(keys)
 }
 
 fn decode_segment_keys(bytes: &[u8]) -> Result<Vec<Vec<u8>>, StoreError> {
@@ -180,11 +197,12 @@ impl<S: BlobStore + RootStore> SegmentSource<S> {
             .and_then(|root| (!root.owner_endpoint.is_empty()).then_some(root.owner_endpoint)))
     }
 
-    /// Loads the segment for one index order of a published root, through
-    /// the cache.
+    /// Loads the full key stream for one index order of a published root,
+    /// through the cache: a format-3 manifest's chunks concatenated in
+    /// order, or a pre-format-3 flat segment as stored.
     ///
     /// # Errors
-    /// Returns an error when the blob cannot be loaded.
+    /// Returns an error when a blob cannot be loaded or is missing.
     pub async fn segment(
         &self,
         root: &DbRoot,
@@ -199,9 +217,26 @@ impl<S: BlobStore + RootStore> SegmentSource<S> {
             IndexOrder::Avet => 2,
             IndexOrder::Vaet => 3,
         };
-        self.cache
+        let Some(blob) = self
+            .cache
             .get_or_load(self.store.as_ref(), &roots[slot])
-            .await
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !is_index_manifest(&blob) {
+            return Ok(Some(blob));
+        }
+        let mut bytes = Vec::new();
+        for child in decode_index_manifest(&blob)? {
+            let chunk = self
+                .cache
+                .get_or_load(self.store.as_ref(), &child)
+                .await?
+                .ok_or_else(|| StoreError::MissingBlob(child.clone()))?;
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(bytes.into()))
     }
 
     /// Decodes a segment's length-prefixed key entries.
@@ -264,6 +299,60 @@ mod tests {
             .expect("published snapshot");
         assert_eq!(db.basis_t(), 37);
         assert_eq!(db.datoms(), vec![datom]);
+    }
+
+    #[tokio::test]
+    async fn loads_chunked_manifest_snapshot() {
+        let store = MemoryStore::default();
+        let datoms: Vec<Datom> = (0..4u64)
+            .map(|n| Datom {
+                e: EntityId::from_raw(1_001 + n),
+                a: EntityId::from_raw(101),
+                v: Value::Long(i64::try_from(n).unwrap()),
+                tx: EntityId::from_raw(37),
+                added: true,
+            })
+            .collect();
+        // Two chunks of two keys each, under one manifest per index.
+        let mut chunk_ids = Vec::new();
+        for pair in datoms.chunks(2) {
+            let mut chunk = Vec::new();
+            for datom in pair {
+                let key = datom.key(IndexOrder::Eavt);
+                chunk.extend_from_slice(&(key.len() as u64).to_be_bytes());
+                chunk.extend_from_slice(&key);
+            }
+            chunk_ids.push(store.put(&chunk).await.expect("put chunk"));
+        }
+        let manifest = corium_store::encode_index_manifest(&chunk_ids);
+        let id = store.put(&manifest).await.expect("put manifest");
+        let root = DbRoot {
+            format_version: FORMAT_VERSION,
+            lease_version: 1,
+            owner: "test".into(),
+            lease_expires_unix_ms: 0,
+            owner_endpoint: String::new(),
+            index_basis_t: 37,
+            roots: Some([id.clone(), id.clone(), id.clone(), id]),
+        };
+        RootStore::cas_root(&store, &db_root_name("music"), None, &root.encode())
+            .await
+            .expect("put root");
+        let metadata = codec::encode_metadata(
+            &corium_core::Schema::default(),
+            &Idents::default(),
+            &KeywordInterner::default(),
+        );
+        RootStore::cas_root(&store, &meta_root_name("music"), None, &metadata)
+            .await
+            .expect("put metadata");
+
+        let db = load_current_snapshot(&store, "music")
+            .await
+            .expect("load snapshot")
+            .expect("published snapshot");
+        assert_eq!(db.basis_t(), 37);
+        assert_eq!(db.datoms(), datoms);
     }
 
     #[tokio::test]

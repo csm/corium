@@ -168,11 +168,44 @@ message GcDeletedDatabasesResponse {
   uint64 swept_blobs = 1;
 }
 
+message RequestIndexRequest {
+  string db = 1;
+}
+
+message RequestIndexResponse {
+  // Index basis after the publication; when the published indexes already
+  // covered every committed transaction, the current index basis.
+  uint64 index_basis_t = 1;
+}
+
+// Per-database runtime overrides of the index-publication pacing configured
+// by the transactor's flags. Only set fields change; a request with no
+// fields set reads the current policy.
+message SetIndexPolicyRequest {
+  string db = 1;
+  optional uint64 interval_ms = 2;
+  optional uint32 backoff = 3;
+  optional uint64 tail_threshold = 4;
+  optional uint64 tail_deadline_ms = 5;
+}
+
+// The policy in effect after applying the request.
+message SetIndexPolicyResponse {
+  uint64 interval_ms = 1;
+  uint32 backoff = 2;
+  uint64 tail_threshold = 3;
+  uint64 tail_deadline_ms = 4;
+}
+
 service Catalog {
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc DeleteDatabase(DeleteDatabaseRequest) returns (DeleteDatabaseResponse);
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   rpc GcDeletedDatabases(GcDeletedDatabasesRequest) returns (GcDeletedDatabasesResponse);
+  // Publishes the database's covering indexes now, bypassing pacing.
+  rpc RequestIndex(RequestIndexRequest) returns (RequestIndexResponse);
+  // Adjusts (or reads) the database's index-publication pacing at runtime.
+  rpc SetIndexPolicy(SetIndexPolicyRequest) returns (SetIndexPolicyResponse);
 }
 
 // ---------------------------------------------------------------------------

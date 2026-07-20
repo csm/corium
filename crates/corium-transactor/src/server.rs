@@ -12,7 +12,7 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::node::{DbState, NodeError, TransactorNode};
+use crate::node::{DbState, IndexPolicyUpdate, NodeError, TransactorNode};
 
 /// Maps node errors onto gRPC statuses.
 #[must_use]
@@ -274,6 +274,47 @@ impl Catalog for CatalogSvc {
         let swept_blobs = swept.map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::GcDeletedDatabasesResponse {
             swept_blobs,
+        }))
+    }
+
+    async fn request_index(
+        &self,
+        request: Request<pb::RequestIndexRequest>,
+    ) -> Result<Response<pb::RequestIndexResponse>, Status> {
+        let request = request.into_inner();
+        let index_basis_t = self
+            .0
+            .request_index(&request.db)
+            .await
+            .map_err(|error| to_status(&error))?;
+        Ok(Response::new(pb::RequestIndexResponse { index_basis_t }))
+    }
+
+    async fn set_index_policy(
+        &self,
+        request: Request<pb::SetIndexPolicyRequest>,
+    ) -> Result<Response<pb::SetIndexPolicyResponse>, Status> {
+        let request = request.into_inner();
+        let update = IndexPolicyUpdate {
+            interval: request.interval_ms.map(std::time::Duration::from_millis),
+            backoff: request.backoff,
+            tail_threshold: request.tail_threshold,
+            tail_deadline: request
+                .tail_deadline_ms
+                .map(std::time::Duration::from_millis),
+        };
+        let policy = self
+            .0
+            .set_index_policy(&request.db, update)
+            .await
+            .map_err(|error| to_status(&error))?;
+        let millis =
+            |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        Ok(Response::new(pb::SetIndexPolicyResponse {
+            interval_ms: millis(policy.interval),
+            backoff: policy.backoff,
+            tail_threshold: policy.tail_threshold,
+            tail_deadline_ms: millis(policy.tail_deadline),
         }))
     }
 }

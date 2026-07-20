@@ -501,6 +501,41 @@ async fn tls_and_bearer_token_auth_guard_every_service() {
     drop(proc);
 }
 
+/// Runtime index control: override pacing, read it back, force a publish.
+fn index_control_round_trip(run: &impl Fn(Vec<String>) -> String, endpoint: &str) {
+    let policy = run(vec![
+        "db".into(),
+        "index-policy".into(),
+        "clidb".into(),
+        "--interval-ms".into(),
+        "600000".into(),
+        "--tail-threshold".into(),
+        "5000".into(),
+        "--transactor".into(),
+        endpoint.to_owned(),
+    ]);
+    assert!(
+        policy.contains(":interval-ms 600000") && policy.contains(":tail-threshold 5000"),
+        "{policy}"
+    );
+    let read_back = run(vec![
+        "db".into(),
+        "index-policy".into(),
+        "clidb".into(),
+        "--transactor".into(),
+        endpoint.to_owned(),
+    ]);
+    assert!(read_back.contains(":interval-ms 600000"), "{read_back}");
+    let requested = run(vec![
+        "db".into(),
+        "request-index".into(),
+        "clidb".into(),
+        "--transactor".into(),
+        endpoint.to_owned(),
+    ]);
+    assert!(requested.contains(":index-basis-t 1"), "{requested}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_admin_commands_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -559,6 +594,8 @@ async fn cli_admin_commands_round_trip() {
         stats.contains(":basis-t 1") && stats.contains(":datoms 1"),
         "{stats}"
     );
+
+    index_control_round_trip(&run, &endpoint);
 
     // Offline log inspection sees the committed record.
     let logged = run(vec![
