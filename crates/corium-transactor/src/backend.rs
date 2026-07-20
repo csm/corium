@@ -289,6 +289,15 @@ impl LogBackend {
         }
     }
 
+    /// Reports whether any log exists for `name`.
+    #[must_use]
+    pub fn exists(&self, name: &str) -> bool {
+        match self {
+            Self::Fs(dir) => VersionedLog::exists(dir, name),
+            Self::Mem(registry) => registry.exists(name),
+        }
+    }
+
     /// Deletes every log for `name`.
     ///
     /// # Errors

@@ -285,6 +285,35 @@ After restore, start the target transactor and compare `corium db stats` with
 the backup report's basis. The manifest and database root carry a format
 version; a newer unsupported format fails clearly before publication.
 
+## Forking a database
+
+A fork creates a new database that duplicates an existing one at a
+transaction basis — a sandbox wound back to a point in time, useful for
+debugging against real data or trying an alternative approach without
+touching the original. Unlike backup/restore, forking is online: it runs
+against the live transactor through the catalog service.
+
+```sh
+corium db fork people people-debug --as-of 1234
+corium db fork people people-scratch          # fork at the current basis
+```
+
+The fork copies only the transaction-log prefix through the requested basis
+(every `t` up to the source's basis is a transaction, so any value in range
+is exact); schema metadata is shared and index segments dedupe by content
+address in the blob store. The new database replays that prefix, publishes
+its own indexes, and from then on transacts completely independently of its
+source. The command prints the fork's basis:
+
+```
+{:db "people-debug" :forked-from "people" :basis-t 1234 :created true}
+```
+
+Forking refuses a basis ahead of the source and never overwrites: an
+existing target reports `:created false` and nothing is changed. Note that
+a read-only point-in-time view does not need a fork — peers get one locally
+with `as-of` — so fork only when the sandbox must accept writes.
+
 ## Garbage collection
 
 The transactor runs GC hourly by default and retains unreachable blobs for 72

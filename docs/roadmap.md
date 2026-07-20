@@ -107,8 +107,47 @@ error surfacing to callers beyond retry latency.
 
 ## Post-v1 backlog (unordered)
 
-S3-compatible and Postgres storage backends (traits already fit); fulltext
-(`tantivy`) and tuple value types; excision (design reserved in
-time-model.md); query fn clauses in user cljrs code; leapfrog join; HTTP/JSON
-gateway; adaptive index statistics; disk tier for peer segment cache;
-`:db/ensure` entity specs.
+Scaling and durability (see
+[log-and-transactor.md](design/log-and-transactor.md) for the log design):
+
+- **Durable log in shared storage.** Move the transaction log from per-node
+  files into the storage service: conditional-write tail objects plus sealed
+  chunks under a `log-root` for object stores, a `(db, lease-version, t)`
+  log table for the SQL backends. Removes HA's shared-data-directory
+  requirement, lets a standby take over from a dead node's database, and
+  unpins databases from transactor machines. Prerequisite for partitioned
+  transactors.
+- **Recovery from the index root.** Open a database from its published
+  indexes plus the log tail since `index-basis-t` instead of full-log
+  replay, making open and restart time proportional to the tail rather than
+  the history. Requires publishing the history trees ("future history
+  roots" in [indexes-and-storage.md](design/indexes-and-storage.md)) —
+  v1 segments carry current facts only, so a transactor recovered from them
+  could not yet serve complete `history`/`as-of` views.
+- **Transactor hosting policy.** Host a configured subset of the catalog
+  (filter flags or a placement map in the root store) so concurrent
+  transactors partition many databases; per-database leases and peer
+  lease-holder rediscovery already suffice for routing. Includes
+  open-on-demand with idle eviction — acquire the lease and replay on first
+  client touch, release the lease and drop in-memory state after an idle
+  window — so a cold database costs only its root records, and lease
+  renewals (a root CAS per hosted database every TTL/3) stop dominating
+  root-store traffic at large catalog sizes. Cross-machine placement
+  depends on the durable-log item.
+- **Copy-free fork.** `db fork` currently copies the log prefix and
+  rebuilds indexes; share the parent's index roots behind an as-of ceiling
+  in the DbRoot (format bump) to make fork cost independent of database
+  size. Depends on published history roots (rewinding below the parent's
+  index basis needs retracted facts), and needs explicit semantics for
+  `:db/noHistory` attributes, whose pre-retraction values cannot be
+  faithfully rewound.
+- **S3-compatible storage backend.** The `BlobStore`/`RootStore` traits
+  already fit; root CAS uses S3 conditional writes, with a small strongly
+  consistent KV for roots as the fallback split where those are missing.
+
+Engine and API:
+
+- Fulltext (`tantivy`) and tuple value types; excision (design reserved in
+  [time-model.md](design/time-model.md)); query fn clauses in user cljrs
+  code; leapfrog join; HTTP/JSON gateway; adaptive index statistics; disk
+  tier for peer segment cache; `:db/ensure` entity specs.

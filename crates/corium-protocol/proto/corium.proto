@@ -152,6 +152,22 @@ message DeleteDatabaseResponse {
   bool deleted = 1;
 }
 
+message ForkDatabaseRequest {
+  // Source database.
+  string db = 1;
+  // Name for the new fork.
+  string target = 2;
+  // Transaction basis to fork at; 0 forks at the source's current basis.
+  uint64 as_of_t = 3;
+}
+
+message ForkDatabaseResponse {
+  // False when the target already existed (nothing was forked).
+  bool created = 1;
+  // The fork's basis: the source transaction it duplicates through.
+  uint64 basis_t = 2;
+}
+
 message ListDatabasesRequest {}
 
 message ListDatabasesResponse {
@@ -200,6 +216,9 @@ message SetIndexPolicyResponse {
 service Catalog {
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc DeleteDatabase(DeleteDatabaseRequest) returns (DeleteDatabaseResponse);
+  // Creates a new database duplicating an existing one at a transaction
+  // basis (point-in-time fork).
+  rpc ForkDatabase(ForkDatabaseRequest) returns (ForkDatabaseResponse);
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   rpc GcDeletedDatabases(GcDeletedDatabasesRequest) returns (GcDeletedDatabasesResponse);
   // Publishes the database's covering indexes now, bypassing pacing.

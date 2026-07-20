@@ -373,6 +373,19 @@ enum DbCommand {
         #[command(flatten)]
         client: ClientFlags,
     },
+    /// Fork a database: create a new database duplicating an existing one
+    /// at a transaction basis (e.g. as a sandbox wound back to a point).
+    Fork {
+        /// Source database name.
+        name: String,
+        /// Name for the new fork.
+        target: String,
+        /// Transaction basis to fork at (defaults to the current basis).
+        #[arg(long)]
+        as_of: Option<u64>,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
     /// List databases.
     List {
         #[command(flatten)]
@@ -860,6 +873,25 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
                 .await
                 .map_err(|error| error.to_string())?;
             println!("{{:db {name:?} :deleted {deleted}}}");
+            Ok(())
+        }
+        DbCommand::Fork {
+            name,
+            target,
+            as_of,
+            client,
+        } => {
+            let mut admin = admin_client(&client).await?;
+            let forked = admin
+                .fork_database(&name, &target, as_of)
+                .await
+                .map_err(|error| error.to_string())?;
+            match forked {
+                Some(basis_t) => println!(
+                    "{{:db {target:?} :forked-from {name:?} :basis-t {basis_t} :created true}}"
+                ),
+                None => println!("{{:db {target:?} :created false}}"),
+            }
             Ok(())
         }
         DbCommand::List { client } => {
