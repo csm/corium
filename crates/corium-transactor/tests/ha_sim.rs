@@ -166,16 +166,17 @@ impl RootStore for ScriptedStore {
             self.world.tick().await;
         }
         let result = self.world.raw.cas_root(name, expected, new).await;
-        if result.is_ok() && name == db_root_name(DB) {
-            if let Some(root) = DbRoot::decode(new) {
-                let mut script = self.world.script.lock().expect("script lock");
-                let after_takeover = script.fired;
-                script.installs.push(Install {
-                    by_active: self.counted,
-                    after_takeover,
-                    root,
-                });
-            }
+        if result.is_ok()
+            && name == db_root_name(DB)
+            && let Some(root) = DbRoot::decode(new)
+        {
+            let mut script = self.world.script.lock().expect("script lock");
+            let after_takeover = script.fired;
+            script.installs.push(Install {
+                by_active: self.counted,
+                after_takeover,
+                root,
+            });
         }
         result
     }

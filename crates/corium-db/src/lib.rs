@@ -288,6 +288,19 @@ impl Db {
         self.indexes()[slot(order)].values()
     }
 
+    /// Iterates this view's datoms for one attribute in AEVT order.
+    ///
+    /// Unlike AVET, AEVT covers every installed attribute. Callers can use
+    /// this as the fallback for attribute predicates that do not have AVET
+    /// coverage.
+    pub fn datoms_for_attribute(&self, a: AttrId) -> impl Iterator<Item = &Datom> {
+        let prefix = key_prefix(IndexOrder::Aevt, None, Some(a), None);
+        self.indexes()[slot(IndexOrder::Aevt)]
+            .range(prefix.clone()..)
+            .take_while(move |(key, _)| key.starts_with(&prefix))
+            .map(|(_, datom)| datom)
+    }
+
     /// Iterates datoms whose key in `order` starts with `prefix`.
     pub fn datoms_prefix<'a>(
         &'a self,
@@ -597,6 +610,15 @@ mod tests {
             vec![Value::Str("alicia".into())]
         );
         assert_eq!(db.stats().datoms, 3);
+    }
+
+    #[test]
+    fn attribute_scan_uses_complete_aevt_coverage() {
+        let db = sample();
+        let datoms = db.datoms_for_attribute(attr(1)).collect::<Vec<_>>();
+        assert_eq!(datoms.len(), 1);
+        assert_eq!(datoms[0].v, Value::Str("alicia".into()));
+        assert!(datoms.iter().all(|datom| datom.a == attr(1)));
     }
 
     #[test]

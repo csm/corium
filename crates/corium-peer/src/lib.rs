@@ -640,10 +640,10 @@ async fn run_loop(inner: Arc<Inner>, initial: Option<tonic::Streaming<pb::Subscr
             match next {
                 Ok(Some(item)) => {
                     backoff = inner.config.reconnect_min;
-                    if let Some(item) = item.item {
-                        if apply_item(&inner, item).is_err() {
-                            stream = None;
-                        }
+                    if let Some(item) = item.item
+                        && apply_item(&inner, item).is_err()
+                    {
+                        stream = None;
                     }
                     continue;
                 }

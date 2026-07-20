@@ -5,6 +5,9 @@ fact-oriented, with Datalog queries and peer-local query execution — written
 in Rust, paired with [Clojurust](https://github.com/csm/clojurust) for
 EDN/Clojure data handling and database function execution.
 
+The peer also exposes read-only SQL through the `corium-sql` Rust crate and the
+`corium sql` interactive shell; see the [SQL interface](docs/sql.md).
+
 All roadmap milestones (M0–M7, through active/standby high availability)
 are implemented. Start with the
 [getting-started guide](docs/getting-started.md), work through the

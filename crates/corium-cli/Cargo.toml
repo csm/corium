@@ -25,6 +25,7 @@ corium-log = { workspace = true }
 corium-peer = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
+corium-sql = { workspace = true }
 corium-store = { workspace = true }
 corium-transactor = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

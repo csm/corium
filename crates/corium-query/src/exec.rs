@@ -77,10 +77,10 @@ impl<'a> ExecCtx<'a> {
         if builtins::is_native(name) {
             return builtins::call(name, values);
         }
-        if let Some(extern_call) = &self.extern_call {
-            if let Some(result) = extern_call(name, values) {
-                return result;
-            }
+        if let Some(extern_call) = &self.extern_call
+            && let Some(result) = extern_call(name, values)
+        {
+            return result;
         }
         builtins::call(name, values)
     }

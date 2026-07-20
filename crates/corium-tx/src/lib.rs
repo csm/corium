@@ -118,12 +118,11 @@ pub fn prepare(
     let mut tempids = BTreeMap::new();
     // Identity assertions unify a tempid with an existing entity before allocation.
     for op in &ops {
-        if let TxOp::Add(EntityRef::Temp(temp), a, value) = op {
-            if db.schema().get(*a).and_then(|x| x.unique) == Some(Unique::Identity) {
-                if let Some(e) = db.lookup(*a, value) {
-                    tempids.insert(temp.clone(), e);
-                }
-            }
+        if let TxOp::Add(EntityRef::Temp(temp), a, value) = op
+            && db.schema().get(*a).and_then(|x| x.unique) == Some(Unique::Identity)
+            && let Some(e) = db.lookup(*a, value)
+        {
+            tempids.insert(temp.clone(), e);
         }
     }
     let mut next = next_user_sequence.max(FIRST_USER_ID);
@@ -283,10 +282,10 @@ fn collect_entity_retractions(
     }
     for datom in db.datoms() {
         if datom.e == e {
-            if db.schema().get(datom.a).is_some_and(|a| a.is_component) {
-                if let Value::Ref(child) = &datom.v {
-                    collect_entity_retractions(db, *child, facts, seen);
-                }
+            if db.schema().get(datom.a).is_some_and(|a| a.is_component)
+                && let Value::Ref(child) = &datom.v
+            {
+                collect_entity_retractions(db, *child, facts, seen);
             }
             facts.insert((datom.e, datom.a, datom.v));
         } else if datom.v == Value::Ref(e) {

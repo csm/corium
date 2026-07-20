@@ -432,10 +432,9 @@ fn version_files(dir: &Path, name: &str) -> Vec<(u64, PathBuf)> {
                 .strip_prefix(&prefix)
                 .and_then(|rest| rest.strip_suffix(".log"))
                 .and_then(|v| v.parse::<u64>().ok())
+                && version > 0
             {
-                if version > 0 {
-                    files.push((version, entry.path()));
-                }
+                files.push((version, entry.path()));
             }
         }
     }

@@ -382,25 +382,23 @@ fn input_value(db: Option<&Db>, form: &Edn) -> Result<Value, QueryError> {
         return Ok(value);
     }
     // Lookup ref `[attr value]` resolved against the default database.
-    if let (Some(db), Edn::Vector(items)) = (db, form) {
-        if let [attr_form, value_form] = items.as_slice() {
-            if let Some(attr_kw) = attr_form.as_keyword() {
-                let attr = db
-                    .idents()
-                    .entid(attr_kw)
-                    .ok_or_else(|| QueryError::UnknownIdent(attr_kw.clone()))?;
-                let value = edn_to_value(Some(db), value_form).ok_or_else(|| {
-                    QueryError::Type(format!("bad lookup ref value {value_form}"))
-                })?;
-                let value = db.schema().get(attr).map_or(value.clone(), |meta| {
-                    exec::coerce_for_type(value, meta.value_type)
-                });
-                return db
-                    .lookup(attr, &value)
-                    .map(Value::Ref)
-                    .ok_or_else(|| QueryError::Type(format!("lookup ref {form} did not resolve")));
-            }
-        }
+    if let (Some(db), Edn::Vector(items)) = (db, form)
+        && let [attr_form, value_form] = items.as_slice()
+        && let Some(attr_kw) = attr_form.as_keyword()
+    {
+        let attr = db
+            .idents()
+            .entid(attr_kw)
+            .ok_or_else(|| QueryError::UnknownIdent(attr_kw.clone()))?;
+        let value = edn_to_value(Some(db), value_form)
+            .ok_or_else(|| QueryError::Type(format!("bad lookup ref value {value_form}")))?;
+        let value = db.schema().get(attr).map_or(value.clone(), |meta| {
+            exec::coerce_for_type(value, meta.value_type)
+        });
+        return db
+            .lookup(attr, &value)
+            .map(Value::Ref)
+            .ok_or_else(|| QueryError::Type(format!("lookup ref {form} did not resolve")));
     }
     Err(QueryError::Type(format!("cannot convert input {form}")))
 }

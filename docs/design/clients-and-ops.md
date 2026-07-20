@@ -14,6 +14,7 @@ corium backup <uri> <dest>                 # see below
 corium restore <src> <uri>
 corium log <uri> --from t1 --to t2         # dump tx-range as EDN
 corium console <uri>                       # interactive query console
+corium sql <uri>                           # interactive read-only SQL shell
 ```
 
 Config files are EDN (read via cljrs-reader): storage backend + credentials,
@@ -32,6 +33,14 @@ A full cljrs REPL with `corium.api` loaded (via the cljrs nREPL/REPL tooling)
 is the richer alternative for Clojure-fluent users and costs us nothing beyond
 the M5 bindings — the console exists so the database is explorable without
 knowing Clojure.
+
+## SQL shell
+
+`corium sql` embeds the peer-local SQL engine and uses the same connection
+flags as `corium console`. It supports interactive, `-c` command, and `-f` file
+modes. Backslash commands select current/as-of/since/history sessions, inspect
+the basis and registered relations, and enable timing. SQL is read-only; see
+[../sql.md](../sql.md) for the relational projection and Rust API.
 
 ## Backup and restore
 

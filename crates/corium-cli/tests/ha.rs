@@ -81,10 +81,10 @@ impl TransactorProc {
     async fn wait_ready(&self) -> Admin {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Ok(mut admin) = Admin::connect(&self.endpoint(), None, None).await {
-                if admin.list_databases().await.is_ok() {
-                    return admin;
-                }
+            if let Ok(mut admin) = Admin::connect(&self.endpoint(), None, None).await
+                && admin.list_databases().await.is_ok()
+            {
+                return admin;
             }
             assert!(
                 Instant::now() < deadline,

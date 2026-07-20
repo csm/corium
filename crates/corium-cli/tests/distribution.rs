@@ -84,10 +84,10 @@ impl TransactorProc {
     async fn wait_ready(&self) -> Admin {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Ok(mut admin) = Admin::connect(&self.endpoint(), None, None).await {
-                if admin.list_databases().await.is_ok() {
-                    return admin;
-                }
+            if let Ok(mut admin) = Admin::connect(&self.endpoint(), None, None).await
+                && admin.list_databases().await.is_ok()
+            {
+                return admin;
             }
             assert!(
                 Instant::now() < deadline,
@@ -203,10 +203,11 @@ async fn n_peers_converge_and_reconnect_backfills_gaplessly() {
         FsStore::open(data.join("store")).expect("open store"),
     ));
     let root = loop {
-        if let Some(root) = source.index_root("converge").await.expect("root") {
-            if root.roots.is_some() && root.index_basis_t >= 40 {
-                break root;
-            }
+        if let Some(root) = source.index_root("converge").await.expect("root")
+            && root.roots.is_some()
+            && root.index_basis_t >= 40
+        {
+            break root;
         }
         assert!(Instant::now() < deadline, "index never published");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -432,10 +433,9 @@ async fn tls_and_bearer_token_auth_guard_every_service() {
     let mut admin = loop {
         if let Ok(mut admin) =
             Admin::connect(&endpoint, Some("secret-token".into()), Some(tls.clone())).await
+            && admin.list_databases().await.is_ok()
         {
-            if admin.list_databases().await.is_ok() {
-                break admin;
-            }
+            break admin;
         }
         assert!(Instant::now() < deadline, "TLS transactor never ready");
         tokio::time::sleep(Duration::from_millis(100)).await;

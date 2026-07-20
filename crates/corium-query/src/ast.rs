@@ -282,14 +282,14 @@ fn normalize_to_map(form: &Edn) -> Result<Edn, QueryError> {
             let mut pairs: Vec<(Edn, Edn)> = Vec::new();
             let mut current: Option<(Edn, Vec<Edn>)> = None;
             for item in items {
-                if let Edn::Keyword(k) = item {
-                    if k.namespace.is_none() {
-                        if let Some((key, values)) = current.take() {
-                            pairs.push((key, Edn::Vector(values)));
-                        }
-                        current = Some((Edn::Keyword(k.clone()), Vec::new()));
-                        continue;
+                if let Edn::Keyword(k) = item
+                    && k.namespace.is_none()
+                {
+                    if let Some((key, values)) = current.take() {
+                        pairs.push((key, Edn::Vector(values)));
                     }
+                    current = Some((Edn::Keyword(k.clone()), Vec::new()));
+                    continue;
                 }
                 match &mut current {
                     Some((_, values)) => values.push(item.clone()),
@@ -315,21 +315,21 @@ fn parse_find(items: &[Edn]) -> Result<FindSpec, QueryError> {
         return Ok(FindSpec::Scalar(parse_find_elem(&items[0])?));
     }
     // Collection `[?x …]` or single tuple `[?x ?y]`.
-    if items.len() == 1 {
-        if let Edn::Vector(inner) = &items[0] {
-            if inner.last().and_then(Edn::as_symbol) == Some("...") {
-                if inner.len() != 2 {
-                    return Err(parse_error("collection find takes one element"));
-                }
-                return Ok(FindSpec::Coll(parse_find_elem(&inner[0])?));
+    if items.len() == 1
+        && let Edn::Vector(inner) = &items[0]
+    {
+        if inner.last().and_then(Edn::as_symbol) == Some("...") {
+            if inner.len() != 2 {
+                return Err(parse_error("collection find takes one element"));
             }
-            return Ok(FindSpec::Tuple(
-                inner
-                    .iter()
-                    .map(parse_find_elem)
-                    .collect::<Result<_, _>>()?,
-            ));
+            return Ok(FindSpec::Coll(parse_find_elem(&inner[0])?));
         }
+        return Ok(FindSpec::Tuple(
+            inner
+                .iter()
+                .map(parse_find_elem)
+                .collect::<Result<_, _>>()?,
+        ));
     }
     Ok(FindSpec::Rel(
         items
@@ -385,12 +385,12 @@ fn parse_in_spec(form: &Edn) -> Result<InSpec, QueryError> {
                 }
                 return Ok(InSpec::Coll(expect_var(&items[0])?));
             }
-            if items.len() == 1 {
-                if let Edn::Vector(inner) = &items[0] {
-                    return Ok(InSpec::Rel(
-                        inner.iter().map(expect_var).collect::<Result<_, _>>()?,
-                    ));
-                }
+            if items.len() == 1
+                && let Edn::Vector(inner) = &items[0]
+            {
+                return Ok(InSpec::Rel(
+                    inner.iter().map(expect_var).collect::<Result<_, _>>()?,
+                ));
             }
             Ok(InSpec::Tuple(
                 items.iter().map(expect_var).collect::<Result<_, _>>()?,
@@ -531,10 +531,10 @@ fn parse_branches(forms: &[Edn]) -> Result<Vec<Vec<Clause>>, QueryError> {
     forms
         .iter()
         .map(|form| {
-            if let Edn::List(items) = form {
-                if items.first().and_then(Edn::as_symbol) == Some("and") {
-                    return parse_clauses(&items[1..]);
-                }
+            if let Edn::List(items) = form
+                && items.first().and_then(Edn::as_symbol) == Some("and")
+            {
+                return parse_clauses(&items[1..]);
             }
             Ok(vec![parse_clause(form)?])
         })
@@ -558,12 +558,12 @@ fn parse_binding(form: &Edn) -> Result<Binding, QueryError> {
                 }
                 return Ok(Binding::Coll(target(&items[0])?));
             }
-            if items.len() == 1 {
-                if let Edn::Vector(inner) = &items[0] {
-                    return Ok(Binding::Rel(
-                        inner.iter().map(target).collect::<Result<_, _>>()?,
-                    ));
-                }
+            if items.len() == 1
+                && let Edn::Vector(inner) = &items[0]
+            {
+                return Ok(Binding::Rel(
+                    inner.iter().map(target).collect::<Result<_, _>>()?,
+                ));
             }
             Ok(Binding::Tuple(
                 items.iter().map(target).collect::<Result<_, _>>()?,
