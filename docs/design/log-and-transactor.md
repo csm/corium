@@ -19,6 +19,47 @@ append + fsync; object stores later: small per-tx objects compacted into
 chunks by the indexing job). The `corium-log` crate hides this behind
 `append(tx) -> t` and `replay(range)`.
 
+> **Status:** v1 implements the filesystem layout only (per-lease-version
+> files under the data directory); the shared-storage layouts below are
+> design for a backlog item. Until then, log durability is the data
+> directory's, and HA requires the members to share it.
+
+### Object-store log layout (future)
+
+On S3-class backends the current log semantics port without append support,
+using conditional writes:
+
+- **Live tail:** one small object per transaction (or micro-batch of the
+  queued pipeline — group commit), written with a create-only PUT
+  (`If-None-Match`) at `log/<db>/v<lease-version>/<t>` (`t` zero-padded so
+  listings sort). The PUT returning is the durability point; **no
+  per-transaction root CAS is needed**, so commits never contend with the
+  DbRoot record.
+- **Fencing carries over:** the version prefix is the object-store image of
+  the per-lease-version log files. Readers list every version prefix and
+  apply the same merge cutoff rule, discarding a deposed writer's stale
+  appends; the create-only condition rejects a duplicate `t` within a
+  version; and the post-append ownership re-check before acknowledgement is
+  unchanged.
+- **Sealing:** the indexing job compacts the tail — concatenate records
+  through `t*` into a content-addressed chunk, link it into the log tree,
+  CAS the DbRoot with the new `log-root` and log basis, then delete the
+  superseded tail objects. Every step is crash-only: orphan chunks are GC
+  garbage and an undeleted tail object is inert below the log basis.
+- **Roots on S3** rely on conditional writes (`If-Match` ETag CAS); for
+  providers without them, split the root store onto a small strongly
+  consistent KV (the DynamoDB pairing) — the `BlobStore`/`RootStore` trait
+  split anticipates exactly that mix.
+
+SQL backends (`PostgreSQL`, Turso) fit better as a **log table** keyed
+`(db, lease-version, t)` with one insert per commit — the same merge cutoff
+over rows, at lower latency than chunked blobs.
+
+A shared-storage log removes HA's shared-data-directory requirement, lets a
+standby take over from a node whose disk is gone, and unpins databases from
+transactor machines — the prerequisite for partitioning a catalog across
+concurrent transactors.
+
 ## Transaction pipeline
 
 One logical thread of control per database (the write serialization point):
