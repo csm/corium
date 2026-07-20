@@ -51,10 +51,10 @@ corium-tx = { path = "crates/corium-tx", version = "0.1.0" }
 
 ratatui = "0.29"
 
-cljrs-builtins = "0.1.225"
-cljrs-env = "0.1.225"
-cljrs-gc = "0.1.225"
-cljrs-interop = "0.1.225"
-cljrs-interp = "0.1.225"
-cljrs-reader = "0.1.225"
-cljrs-value = "0.1.225"
+cljrs-builtins = "0.1.226"
+cljrs-env = "0.1.226"
+cljrs-gc = "0.1.226"
+cljrs-interop = "0.1.226"
+cljrs-interp = "0.1.226"
+cljrs-reader = "0.1.226"
+cljrs-value = "0.1.226"
