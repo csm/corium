@@ -9,6 +9,7 @@ description = "Corium transactor"
 
 [features]
 default = []
+postgres = ["corium-store/postgres"]
 turso = ["corium-store/turso"]
 
 [dependencies]

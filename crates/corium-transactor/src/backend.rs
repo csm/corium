@@ -3,11 +3,13 @@
 //! A transactor keeps two kinds of durable state: the content-addressed
 //! blob store plus fenced root pointers (the "storage service"), and the
 //! per-database transaction log. [`StoreSpec`] selects the storage service
-//! backend — in-memory, filesystem, or Turso — and [`NodeStore`] dispatches
-//! the [`BlobStore`]/[`RootStore`] operations to it. The log stays local
-//! (in-memory for `mem`, filesystem otherwise) because the commit pipeline
-//! appends to it synchronously; see `docs/design/log-and-transactor.md`.
+//! backend — in-memory, filesystem, `PostgreSQL`, or Turso — and [`NodeStore`]
+//! dispatches the [`BlobStore`]/[`RootStore`] operations to it. The log stays
+//! local (in-memory for `mem`, filesystem otherwise) because the commit
+//! pipeline appends to it synchronously; see
+//! `docs/design/log-and-transactor.md`.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -16,11 +18,13 @@ use async_trait::async_trait;
 use corium_log::{LogError, MemLogRegistry, TransactionLog, VersionedLog};
 use corium_store::{BlobId, BlobIdStream, BlobStore, FsStore, MemoryStore, RootStore, StoreError};
 
+#[cfg(feature = "postgres")]
+use corium_store::PostgresBlobStore;
 #[cfg(feature = "turso")]
 use corium_store::TursoBlobStore;
 
 /// Selects the transactor's storage-service backend (blobs + roots).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub enum StoreSpec {
     /// In-memory blobs and roots; fully ephemeral and confined to one
     /// process. The transaction log is in memory too, so the whole database
@@ -29,6 +33,13 @@ pub enum StoreSpec {
     /// Blobs and roots under `{data_dir}/store`, log under `{data_dir}/logs`.
     #[default]
     Fs,
+    /// Blobs and roots in `PostgreSQL`; the transaction log stays on the local
+    /// filesystem under the data directory.
+    #[cfg(feature = "postgres")]
+    Postgres {
+        /// `PostgreSQL` URL or keyword/value connection string.
+        connection_string: String,
+    },
     /// Blobs and roots in a Turso (embeddable `SQLite`) database at `path`;
     /// the transaction log stays on the local filesystem under the data
     /// directory. `path` is a local database file.
@@ -37,6 +48,22 @@ pub enum StoreSpec {
         /// Filesystem path of the Turso database.
         path: String,
     },
+}
+
+impl fmt::Debug for StoreSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory => formatter.write_str("Memory"),
+            Self::Fs => formatter.write_str("Fs"),
+            #[cfg(feature = "postgres")]
+            Self::Postgres { .. } => formatter
+                .debug_struct("Postgres")
+                .field("connection_string", &"[REDACTED]")
+                .finish(),
+            #[cfg(feature = "turso")]
+            Self::Turso { path } => formatter.debug_struct("Turso").field("path", path).finish(),
+        }
+    }
 }
 
 /// The blob + root storage service a [`crate::node::TransactorNode`] runs
@@ -48,6 +75,9 @@ pub enum NodeStore {
     Mem(MemoryStore),
     /// Filesystem backend.
     Fs(FsStore),
+    /// `PostgreSQL` backend.
+    #[cfg(feature = "postgres")]
+    Postgres(PostgresBlobStore),
     /// Turso backend.
     #[cfg(feature = "turso")]
     Turso(TursoBlobStore),
@@ -59,12 +89,16 @@ impl NodeStore {
     ///
     /// # Errors
     /// Returns an error when the backing store cannot be opened.
-    // Only the Turso arm awaits; the mem/fs arms are synchronous.
+    // Only optional database-backed arms await; mem/fs are synchronous.
     #[allow(clippy::unused_async)]
     pub async fn open(spec: &StoreSpec, data_dir: &std::path::Path) -> Result<Self, StoreError> {
         match spec {
             StoreSpec::Memory => Ok(Self::Mem(MemoryStore::default())),
             StoreSpec::Fs => Ok(Self::Fs(FsStore::open(data_dir.join("store"))?)),
+            #[cfg(feature = "postgres")]
+            StoreSpec::Postgres { connection_string } => Ok(Self::Postgres(
+                PostgresBlobStore::connect(connection_string).await?,
+            )),
             #[cfg(feature = "turso")]
             StoreSpec::Turso { path } => Ok(Self::Turso(TursoBlobStore::open(path).await?)),
         }
@@ -77,6 +111,8 @@ impl BlobStore for NodeStore {
         match self {
             Self::Mem(store) => store.put(bytes).await,
             Self::Fs(store) => store.put(bytes).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.put(bytes).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.put(bytes).await,
         }
@@ -86,6 +122,8 @@ impl BlobStore for NodeStore {
         match self {
             Self::Mem(store) => store.get(id).await,
             Self::Fs(store) => store.get(id).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.get(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.get(id).await,
         }
@@ -95,6 +133,8 @@ impl BlobStore for NodeStore {
         match self {
             Self::Mem(store) => store.contains(id).await,
             Self::Fs(store) => store.contains(id).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.contains(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.contains(id).await,
         }
@@ -104,6 +144,8 @@ impl BlobStore for NodeStore {
         match self {
             Self::Mem(store) => store.delete(id).await,
             Self::Fs(store) => store.delete(id).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.delete(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.delete(id).await,
         }
@@ -113,6 +155,8 @@ impl BlobStore for NodeStore {
         match self {
             Self::Mem(store) => store.list().await,
             Self::Fs(store) => store.list().await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.list().await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.list().await,
         }
@@ -122,6 +166,8 @@ impl BlobStore for NodeStore {
         match self {
             Self::Mem(store) => store.modified_at(id).await,
             Self::Fs(store) => store.modified_at(id).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.modified_at(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.modified_at(id).await,
         }
@@ -134,6 +180,8 @@ impl RootStore for NodeStore {
         match self {
             Self::Mem(store) => store.get_root(name).await,
             Self::Fs(store) => store.get_root(name).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.get_root(name).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.get_root(name).await,
         }
@@ -148,6 +196,8 @@ impl RootStore for NodeStore {
         match self {
             Self::Mem(store) => store.cas_root(name, expected, new).await,
             Self::Fs(store) => store.cas_root(name, expected, new).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.cas_root(name, expected, new).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.cas_root(name, expected, new).await,
         }
@@ -157,6 +207,8 @@ impl RootStore for NodeStore {
         match self {
             Self::Mem(store) => store.delete_root(name).await,
             Self::Fs(store) => store.delete_root(name).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.delete_root(name).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.delete_root(name).await,
         }
@@ -166,6 +218,8 @@ impl RootStore for NodeStore {
         match self {
             Self::Mem(store) => store.list_roots(prefix).await,
             Self::Fs(store) => store.list_roots(prefix).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.list_roots(prefix).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.list_roots(prefix).await,
         }
@@ -189,6 +243,8 @@ impl LogBackend {
         match spec {
             StoreSpec::Memory => Self::Mem(MemLogRegistry::new()),
             StoreSpec::Fs => Self::Fs(data_dir.join("logs")),
+            #[cfg(feature = "postgres")]
+            StoreSpec::Postgres { .. } => Self::Fs(data_dir.join("logs")),
             #[cfg(feature = "turso")]
             StoreSpec::Turso { .. } => Self::Fs(data_dir.join("logs")),
         }

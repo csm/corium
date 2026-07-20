@@ -1,6 +1,7 @@
 //! Content-addressed blob and fenced root stores for immutable index segments.
 //!
-//! Enable the `turso` Cargo feature to use [`TursoBlobStore`].
+//! Enable the `postgres` or `turso` Cargo feature to use
+//! [`PostgresBlobStore`] or [`TursoBlobStore`], respectively.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -18,6 +19,10 @@ use fs2::FileExt;
 use thiserror::Error;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
+#[cfg(feature = "postgres")]
+mod postgres_store;
+#[cfg(feature = "postgres")]
+pub use postgres_store::PostgresBlobStore;
 #[cfg(feature = "turso")]
 mod turso_store;
 #[cfg(feature = "turso")]
@@ -74,6 +79,26 @@ pub enum StoreError {
     /// A blocking store worker failed before returning its result.
     #[error("store blocking task failed: {0}")]
     BlockingTask(String),
+    /// `PostgreSQL` database failure.
+    #[cfg(feature = "postgres")]
+    #[error("PostgreSQL store failed: {0}")]
+    Postgres(#[from] deadpool_postgres::tokio_postgres::Error),
+    /// `PostgreSQL` connection-pool checkout failure.
+    #[cfg(feature = "postgres")]
+    #[error("PostgreSQL connection pool failed: {0}")]
+    PostgresPool(#[from] deadpool_postgres::PoolError),
+    /// `PostgreSQL` connection-pool configuration failure.
+    #[cfg(feature = "postgres")]
+    #[error("PostgreSQL connection pool configuration failed: {0}")]
+    PostgresPoolCreate(#[from] deadpool_postgres::CreatePoolError),
+    /// No native certificate roots were available for `PostgreSQL` TLS.
+    #[cfg(feature = "postgres")]
+    #[error("cannot load native certificate roots for PostgreSQL TLS: {0}")]
+    PostgresTlsRoots(String),
+    /// `PostgreSQL` returned invalid store data.
+    #[cfg(feature = "postgres")]
+    #[error("PostgreSQL store contains invalid data: {0}")]
+    InvalidPostgresData(String),
     /// Turso database failure.
     #[cfg(feature = "turso")]
     #[error("Turso blob store failed: {0}")]

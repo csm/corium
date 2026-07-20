@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Enables the PostgreSQL storage backend for `corium transactor --store postgres`.
+postgres = ["corium-transactor/postgres"]
 # Enables the Turso storage backend for `corium transactor --store turso`.
 turso = ["corium-transactor/turso"]
 
