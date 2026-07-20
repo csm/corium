@@ -337,8 +337,9 @@ fn transactor_lines(status: &corium_protocol::pb::StatusResponse) -> Vec<(String
     } else {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+            });
         let remaining = status.lease_expires_unix_ms.saturating_sub(now_ms);
         format!(
             "{} (v{}, expires in {:.1}s)",
