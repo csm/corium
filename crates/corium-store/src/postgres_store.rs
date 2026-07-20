@@ -11,8 +11,12 @@ const CREATE_BLOBS_TABLE: &str = "
         id TEXT PRIMARY KEY NOT NULL,
         data BYTEA NOT NULL,
         created_at_unix_seconds BIGINT NOT NULL DEFAULT
-            (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::BIGINT)
-    )
+            (FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
+    );
+
+    ALTER TABLE corium_blobs
+        ALTER COLUMN created_at_unix_seconds SET DEFAULT
+            (FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP))::BIGINT)
 ";
 
 const CREATE_ROOTS_TABLE: &str = "
