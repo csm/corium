@@ -1320,11 +1320,7 @@ mod tests {
     #[test]
     fn fast_publications_leave_the_interval_untouched() {
         let pacing = pacing(5_000, 4, 0, 60_000);
-        assert!(pacing.due(
-            Duration::from_millis(5_000),
-            Duration::from_millis(3),
-            Some(1)
-        ));
+        assert!(pacing.due(Duration::from_secs(5), Duration::from_millis(3), Some(1)));
     }
 
     #[test]
