@@ -20,7 +20,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.15"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.88"
 homepage = "https://github.com/csm/corium"
@@ -34,20 +34,20 @@ all = "warn"
 pedantic = "warn"
 
 [workspace.dependencies]
-corium-cli = { path = "crates/corium-cli", version = "0.1.0" }
-corium-cljrs = { path = "crates/corium-cljrs", version = "0.1.0" }
-corium-core = { path = "crates/corium-core", version = "0.1.0" }
-corium-db = { path = "crates/corium-db", version = "0.1.0" }
-corium-index = { path = "crates/corium-index", version = "0.1.0" }
-corium-log = { path = "crates/corium-log", version = "0.1.0" }
-corium-peer = { path = "crates/corium-peer", version = "0.1.0" }
-corium-protocol = { path = "crates/corium-protocol", version = "0.1.0" }
-corium-query = { path = "crates/corium-query", version = "0.1.0" }
-corium-sql = { path = "crates/corium-sql", version = "0.1.0" }
-corium-sim = { path = "crates/corium-sim", version = "0.1.0" }
-corium-store = { path = "crates/corium-store", version = "0.1.0" }
-corium-transactor = { path = "crates/corium-transactor", version = "0.1.0" }
-corium-tx = { path = "crates/corium-tx", version = "0.1.0" }
+corium-cli = { path = "crates/corium-cli", version = "0.1.15" }
+corium-cljrs = { path = "crates/corium-cljrs", version = "0.1.15" }
+corium-core = { path = "crates/corium-core", version = "0.1.15" }
+corium-db = { path = "crates/corium-db", version = "0.1.15" }
+corium-index = { path = "crates/corium-index", version = "0.1.15" }
+corium-log = { path = "crates/corium-log", version = "0.1.15" }
+corium-peer = { path = "crates/corium-peer", version = "0.1.15" }
+corium-protocol = { path = "crates/corium-protocol", version = "0.1.15" }
+corium-query = { path = "crates/corium-query", version = "0.1.15" }
+corium-sql = { path = "crates/corium-sql", version = "0.1.15" }
+corium-sim = { path = "crates/corium-sim", version = "0.1.15" }
+corium-store = { path = "crates/corium-store", version = "0.1.15" }
+corium-transactor = { path = "crates/corium-transactor", version = "0.1.15" }
+corium-tx = { path = "crates/corium-tx", version = "0.1.15" }
 
 ratatui = "0.29"
 
