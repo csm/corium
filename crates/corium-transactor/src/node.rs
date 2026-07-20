@@ -63,6 +63,18 @@ pub struct NodeConfig {
     pub advertise: Option<String>,
     /// Interval between background index publications.
     pub index_interval: Duration,
+    /// Minimum wait before the next index publication, as a multiple of the
+    /// previous publication's duration. Publications currently rewrite every
+    /// index in full, so this stretches the effective interval as the
+    /// database grows, bounding the share of time and storage bandwidth
+    /// spent republishing to at most `1/(1+n)`; 0 disables the backoff.
+    pub index_backoff: u32,
+    /// Pending log-tail growth (recorded datoms) below which a due
+    /// publication is deferred, so trickle writes coalesce instead of
+    /// rewriting every index; 0 publishes any pending work.
+    pub index_tail_threshold: u64,
+    /// Longest a pending below-threshold tail may defer publication.
+    pub index_tail_deadline: Duration,
     /// Interval between heartbeats on subscription streams.
     pub heartbeat_interval: Duration,
     /// Interval between scheduled garbage-collection duties; `None` disables it.
@@ -84,6 +96,9 @@ impl std::fmt::Debug for NodeConfig {
             .field("ha", &self.ha)
             .field("advertise", &self.advertise)
             .field("index_interval", &self.index_interval)
+            .field("index_backoff", &self.index_backoff)
+            .field("index_tail_threshold", &self.index_tail_threshold)
+            .field("index_tail_deadline", &self.index_tail_deadline)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("gc_interval", &self.gc_interval)
             .field("gc_retention", &self.gc_retention)
@@ -108,10 +123,57 @@ impl NodeConfig {
             ha: false,
             advertise: None,
             index_interval: Duration::from_secs(5),
+            index_backoff: 4,
+            index_tail_threshold: 0,
+            index_tail_deadline: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(10),
             gc_interval: Some(Duration::from_secs(60 * 60)),
             gc_retention: Duration::from_secs(72 * 60 * 60),
             tx_fn_expander: None,
+        }
+    }
+}
+
+/// Pacing policy for the background indexing job.
+///
+/// A publication is due when the adaptive floor has elapsed — the base
+/// interval stretched by a multiple of the previous publication's duration,
+/// which bounds the indexing duty cycle as full republication gets slower —
+/// and the pending log tail is either large enough to be worth rewriting
+/// every index or old enough that deferring it further would leave cold
+/// readers and backups too far behind.
+#[derive(Clone, Copy, Debug)]
+struct IndexPacing {
+    interval: Duration,
+    backoff: u32,
+    tail_threshold: u64,
+    tail_deadline: Duration,
+}
+
+impl IndexPacing {
+    fn new(config: &NodeConfig) -> Self {
+        Self {
+            interval: config.index_interval,
+            backoff: config.index_backoff,
+            tail_threshold: config.index_tail_threshold,
+            tail_deadline: config.index_tail_deadline,
+        }
+    }
+
+    /// Decides whether pending work should publish now. `since_publish` is
+    /// the time since the last publication finished (or the job started),
+    /// `last_duration` how long it took (zero before the first), and
+    /// `pending` the recorded datoms appended since it — `None` until a
+    /// publication in this process establishes a baseline, which publishes
+    /// at base pacing (covers restarting with an unindexed backlog).
+    fn due(&self, since_publish: Duration, last_duration: Duration, pending: Option<u64>) -> bool {
+        let floor = self.interval.max(last_duration.saturating_mul(self.backoff));
+        if since_publish < floor {
+            return false;
+        }
+        match pending {
+            Some(pending) if pending < self.tail_threshold => since_publish >= self.tail_deadline,
+            _ => true,
         }
     }
 }
@@ -630,47 +692,7 @@ impl TransactorNode {
                 }
             }
         });
-        // Background indexing.
-        let node = Arc::clone(self);
-        let db = Arc::clone(state);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(node.config.index_interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                if db.deposed.load(Ordering::Acquire) {
-                    return;
-                }
-                if db.db().basis_t() <= db.index_basis() {
-                    continue;
-                }
-                let _gc = node.gc_lock.lock().await;
-                let version = db.lease().version;
-                let root_name = db_root_name(&db.name);
-                let started = Instant::now();
-                let published = db
-                    .transactor
-                    .publish_indexes(node.store.as_ref(), &root_name, version)
-                    .await;
-                node.metrics.record_index(started.elapsed());
-                match published {
-                    Ok(root) => {
-                        tracing::debug!(db = %db.name, index_basis_t = root.index_basis_t, "published indexes");
-                        db.index_basis.store(root.index_basis_t, Ordering::Release);
-                        let _ = db.broadcast.send(pb::subscribe_item::Item::IndexBasis(
-                            pb::IndexBasis {
-                                index_basis_t: root.index_basis_t,
-                            },
-                        ));
-                    }
-                    Err(TransactError::Deposed { .. }) => {
-                        node.depose(&db, "database root fenced by a newer lease");
-                        return;
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
+        self.spawn_indexing(state);
         // Heartbeats.
         let node = Arc::clone(self);
         let db = Arc::clone(state);
@@ -687,6 +709,67 @@ impl TransactorNode {
                     .send(pb::subscribe_item::Item::Heartbeat(pb::Heartbeat {
                         basis_t: db.db().basis_t(),
                     }));
+            }
+        });
+    }
+
+    /// Spawns the background indexing job, paced by [`IndexPacing`].
+    fn spawn_indexing(self: &Arc<Self>, state: &Arc<DbState>) {
+        let node = Arc::clone(self);
+        let db = Arc::clone(state);
+        tokio::spawn(async move {
+            let pacing = IndexPacing::new(&node.config);
+            let mut ticker = tokio::time::interval(node.config.index_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut published_at = Instant::now();
+            let mut last_duration = Duration::ZERO;
+            let mut published_len: Option<u64> = None;
+            loop {
+                ticker.tick().await;
+                if db.deposed.load(Ordering::Acquire) {
+                    return;
+                }
+                let snapshot = db.db();
+                if snapshot.basis_t() <= db.index_basis() {
+                    continue;
+                }
+                let recorded_len =
+                    u64::try_from(snapshot.recorded_datoms().len()).unwrap_or(u64::MAX);
+                let pending = published_len.map(|len| recorded_len.saturating_sub(len));
+                if !pacing.due(published_at.elapsed(), last_duration, pending) {
+                    continue;
+                }
+                let _gc = node.gc_lock.lock().await;
+                let version = db.lease().version;
+                let root_name = db_root_name(&db.name);
+                let started = Instant::now();
+                let published = db
+                    .transactor
+                    .publish_indexes(node.store.as_ref(), &root_name, version)
+                    .await;
+                last_duration = started.elapsed();
+                published_at = Instant::now();
+                node.metrics.record_index(last_duration);
+                match published {
+                    Ok(root) => {
+                        // publish_indexes snapshots after this loop did, so
+                        // the covered length is at least recorded_len; the
+                        // underestimate only makes the next tail look bigger.
+                        published_len = Some(recorded_len);
+                        tracing::debug!(db = %db.name, index_basis_t = root.index_basis_t, "published indexes");
+                        db.index_basis.store(root.index_basis_t, Ordering::Release);
+                        let _ = db.broadcast.send(pb::subscribe_item::Item::IndexBasis(
+                            pb::IndexBasis {
+                                index_basis_t: root.index_basis_t,
+                            },
+                        ));
+                    }
+                    Err(TransactError::Deposed { .. }) => {
+                        node.depose(&db, "database root fenced by a newer lease");
+                        return;
+                    }
+                    Err(_) => {}
+                }
             }
         });
     }
@@ -1083,5 +1166,74 @@ impl TransactorNode {
                 return Ok(*basis.borrow());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IndexPacing;
+    use std::time::Duration;
+
+    fn pacing(interval_ms: u64, backoff: u32, threshold: u64, deadline_ms: u64) -> IndexPacing {
+        IndexPacing {
+            interval: Duration::from_millis(interval_ms),
+            backoff,
+            tail_threshold: threshold,
+            tail_deadline: Duration::from_millis(deadline_ms),
+        }
+    }
+
+    #[test]
+    fn base_interval_gates_publication() {
+        let pacing = pacing(100, 4, 0, 60_000);
+        assert!(!pacing.due(Duration::from_millis(99), Duration::ZERO, None));
+        assert!(pacing.due(Duration::from_millis(100), Duration::ZERO, None));
+    }
+
+    #[test]
+    fn backoff_stretches_the_floor_past_the_interval() {
+        let pacing = pacing(100, 4, 0, 60_000);
+        let last = Duration::from_millis(300);
+        assert!(!pacing.due(Duration::from_millis(1_199), last, Some(10)));
+        assert!(pacing.due(Duration::from_millis(1_200), last, Some(10)));
+    }
+
+    #[test]
+    fn zero_backoff_keeps_the_base_interval() {
+        let pacing = pacing(100, 0, 0, 60_000);
+        assert!(pacing.due(Duration::from_millis(100), Duration::from_secs(30), Some(10)));
+    }
+
+    #[test]
+    fn fast_publications_leave_the_interval_untouched() {
+        let pacing = pacing(5_000, 4, 0, 60_000);
+        assert!(pacing.due(Duration::from_millis(5_000), Duration::from_millis(3), Some(1)));
+    }
+
+    #[test]
+    fn small_tail_defers_until_the_deadline() {
+        let pacing = pacing(100, 4, 1_000, 60_000);
+        assert!(!pacing.due(Duration::from_secs(30), Duration::ZERO, Some(999)));
+        assert!(pacing.due(Duration::from_secs(60), Duration::ZERO, Some(999)));
+    }
+
+    #[test]
+    fn tail_at_threshold_publishes_at_base_pacing() {
+        let pacing = pacing(100, 4, 1_000, 60_000);
+        assert!(pacing.due(Duration::from_millis(100), Duration::ZERO, Some(1_000)));
+    }
+
+    #[test]
+    fn unknown_tail_publishes_at_base_pacing() {
+        let pacing = pacing(100, 4, 1_000, 60_000);
+        assert!(pacing.due(Duration::from_millis(100), Duration::ZERO, None));
+    }
+
+    #[test]
+    fn deadline_never_overrides_the_backoff_floor() {
+        let pacing = pacing(100, 4, 1_000, 200);
+        let last = Duration::from_millis(300);
+        assert!(!pacing.due(Duration::from_millis(400), last, Some(1)));
+        assert!(pacing.due(Duration::from_millis(1_200), last, Some(1)));
     }
 }

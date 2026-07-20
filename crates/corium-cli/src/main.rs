@@ -210,6 +210,17 @@ enum Command {
         /// Interval between background index publications (ms).
         #[arg(long, default_value_t = 5_000)]
         index_interval_ms: u64,
+        /// Minimum wait before the next index publication, as a multiple of
+        /// the previous publication's duration (0 disables the backoff).
+        #[arg(long, default_value_t = 4)]
+        index_backoff: u32,
+        /// Defer index publication while fewer than this many new datoms are
+        /// pending (0 publishes any pending work).
+        #[arg(long, default_value_t = 0)]
+        index_tail_threshold: u64,
+        /// Longest a below-threshold tail defers index publication (ms).
+        #[arg(long, default_value_t = 60_000)]
+        index_tail_deadline_ms: u64,
         /// Interval between subscription heartbeats (ms).
         #[arg(long, default_value_t = 10_000)]
         heartbeat_ms: u64,
@@ -412,6 +423,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             ha,
             advertise,
             index_interval_ms,
+            index_backoff,
+            index_tail_threshold,
+            index_tail_deadline_ms,
             heartbeat_ms,
             metrics_listen,
             gc_interval,
@@ -431,6 +445,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             config.ha = ha;
             config.advertise = advertise;
             config.index_interval = Duration::from_millis(index_interval_ms);
+            config.index_backoff = index_backoff;
+            config.index_tail_threshold = index_tail_threshold;
+            config.index_tail_deadline = Duration::from_millis(index_tail_deadline_ms);
             config.heartbeat_interval = Duration::from_millis(heartbeat_ms);
             config.gc_interval = if gc_interval == "off" {
                 None

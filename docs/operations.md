@@ -47,6 +47,32 @@ depth, indexing duration, and GC. Peer metrics cover query count/latency and
 query fuel spent. `corium db stats` and the transactor `Status` RPC provide
 basis, index lag, counts, queue depth, and GC counters on demand.
 
+## Index publication pacing and bulk loading
+
+The transactor republishes its covering indexes in the background so cold
+peers can bootstrap from a snapshot instead of replaying the whole log.
+Publication currently rewrites every index in full, so its cost grows with
+the database; pacing is governed by:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `--index-interval-ms` | 5000 | Base interval between publications. |
+| `--index-backoff` | 4 | Minimum wait before the next publication, as a multiple `n` of the previous publication's duration. Bounds indexing to at most `1/(1+n)` of wall time and storage bandwidth as publications get slower; `0` disables. |
+| `--index-tail-threshold` | 0 | Defer a due publication while fewer than this many new datoms are pending, so trickle writes coalesce instead of rewriting every index. `0` publishes any pending work. |
+| `--index-tail-deadline-ms` | 60000 | Longest a below-threshold tail defers publication. |
+
+Indexing is an optimization, never a durability requirement: the log append
+is the commit point, and the transactor serves from its in-memory value
+regardless of index lag. Deferring publication only lengthens cold-peer
+bootstrap (the log tail past the published basis is replayed) and the
+freshness of backups.
+
+For bulk loads, raise `--index-tail-threshold` (for example to a million
+datoms) so the load coalesces publications, and rely on the backoff to keep
+the indexing duty cycle bounded as the database grows. Watch `index_lag` in
+`corium db stats` or the metrics endpoint during the load; the final tail
+publishes within the tail deadline of the last transaction.
+
 ## Query console
 
 ```sh
