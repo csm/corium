@@ -79,15 +79,18 @@ transactor (`corium-cljrs::sandbox`):
   primitives are native Rust in `corium-tx`, not sandboxed code.
 
 The sandbox needs cljrs to support a restricted environment (custom namespace
-resolution + step-limited interpretation). **Resolved at M5**: `cljrs-interp`
-does not expose a per-step fuel hook, but `GlobalEnv` takes a pluggable
-`call_cljrs_fn` dispatch hook that every function application (user fns,
-builtin higher-order iteration, recursion) routes through. The sandbox
-installs a hook charging one fuel unit per application and enforcing the
-allocation cap (isolate-heap counter), a call-depth cap (the tree-walker
-consumes real stack per frame), and the wall-clock deadline. Special-form-only
-loops (`loop`/`recur` with no function application) never cross the hook, so
-the worker thread doubles as the watchdog: the caller waits on the reply
+resolution + step-limited interpretation). **Resolved at M5** (upgraded once
+`cljrs-interp` shipped `eval_with_gas`): cljrs now meters evaluation with
+execution credits — roughly one credit per basic block — via a thread-local
+gas meter, so the sandbox charges the fuel budget through that path;
+exhaustion surfaces as `GasExhausted`, uncatchable by sandboxed
+`try`/`catch`, and covers special-form-only loops (`loop`/`recur`) that the
+dispatch hook never sees. The pluggable `call_cljrs_fn` hook on `GlobalEnv`
+(crossed by every function application: user fns, builtin higher-order
+iteration, recursion) still enforces the allocation cap (isolate-heap
+counter) and a call-depth cap (the tree-walker consumes real stack per
+frame). The wall-clock deadline remains the backstop for native builtins
+that run long without evaluation checkpoints: the caller waits on the reply
 channel with a timeout and abandons/replaces the worker on expiry — the
 fallback the roadmap sanctioned. Namespace restriction prunes I/O, time,
 randomness, mutable state, and namespace/var escape from `clojure.core`; a

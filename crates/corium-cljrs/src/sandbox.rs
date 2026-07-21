@@ -8,16 +8,19 @@
 //! Resource discipline, resolving the M5 risk checkpoint from
 //! `docs/design/clojurust-integration.md`:
 //!
-//! - **Fuel**: `cljrs-interp` routes every function application (user fns,
-//!   builtin higher-order iteration, recursion) through the pluggable
-//!   `call_cljrs_fn` hook on `GlobalEnv`; the sandbox installs a hook that
-//!   charges one fuel unit per call and aborts on exhaustion.
-//! - **Allocation cap**: the same hook compares the isolate heap's
-//!   cumulative allocation counter against the per-invocation cap.
-//! - **Watchdog deadline**: special-form-only loops (`loop`/`recur` with no
-//!   function calls) never cross the hook, so the caller waits on the reply
-//!   channel with a timeout; on expiry the worker is abandoned and replaced,
-//!   and the invocation fails cleanly.
+//! - **Fuel (gas)**: cljrs meters evaluation with execution credits —
+//!   roughly one credit per basic block — through the thread-local gas
+//!   meter behind `eval_with_gas`. The sandbox installs a meter for the
+//!   budget's fuel; exhaustion aborts with `EvalError::GasExhausted`
+//!   (uncatchable by sandboxed `try`/`catch`) and covers special-form-only
+//!   loops (`loop`/`recur`), which the call hook never sees.
+//! - **Allocation cap**: the pluggable `call_cljrs_fn` hook on `GlobalEnv`
+//!   compares the isolate heap's cumulative allocation counter against the
+//!   per-invocation cap on every function application.
+//! - **Watchdog deadline**: native builtins that run long without crossing
+//!   an evaluation checkpoint are billed by wall clock: the caller waits on
+//!   the reply channel with a timeout; on expiry the worker is abandoned
+//!   and replaced, and the invocation fails cleanly.
 //!
 //! Namespace restriction removes I/O, interop escape, mutable state,
 //! nondeterminism, and namespace manipulation from `clojure.core`; a
@@ -33,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use cljrs_env::env::{Env, GlobalEnv};
 use cljrs_env::error::{EvalError, EvalResult};
+use cljrs_env::gas::{GasGuard, GasMeter};
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::{CljxFn, Value};
@@ -45,7 +49,8 @@ use crate::convert;
 /// Per-invocation resource budget (transactor configuration).
 #[derive(Clone, Copy, Debug)]
 pub struct SandboxBudget {
-    /// Function applications the invocation may perform.
+    /// Execution credits (cljrs gas) the invocation may spend; each credit
+    /// covers roughly one basic block of evaluation.
     pub fuel: u64,
     /// Bytes the invocation may allocate on the isolate heap.
     pub max_alloc_bytes: u64,
@@ -84,7 +89,7 @@ pub enum SandboxError {
     /// Evaluation failed (including fuel and allocation exhaustion).
     #[error("db function failed: {0}")]
     Eval(String),
-    /// The fuel budget ran out.
+    /// The fuel (execution-credit) budget ran out.
     #[error("db function fuel exhausted")]
     FuelExhausted,
     /// The allocation cap was exceeded.
@@ -101,14 +106,12 @@ pub enum SandboxError {
     Convert(#[from] convert::ConvertError),
 }
 
-const FUEL_MSG: &str = "corium sandbox: fuel exhausted";
 const ALLOC_MSG: &str = "corium sandbox: allocation budget exceeded";
 const DEADLINE_MSG: &str = "corium sandbox: deadline exceeded";
 const DEPTH_MSG: &str = "corium sandbox: call depth exceeded";
 
 #[derive(Clone, Copy)]
 struct BudgetState {
-    remaining: u64,
     alloc_start: u64,
     max_alloc: u64,
     max_depth: u64,
@@ -120,19 +123,16 @@ thread_local! {
     static BUDGET: Cell<Option<BudgetState>> = const { Cell::new(None) };
 }
 
-/// The pluggable function-application hook: charges fuel, enforces the
-/// allocation cap, call depth, and deadline, then delegates to the
-/// tree-walking apply. (The signature — including the error size — is
-/// fixed by `GlobalEnv`.)
+/// The pluggable function-application hook: enforces the allocation cap,
+/// call depth, and deadline, then delegates to the tree-walking apply.
+/// (Fuel is metered separately by the cljrs gas meter, which also covers
+/// special forms. The signature — including the error size — is fixed by
+/// `GlobalEnv`.)
 #[allow(clippy::result_large_err)]
 fn hook_call(f: &CljxFn, args: &[Value], env: &mut Env) -> EvalResult {
     let Some(mut budget) = BUDGET.with(Cell::get) else {
         return cljrs_interp::apply::call_cljrs_fn(f, args, env);
     };
-    if budget.remaining == 0 {
-        return Err(EvalError::Runtime(FUEL_MSG.into()));
-    }
-    budget.remaining -= 1;
     // Depth guards the worker's Rust stack: each interpreted call consumes
     // real stack frames, and an overflow would abort the whole process.
     if budget.depth >= budget.max_depth {
@@ -445,10 +445,11 @@ fn spawn_worker() -> mpsc::Sender<Request> {
 }
 
 fn map_eval_error(error: &EvalError) -> SandboxError {
+    if matches!(error, EvalError::GasExhausted) {
+        return SandboxError::FuelExhausted;
+    }
     let text = format!("{error:?}");
-    if text.contains(FUEL_MSG) {
-        SandboxError::FuelExhausted
-    } else if text.contains(ALLOC_MSG) {
+    if text.contains(ALLOC_MSG) {
         SandboxError::AllocExceeded
     } else if text.contains(DEPTH_MSG) {
         SandboxError::DepthExceeded
@@ -475,12 +476,14 @@ fn serve(globals: &Arc<GlobalEnv>, request: &Request) -> Result<Edn, SandboxErro
     let mut env = Env::new(Arc::clone(globals), "user");
     let _roots = cljrs_env::gc_roots::root_values(&args);
     let guard = install_budget(request.budget);
+    let gas_guard = GasGuard::install(GasMeter::new(request.budget.fuel));
     let outcome = globals.call_cljrs_fn(f.get(), &args, &mut env);
     // Convert under the same budget: realizing lazy results re-enters the
-    // interpreter through the hook.
+    // interpreter, which charges the same gas meter and crosses the hook.
     let converted = outcome
         .map_err(|error| map_eval_error(&error))
         .and_then(|value| convert::to_edn(&value).map_err(SandboxError::from));
+    drop(gas_guard);
     drop(guard);
     converted
 }
@@ -496,7 +499,6 @@ impl Drop for BudgetGuard {
 fn install_budget(budget: SandboxBudget) -> BudgetGuard {
     BUDGET.with(|cell| {
         cell.set(Some(BudgetState {
-            remaining: budget.fuel,
             alloc_start: heap_allocated(),
             max_alloc: budget.max_alloc_bytes,
             max_depth: budget.max_call_depth,
@@ -532,7 +534,7 @@ fn compiled(
     guard_form(form, false)?;
     let mut env = Env::new(Arc::clone(globals), "user");
     let guard = install_budget(budget);
-    let value = cljrs_interp::eval::eval(form, &mut env);
+    let value = cljrs_interp::eval::eval_with_gas(form, &mut env, budget.fuel);
     drop(guard);
     let value = value.map_err(|error| map_eval_error(&error))?;
     if !matches!(value, Value::Fn(_)) {

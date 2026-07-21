@@ -183,9 +183,29 @@ fn allocation_cap_aborts_cleanly() {
 }
 
 #[test]
+fn special_form_loop_hits_fuel_without_abandoning_worker() {
+    let sandbox = Sandbox::new();
+    // Gas metering charges every evaluated form, so a `loop`/`recur` spin
+    // with no function calls exhausts fuel cleanly instead of burning the
+    // wall-clock watchdog (and the worker, with its compile cache).
+    let error = sandbox
+        .invoke("(fn [] (loop [] (recur)))", None, vec![], budget())
+        .expect_err("must exhaust fuel");
+    assert_eq!(error, SandboxError::FuelExhausted);
+    assert!(!sandbox.abandoned_worker());
+    let result = sandbox
+        .invoke("(fn [] 7)", None, vec![], budget())
+        .expect("invoke after exhaustion");
+    assert_eq!(result, Edn::Long(7));
+}
+
+#[test]
 fn unbounded_special_form_loop_hits_watchdog() {
     let sandbox = Sandbox::new();
+    // With effectively unlimited fuel the spin never trips the gas meter,
+    // leaving the wall-clock watchdog as the backstop.
     let tight = SandboxBudget {
+        fuel: u64::MAX,
         deadline: Duration::from_millis(300),
         ..budget()
     };
@@ -208,8 +228,8 @@ fn fn_calling_loop_hits_fuel_not_watchdog() {
         fuel: 10_000,
         ..budget()
     };
-    // The loop body applies a cljrs function every iteration, so the fuel
-    // hook sees it. (Native builtins alone are billed by the deadline.)
+    // Every form the loop evaluates charges the gas meter, so fuel runs
+    // out long before the deadline.
     let error = sandbox
         .invoke(
             "(fn [] (let [f (fn [x] (inc x))] (loop [n 0] (recur (f n)))))",
