@@ -4,10 +4,9 @@
 //! blob store plus fenced root pointers (the "storage service"), and the
 //! per-database transaction log. [`StoreSpec`] selects the storage service
 //! backend — in-memory, filesystem, `PostgreSQL`, Turso, or S3 — and [`NodeStore`]
-//! dispatches the [`BlobStore`]/[`RootStore`] operations to it. The log stays
-//! local (in-memory for `mem`, filesystem otherwise) because the commit
-//! pipeline appends to it synchronously; see
-//! `docs/design/log-and-transactor.md`.
+//! dispatches the [`BlobStore`]/[`RootStore`] operations to it. Native
+//! service backends keep transaction logs in the same storage system as blobs
+//! and roots; memory and filesystem retain their existing log stores.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -16,6 +15,8 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use corium_log::{LogError, MemLogRegistry, TransactionLog, VersionedLog};
+#[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+use corium_log::{NativeLogStorage, NativeVersionedLog};
 use corium_store::{BlobId, BlobIdStream, BlobStore, FsStore, MemoryStore, RootStore, StoreError};
 
 #[cfg(feature = "postgres")]
@@ -35,23 +36,20 @@ pub enum StoreSpec {
     /// Blobs and roots under `{data_dir}/store`, log under `{data_dir}/logs`.
     #[default]
     Fs,
-    /// Blobs and roots in `PostgreSQL`; the transaction log stays on the local
-    /// filesystem under the data directory.
+    /// Blobs, roots, and transaction logs in `PostgreSQL`.
     #[cfg(feature = "postgres")]
     Postgres {
         /// `PostgreSQL` URL or keyword/value connection string.
         connection_string: String,
     },
-    /// Blobs and roots in a Turso (embeddable `SQLite`) database at `path`;
-    /// the transaction log stays on the local filesystem under the data
-    /// directory. `path` is a local database file.
+    /// Blobs, roots, and transaction logs in a Turso (embeddable `SQLite`)
+    /// database at `path`. `path` is a local database file.
     #[cfg(feature = "turso")]
     Turso {
         /// Filesystem path of the Turso database.
         path: String,
     },
-    /// Blobs and roots in an S3 (or S3-compatible) bucket; the transaction
-    /// log stays on the local filesystem under the data directory.
+    /// Blobs, roots, and transaction logs in an S3 (or S3-compatible) bucket.
     #[cfg(feature = "s3")]
     S3 {
         /// Target bucket name.
@@ -298,29 +296,38 @@ impl RootStore for NodeStore {
     }
 }
 
-/// Where a node's per-database transaction logs live. The mem backend keeps
-/// them in a process-shared registry; every other backend uses versioned
-/// files under a directory, exactly as before store selection existed.
+/// Where a node's per-database transaction logs live.
 pub enum LogBackend {
     /// Versioned log files under this directory.
     Fs(PathBuf),
     /// In-memory versioned logs shared across a process.
     Mem(MemLogRegistry),
+    /// Versioned logs stored through the native root store.
+    #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+    Native(Arc<dyn NativeLogStorage>),
 }
 
 impl LogBackend {
     /// The log backend that pairs with `spec`.
     #[must_use]
-    pub fn for_spec(spec: &StoreSpec, data_dir: &std::path::Path) -> Self {
+    pub fn for_spec(
+        spec: &StoreSpec,
+        data_dir: &std::path::Path,
+        #[cfg_attr(
+            not(any(feature = "postgres", feature = "turso", feature = "s3")),
+            allow(unused_variables)
+        )]
+        store: Arc<NodeStore>,
+    ) -> Self {
         match spec {
             StoreSpec::Memory => Self::Mem(MemLogRegistry::new()),
             StoreSpec::Fs => Self::Fs(data_dir.join("logs")),
             #[cfg(feature = "postgres")]
-            StoreSpec::Postgres { .. } => Self::Fs(data_dir.join("logs")),
+            StoreSpec::Postgres { .. } => Self::Native(Arc::new(NativeRootLogStore::new(store))),
             #[cfg(feature = "turso")]
-            StoreSpec::Turso { .. } => Self::Fs(data_dir.join("logs")),
+            StoreSpec::Turso { .. } => Self::Native(Arc::new(NativeRootLogStore::new(store))),
             #[cfg(feature = "s3")]
-            StoreSpec::S3 { .. } => Self::Fs(data_dir.join("logs")),
+            StoreSpec::S3 { .. } => Self::Native(Arc::new(NativeRootLogStore::new(store))),
         }
     }
 
@@ -336,6 +343,12 @@ impl LogBackend {
         match self {
             Self::Fs(dir) => Ok(Arc::new(VersionedLog::open(dir, name, write_version)?)),
             Self::Mem(registry) => Ok(Arc::new(registry.open(name, write_version))),
+            #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+            Self::Native(storage) => Ok(Arc::new(NativeVersionedLog::open(
+                Arc::clone(storage),
+                name,
+                write_version,
+            )?)),
         }
     }
 
@@ -345,6 +358,10 @@ impl LogBackend {
         match self {
             Self::Fs(dir) => VersionedLog::exists(dir, name),
             Self::Mem(registry) => registry.exists(name),
+            #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+            Self::Native(storage) => storage
+                .versions(name)
+                .is_ok_and(|versions| !versions.is_empty()),
         }
     }
 
@@ -359,6 +376,82 @@ impl LogBackend {
                 registry.delete_all(name);
                 Ok(())
             }
+            #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+            Self::Native(storage) => storage.delete_versions(name),
         }
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+struct NativeRootLogStore {
+    store: Arc<NodeStore>,
+}
+
+#[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+impl NativeRootLogStore {
+    fn new(store: Arc<NodeStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+impl NativeRootLogStore {
+    fn key(name: &str, version: u64) -> String {
+        format!("log:{name}:v{version:020}")
+    }
+
+    fn prefix(name: &str) -> String {
+        format!("log:{name}:v")
+    }
+
+    fn block_on<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, StoreError>>,
+    ) -> Result<T, LogError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(future)
+                .map_err(|error| LogError::Native(error.to_string()))
+        })
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+impl NativeLogStorage for NativeRootLogStore {
+    fn read_version(&self, name: &str, version: u64) -> Result<Option<Vec<u8>>, LogError> {
+        self.block_on(self.store.get_root(&Self::key(name, version)))
+    }
+
+    fn cas_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), LogError> {
+        self.block_on(
+            self.store
+                .cas_root(&Self::key(name, version), expected, new),
+        )
+    }
+
+    fn versions(&self, name: &str) -> Result<Vec<u64>, LogError> {
+        let prefix = Self::prefix(name);
+        let names = self.block_on(self.store.list_roots(&prefix))?;
+        names
+            .into_iter()
+            .map(|key| {
+                key.strip_prefix(&prefix)
+                    .and_then(|version| version.parse::<u64>().ok())
+                    .ok_or(LogError::Corrupt)
+            })
+            .collect()
+    }
+
+    fn delete_versions(&self, name: &str) -> Result<(), LogError> {
+        for version in self.versions(name)? {
+            self.block_on(self.store.delete_root(&Self::key(name, version)))?;
+        }
+        Ok(())
     }
 }
