@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio_stream::wrappers::ReceiverStream;
 use turso::{Builder, Database};
 
-use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, TransactionLogStore, digest};
 
 const CREATE_BLOBS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS corium_blobs (
@@ -21,6 +21,15 @@ const CREATE_ROOTS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS corium_roots (
         name TEXT PRIMARY KEY NOT NULL,
         data BLOB NOT NULL
+    )
+";
+
+const CREATE_LOGS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS corium_tx_logs (
+        name TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        data BLOB NOT NULL,
+        PRIMARY KEY (name, version)
     )
 ";
 
@@ -89,11 +98,108 @@ impl TursoBlobStore {
         let connection = database.connect()?;
         connection.execute(CREATE_BLOBS_TABLE, ()).await?;
         connection.execute(CREATE_ROOTS_TABLE, ()).await?;
+        connection.execute(CREATE_LOGS_TABLE, ()).await?;
         Ok(Self { database })
     }
 
     fn connect(&self) -> Result<turso::Connection, StoreError> {
         Ok(self.database.connect()?)
+    }
+}
+
+#[async_trait]
+impl TransactionLogStore for TursoBlobStore {
+    async fn get_log_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let version = i64::try_from(version).map_err(|_| {
+            StoreError::InvalidTursoData(format!("log version too large: {version}"))
+        })?;
+        let mut rows = self
+            .connect()?
+            .query(
+                "SELECT data FROM corium_tx_logs WHERE name = ?1 AND version = ?2",
+                (name, version),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<Vec<u8>>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn cas_log_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        let version = i64::try_from(version).map_err(|_| {
+            StoreError::InvalidTursoData(format!("log version too large: {version}"))
+        })?;
+        let connection = self.connect()?;
+        connection.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = async {
+            let mut rows = connection
+                .query(
+                    "SELECT data FROM corium_tx_logs WHERE name = ?1 AND version = ?2",
+                    (name, version),
+                )
+                .await?;
+            let actual = match rows.next().await? {
+                Some(row) => Some(row.get::<Vec<u8>>(0)?),
+                None => None,
+            };
+            if actual.as_deref() != expected {
+                return Err(StoreError::CasFailed {
+                    expected: expected.map(<[u8]>::to_vec),
+                    actual,
+                });
+            }
+            connection
+                .execute(
+                    "INSERT INTO corium_tx_logs (name, version, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(name, version) DO UPDATE SET data = excluded.data",
+                    (name, version, new),
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            connection.execute("COMMIT", ()).await?;
+        } else {
+            let _ = connection.execute("ROLLBACK", ()).await;
+        }
+        result
+    }
+
+    async fn list_log_versions(&self, name: &str) -> Result<Vec<u64>, StoreError> {
+        let connection = self.connect()?;
+        let mut rows = connection
+            .query(
+                "SELECT version FROM corium_tx_logs WHERE name = ?1 ORDER BY version",
+                [name],
+            )
+            .await?;
+        let mut versions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let version: i64 = row.get(0)?;
+            versions.push(u64::try_from(version).map_err(|_| {
+                StoreError::InvalidTursoData(format!("negative log version {version}"))
+            })?);
+        }
+        Ok(versions)
+    }
+
+    async fn delete_log_versions(&self, name: &str) -> Result<(), StoreError> {
+        self.connect()?
+            .execute("DELETE FROM corium_tx_logs WHERE name = ?1", [name])
+            .await?;
+        Ok(())
     }
 }
 

@@ -8,7 +8,7 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, TransactionLogStore, digest};
 
 /// Content-addressed blob and fenced-root storage backed by an S3 (or
 /// S3-compatible) bucket.
@@ -81,12 +81,20 @@ impl S3BlobStore {
         format!("{}roots/", self.prefix)
     }
 
+    fn log_prefix(&self) -> String {
+        format!("{}logs/", self.prefix)
+    }
+
     fn blob_key(&self, id: &BlobId) -> String {
         format!("{}{}", self.blob_prefix(), id.as_str())
     }
 
     fn root_key(&self, name: &str) -> String {
         format!("{}{}", self.root_prefix(), name)
+    }
+
+    fn log_key(&self, name: &str, version: u64) -> String {
+        format!("{}{name}.v{version:020}.log", self.log_prefix())
     }
 
     /// Reads a root's current bytes together with the `ETag` fencing them,
@@ -149,6 +157,163 @@ impl S3BlobStore {
             Err(error) if is_precondition_conflict(&error, if_match.is_some()) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[async_trait]
+impl TransactionLogStore for S3BlobStore {
+    async fn get_log_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = self.log_key(name, version);
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(output) => Ok(Some(collect_body(output.body).await?)),
+            Err(error)
+                if matches!(error.as_service_error(), Some(GetObjectError::NoSuchKey(_))) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn cas_log_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        let key = self.log_key(name, version);
+        match expected {
+            None => {
+                if self.put_conditional(&key, new.to_vec(), None, true).await? {
+                    Ok(())
+                } else {
+                    let actual = self.get_log_version(name, version).await?;
+                    Err(StoreError::CasFailed {
+                        expected: None,
+                        actual,
+                    })
+                }
+            }
+            Some(expected_bytes) => {
+                let current = match self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                {
+                    Ok(output) => {
+                        let etag = output
+                            .e_tag()
+                            .ok_or_else(|| {
+                                StoreError::InvalidS3Data(format!(
+                                    "log {name:?} version {version} has no ETag"
+                                ))
+                            })?
+                            .to_owned();
+                        Some((collect_body(output.body).await?, etag))
+                    }
+                    Err(error)
+                        if matches!(
+                            error.as_service_error(),
+                            Some(GetObjectError::NoSuchKey(_))
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let Some((actual_bytes, etag)) = current else {
+                    return Err(StoreError::CasFailed {
+                        expected: Some(expected_bytes.to_vec()),
+                        actual: None,
+                    });
+                };
+                if actual_bytes != expected_bytes {
+                    return Err(StoreError::CasFailed {
+                        expected: Some(expected_bytes.to_vec()),
+                        actual: Some(actual_bytes),
+                    });
+                }
+                if self
+                    .put_conditional(&key, new.to_vec(), Some(&etag), false)
+                    .await?
+                {
+                    Ok(())
+                } else {
+                    let actual = self.get_log_version(name, version).await?;
+                    Err(StoreError::CasFailed {
+                        expected: Some(expected_bytes.to_vec()),
+                        actual,
+                    })
+                }
+            }
+        }
+    }
+
+    async fn list_log_versions(&self, name: &str) -> Result<Vec<u64>, StoreError> {
+        let log_prefix = self.log_prefix();
+        let full_prefix = format!("{log_prefix}{name}.v");
+        let mut versions = Vec::new();
+        let mut continuation = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full_prefix);
+            if let Some(token) = continuation.take() {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await?;
+            for object in output.contents() {
+                let Some(key) = object.key() else { continue };
+                let Some(rest) = key.strip_prefix(&full_prefix) else {
+                    continue;
+                };
+                let Some(version) = rest
+                    .strip_suffix(".log")
+                    .and_then(|version| version.parse::<u64>().ok())
+                else {
+                    return Err(StoreError::InvalidS3Data(format!(
+                        "invalid log key {key:?}"
+                    )));
+                };
+                versions.push(version);
+            }
+            continuation = output.next_continuation_token().map(str::to_owned);
+            if continuation.is_none() {
+                break;
+            }
+        }
+        versions.sort_unstable();
+        Ok(versions)
+    }
+
+    async fn delete_log_versions(&self, name: &str) -> Result<(), StoreError> {
+        for version in self.list_log_versions(name).await? {
+            let key = self.log_key(name, version);
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await?;
+        }
+        Ok(())
     }
 }
 

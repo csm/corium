@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use deadpool_postgres::{Config, Pool, Runtime};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
-use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, TransactionLogStore, digest};
 
 const CREATE_BLOBS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS corium_blobs (
@@ -23,6 +23,15 @@ const CREATE_ROOTS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS corium_roots (
         name TEXT PRIMARY KEY NOT NULL,
         data BYTEA NOT NULL
+    )
+";
+
+const CREATE_LOGS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS corium_tx_logs (
+        name TEXT NOT NULL,
+        version BIGINT NOT NULL,
+        data BYTEA NOT NULL,
+        PRIMARY KEY (name, version)
     )
 ";
 
@@ -100,6 +109,7 @@ impl PostgresBlobStore {
         let client = pool.get().await?;
         client.batch_execute(CREATE_BLOBS_TABLE).await?;
         client.batch_execute(CREATE_ROOTS_TABLE).await?;
+        client.batch_execute(CREATE_LOGS_TABLE).await?;
         Ok(Self { pool })
     }
 
@@ -127,6 +137,100 @@ impl PostgresBlobStore {
             },
             Err(error) => error,
         }
+    }
+}
+
+#[async_trait]
+impl TransactionLogStore for PostgresBlobStore {
+    async fn get_log_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let version = i64::try_from(version).map_err(|_| {
+            StoreError::InvalidPostgresData(format!("log version too large: {version}"))
+        })?;
+        let row = self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT data FROM corium_tx_logs WHERE name = $1 AND version = $2",
+                &[&name, &version],
+            )
+            .await?;
+        match row {
+            Some(row) => Ok(Some(row.try_get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn cas_log_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        let version = i64::try_from(version).map_err(|_| {
+            StoreError::InvalidPostgresData(format!("log version too large: {version}"))
+        })?;
+        let changed = if let Some(expected) = expected {
+            self.client()
+                .await?
+                .execute(
+                    "UPDATE corium_tx_logs SET data = $4
+                     WHERE name = $1 AND version = $2 AND data = $3",
+                    &[&name, &version, &expected, &new],
+                )
+                .await?
+        } else {
+            self.client()
+                .await?
+                .execute(
+                    "INSERT INTO corium_tx_logs (name, version, data) VALUES ($1, $2, $3)
+                     ON CONFLICT (name, version) DO NOTHING",
+                    &[&name, &version, &new],
+                )
+                .await?
+        };
+        if changed == 1 {
+            Ok(())
+        } else {
+            let actual = self
+                .get_log_version(name, u64::try_from(version).unwrap_or_default())
+                .await?;
+            Err(StoreError::CasFailed {
+                expected: expected.map(<[u8]>::to_vec),
+                actual,
+            })
+        }
+    }
+
+    async fn list_log_versions(&self, name: &str) -> Result<Vec<u64>, StoreError> {
+        let rows = self
+            .client()
+            .await?
+            .query(
+                "SELECT version FROM corium_tx_logs WHERE name = $1 ORDER BY version",
+                &[&name],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let version: i64 = row.try_get(0)?;
+                u64::try_from(version).map_err(|_| {
+                    StoreError::InvalidPostgresData(format!("negative log version {version}"))
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_log_versions(&self, name: &str) -> Result<(), StoreError> {
+        self.client()
+            .await?
+            .execute("DELETE FROM corium_tx_logs WHERE name = $1", &[&name])
+            .await?;
+        Ok(())
     }
 }
 

@@ -17,7 +17,10 @@ use async_trait::async_trait;
 use corium_log::{LogError, MemLogRegistry, TransactionLog, VersionedLog};
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 use corium_log::{NativeLogStorage, NativeVersionedLog};
-use corium_store::{BlobId, BlobIdStream, BlobStore, FsStore, MemoryStore, RootStore, StoreError};
+use corium_store::{
+    BlobId, BlobIdStream, BlobStore, FsStore, MemoryStore, RootStore, StoreError,
+    TransactionLogStore,
+};
 
 #[cfg(feature = "postgres")]
 use corium_store::PostgresBlobStore;
@@ -296,13 +299,78 @@ impl RootStore for NodeStore {
     }
 }
 
+#[async_trait]
+impl TransactionLogStore for NodeStore {
+    async fn get_log_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        match self {
+            Self::Mem(store) => store.get_log_version(name, version).await,
+            Self::Fs(store) => store.get_log_version(name, version).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.get_log_version(name, version).await,
+            #[cfg(feature = "turso")]
+            Self::Turso(store) => store.get_log_version(name, version).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.get_log_version(name, version).await,
+        }
+    }
+
+    async fn cas_log_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Mem(store) => store.cas_log_version(name, version, expected, new).await,
+            Self::Fs(store) => store.cas_log_version(name, version, expected, new).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.cas_log_version(name, version, expected, new).await,
+            #[cfg(feature = "turso")]
+            Self::Turso(store) => store.cas_log_version(name, version, expected, new).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.cas_log_version(name, version, expected, new).await,
+        }
+    }
+
+    async fn list_log_versions(&self, name: &str) -> Result<Vec<u64>, StoreError> {
+        match self {
+            Self::Mem(store) => store.list_log_versions(name).await,
+            Self::Fs(store) => store.list_log_versions(name).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.list_log_versions(name).await,
+            #[cfg(feature = "turso")]
+            Self::Turso(store) => store.list_log_versions(name).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.list_log_versions(name).await,
+        }
+    }
+
+    async fn delete_log_versions(&self, name: &str) -> Result<(), StoreError> {
+        match self {
+            Self::Mem(store) => store.delete_log_versions(name).await,
+            Self::Fs(store) => store.delete_log_versions(name).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => store.delete_log_versions(name).await,
+            #[cfg(feature = "turso")]
+            Self::Turso(store) => store.delete_log_versions(name).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.delete_log_versions(name).await,
+        }
+    }
+}
+
 /// Where a node's per-database transaction logs live.
 pub enum LogBackend {
     /// Versioned log files under this directory.
     Fs(PathBuf),
     /// In-memory versioned logs shared across a process.
     Mem(MemLogRegistry),
-    /// Versioned logs stored through the native root store.
+    /// Versioned logs stored through the native store.
     #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
     Native(Arc<dyn NativeLogStorage>),
 }
@@ -323,11 +391,11 @@ impl LogBackend {
             StoreSpec::Memory => Self::Mem(MemLogRegistry::new()),
             StoreSpec::Fs => Self::Fs(data_dir.join("logs")),
             #[cfg(feature = "postgres")]
-            StoreSpec::Postgres { .. } => Self::Native(Arc::new(NativeRootLogStore::new(store))),
+            StoreSpec::Postgres { .. } => Self::Native(Arc::new(NativeStoreLogAdapter::new(store))),
             #[cfg(feature = "turso")]
-            StoreSpec::Turso { .. } => Self::Native(Arc::new(NativeRootLogStore::new(store))),
+            StoreSpec::Turso { .. } => Self::Native(Arc::new(NativeStoreLogAdapter::new(store))),
             #[cfg(feature = "s3")]
-            StoreSpec::S3 { .. } => Self::Native(Arc::new(NativeRootLogStore::new(store))),
+            StoreSpec::S3 { .. } => Self::Native(Arc::new(NativeStoreLogAdapter::new(store))),
         }
     }
 
@@ -383,27 +451,19 @@ impl LogBackend {
 }
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-struct NativeRootLogStore {
+struct NativeStoreLogAdapter {
     store: Arc<NodeStore>,
 }
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-impl NativeRootLogStore {
+impl NativeStoreLogAdapter {
     fn new(store: Arc<NodeStore>) -> Self {
         Self { store }
     }
 }
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-impl NativeRootLogStore {
-    fn key(name: &str, version: u64) -> String {
-        format!("log:{name}:v{version:020}")
-    }
-
-    fn prefix(name: &str) -> String {
-        format!("log:{name}:v")
-    }
-
+impl NativeStoreLogAdapter {
     fn block_on<T>(
         &self,
         future: impl std::future::Future<Output = Result<T, StoreError>>,
@@ -417,9 +477,9 @@ impl NativeRootLogStore {
 }
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-impl NativeLogStorage for NativeRootLogStore {
+impl NativeLogStorage for NativeStoreLogAdapter {
     fn read_version(&self, name: &str, version: u64) -> Result<Option<Vec<u8>>, LogError> {
-        self.block_on(self.store.get_root(&Self::key(name, version)))
+        self.block_on(self.store.get_log_version(name, version))
     }
 
     fn cas_version(
@@ -429,29 +489,14 @@ impl NativeLogStorage for NativeRootLogStore {
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<(), LogError> {
-        self.block_on(
-            self.store
-                .cas_root(&Self::key(name, version), expected, new),
-        )
+        self.block_on(self.store.cas_log_version(name, version, expected, new))
     }
 
     fn versions(&self, name: &str) -> Result<Vec<u64>, LogError> {
-        let prefix = Self::prefix(name);
-        let names = self.block_on(self.store.list_roots(&prefix))?;
-        names
-            .into_iter()
-            .map(|key| {
-                key.strip_prefix(&prefix)
-                    .and_then(|version| version.parse::<u64>().ok())
-                    .ok_or(LogError::Corrupt)
-            })
-            .collect()
+        self.block_on(self.store.list_log_versions(name))
     }
 
     fn delete_versions(&self, name: &str) -> Result<(), LogError> {
-        for version in self.versions(name)? {
-            self.block_on(self.store.delete_root(&Self::key(name, version)))?;
-        }
-        Ok(())
+        self.block_on(self.store.delete_log_versions(name))
     }
 }

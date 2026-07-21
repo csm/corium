@@ -257,6 +257,35 @@ pub trait RootStore: Send + Sync {
     async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
 }
 
+/// Native storage for versioned transaction-log byte streams.
+///
+/// Each `(database name, lease version)` pair is stored as one opaque,
+/// compare-and-swap fenced byte stream. Implementations should place these
+/// streams in the same native backend as their blobs and roots, without
+/// requiring callers to encode them as root records.
+#[async_trait]
+pub trait TransactionLogStore: Send + Sync {
+    /// Reads one version's encoded transaction-log bytes.
+    async fn get_log_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError>;
+    /// Publishes one version's encoded bytes if the stored bytes match
+    /// `expected`.
+    async fn cas_log_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError>;
+    /// Lists all versions present for `name`, sorted ascending.
+    async fn list_log_versions(&self, name: &str) -> Result<Vec<u64>, StoreError>;
+    /// Deletes all log versions for `name`.
+    async fn delete_log_versions(&self, name: &str) -> Result<(), StoreError>;
+}
+
 /// In-memory blob and root store for tests and embedded use.
 #[derive(Clone, Default)]
 pub struct MemoryStore {
@@ -266,6 +295,7 @@ pub struct MemoryStore {
 struct MemoryInner {
     blobs: HashMap<BlobId, Vec<u8>>,
     roots: BTreeMap<String, Vec<u8>>,
+    logs: BTreeMap<(String, u64), Vec<u8>>,
 }
 
 #[async_trait]
@@ -391,6 +421,80 @@ impl RootStore for MemoryStore {
     }
 }
 
+#[async_trait]
+impl TransactionLogStore for MemoryStore {
+    async fn get_log_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        run_blocking(move || {
+            Ok(inner
+                .read()
+                .expect("poisoned store lock")
+                .logs
+                .get(&(name, version))
+                .cloned())
+        })
+        .await
+    }
+
+    async fn cas_log_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        let expected = expected.map(<[u8]>::to_vec);
+        let new = new.to_vec();
+        run_blocking(move || {
+            let mut inner = inner.write().expect("poisoned store lock");
+            let key = (name, version);
+            let actual = inner.logs.get(&key).cloned();
+            if actual != expected {
+                return Err(StoreError::CasFailed { expected, actual });
+            }
+            inner.logs.insert(key, new);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_log_versions(&self, name: &str) -> Result<Vec<u64>, StoreError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        run_blocking(move || {
+            Ok(inner
+                .read()
+                .expect("poisoned store lock")
+                .logs
+                .keys()
+                .filter_map(|(record_name, version)| (record_name == &name).then_some(*version))
+                .collect())
+        })
+        .await
+    }
+
+    async fn delete_log_versions(&self, name: &str) -> Result<(), StoreError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_owned();
+        run_blocking(move || {
+            inner
+                .write()
+                .expect("poisoned store lock")
+                .logs
+                .retain(|(record_name, _), _| record_name != &name);
+            Ok(())
+        })
+        .await
+    }
+}
+
 /// Filesystem-backed content-addressed blob and fenced root store.
 #[derive(Clone)]
 pub struct FsStore {
@@ -406,6 +510,7 @@ impl FsStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("roots"))?;
+        fs::create_dir_all(root.join("logs"))?;
         Ok(Self { root })
     }
     fn blob_path(&self, id: &BlobId) -> PathBuf {
@@ -602,6 +707,120 @@ impl RootStore for FsStore {
         })
         .await
     }
+}
+
+#[async_trait]
+impl TransactionLogStore for FsStore {
+    async fn get_log_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let store = self.clone();
+        let name = log_version_file_name(name, version)?;
+        run_blocking(move || match fs::read(store.root.join("logs").join(name)) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        })
+        .await
+    }
+
+    async fn cas_log_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        let store = self.clone();
+        let name = log_version_file_name(name, version)?;
+        let expected = expected.map(<[u8]>::to_vec);
+        let new = new.to_vec();
+        run_blocking(move || {
+            let dir = store.root.join("logs");
+            fs::create_dir_all(&dir)?;
+            let path = dir.join(name);
+            let _lock = RootLock::acquire(&path.with_extension("lock"))?;
+            let actual = match fs::read(&path) {
+                Ok(value) => Some(value),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if actual != expected {
+                return Err(StoreError::CasFailed { expected, actual });
+            }
+            let tmp = path.with_extension("tmp");
+            fs::write(&tmp, new)?;
+            fs::rename(tmp, path)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_log_versions(&self, name: &str) -> Result<Vec<u64>, StoreError> {
+        let root = self.root.clone();
+        let prefix = log_version_prefix(name)?;
+        run_blocking(move || {
+            let dir = root.join("logs");
+            let mut versions = Vec::new();
+            let Ok(entries) = fs::read_dir(dir) else {
+                return Ok(versions);
+            };
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if let Some(version) = file_name
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(".log"))
+                    .and_then(|version| version.parse().ok())
+                {
+                    versions.push(version);
+                }
+            }
+            versions.sort_unstable();
+            Ok(versions)
+        })
+        .await
+    }
+
+    async fn delete_log_versions(&self, name: &str) -> Result<(), StoreError> {
+        let store = self.clone();
+        let versions = self.list_log_versions(name).await?;
+        let name = name.to_owned();
+        run_blocking(move || {
+            for version in versions {
+                let file_name = log_version_file_name(&name, version)?;
+                match fs::remove_file(store.root.join("logs").join(file_name)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn valid_store_name(name: &str) -> bool {
+    !(name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\'))
+}
+
+fn log_version_prefix(name: &str) -> Result<String, StoreError> {
+    if !valid_store_name(name) {
+        return Err(StoreError::InvalidRootName(name.to_owned()));
+    }
+    Ok(format!("{name}.v"))
+}
+
+fn log_version_file_name(name: &str, version: u64) -> Result<String, StoreError> {
+    Ok(format!("{}{version:020}.log", log_version_prefix(name)?))
 }
 
 /// Computes the content id [`BlobStore::put`] would assign to `bytes`.

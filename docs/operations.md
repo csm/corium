@@ -20,9 +20,9 @@ store versioned logs natively in the same backend as their blobs and roots.
 Backup, restore, and offline GC operate on the filesystem data directory and
 therefore apply to `fs`.
 
-The PostgreSQL backend creates `corium_blobs` and `corium_roots` in the
-connection's current schema and stores transaction-log objects as fenced
-root records with `log:` names. It uses the platform certificate store for TLS.
+The PostgreSQL backend creates `corium_blobs`, `corium_roots`, and
+`corium_tx_logs` in the connection's current schema and uses the platform
+certificate store for TLS.
 For example:
 
 ```sh
@@ -32,9 +32,9 @@ cargo run -p corium-cli --features postgres -- \
   --data-dir /srv/corium
 ```
 
-The S3 backend stores blobs under `{prefix}blobs/` and roots — including
-versioned transaction-log objects with `log:` names — under `{prefix}roots/`
-in the target bucket, and fences root publication with S3 conditional writes
+The S3 backend stores blobs under `{prefix}blobs/`, roots under
+`{prefix}roots/`, and transaction-log objects under `{prefix}logs/` in the
+target bucket, and fences root and log publication with S3 conditional writes
 (`If-None-Match`/`If-Match`), so the bucket (or S3-compatible substitute)
 must support them. The bucket itself is not created automatically — provision
 it beforehand, since bucket creation
