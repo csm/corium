@@ -83,7 +83,13 @@ python3 -m http.server -d web 8080
 # open http://localhost:8080  (demo at /mbrainz.html)
 ```
 
-Optionally shrink the artifact with `wasm-opt -Oz web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm`.
+Optionally shrink the artifact with `wasm-opt -Oz --enable-reference-types web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm`.
+Use a current [binaryen](https://github.com/WebAssembly/binaryen) (≥ v110 — e.g.
+`npm install binaryen`, **not** Ubuntu's apt v108). Older binaryen has
+[binaryen#4711](https://github.com/WebAssembly/binaryen/issues/4711): it
+mis-points wasm-bindgen's `__wbindgen_externrefs` table export at the funcref
+table, so the demo fails to init in every browser with `WebAssembly.Table.grow …
+could not grow the table`.
 
 The generated `corium_wasm.js` / `corium_wasm_bg.wasm` are gitignored;
 `.github/workflows/publish-site.yml` rebuilds them and uploads `web/` over
