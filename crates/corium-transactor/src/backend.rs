@@ -310,6 +310,7 @@ pub enum LogBackend {
 impl LogBackend {
     /// The log backend that pairs with `spec`.
     #[must_use]
+    a#[allow(clippy::needless_pass_by_value)]
     pub fn for_spec(
         spec: &StoreSpec,
         data_dir: &std::path::Path,
@@ -317,7 +318,7 @@ impl LogBackend {
             not(any(feature = "postgres", feature = "turso", feature = "s3")),
             allow(unused_variables)
         )]
-        store: &Arc<NodeStore>,
+        store: Arc<NodeStore>,
     ) -> Self {
         match spec {
             StoreSpec::Memory => Self::Mem(MemLogRegistry::new()),
