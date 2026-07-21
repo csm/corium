@@ -78,6 +78,27 @@ pub fn index_blob_children(bytes: &[u8]) -> Result<Vec<BlobId>, StoreError> {
     }
 }
 
+/// Decodes one `(u64 big-endian length, key)*` chunk or flat segment blob
+/// back into its sorted key stream. Inverse of [`chunk_segment_keys`]'
+/// per-chunk framing; a pre-format-3 flat snapshot is one such run.
+///
+/// # Errors
+/// Returns an error when the framing is truncated or a length is unrepresentable.
+pub fn decode_segment_keys(bytes: &[u8]) -> Result<Vec<Vec<u8>>, StoreError> {
+    let truncated = || StoreError::Io(std::io::Error::other("truncated segment"));
+    let mut keys = Vec::new();
+    let mut input = bytes;
+    while !input.is_empty() {
+        let (len_bytes, rest) = input.split_at_checked(8).ok_or_else(truncated)?;
+        let len = usize::try_from(u64::from_be_bytes(len_bytes.try_into().unwrap_or_default()))
+            .map_err(|_| StoreError::Io(std::io::Error::other("segment key too large")))?;
+        let (key, rest) = rest.split_at_checked(len).ok_or_else(truncated)?;
+        keys.push(key.to_vec());
+        input = rest;
+    }
+    Ok(keys)
+}
+
 fn boundary_hash(key: &[u8]) -> u64 {
     // FNV-1a; any stable hash works, but it must never change: chunk
     // boundaries are part of the published format's sharing behavior.

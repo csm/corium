@@ -1,14 +1,50 @@
 //! Embedded pipeline, indexing, and crash-recovery tests.
 
-use corium_core::{Cardinality, EntityId, Partition, Schema, Value, ValueType};
-use corium_db::attribute;
+use corium_core::{
+    Cardinality, Datom, EntityId, IndexOrder, KeywordInterner, Partition, Schema, Value, ValueType,
+};
+use corium_db::{Db, Idents, attribute};
 use corium_log::{FileLog, TransactionLog};
-use corium_store::{BlobId, BlobStore, FsStore, RootStore};
+use corium_store::{BlobId, BlobStore, DbRoot, FsStore, RootStore};
 use corium_transactor::EmbeddedTransactor;
 use corium_tx::{EntityRef, TxItem, TxOp};
 use std::collections::HashSet;
 use std::{sync::Arc, thread};
 use tokio_stream::StreamExt;
+
+/// Materializes the current value at a published index root the way a
+/// transactor recovering from the index root does: read the EAVT snapshot,
+/// decode its keys back to datoms.
+async fn load_index_root_snapshot(store: &FsStore, root: &DbRoot, schema: Schema) -> Db {
+    use corium_store::{decode_index_manifest, decode_segment_keys, is_index_manifest};
+    let eavt = &root.roots.as_ref().expect("published roots")[IndexOrder::Eavt as usize];
+    let blob = store
+        .get(eavt)
+        .await
+        .expect("get eavt")
+        .expect("eavt present");
+    let keys = if is_index_manifest(&blob) {
+        let mut keys = Vec::new();
+        for child in decode_index_manifest(&blob).expect("manifest") {
+            let chunk = store.get(&child).await.expect("get chunk").expect("chunk");
+            keys.extend(decode_segment_keys(&chunk).expect("chunk keys"));
+        }
+        keys
+    } else {
+        decode_segment_keys(&blob).expect("flat keys")
+    };
+    let datoms = keys
+        .iter()
+        .map(|key| Datom::from_key(IndexOrder::Eavt, key).expect("decode datom"))
+        .collect();
+    Db::from_current_snapshot(
+        root.index_basis_t,
+        schema,
+        Idents::default(),
+        KeywordInterner::default(),
+        datoms,
+    )
+}
 fn schema() -> (Schema, EntityId) {
     let a = EntityId::new(Partition::Db as u32, 100);
     let mut schema = Schema::default();
@@ -19,7 +55,8 @@ fn schema() -> (Schema, EntityId) {
 async fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (schema, a) = schema();
-    let log = Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
+    let log: Arc<dyn TransactionLog> =
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
     let tx = Arc::new(EmbeddedTransactor::recover(schema.clone(), log).expect("recover"));
     let report_rx = tx.subscribe();
     tx.transact([TxItem::Op(TxOp::Add(
@@ -64,7 +101,8 @@ async fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {
 fn recovery_never_reuses_retracted_entity_ids() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (schema, a) = schema();
-    let log = Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
+    let log: Arc<dyn TransactionLog> =
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
     let tx = EmbeddedTransactor::recover(schema.clone(), log).expect("recover");
     let first = tx
         .transact([TxItem::Op(TxOp::Add(
@@ -119,7 +157,8 @@ async fn republication_uploads_only_the_chunks_a_change_touches() {
     // straight into the durable log — this test is about publication, and
     // per-item transaction validation over a database this size would
     // dominate its runtime.
-    let log = Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
+    let log: Arc<dyn TransactionLog> =
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
     let datoms: Vec<_> = (0u64..30_000)
         .map(|n| corium_core::Datom {
             e: EntityId::new(Partition::User as u32, corium_db::FIRST_USER_ID + n),
@@ -253,4 +292,129 @@ async fn deposed_lease_version_cannot_publish() {
         error,
         corium_transactor::TransactError::Deposed { published: 2 }
     ));
+}
+
+#[tokio::test]
+async fn index_root_recovery_matches_full_log_replay() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let store = FsStore::open(dir.path().join("store")).expect("store");
+    let log: Arc<dyn TransactionLog> =
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
+    let tx = EmbeddedTransactor::recover(schema.clone(), Arc::clone(&log)).expect("recover");
+    for value in 1..=3 {
+        tx.transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp(format!("e{value}")),
+            a,
+            Value::Long(value),
+        ))])
+        .expect("transact head");
+    }
+    // Publish a snapshot mid-history, then commit a tail past it.
+    let root = tx
+        .publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("publish");
+    assert_eq!(root.index_basis_t, 3);
+    for value in 4..=6 {
+        tx.transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp(format!("e{value}")),
+            a,
+            Value::Long(value),
+        ))])
+        .expect("transact tail");
+    }
+    drop(tx);
+
+    // Recovering from the index root replays only the (3, 6] tail.
+    let snapshot = load_index_root_snapshot(&store, &root, schema.clone()).await;
+    let from_index = EmbeddedTransactor::recover_from_snapshot(
+        snapshot,
+        root.next_entity_id,
+        root.last_tx_instant,
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("reopen log")),
+    )
+    .expect("index-root recovery");
+    // Full-log replay is the reference: the two must agree on the current value.
+    let from_log = EmbeddedTransactor::recover(
+        schema,
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("reopen log")),
+    )
+    .expect("full replay");
+    assert_eq!(from_index.db().basis_t(), from_log.db().basis_t());
+    assert_eq!(from_index.db().basis_t(), 6);
+    assert_eq!(
+        from_index.db().datoms(),
+        from_log.db().datoms(),
+        "index-root recovery must reconstruct the same current value as full replay"
+    );
+}
+
+#[tokio::test]
+async fn index_root_recovery_does_not_reuse_ids_retracted_before_the_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let store = FsStore::open(dir.path().join("store")).expect("store");
+    let log: Arc<dyn TransactionLog> =
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
+    let tx = EmbeddedTransactor::recover(schema.clone(), Arc::clone(&log)).expect("recover");
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp("keep".into()),
+        a,
+        Value::Long(1),
+    ))])
+    .expect("create survivor");
+    // The highest-numbered entity is fully retracted *before* the snapshot,
+    // so it leaves no live datom for the EAVT snapshot to carry — only the
+    // persisted allocator high-water records that its id was ever used.
+    let doomed = tx
+        .transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp("doomed".into()),
+            a,
+            Value::Long(2),
+        ))])
+        .expect("create doomed")
+        .tx
+        .tempids["doomed"];
+    tx.transact([TxItem::Op(TxOp::RetractEntity(EntityRef::Id(doomed)))])
+        .expect("retract doomed");
+    let root = tx
+        .publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("publish");
+    assert!(
+        root.next_entity_id > doomed.sequence(),
+        "published high-water must be past the retracted id"
+    );
+    drop(tx);
+
+    // Recover from the index root with an empty tail: only the persisted
+    // high-water stands between allocation and reusing `doomed`'s id.
+    let snapshot = load_index_root_snapshot(&store, &root, schema.clone()).await;
+    assert!(
+        snapshot.datoms().iter().all(|datom| datom.e != doomed),
+        "snapshot must not carry the fully retracted entity"
+    );
+    let recovered = EmbeddedTransactor::recover_from_snapshot(
+        snapshot,
+        root.next_entity_id,
+        root.last_tx_instant,
+        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("reopen log")),
+    )
+    .expect("index-root recovery");
+    let fresh = recovered
+        .transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp("fresh".into()),
+            a,
+            Value::Long(3),
+        ))])
+        .expect("allocate after recovery")
+        .tx
+        .tempids["fresh"];
+    assert!(
+        fresh.sequence() > doomed.sequence(),
+        "id {} reused after index-root recovery (retracted id was {})",
+        fresh.sequence(),
+        doomed.sequence()
+    );
 }

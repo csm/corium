@@ -134,6 +134,12 @@ pub async fn acquire(
             owner_endpoint: endpoint.to_owned(),
             index_basis_t: current.as_ref().map_or(0, |root| root.index_basis_t),
             roots: current.as_ref().and_then(|root| root.roots.clone()),
+            // Preserve the published snapshot's recovery hints across the
+            // fence bump so a successor can still recover from the index root.
+            next_entity_id: current.as_ref().map_or(0, |root| root.next_entity_id),
+            last_tx_instant: current
+                .as_ref()
+                .map_or(i64::MIN, |root| root.last_tx_instant),
         };
         match store
             .cas_root(&name, current_bytes.as_deref(), &next.encode())

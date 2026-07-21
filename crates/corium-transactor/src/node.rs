@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use corium_core::{KeywordInterner, Schema};
+use corium_core::{Datom, IndexOrder, KeywordInterner, Schema};
 use corium_db::{Db, Idents};
 use corium_log::{LogError, TransactionLog, TxRecord};
 use corium_protocol::codec::{self, CodecError};
@@ -16,7 +16,10 @@ use corium_protocol::pb;
 use corium_protocol::schemaform::{SchemaFormError, schema_from_edn};
 use corium_protocol::txforms::{TxFormError, tx_items_from_edn};
 use corium_query::edn::Edn;
-use corium_store::{RootStore, StoreError, mark_and_sweep_retained, meta_root_name};
+use corium_store::{
+    BlobId, BlobStore, RootStore, StoreError, decode_index_manifest, decode_segment_keys,
+    is_index_manifest, mark_and_sweep_retained, meta_root_name,
+};
 use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use tracing::Instrument;
@@ -597,21 +600,24 @@ impl TransactorNode {
         }
         // Acquisition rewrites the root record under our lease version, so
         // it doubles as the fence bump: a deposed writer's pending root CAS
-        // now has stale expected bytes and must fail.
+        // now has stale expected bytes and must fail. It also preserves the
+        // published snapshot's recovery hints, so the root we re-read below
+        // carries everything index-root recovery needs.
         let held = self.acquire_lease(name).await?;
         // The log tail replay below happens strictly after the fence, so it
         // observes every record a previous owner could ever have acked.
         let log = self.log_backend.open(name, held.version)?;
-        let base = Db::new(schema.clone()).with_naming(idents.clone(), interner.clone());
-        let transactor = EmbeddedTransactor::recover_from(base, Arc::clone(&log))?;
-        let basis_t = transactor.db().basis_t();
-        let index_basis = self
+        let post_fence = self
             .store
             .get_root(&root_name)
             .await?
             .as_deref()
-            .and_then(DbRoot::decode)
-            .map_or(0, |root| root.index_basis_t);
+            .and_then(DbRoot::decode);
+        let transactor = self
+            .recover_transactor(name, &schema, &idents, &interner, post_fence.as_ref(), &log)
+            .await?;
+        let basis_t = transactor.db().basis_t();
+        let index_basis = post_fence.map_or(0, |root| root.index_basis_t);
         let state = Arc::new(DbState {
             name: name.to_owned(),
             transactor,
@@ -631,6 +637,111 @@ impl TransactorNode {
         });
         self.spawn_maintenance(&state);
         Ok(state)
+    }
+
+    /// Builds the recovered transactor for `open_db`.
+    ///
+    /// When the post-fence root publishes a current snapshot with recovery
+    /// hints, recovers from the index root plus the log tail — open time
+    /// proportional to the tail, not the whole history. Any missing hint
+    /// (a pre-recovery root, or a bare fence bump with no snapshot) or a
+    /// failure materializing the snapshot falls back to full-log replay,
+    /// which is always correct because the log is the source of truth.
+    async fn recover_transactor(
+        &self,
+        name: &str,
+        schema: &Schema,
+        idents: &Idents,
+        interner: &KeywordInterner,
+        root: Option<&DbRoot>,
+        log: &Arc<dyn TransactionLog>,
+    ) -> Result<EmbeddedTransactor, NodeError> {
+        // `next_entity_id == 0` is the "no hint" sentinel (see DbRoot); it and
+        // an absent snapshot both rule out the tail-only path.
+        if let Some(root) = root
+            && let Some(roots) = &root.roots
+            && root.next_entity_id != 0
+        {
+            match self
+                .load_current_snapshot(
+                    root,
+                    &roots[IndexOrder::Eavt as usize],
+                    schema,
+                    idents,
+                    interner,
+                )
+                .await
+            {
+                Ok(snapshot) => {
+                    return Ok(EmbeddedTransactor::recover_from_snapshot(
+                        snapshot,
+                        root.next_entity_id,
+                        root.last_tx_instant,
+                        Arc::clone(log),
+                    )?);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        db = %name,
+                        %error,
+                        "index-root recovery failed; falling back to full-log replay"
+                    );
+                }
+            }
+        }
+        let base = Db::new(schema.clone()).with_naming(idents.clone(), interner.clone());
+        Ok(EmbeddedTransactor::recover_from(base, Arc::clone(log))?)
+    }
+
+    /// Materializes the current database value at a published index root from
+    /// its EAVT snapshot — the transactor-side counterpart of the peer's
+    /// bootstrap (`corium-peer`'s `load_current_snapshot`). Only current
+    /// facts are reconstructed; the log tail carries everything since.
+    async fn load_current_snapshot(
+        &self,
+        root: &DbRoot,
+        eavt: &BlobId,
+        schema: &Schema,
+        idents: &Idents,
+        interner: &KeywordInterner,
+    ) -> Result<Db, StoreError> {
+        let datoms = self
+            .load_index_keys(eavt)
+            .await?
+            .into_iter()
+            .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))?;
+        Ok(Db::from_current_snapshot(
+            root.index_basis_t,
+            schema.clone(),
+            idents.clone(),
+            interner.clone(),
+            datoms,
+        ))
+    }
+
+    /// Reads one covering index's sorted key stream from the blob store: a
+    /// format-3 manifest's chunks in order, or a pre-format-3 flat blob.
+    async fn load_index_keys(&self, id: &BlobId) -> Result<Vec<Vec<u8>>, StoreError> {
+        let blob = self
+            .store
+            .get(id)
+            .await?
+            .ok_or_else(|| StoreError::MissingBlob(id.clone()))?;
+        if !is_index_manifest(&blob) {
+            return decode_segment_keys(&blob);
+        }
+        let mut keys = Vec::new();
+        for child in decode_index_manifest(&blob)? {
+            let chunk = self
+                .store
+                .get(&child)
+                .await?
+                .ok_or_else(|| StoreError::MissingBlob(child.clone()))?;
+            keys.extend(decode_segment_keys(&chunk)?);
+        }
+        Ok(keys)
     }
 
     /// HA standby duty: at the lease-renewal cadence, rediscover databases

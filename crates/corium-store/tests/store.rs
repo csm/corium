@@ -289,6 +289,8 @@ fn db_root_round_trips_lease_fields() {
         owner_endpoint: "http://transactor-a:4334".into(),
         index_basis_t: 42,
         roots: None,
+        next_entity_id: 1_042,
+        last_tx_instant: 123_400,
     };
     assert_eq!(DbRoot::decode(&root.encode()), Some(root.clone()));
     let released = DbRoot {
@@ -312,4 +314,20 @@ fn format_one_roots_decode_with_an_unowned_lease() {
     assert!(decoded.owner.is_empty());
     assert_eq!(decoded.lease_expires_unix_ms, 0);
     assert!(decoded.owner_endpoint.is_empty());
+    // Recovery hints absent: the sentinel forces full-log replay.
+    assert_eq!(decoded.next_entity_id, 0);
+    assert_eq!(decoded.last_tx_instant, i64::MIN);
+}
+
+#[test]
+fn format_two_roots_without_hints_default_to_full_replay() {
+    use corium_store::DbRoot;
+    // A format-2/3 root written before recovery hints existed: header, lease
+    // version, index basis, four id slots, then only the lease fields.
+    let legacy = b"corium-root-v3\n5\n17\n-\n-\n-\n-\ntransactor-a\n123456\nhttp://a:4334\n";
+    let decoded = DbRoot::decode(legacy).expect("format-2 root decodes");
+    assert_eq!(decoded.lease_version, 5);
+    assert_eq!(decoded.owner, "transactor-a");
+    assert_eq!(decoded.next_entity_id, 0);
+    assert_eq!(decoded.last_tx_instant, i64::MIN);
 }
