@@ -432,7 +432,7 @@ impl TransactorNode {
     /// be recovered.
     pub async fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
         let store = Arc::new(NodeStore::open(&config.store, &config.data_dir).await?);
-        let log_backend = LogBackend::for_spec(&config.store, &config.data_dir);
+        let log_backend = LogBackend::for_spec(&config.store, &config.data_dir, Arc::clone(&store));
         let node = Arc::new(Self {
             config,
             store,

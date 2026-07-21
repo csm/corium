@@ -167,3 +167,75 @@ fn versioned_log_survives_torn_tail_in_an_older_version_file() {
     new.append(&record(2)).expect("append past torn tail");
     assert_eq!(new.replay().expect("replay"), vec![record(1), record(2)]);
 }
+
+#[derive(Default)]
+struct TestNativeStorage(std::sync::Mutex<std::collections::BTreeMap<(String, u64), Vec<u8>>>);
+
+impl corium_log::NativeLogStorage for TestNativeStorage {
+    fn read_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
+        Ok(self
+            .0
+            .lock()
+            .expect("lock")
+            .get(&(name.to_owned(), version))
+            .cloned())
+    }
+
+    fn cas_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), corium_log::LogError> {
+        let mut guard = self.0.lock().expect("lock");
+        let key = (name.to_owned(), version);
+        if guard.get(&key).map(Vec::as_slice) != expected {
+            return Err(corium_log::LogError::Corrupt);
+        }
+        guard.insert(key, new.to_vec());
+        Ok(())
+    }
+
+    fn versions(&self, name: &str) -> Result<Vec<u64>, corium_log::LogError> {
+        Ok(self
+            .0
+            .lock()
+            .expect("lock")
+            .keys()
+            .filter_map(|(record_name, version)| (record_name == name).then_some(*version))
+            .collect())
+    }
+
+    fn delete_versions(&self, name: &str) -> Result<(), corium_log::LogError> {
+        self.0
+            .lock()
+            .expect("lock")
+            .retain(|(record_name, _), _| record_name != name);
+        Ok(())
+    }
+}
+
+#[test]
+fn native_versioned_log_uses_store_versions_and_takeover_cutoff() {
+    let storage = std::sync::Arc::new(TestNativeStorage::default());
+    let v1 = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .expect("open v1");
+    v1.append(&record(1)).expect("append 1");
+    v1.append(&record(2)).expect("append 2");
+
+    let v2 = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 2)
+        .expect("open v2");
+    v2.append(&record(3)).expect("append 3");
+    v1.append(&record(3)).expect("stale append");
+    v1.append(&record(4)).expect("stale append 4");
+
+    assert_eq!(
+        v2.replay().expect("replay"),
+        vec![record(1), record(2), record(3)]
+    );
+}
