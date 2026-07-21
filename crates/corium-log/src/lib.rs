@@ -33,6 +33,9 @@ pub enum LogError {
     /// Malformed or incomplete log data.
     #[error("corrupt transaction log")]
     Corrupt,
+    /// Native store backend failure.
+    #[error("native transaction log store failed: {0}")]
+    Native(String),
 }
 
 /// Common transaction log interface.
@@ -269,6 +272,113 @@ fn merge_versions(mut per_version: Vec<Vec<TxRecord>>) -> Vec<TxRecord> {
         }
     }
     per_version.into_iter().flatten().collect()
+}
+
+/// Synchronous byte store for versioned transaction-log objects.
+///
+/// Implementations usually adapt the same native storage system used for
+/// blobs and roots. Each object is one lease-version log for one database.
+pub trait NativeLogStorage: Send + Sync {
+    /// Reads the encoded bytes for `name` and `version`.
+    ///
+    /// # Errors
+    /// Returns an error when the native backend cannot read the version
+    /// object or when backend data cannot be represented as log bytes.
+    fn read_version(&self, name: &str, version: u64) -> Result<Option<Vec<u8>>, LogError>;
+    /// Compare-and-swap writes encoded bytes for `name` and `version`.
+    ///
+    /// # Errors
+    /// Returns an error when the compare-and-swap fails, the native backend
+    /// cannot publish the version object, or the backend reports invalid data.
+    fn cas_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), LogError>;
+    /// Lists versions present for `name`, sorted ascending.
+    ///
+    /// # Errors
+    /// Returns an error when the native backend cannot enumerate version
+    /// objects or returns an invalid version identifier.
+    fn versions(&self, name: &str) -> Result<Vec<u64>, LogError>;
+    /// Deletes all versions for `name`.
+    ///
+    /// # Errors
+    /// Returns an error when the native backend cannot remove a version object.
+    fn delete_versions(&self, name: &str) -> Result<(), LogError>;
+}
+
+/// Versioned transaction log backed by a native key/value-style store.
+pub struct NativeVersionedLog<S: ?Sized> {
+    storage: Arc<S>,
+    name: String,
+    write_version: u64,
+    next_t: RwLock<u64>,
+}
+
+impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
+    /// Opens the log for writing under `write_version`.
+    ///
+    /// # Errors
+    /// Returns an error when stored records cannot be read or decoded.
+    pub fn open(storage: Arc<S>, name: &str, write_version: u64) -> Result<Self, LogError> {
+        let records = read_native_merged(storage.as_ref(), name)?;
+        Ok(Self {
+            storage,
+            name: name.to_owned(),
+            write_version,
+            next_t: RwLock::new(records.last().map_or(1, |r| r.t + 1)),
+        })
+    }
+}
+
+impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedLog<S> {
+    fn append(&self, record: &TxRecord) -> Result<(), LogError> {
+        let mut next_t = self.next_t.write().expect("poisoned log lock");
+        if *next_t != record.t {
+            return Err(LogError::Corrupt);
+        }
+        let current = self.storage.read_version(&self.name, self.write_version)?;
+        let current_bytes = current.as_deref().unwrap_or_default();
+        let existing = decode_framed_records(current_bytes)?;
+        if existing.last().map_or(*next_t, |r| r.t + 1) != record.t {
+            return Err(LogError::Corrupt);
+        }
+        let mut new = current_bytes.to_vec();
+        append_framed_record(&mut new, record)?;
+        self.storage
+            .cas_version(&self.name, self.write_version, current.as_deref(), &new)?;
+        *next_t += 1;
+        Ok(())
+    }
+
+    fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
+        let _guard = self.next_t.read().expect("poisoned log lock");
+        Ok(read_native_merged(self.storage.as_ref(), &self.name)?
+            .into_iter()
+            .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
+            .collect())
+    }
+}
+
+fn read_native_merged<S: NativeLogStorage + ?Sized>(
+    storage: &S,
+    name: &str,
+) -> Result<Vec<TxRecord>, LogError> {
+    let mut per_version = Vec::new();
+    for version in storage.versions(name)? {
+        let bytes = storage.read_version(name, version)?.unwrap_or_default();
+        per_version.push(decode_framed_records(&bytes)?);
+    }
+    let merged = merge_versions(per_version);
+    for pair in merged.windows(2) {
+        if pair[1].t != pair[0].t + 1 {
+            return Err(LogError::Corrupt);
+        }
+    }
+    Ok(merged)
 }
 
 /// Shared store of one log's records, each tagged with the lease version it
@@ -547,4 +657,45 @@ fn read_records(path: &Path) -> Result<(Vec<TxRecord>, u64), LogError> {
         durable_len += 8 + len as u64;
     }
     Ok((records, durable_len))
+}
+
+/// Appends one length-prefixed encoded record to `out`.
+///
+/// # Errors
+/// Returns an error if the record payload length is not representable.
+pub fn append_framed_record(out: &mut Vec<u8>, record: &TxRecord) -> Result<(), LogError> {
+    let payload = encode_record(record);
+    out.extend_from_slice(
+        &u64::try_from(payload.len())
+            .map_err(|_| LogError::Corrupt)?
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(&payload);
+    Ok(())
+}
+
+/// Decodes all records from a length-prefixed byte slice.
+///
+/// Unlike filesystem crash recovery, native stores publish whole values
+/// atomically, so any trailing partial frame is treated as corruption.
+///
+/// # Errors
+/// Returns an error when any frame is truncated, has an invalid length, or
+/// contains a corrupt encoded transaction record.
+pub fn decode_framed_records(mut bytes: &[u8]) -> Result<Vec<TxRecord>, LogError> {
+    let mut records = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < 8 {
+            return Err(LogError::Corrupt);
+        }
+        let len = usize::try_from(u64::from_be_bytes(
+            bytes[..8].try_into().map_err(|_| LogError::Corrupt)?,
+        ))
+        .map_err(|_| LogError::Corrupt)?;
+        bytes = &bytes[8..];
+        let payload = bytes.get(..len).ok_or(LogError::Corrupt)?;
+        records.push(decode_record(payload)?);
+        bytes = &bytes[len..];
+    }
+    Ok(records)
 }
