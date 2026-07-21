@@ -23,7 +23,10 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       localstack:
-        image: localstack/localstack:3
+        # S3 conditional-write (If-Match/If-None-Match) support landed
+        # incrementally in LocalStack; pin to a major known to enforce it,
+        # since the fenced-root race tests below depend on real enforcement.
+        image: localstack/localstack:4
         env:
           SERVICES: s3
         ports:

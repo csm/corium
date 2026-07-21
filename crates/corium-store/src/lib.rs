@@ -134,13 +134,18 @@ pub enum StoreError {
 /// Converts any S3 SDK operation error into [`StoreError::S3`]. Generic over
 /// the operation's modeled error type so every `?` on an S3 SDK call
 /// converts without a per-operation `From` impl.
+///
+/// Formats with [`DisplayErrorContext`](aws_sdk_s3::error::DisplayErrorContext)
+/// rather than `SdkError`'s own terse `Display` (e.g. "service error"), which
+/// drops the underlying S3 error code and message (`AccessDenied`,
+/// `NoSuchBucket`, etc.) that operators need to diagnose a failure.
 #[cfg(feature = "s3")]
 impl<E> From<aws_sdk_s3::error::SdkError<E>> for StoreError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(error: aws_sdk_s3::error::SdkError<E>) -> Self {
-        StoreError::S3(error.to_string())
+        StoreError::S3(aws_sdk_s3::error::DisplayErrorContext(error).to_string())
     }
 }
 

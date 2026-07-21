@@ -79,6 +79,10 @@ async fn s3_store_conforms() {
         .cas_root(&root, Some(b"v1"), b"v2")
         .await
         .expect("fenced root update");
+    assert!(matches!(
+        store.cas_root(&root, Some(b"v1"), b"v3").await,
+        Err(StoreError::CasFailed { actual: Some(actual), .. }) if actual == b"v2"
+    ));
     store
         .cas_root(&other_root, None, b"other")
         .await
@@ -126,4 +130,63 @@ async fn s3_store_conforms() {
     reopened.delete(&id).await.expect("delete blob");
     reopened.delete(&id).await.expect("repeat delete");
     assert!(!reopened.contains(&id).await.expect("deleted blob"));
+}
+
+/// Two racers that both read the same starting value before either writes
+/// cannot be distinguished by `cas_root`'s in-process byte comparison; only
+/// one may win, which exercises S3's `If-Match` enforcement on the fenced
+/// (`Some(expected)`) path itself, rather than corium's pre-check.
+#[tokio::test]
+async fn s3_fenced_root_cas_enforced_by_precondition() {
+    let Ok(bucket) = std::env::var("CORIUM_TEST_S3_BUCKET") else {
+        return;
+    };
+    let client = test_client().await;
+    let _ = client.create_bucket().bucket(&bucket).send().await;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let test_prefix = format!("corium-test/{}/{nonce}/", std::process::id());
+    let root = format!("fenced-race:{nonce}");
+
+    let cleanup_store = S3BlobStore::from_client(client.clone(), &bucket, &test_prefix)
+        .await
+        .expect("connect cleanup store");
+    let first_store = S3BlobStore::from_client(client.clone(), &bucket, &test_prefix)
+        .await
+        .expect("connect first store");
+    let second_store = S3BlobStore::from_client(client, &bucket, &test_prefix)
+        .await
+        .expect("connect second store");
+    first_store
+        .cas_root(&root, None, b"base")
+        .await
+        .expect("seed fenced race root");
+
+    let first_root = root.clone();
+    let second_root = root.clone();
+    let (first, second) = tokio::join!(
+        async move {
+            first_store
+                .cas_root(&first_root, Some(b"base"), b"first")
+                .await
+        },
+        async move {
+            second_store
+                .cas_root(&second_root, Some(b"base"), b"second")
+                .await
+        }
+    );
+    assert!(
+        (first.is_ok() && matches!(&second, Err(StoreError::CasFailed { .. })))
+            || (second.is_ok() && matches!(&first, Err(StoreError::CasFailed { .. }))),
+        "exactly one concurrent publisher must cross a fenced If-Match update"
+    );
+
+    cleanup_store
+        .delete_root(&root)
+        .await
+        .expect("delete fenced race root");
 }

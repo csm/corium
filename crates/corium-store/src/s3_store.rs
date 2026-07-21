@@ -146,7 +146,7 @@ impl S3BlobStore {
         }
         match request.send().await {
             Ok(_) => Ok(true),
-            Err(error) if is_precondition_conflict(&error) => Ok(false),
+            Err(error) if is_precondition_conflict(&error, if_match.is_some()) => Ok(false),
             Err(error) => Err(error.into()),
         }
     }
@@ -164,17 +164,26 @@ async fn collect_body(body: ByteStream) -> Result<Vec<u8>, StoreError> {
     Ok(body
         .collect()
         .await
-        .map_err(|error| StoreError::S3(error.to_string()))?
+        // `ByteStreamError`'s own `Display` is terse ("streaming error"); its
+        // real detail lives in `source()`, which `DisplayErrorContext` prints.
+        .map_err(|error| StoreError::S3(aws_sdk_s3::error::DisplayErrorContext(error).to_string()))?
         .into_bytes()
         .to_vec())
 }
 
-/// True when `error` is an S3 `412 Precondition Failed` or
-/// `409 ConditionalRequestConflict` response to a conditional `PutObject`.
-fn is_precondition_conflict<E>(error: &SdkError<E>) -> bool {
-    error
-        .raw_response()
-        .is_some_and(|response| matches!(response.status().as_u16(), 409 | 412))
+/// True when `error` is an S3 response to a conditional `PutObject` that
+/// means the precondition was not met: `412 Precondition Failed`,
+/// `409 ConditionalRequestConflict`, or — for an `If-Match` request only —
+/// `404 Not Found`, which S3 returns when the target key was deleted (racing
+/// a `delete_root`) rather than the RFC 7232 `412`. Any resulting `false` is
+/// resolved by a follow-up `get_root`, so a coincidental 404 from another
+/// cause (e.g. the bucket itself vanishing) still surfaces as a real error
+/// there instead of being silently swallowed here.
+fn is_precondition_conflict<E>(error: &SdkError<E>, if_match: bool) -> bool {
+    error.raw_response().is_some_and(|response| {
+        matches!(response.status().as_u16(), 409 | 412)
+            || (if_match && response.status().as_u16() == 404)
+    })
 }
 
 #[async_trait]
