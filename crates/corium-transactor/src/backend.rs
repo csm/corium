@@ -317,7 +317,7 @@ impl LogBackend {
             not(any(feature = "postgres", feature = "turso", feature = "s3")),
             allow(unused_variables)
         )]
-        store: Arc<NodeStore>,
+        store: &Arc<NodeStore>,
     ) -> Self {
         match spec {
             StoreSpec::Memory => Self::Mem(MemLogRegistry::new()),
