@@ -17,6 +17,8 @@ default = []
 postgres = ["corium-transactor/postgres"]
 # Enables the Turso storage backend for `corium transactor --store turso`.
 turso = ["corium-transactor/turso"]
+# Enables the S3 storage backend for `corium transactor --store s3`.
+s3 = ["corium-transactor/s3"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

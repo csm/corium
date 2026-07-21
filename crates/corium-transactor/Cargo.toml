@@ -11,6 +11,7 @@ description = "Corium transactor"
 default = []
 postgres = ["corium-store/postgres"]
 turso = ["corium-store/turso"]
+s3 = ["corium-store/s3"]
 
 [dependencies]
 corium-core = { workspace = true }

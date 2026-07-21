@@ -3,7 +3,7 @@
 //! A transactor keeps two kinds of durable state: the content-addressed
 //! blob store plus fenced root pointers (the "storage service"), and the
 //! per-database transaction log. [`StoreSpec`] selects the storage service
-//! backend — in-memory, filesystem, `PostgreSQL`, or Turso — and [`NodeStore`]
+//! backend — in-memory, filesystem, `PostgreSQL`, Turso, or S3 — and [`NodeStore`]
 //! dispatches the [`BlobStore`]/[`RootStore`] operations to it. The log stays
 //! local (in-memory for `mem`, filesystem otherwise) because the commit
 //! pipeline appends to it synchronously; see
@@ -20,6 +20,8 @@ use corium_store::{BlobId, BlobIdStream, BlobStore, FsStore, MemoryStore, RootSt
 
 #[cfg(feature = "postgres")]
 use corium_store::PostgresBlobStore;
+#[cfg(feature = "s3")]
+use corium_store::S3BlobStore;
 #[cfg(feature = "turso")]
 use corium_store::TursoBlobStore;
 
@@ -48,6 +50,15 @@ pub enum StoreSpec {
         /// Filesystem path of the Turso database.
         path: String,
     },
+    /// Blobs and roots in an S3 (or S3-compatible) bucket; the transaction
+    /// log stays on the local filesystem under the data directory.
+    #[cfg(feature = "s3")]
+    S3 {
+        /// Target bucket name.
+        bucket: String,
+        /// Key prefix namespacing every object this store touches.
+        prefix: String,
+    },
 }
 
 impl fmt::Debug for StoreSpec {
@@ -62,6 +73,12 @@ impl fmt::Debug for StoreSpec {
                 .finish(),
             #[cfg(feature = "turso")]
             Self::Turso { path } => formatter.debug_struct("Turso").field("path", path).finish(),
+            #[cfg(feature = "s3")]
+            Self::S3 { bucket, prefix } => formatter
+                .debug_struct("S3")
+                .field("bucket", bucket)
+                .field("prefix", prefix)
+                .finish(),
         }
     }
 }
@@ -81,6 +98,9 @@ pub enum NodeStore {
     /// Turso backend.
     #[cfg(feature = "turso")]
     Turso(TursoBlobStore),
+    /// S3 backend.
+    #[cfg(feature = "s3")]
+    S3(S3BlobStore),
 }
 
 impl NodeStore {
@@ -101,6 +121,10 @@ impl NodeStore {
             )),
             #[cfg(feature = "turso")]
             StoreSpec::Turso { path } => Ok(Self::Turso(TursoBlobStore::open(path).await?)),
+            #[cfg(feature = "s3")]
+            StoreSpec::S3 { bucket, prefix } => {
+                Ok(Self::S3(S3BlobStore::connect(bucket, prefix).await?))
+            }
         }
     }
 
@@ -125,6 +149,10 @@ impl NodeStore {
             StoreSpec::Turso { path } => {
                 Ok(Self::Turso(TursoBlobStore::open_existing(path).await?))
             }
+            #[cfg(feature = "s3")]
+            StoreSpec::S3 { bucket, prefix } => {
+                Ok(Self::S3(S3BlobStore::connect(bucket, prefix).await?))
+            }
         }
     }
 }
@@ -139,6 +167,8 @@ impl BlobStore for NodeStore {
             Self::Postgres(store) => store.put(bytes).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.put(bytes).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.put(bytes).await,
         }
     }
 
@@ -150,6 +180,8 @@ impl BlobStore for NodeStore {
             Self::Postgres(store) => store.get(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.get(id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.get(id).await,
         }
     }
 
@@ -161,6 +193,8 @@ impl BlobStore for NodeStore {
             Self::Postgres(store) => store.contains(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.contains(id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.contains(id).await,
         }
     }
 
@@ -172,6 +206,8 @@ impl BlobStore for NodeStore {
             Self::Postgres(store) => store.delete(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.delete(id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.delete(id).await,
         }
     }
 
@@ -183,6 +219,8 @@ impl BlobStore for NodeStore {
             Self::Postgres(store) => store.list().await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.list().await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.list().await,
         }
     }
 
@@ -194,6 +232,8 @@ impl BlobStore for NodeStore {
             Self::Postgres(store) => store.modified_at(id).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.modified_at(id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.modified_at(id).await,
         }
     }
 }
@@ -208,6 +248,8 @@ impl RootStore for NodeStore {
             Self::Postgres(store) => store.get_root(name).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.get_root(name).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.get_root(name).await,
         }
     }
 
@@ -224,6 +266,8 @@ impl RootStore for NodeStore {
             Self::Postgres(store) => store.cas_root(name, expected, new).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.cas_root(name, expected, new).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.cas_root(name, expected, new).await,
         }
     }
 
@@ -235,6 +279,8 @@ impl RootStore for NodeStore {
             Self::Postgres(store) => store.delete_root(name).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.delete_root(name).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.delete_root(name).await,
         }
     }
 
@@ -246,6 +292,8 @@ impl RootStore for NodeStore {
             Self::Postgres(store) => store.list_roots(prefix).await,
             #[cfg(feature = "turso")]
             Self::Turso(store) => store.list_roots(prefix).await,
+            #[cfg(feature = "s3")]
+            Self::S3(store) => store.list_roots(prefix).await,
         }
     }
 }
@@ -271,6 +319,8 @@ impl LogBackend {
             StoreSpec::Postgres { .. } => Self::Fs(data_dir.join("logs")),
             #[cfg(feature = "turso")]
             StoreSpec::Turso { .. } => Self::Fs(data_dir.join("logs")),
+            #[cfg(feature = "s3")]
+            StoreSpec::S3 { .. } => Self::Fs(data_dir.join("logs")),
         }
     }
 
