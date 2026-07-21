@@ -1,0 +1,92 @@
+name: Publish site
+
+# Builds the static site under web/ — including the corium-wasm bindings —
+# and uploads it to a server over SFTP (password auth).
+#
+# Required repository secrets:
+#   SFTP_HOST        hostname of the SFTP server
+#   SFTP_USERNAME    login user
+#   SFTP_PASSWORD    login password
+#   SFTP_REMOTE_DIR  absolute target directory on the server (published into,
+#                    and mirrored with --delete, so give it a dedicated dir)
+# Optional:
+#   SFTP_PORT        SFTP port (defaults to 22)
+#
+# Note: this uses `sftp:auto-confirm` (accept unknown host key) since only a
+# password is provided. To pin the server's host key instead, add it to a
+# known_hosts and drop auto-confirm.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "crates/corium-wasm/**"
+      - ".github/workflows/publish-site.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: publish-site
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-site
+
+      - name: Build wasm
+        run: cargo build -p corium-wasm --target wasm32-unknown-unknown --release
+
+      - name: Install wasm-bindgen-cli (version pinned to the crate)
+        run: |
+          VER=$(cargo metadata --format-version=1 \
+            | jq -r '[.packages[] | select(.name=="wasm-bindgen")][0].version')
+          echo "wasm-bindgen version: $VER"
+          cargo install wasm-bindgen-cli --version "$VER"
+
+      - name: Generate bindings into web/
+        run: |
+          wasm-bindgen target/wasm32-unknown-unknown/release/corium_wasm.wasm \
+            --out-dir web --target web --no-typescript
+
+      - name: Optimize wasm (wasm-opt)
+        run: |
+          sudo apt-get update && sudo apt-get install -y binaryen
+          wasm-opt -Oz web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm
+          ls -la web/
+
+      - name: Upload over SFTP
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT || '22' }}
+          SFTP_USERNAME: ${{ secrets.SFTP_USERNAME }}
+          LFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
+          SFTP_REMOTE_DIR: ${{ secrets.SFTP_REMOTE_DIR }}
+        run: |
+          sudo apt-get install -y lftp
+          if [ -z "$SFTP_HOST" ] || [ -z "$SFTP_USERNAME" ] || [ -z "$LFTP_PASSWORD" ] || [ -z "$SFTP_REMOTE_DIR" ]; then
+            echo "Missing one of the required SFTP_* secrets." >&2
+            exit 1
+          fi
+          # Password is passed via the LFTP_PASSWORD env (--env-password), never
+          # on the command line. Mirror the web/ dir up, deleting stale remote
+          # files; skip the local .gitignore.
+          lftp -u "$SFTP_USERNAME" --env-password "sftp://${SFTP_HOST}:${SFTP_PORT}" <<EOF
+          set cmd:fail-exit yes
+          set sftp:auto-confirm yes
+          set net:max-retries 3
+          set net:timeout 20
+          mirror --reverse --delete --verbose --no-perms --exclude '(^|/)\.gitignore$' web/ "${SFTP_REMOTE_DIR}"
+          bye
+          EOF

@@ -5,6 +5,7 @@ members = [
     "crates/corium-store",
     "crates/corium-log",
     "crates/corium-tx",
+    "crates/corium-forms",
     "crates/corium-query",
     "crates/corium-sql",
     "crates/corium-db",
@@ -14,6 +15,7 @@ members = [
     "crates/corium-cljrs",
     "crates/corium-cli",
     "crates/corium-sim",
+    "crates/corium-wasm",
     "examples/musicbrainz",
 ]
 resolver = "3"
@@ -38,6 +40,7 @@ corium-cli = { path = "crates/corium-cli", version = "0.1.0" }
 corium-cljrs = { path = "crates/corium-cljrs", version = "0.1.0" }
 corium-core = { path = "crates/corium-core", version = "0.1.0" }
 corium-db = { path = "crates/corium-db", version = "0.1.0" }
+corium-forms = { path = "crates/corium-forms", version = "0.1.0" }
 corium-index = { path = "crates/corium-index", version = "0.1.0" }
 corium-log = { path = "crates/corium-log", version = "0.1.0" }
 corium-peer = { path = "crates/corium-peer", version = "0.1.0" }

@@ -1,0 +1,239 @@
+/* corium site — reactive purple theme (Solarized-like, violet tones).
+ *
+ * Light: very dark purple text on pale lavender.
+ * Dark:  pale lavender text on deep aubergine (roughly inverted).
+ *
+ * The palette is driven by custom properties set in three places:
+ *   :root                          → light (default)
+ *   @media (prefers-color-scheme)  → follows the system when unset
+ *   :root[data-theme="…"]          → explicit manual override (wins)
+ * Icon visibility (--show-sun/--show-moon) rides the same blocks, so the
+ * toggle shows the right glyph — including live OS changes in system mode. */
+
+:root {
+  --bg: #f3eefb;
+  --bg-soft: #e9e0f6;
+  --bg-softer: #ddd0f0;
+  --fg: #241541;
+  --fg-muted: #5b4a86;
+  --border: #d4c6ec;
+  --accent: #6d28d9;
+  --accent-hover: #5b1fc4;
+  --shadow: rgba(60, 30, 110, 0.12);
+  --theme-name: "light";
+  --show-sun: none;
+  --show-moon: inline-block;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #17102b;
+    --bg-soft: #201631;
+    --bg-softer: #2b1f45;
+    --fg: #e6dcf7;
+    --fg-muted: #a996cc;
+    --border: #362a52;
+    --accent: #c4b5fd;
+    --accent-hover: #d6c7ff;
+    --shadow: rgba(0, 0, 0, 0.4);
+    --theme-name: "dark";
+    --show-sun: inline-block;
+    --show-moon: none;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #f3eefb;
+  --bg-soft: #e9e0f6;
+  --bg-softer: #ddd0f0;
+  --fg: #241541;
+  --fg-muted: #5b4a86;
+  --border: #d4c6ec;
+  --accent: #6d28d9;
+  --accent-hover: #5b1fc4;
+  --shadow: rgba(60, 30, 110, 0.12);
+  --theme-name: "light";
+  --show-sun: none;
+  --show-moon: inline-block;
+}
+
+:root[data-theme="dark"] {
+  --bg: #17102b;
+  --bg-soft: #201631;
+  --bg-softer: #2b1f45;
+  --fg: #e6dcf7;
+  --fg-muted: #a996cc;
+  --border: #362a52;
+  --accent: #c4b5fd;
+  --accent-hover: #d6c7ff;
+  --shadow: rgba(0, 0, 0, 0.4);
+  --theme-name: "dark";
+  --show-sun: inline-block;
+  --show-moon: none;
+}
+
+* { box-sizing: border-box; }
+
+html { color-scheme: light dark; }
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: clamp(2rem, 6vw, 4.5rem) 1.25rem 4rem;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+/* ── site header ─────────────────────────────────────────────────────── */
+.site-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+h1 {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: clamp(2rem, 7vw, 3rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+  color: var(--fg);
+}
+h1 .dot { color: var(--accent); }
+
+.lede {
+  font-size: 1.05rem;
+  color: var(--fg-muted);
+  margin: 1rem 0 2.25rem;
+  max-width: 40ch;
+}
+
+/* ── link list ───────────────────────────────────────────────────────── */
+.links { list-style: none; margin: 0; padding: 0; }
+.links li { margin: 0; }
+.links a {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.85rem 0.25rem;
+  border-top: 1px solid var(--border);
+  color: var(--fg);
+}
+.links li:last-child a { border-bottom: 1px solid var(--border); }
+.links a:hover { color: var(--accent); text-decoration: none; }
+.links .label { font-weight: 600; }
+.links .desc { color: var(--fg-muted); font-size: 0.92rem; }
+.links a:hover .arrow { transform: translateX(3px); }
+.arrow { margin-left: auto; color: var(--accent); transition: transform 0.15s ease; }
+
+footer {
+  margin-top: 3rem;
+  color: var(--fg-muted);
+  font-size: 0.85rem;
+}
+
+/* ── theme toggle ────────────────────────────────────────────────────── */
+#theme-toggle {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-soft);
+  color: var(--accent);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+#theme-toggle:hover { background: var(--bg-softer); border-color: var(--accent); }
+#theme-toggle .icon { width: 1.05rem; height: 1.05rem; }
+#theme-toggle .icon-sun { display: var(--show-sun); }
+#theme-toggle .icon-moon { display: var(--show-moon); }
+
+/* ── demo page ───────────────────────────────────────────────────────── */
+.back { font-size: 0.9rem; color: var(--fg-muted); }
+.back a { color: var(--fg-muted); }
+.back a:hover { color: var(--accent); }
+
+.field-label {
+  font-weight: 600;
+  margin: 1.75rem 0 0.5rem;
+  font-size: 0.95rem;
+}
+.hint { color: var(--fg-muted); font-size: 0.85rem; font-weight: 400; }
+
+textarea {
+  width: 100%;
+  min-height: 5.5rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--fg);
+  font: 0.9rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  resize: vertical;
+}
+textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.btn-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.6rem; }
+
+button.action {
+  font: inherit;
+  font-size: 0.88rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-soft);
+  color: var(--fg);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+button.action:hover { background: var(--bg-softer); border-color: var(--accent); }
+button.action.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+button.action.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+.examples { margin-top: 0.75rem; }
+.examples .chip {
+  font-size: 0.82rem;
+  padding: 0.3rem 0.7rem;
+  color: var(--accent);
+  background: transparent;
+}
+
+pre.output {
+  margin-top: 0.6rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 3rem;
+  font: 0.88rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+details { margin-top: 1.5rem; color: var(--fg-muted); font-size: 0.9rem; }
+details pre { margin: 0.5rem 0 0; }

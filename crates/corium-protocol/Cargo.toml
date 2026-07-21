@@ -10,6 +10,7 @@ description = "Corium gRPC network protocol"
 [dependencies]
 corium-core = { workspace = true }
 corium-db = { workspace = true }
+corium-forms = { workspace = true }
 corium-log = { workspace = true }
 corium-query = { workspace = true }
 corium-tx = { workspace = true }

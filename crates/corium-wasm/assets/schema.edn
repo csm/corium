@@ -1,0 +1,144 @@
+;; MusicBrainz schema for corium, adapted from the Datomic mbrainz example.
+;;
+;; Corium's schema scope (ADR-0009) covers idents, value types, cardinality,
+;; uniqueness, components, and indexing — but not runtime :db/ident enum
+;; entities. So where Datomic models enumerated values (artist type, release
+;; status, medium format, …) as refs to ident entities, this schema uses
+;; plain :db.type/keyword values such as :artist.type/person. Relationships
+;; between real entities stay :db.type/ref and are linked with lookup refs on
+;; the unique :*/gid attributes (corium does not resolve value-position
+;; tempids), so every linkable entity — including media and tracks — carries
+;; a gid here even though Datomic gives those none.
+;;
+;; UUID literals are 32 hex digits with no dashes: #uuid "0000…0001".
+
+[;; ── Artists ──────────────────────────────────────────────────────────────
+ {:db/ident :artist/gid
+  :db/valueType :db.type/uuid
+  :db/cardinality :db.cardinality/one
+  :db/unique :db.unique/identity}
+ {:db/ident :artist/name
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one
+  :db/index true}
+ {:db/ident :artist/sortName
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :artist/type
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :artist/gender
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :artist/country
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :artist/startYear
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one
+  :db/index true}
+ {:db/ident :artist/endYear
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one}
+
+ ;; ── Labels ─────────────────────────────────────────────────────────────
+ {:db/ident :label/gid
+  :db/valueType :db.type/uuid
+  :db/cardinality :db.cardinality/one
+  :db/unique :db.unique/identity}
+ {:db/ident :label/name
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one
+  :db/index true}
+ {:db/ident :label/type
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :label/country
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :label/startYear
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one}
+
+ ;; ── Tracks ─────────────────────────────────────────────────────────────
+ {:db/ident :track/gid
+  :db/valueType :db.type/uuid
+  :db/cardinality :db.cardinality/one
+  :db/unique :db.unique/identity}
+ {:db/ident :track/name
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one
+  :db/index true}
+ {:db/ident :track/position
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :track/duration
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :track/artists
+  :db/valueType :db.type/ref
+  :db/cardinality :db.cardinality/many}
+ {:db/ident :track/artistCredit
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one}
+
+ ;; ── Media ──────────────────────────────────────────────────────────────
+ {:db/ident :medium/gid
+  :db/valueType :db.type/uuid
+  :db/cardinality :db.cardinality/one
+  :db/unique :db.unique/identity}
+ {:db/ident :medium/format
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :medium/position
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :medium/name
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :medium/trackCount
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :medium/tracks
+  :db/valueType :db.type/ref
+  :db/cardinality :db.cardinality/many
+  :db/isComponent true}
+
+ ;; ── Releases ───────────────────────────────────────────────────────────
+ {:db/ident :release/gid
+  :db/valueType :db.type/uuid
+  :db/cardinality :db.cardinality/one
+  :db/unique :db.unique/identity}
+ {:db/ident :release/name
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one
+  :db/index true}
+ {:db/ident :release/artists
+  :db/valueType :db.type/ref
+  :db/cardinality :db.cardinality/many}
+ {:db/ident :release/artistCredit
+  :db/valueType :db.type/string
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :release/status
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :release/type
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :release/country
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :release/language
+  :db/valueType :db.type/keyword
+  :db/cardinality :db.cardinality/one}
+ {:db/ident :release/year
+  :db/valueType :db.type/long
+  :db/cardinality :db.cardinality/one
+  :db/index true}
+ {:db/ident :release/labels
+  :db/valueType :db.type/ref
+  :db/cardinality :db.cardinality/many}
+ {:db/ident :release/media
+  :db/valueType :db.type/ref
+  :db/cardinality :db.cardinality/many
+  :db/isComponent true}]

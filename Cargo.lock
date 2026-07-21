@@ -1911,6 +1911,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "corium-forms"
+version = "0.1.0"
+dependencies = [
+ "corium-core",
+ "corium-db",
+ "corium-query",
+ "corium-tx",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "corium-index"
 version = "0.1.0"
 dependencies = [
@@ -1975,6 +1987,7 @@ version = "0.1.0"
 dependencies = [
  "corium-core",
  "corium-db",
+ "corium-forms",
  "corium-log",
  "corium-query",
  "corium-tx",
@@ -2071,6 +2084,18 @@ dependencies = [
  "corium-core",
  "corium-db",
  "thiserror",
+]
+
+[[package]]
+name = "corium-wasm"
+version = "0.1.0"
+dependencies = [
+ "corium-core",
+ "corium-db",
+ "corium-forms",
+ "corium-query",
+ "corium-tx",
+ "wasm-bindgen",
 ]
 
 [[package]]

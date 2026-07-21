@@ -4,8 +4,12 @@
 
 pub mod auth;
 pub mod codec;
-pub mod schemaform;
-pub mod txforms;
+
+// The EDN schema/transaction boundary conversions live in the pure
+// `corium-forms` crate (so they compile on wasm, away from tonic/tokio).
+// Re-exported here for back-compatible paths (`corium_protocol::schemaform`,
+// `corium_protocol::txforms`).
+pub use corium_forms::{schemaform, txforms};
 
 /// Protocol version spoken by this crate.
 pub const PROTOCOL_VERSION: u32 = 1;
