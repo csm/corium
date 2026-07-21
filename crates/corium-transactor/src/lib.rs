@@ -68,6 +68,15 @@ struct State {
     subscribers: Vec<mpsc::Sender<TxReport>>,
 }
 
+/// The next free user-partition entity id given a run of datoms and a floor,
+/// so allocation never revisits an id any of them used.
+fn next_user_id<'a>(datoms: impl Iterator<Item = &'a corium_core::Datom>, floor: u64) -> u64 {
+    datoms
+        .filter(|d| d.e.partition() == Partition::User as u32)
+        .map(|d| d.e.sequence() + 1)
+        .fold(floor, u64::max)
+}
+
 /// A serialized, in-process transactor. The log append is the commit point.
 pub struct EmbeddedTransactor {
     log: Arc<dyn TransactionLog>,
@@ -97,13 +106,7 @@ impl EmbeddedTransactor {
         // Allocation must resume past every id that ever appeared in the log,
         // not just ids with current datoms; otherwise a fully retracted
         // entity's id would be reused after a restart.
-        let next_user = db
-            .recorded_datoms()
-            .iter()
-            .filter(|d| d.e.partition() == Partition::User as u32)
-            .map(|d| d.e.sequence() + 1)
-            .max()
-            .unwrap_or(FIRST_USER_ID);
+        let next_user = next_user_id(db.recorded_datoms().iter(), FIRST_USER_ID);
         Ok(Self {
             log,
             state: Mutex::new(State {
@@ -113,6 +116,69 @@ impl EmbeddedTransactor {
                 subscribers: Vec::new(),
             }),
         })
+    }
+
+    /// Recovers from a published current-state snapshot plus the log tail,
+    /// replaying only transactions after the snapshot's basis instead of the
+    /// whole history — so open and restart cost scale with the tail, not the
+    /// database's age.
+    ///
+    /// `snapshot` is the current value at `snapshot.basis_t()` (typically
+    /// [`Db::from_current_snapshot`] materialized from the published EAVT
+    /// index). `next_entity_id` and `last_tx_instant` are the allocator and
+    /// transaction-time high-water marks recorded in the [`DbRoot`] at
+    /// publication (`DbRoot::next_entity_id` / `DbRoot::last_tx_instant`);
+    /// they carry the state a current-facts snapshot cannot: entities fully
+    /// retracted before the snapshot (whose ids must not be reused) and the
+    /// last commit's instant (for `:db/txInstant` monotonicity when the tail
+    /// is empty). Both are combined by `max` with whatever the replayed tail
+    /// reveals, so an over-estimate is safe and a stale hint can only make
+    /// allocation more conservative.
+    ///
+    /// The caller is responsible for opening `log` at the same lease version
+    /// it recovered the snapshot under, exactly as [`recover_from`] requires.
+    ///
+    /// # Errors
+    /// Returns an error when the log tail cannot be replayed.
+    ///
+    /// [`recover_from`]: Self::recover_from
+    pub fn recover_from_snapshot(
+        snapshot: Db,
+        next_entity_id: u64,
+        last_tx_instant: i64,
+        log: Arc<dyn TransactionLog>,
+    ) -> Result<Self, TransactError> {
+        let mut db = snapshot;
+        let index_basis = db.basis_t();
+        let mut last_instant = last_tx_instant;
+        // The snapshot's live datoms are already covered by the persisted
+        // `next_entity_id`; only the tail can introduce ids past it.
+        let mut next_user = next_entity_id.max(FIRST_USER_ID);
+        for record in log.tx_range(index_basis + 1, None)? {
+            db = db.with_transaction(record.t, &record.datoms);
+            last_instant = last_instant.max(record.tx_instant);
+            next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
+        }
+        Ok(Self {
+            log,
+            state: Mutex::new(State {
+                db,
+                next_user,
+                last_instant,
+                subscribers: Vec::new(),
+            }),
+        })
+    }
+
+    /// Captures a consistent recovery snapshot: the current database value
+    /// with the allocator and transaction-time high-water marks that a
+    /// snapshot-only recovery would otherwise lose, all read under one lock.
+    fn recovery_snapshot(&self) -> (Db, u64, i64) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.db.clone(), state.next_user, state.last_instant)
     }
     /// Returns the current immutable database value.
     #[must_use]
@@ -220,7 +286,7 @@ impl EmbeddedTransactor {
         root_name: &str,
         lease_version: u64,
     ) -> Result<DbRoot, TransactError> {
-        let snapshot = self.db();
+        let (snapshot, next_entity_id, last_tx_instant) = self.recovery_snapshot();
         let datoms = snapshot.datoms();
         let chunked = tokio::task::spawn_blocking(move || {
             [
@@ -260,6 +326,9 @@ impl EmbeddedTransactor {
                 ids[2].clone(),
                 ids[3].clone(),
             ]),
+            // Recovery hints for opening from this root without full replay.
+            next_entity_id,
+            last_tx_instant,
         };
         publish_root(store, root_name, &root).await?;
         Ok(root)

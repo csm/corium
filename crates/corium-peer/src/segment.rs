@@ -13,7 +13,7 @@ use corium_db::Db;
 use corium_protocol::codec::{self, CodecError};
 use corium_store::{
     BlobId, BlobStore, DbRoot, FORMAT_VERSION, RootStore, SegmentCache, StoreError, db_root_name,
-    decode_index_manifest, is_index_manifest, meta_root_name,
+    decode_index_manifest, decode_segment_keys, is_index_manifest, meta_root_name,
 };
 use thiserror::Error;
 
@@ -132,24 +132,6 @@ async fn load_index_keys(store: &dyn PeerStorage, id: &BlobId) -> Result<Vec<Vec
             .await?
             .ok_or_else(|| StoreError::MissingBlob(child.clone()))?;
         keys.extend(decode_segment_keys(&chunk)?);
-    }
-    Ok(keys)
-}
-
-fn decode_segment_keys(bytes: &[u8]) -> Result<Vec<Vec<u8>>, StoreError> {
-    let mut keys = Vec::new();
-    let mut input = bytes;
-    while !input.is_empty() {
-        let (len_bytes, rest) = input
-            .split_at_checked(8)
-            .ok_or_else(|| StoreError::Io(std::io::Error::other("truncated segment")))?;
-        let len = usize::try_from(u64::from_be_bytes(len_bytes.try_into().unwrap_or_default()))
-            .map_err(|_| StoreError::Io(std::io::Error::other("segment key too large")))?;
-        let (key, rest) = rest
-            .split_at_checked(len)
-            .ok_or_else(|| StoreError::Io(std::io::Error::other("truncated segment key")))?;
-        keys.push(key.to_vec());
-        input = rest;
     }
     Ok(keys)
 }
@@ -280,6 +262,8 @@ mod tests {
             owner_endpoint: String::new(),
             index_basis_t: 37,
             roots: Some([id.clone(), id.clone(), id.clone(), id]),
+            next_entity_id: 1_005,
+            last_tx_instant: 0,
         };
         RootStore::cas_root(&store, &db_root_name("music"), None, &root.encode())
             .await
@@ -334,6 +318,8 @@ mod tests {
             owner_endpoint: String::new(),
             index_basis_t: 37,
             roots: Some([id.clone(), id.clone(), id.clone(), id]),
+            next_entity_id: 1_005,
+            last_tx_instant: 0,
         };
         RootStore::cas_root(&store, &db_root_name("music"), None, &root.encode())
             .await

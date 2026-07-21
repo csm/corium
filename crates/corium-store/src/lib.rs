@@ -21,8 +21,8 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
 mod snapshot;
 pub use snapshot::{
-    INDEX_MANIFEST_MAGIC, chunk_segment_keys, decode_index_manifest, encode_index_manifest,
-    index_blob_children, is_index_manifest,
+    INDEX_MANIFEST_MAGIC, chunk_segment_keys, decode_index_manifest, decode_segment_keys,
+    encode_index_manifest, index_blob_children, is_index_manifest,
 };
 
 #[cfg(feature = "postgres")]
@@ -662,6 +662,23 @@ pub struct DbRoot {
     /// EAVT, AEVT, AVET, and VAET blob ids; `None` before the first index
     /// publication (a bare fence bump).
     pub roots: Option<[BlobId; 4]>,
+    /// Next unallocated user-partition entity id as of `index_basis_t`.
+    ///
+    /// A transactor recovering from the index root replays only the log
+    /// tail, so entities created *and* fully retracted before the snapshot
+    /// carry no live datom and are invisible to it. Persisting the writer's
+    /// allocation high-water lets recovery resume past those ids instead of
+    /// reusing them. `0` in roots written before this field existed (and in
+    /// a bare fence bump with no published snapshot); such roots force
+    /// full-log replay, which reconstructs the allocator exactly.
+    pub next_entity_id: u64,
+    /// Largest `:db/txInstant` (Unix ms) committed through `index_basis_t`.
+    ///
+    /// Preserves `:db/txInstant` monotonicity across a recovery whose log
+    /// tail is empty (the snapshot alone does not carry the last commit's
+    /// instant). `i64::MIN` when absent, which is dominated by any real
+    /// instant and so is a safe floor.
+    pub last_tx_instant: i64,
 }
 
 /// Encodes a possibly empty single-line field.
@@ -703,6 +720,12 @@ impl DbRoot {
         out.push_str(&self.lease_expires_unix_ms.to_string());
         out.push('\n');
         field_line(&mut out, &self.owner_endpoint);
+        // Recovery hints (appended after the format-2 lease fields, so older
+        // binaries that stop reading at `owner_endpoint` ignore them and this
+        // stays a plain trailing extension of the same record).
+        out.push_str(&self.next_entity_id.to_string());
+        out.push('\n');
+        out.push_str(&self.last_tx_instant.to_string());
         out.into_bytes()
     }
 
@@ -743,6 +766,14 @@ impl DbRoot {
         let owner = lines.next().map(parse_field).unwrap_or_default();
         let lease_expires_unix_ms = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
         let owner_endpoint = lines.next().map(parse_field).unwrap_or_default();
+        // Recovery hints; absent in roots written before index-root recovery.
+        // A missing `next_entity_id` (0) signals "no hint", forcing full-log
+        // replay, so the default must never look like a valid allocator id.
+        let next_entity_id = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
+        let last_tx_instant = lines
+            .next()
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(i64::MIN);
         Some(Self {
             format_version,
             lease_version,
@@ -751,6 +782,8 @@ impl DbRoot {
             owner_endpoint,
             index_basis_t,
             roots,
+            next_entity_id,
+            last_tx_instant,
         })
     }
 }

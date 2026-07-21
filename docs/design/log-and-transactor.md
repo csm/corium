@@ -19,10 +19,15 @@ append + fsync; object stores later: small per-tx objects compacted into
 chunks by the indexing job). The `corium-log` crate hides this behind
 `append(tx) -> t` and `replay(range)`.
 
-> **Status:** v1 implements the filesystem layout only (per-lease-version
-> files under the data directory); the shared-storage layouts below are
-> design for a backlog item. Until then, log durability is the data
-> directory's, and HA requires the members to share it.
+> **Status:** the filesystem layout (per-lease-version files under the data
+> directory) and the shared-storage layout are both implemented. The native
+> backends (PostgreSQL, Turso, S3) store the log through the root store as a
+> `(db, lease-version, t)` record per commit (`corium-log`'s
+> `NativeVersionedLog`), so log durability is the storage service's and HA
+> no longer needs a shared data directory. The object-store *chunk-sealing*
+> optimization below (compacting the tail under a `log-root`) is still
+> future work; the per-transaction record layout carries the same
+> lease-version fencing in the meantime.
 
 ### Object-store log layout (future)
 

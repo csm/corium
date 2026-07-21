@@ -110,20 +110,31 @@ error surfacing to callers beyond retry latency.
 Scaling and durability (see
 [log-and-transactor.md](design/log-and-transactor.md) for the log design):
 
-- **Durable log in shared storage.** Move the transaction log from per-node
-  files into the storage service: conditional-write tail objects plus sealed
-  chunks under a `log-root` for object stores, a `(db, lease-version, t)`
-  log table for the SQL backends. Removes HA's shared-data-directory
-  requirement, lets a standby take over from a dead node's database, and
-  unpins databases from transactor machines. Prerequisite for partitioned
-  transactors.
-- **Recovery from the index root.** Open a database from its published
-  indexes plus the log tail since `index-basis-t` instead of full-log
-  replay, making open and restart time proportional to the tail rather than
-  the history. Requires publishing the history trees ("future history
-  roots" in [indexes-and-storage.md](design/indexes-and-storage.md)) —
-  v1 segments carry current facts only, so a transactor recovered from them
-  could not yet serve complete `history`/`as-of` views.
+- **Durable log in shared storage.** *(Done.)* The transaction log lives in
+  the storage service for every non-filesystem backend: `corium-log`'s
+  `NativeVersionedLog` keeps a `(db, lease-version, t)` record per commit
+  through the `RootStore`, so PostgreSQL, Turso, and S3 nodes need no shared
+  data directory and a standby can take over from a dead node's database.
+  The lease-version prefix carries the same merge-cutoff fencing as the
+  filesystem layout. Object-store *chunk sealing* (compacting the tail into
+  content-addressed `log-root` chunks) remains future work; until then the
+  native backends keep one record per transaction.
+- **Recovery from the index root.** *(Done for the current value.)* A
+  transactor now opens a database from its published EAVT snapshot plus the
+  log tail since `index-basis-t` (`TransactorNode::recover_transactor` →
+  `EmbeddedTransactor::recover_from_snapshot`), so open and restart time are
+  proportional to the tail, not the whole history. The `DbRoot` carries two
+  recovery hints a current-facts snapshot cannot reconstruct — the entity
+  allocator high-water (`next_entity_id`, so ids of entities retracted
+  before the snapshot are never reused) and the last `:db/txInstant`
+  (`last_tx_instant`, preserving transaction-time monotonicity across an
+  empty tail); a root missing them (or a snapshot that fails to load) falls
+  back to full-log replay, which is always correct. Still open: **complete
+  pre-snapshot `history`/`as-of` views**, which need the history trees
+  ("future history roots" in
+  [indexes-and-storage.md](design/indexes-and-storage.md)) — published v1
+  segments carry current facts only, so those views still require full-log
+  replay.
 - **Transactor hosting policy.** Host a configured subset of the catalog
   (filter flags or a placement map in the root store) so concurrent
   transactors partition many databases; per-database leases and peer
@@ -141,9 +152,12 @@ Scaling and durability (see
   index basis needs retracted facts), and needs explicit semantics for
   `:db/noHistory` attributes, whose pre-retraction values cannot be
   faithfully rewound.
-- **S3-compatible storage backend.** The `BlobStore`/`RootStore` traits
-  already fit; root CAS uses S3 conditional writes, with a small strongly
-  consistent KV for roots as the fallback split where those are missing.
+- **S3-compatible storage backend.** *(Done.)* `S3BlobStore` implements both
+  `BlobStore` and `RootStore` against an S3 (or S3-compatible) bucket; root
+  CAS uses S3 conditional writes (`If-None-Match: *` for a first publish,
+  `If-Match: <etag>` for a fenced update), so no separate KV is required on
+  providers that support them. Selectable via the `s3` Cargo feature and the
+  transactor's `StoreSpec::S3`.
 
 Engine and API:
 

@@ -87,6 +87,17 @@ peer does not reconstruct transactions that ceased contributing live facts
 before the snapshot; complete pre-snapshot historical views still require
 full-log replay (or the future history roots described above).
 
+A recovering **transactor** uses the same published snapshot: it opens a
+database from the EAVT root plus the log tail since `index-basis-t` instead
+of replaying the whole log (see the recovery item in
+[roadmap.md](../roadmap.md)). Because the snapshot drops entities retracted
+before it, the DbRoot also carries two recovery hints the current-facts
+segments cannot supply — `next_entity_id` (the entity-allocator high-water,
+so a retracted id is never reused) and `last_tx_instant` (for
+`:db/txInstant` monotonicity when the tail is empty). A root written before
+these hints existed leaves them at their sentinels, which forces the exact
+full-log replay used previously.
+
 Filesystem, PostgreSQL, Turso, and S3 implement the same peer read interface.
 PostgreSQL readers use ordinary MVCC and do not contend with the root CAS
 writer. Turso 0.7 requires its experimental multi-process WAL for independent
