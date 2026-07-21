@@ -46,17 +46,7 @@ jobs:
           key: publish-site
 
       - name: Build wasm
-        # Disable the `reference-types` / `multivalue` wasm features (default-on
-        # since Rust 1.82). With them enabled, wasm-bindgen manages `externref`
-        # via a wasm table it grows at init (`__wbindgen_init_externref_table`);
-        # mobile/older Safari (WebKit) rejects that `Table.grow` with
-        # "could not grow the table", and `wasm-opt` further corrupts the table
-        # unless told the feature is on (binaryen#4711). Turning the features off
-        # makes wasm-bindgen emit its JS-heap `externref` fallback, which never
-        # grows a table — restoring Safari < 15 / older-iOS support.
         run: cargo build -p corium-wasm --target wasm32-unknown-unknown --release
-        env:
-          RUSTFLAGS: "-C target-feature=-reference-types,-multivalue"
 
       - name: Install wasm-bindgen-cli (version pinned to the crate)
         run: |

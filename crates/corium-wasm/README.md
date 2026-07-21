@@ -73,12 +73,8 @@ wasm bindings from the same directory, so build them there. Needs the
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli          # matching the wasm-bindgen dep version
 
-# from the repo root. RUSTFLAGS disables the `reference-types`/`multivalue`
-# wasm features (default-on since Rust 1.82) so wasm-bindgen uses its JS-heap
-# `externref` fallback instead of a wasm table it grows at init — otherwise
-# mobile/older Safari fails with "Table.grow could not grow the table".
-RUSTFLAGS="-C target-feature=-reference-types,-multivalue" \
-  cargo build -p corium-wasm --target wasm32-unknown-unknown --release
+# from the repo root:
+cargo build -p corium-wasm --target wasm32-unknown-unknown --release
 wasm-bindgen target/wasm32-unknown-unknown/release/corium_wasm.wasm \
   --out-dir web --target web --no-typescript
 
