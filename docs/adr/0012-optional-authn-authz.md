@@ -32,7 +32,10 @@ Model auth as a request-scoped layer of small, synchronous traits in
 - **`Authorizer`** (authz) maps `(Principal, Access)` to a `Decision` of
   `Allow` / `AllowFiltered(ViewFilter)` / `Deny`. `PolicyAuthorizer` is a
   deny-by-default role→grant policy; `ViewFilter` is the per-principal view seam
-  (attribute-level in the spike).
+  (attribute-level in the spike). This trait is **async** so it can consult an
+  external policy oracle (OpenFGA / Auth0 FGA `Check`); `IdentityProvider` stays
+  **sync** because authn is local verification that runs in the synchronous tonic
+  interceptor.
 - **`Guard`** bundles a chosen provider + authorizer and owns the
   anonymous-vs-reject decision. `Guard::disabled()` is the default and is
   behaviourally identical to today's no-auth path.
@@ -54,6 +57,11 @@ metadata, failures stay `UNAUTHENTICATED` / `PERMISSION_DENIED`. The bool
 - The `TokenVerifier` seam fixes the external-provider boundary now while
   deferring the crypto/JWKS dependency and its network calls out of the lowest
   wire crate.
+- The async `Authorizer` supports a networked policy oracle without blocking a
+  runtime thread and needs no extra seam trait (an oracle implements `Authorizer`
+  directly). The cost is a boxed future per decision — via `#[tonic::async_trait]`,
+  already used across the servers — even for local authorizers; acceptable since
+  authz runs once per RPC, not in a tight loop.
 - Real per-tenant *view* filtering beyond attribute visibility needs a hook in
   `corium-query` (executor predicate + query-cache key), which is the largest
   deferred piece; the spike proves the seam without paying for it.

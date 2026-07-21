@@ -166,9 +166,9 @@ Security and multi-tenancy:
   ([`auth`](../crates/corium-protocol/src/auth.rs)). A spike in
   [`corium-protocol::authz`](../crates/corium-protocol/src/authz.rs) explores
   per-request identity, pluggable external identity providers (OIDC/mTLS via a
-  `TokenVerifier` seam), role-based authorization, and per-principal
-  `ViewFilter`s so one transactor or peer server can serve many tenants with
-  different views at once — see [auth.md](design/auth.md) and
+  `TokenVerifier` seam), authorization (a role→grant policy or an async external
+  oracle such as OpenFGA / Auth0 FGA), and per-principal `ViewFilter`s so one
+  transactor or peer server can serve many tenants with different views at once — see [auth.md](design/auth.md) and
   [ADR-0012](adr/0012-optional-authn-authz.md). Remaining work: adopt `Guard`
   in the servers and CLI, a concrete OIDC verifier behind a feature flag,
   externalized policy, and entity/value-level view filtering in the query

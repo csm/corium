@@ -32,8 +32,9 @@ Three requirements push past it:
 
 ## Model
 
-Four small traits, all synchronous and I/O-free on the request path, plus a
-`Guard` that bundles a chosen policy and an interceptor that applies it.
+Four small traits plus a `Guard` that bundles a chosen policy and an interceptor
+that applies it. **Authn is synchronous, authz is asynchronous** — see
+[Sync authn, async authz](#sync-authn-async-authz) for why.
 
 ```
 credentials ──▶ IdentityProvider ──▶ Principal ──▶ Authorizer ──▶ Decision
@@ -87,8 +88,8 @@ request, a verifier maps its SAN/CN to a `Principal`, and
 
 ### Authorizer — authorization (optional)
 
-`authorize(&Principal, &Access) -> Decision`. An `Access` is an `Action` (one
-per RPC family) on an optional target `database`. A `Decision` is:
+`async fn authorize(&Principal, &Access) -> Decision`. An `Access` is an
+`Action` (one per RPC family) on an optional target `database`. A `Decision` is:
 
 - `Allow` — permit with full visibility.
 - `AllowFiltered(Arc<dyn ViewFilter>)` — permit, but restrict what is returned.
@@ -98,6 +99,35 @@ Shipped authorizers: `AllowAll` (authz off) and `PolicyAuthorizer`, a
 deny-by-default role→grant policy. A `Grant` names action *classes*
 (`Read`/`Write`/`Admin`, so policies need not enumerate every action), a set of
 databases (empty = any), and an optional `ViewFilter`.
+
+### Sync authn, async authz
+
+The two traits differ in sync-vs-async on purpose, following where the work
+actually happens:
+
+- **`IdentityProvider::authenticate` is synchronous.** The common providers are
+  local verification: compare a static token, check a JWT signature against
+  cached keys, read an mTLS subject. It also runs inside the tonic
+  `Interceptor`, whose `call` is synchronous — keeping authn sync lets it stay
+  in the interceptor and attach the `Principal` before dispatch. The one authn
+  case that is genuinely networked, OIDC token *introspection*, is handled the
+  way production middleware does: verify against cached state and refresh out of
+  band, so `authenticate` remains a cheap lookup. If a deployment truly needs
+  per-request introspection with no cache, authn moves out of the interceptor
+  into an async `tower` layer or the handler prologue — but that is the
+  exception, not the default.
+- **`Authorizer::authorize` is asynchronous.** The interesting authorizers call
+  an external policy oracle: a relationship-based service such as **OpenFGA** or
+  **Auth0 FGA** answers a per-decision `Check(user, relation, object)` over the
+  network, and modelling that as a blocking call would stall a runtime worker.
+  Authorization already runs handler-side inside the async RPC, so `.await`
+  costs nothing structurally. Local authorizers (`AllowAll`, `PolicyAuthorizer`)
+  simply return without awaiting; the async signature does not make them slower.
+
+Because `Authorizer` is itself the async seam, an external oracle needs no extra
+trait — it implements `Authorizer` directly and awaits inside. The spike's
+`external_async_oracle_authorizer` test demonstrates a `Check`-style oracle
+plugged into a `Guard` via `Arc<dyn Authorizer>`.
 
 ### ViewFilter — different views, one server
 
@@ -142,7 +172,7 @@ The proposed handler shape (peer server `query` as the example):
 ```rust
 let principal = authz::principal(&request);
 let access = Access::on(Action::Query, &spec.db);
-let view = self.guard.authorize(&principal, &access)?; // Option<Arc<dyn ViewFilter>>
+let view = self.guard.authorize(&principal, &access).await?; // Option<Arc<dyn ViewFilter>>
 // ... run the query, then apply `view` to the returned datoms/rows ...
 ```
 
@@ -210,6 +240,7 @@ clients keep working; only what the server does with the token changes.
   `Guard`, and `IdentityInterceptor`.
 - Unit tests covering each requirement: optional-off, distinct static-token
   identities, the external-verifier seam, provider composition, role/database
-  enforcement, per-principal views, interceptor extension propagation, and one
-  guard serving two tenants with different authority.
+  enforcement, an async external-oracle authorizer, per-principal views,
+  interceptor extension propagation, and one guard serving two tenants with
+  different authority.
 - No change to the shipped `auth` module, the wire protocol, or server wiring.

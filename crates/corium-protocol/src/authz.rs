@@ -18,12 +18,22 @@
 //!    callers concurrently and give each a different authorization decision and
 //!    a different [`ViewFilter`] over the same database.
 //!
-//! The model is deliberately transport-adjacent: [`IdentityProvider`] and
-//! [`Authorizer`] are pure traits with no I/O in the hot path, [`Guard`] bundles
-//! a chosen pair, and [`IdentityInterceptor`] is the only tonic-facing piece. A
-//! deployment that wants none of this constructs [`Guard::disabled`] and behaves
-//! exactly as today. See `docs/design/auth.md` for how this maps onto the RPC
-//! surface and the migration away from the bool authenticator.
+//! The model is deliberately transport-adjacent: [`Guard`] bundles a chosen
+//! ([`IdentityProvider`], [`Authorizer`]) pair, and [`IdentityInterceptor`] is
+//! the only tonic-facing piece. A deployment that wants none of this constructs
+//! [`Guard::disabled`] and behaves exactly as today.
+//!
+//! Authn is **synchronous** and authz is **asynchronous**, on purpose:
+//! authenticating a request is local verification (a token compare, a signature
+//! check against cached keys, an mTLS subject) and it runs inside the
+//! synchronous tonic [`Interceptor`]; authorizing one may consult an external
+//! policy oracle (`OpenFGA` / `Auth0 FGA` answer a per-decision network `Check`), and
+//! it runs handler-side where awaiting is free. A provider that genuinely needs
+//! I/O (OIDC token introspection) caches results and refreshes out of band, so
+//! [`IdentityProvider::authenticate`] stays a cheap synchronous lookup.
+//!
+//! See `docs/design/auth.md` for how this maps onto the RPC surface and the
+//! migration away from the bool authenticator.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -331,7 +341,7 @@ impl IdentityProvider for CompositeProvider {
 /// One variant per public RPC family; the mapping from concrete RPCs is in
 /// `docs/design/auth.md`. [`Action::is_write`] and [`Action::is_admin`] let
 /// coarse policies grant by category instead of enumerating every action.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
     /// Datalog query against a database view.
     Query,
@@ -467,9 +477,19 @@ impl fmt::Debug for Decision {
 }
 
 /// Decides whether a [`Principal`] may perform an [`Access`].
+///
+/// This is **async**, unlike [`IdentityProvider`], because the interesting
+/// authorizers call out to an external policy oracle — a relationship-based
+/// service such as `OpenFGA` / `Auth0 FGA` answers a per-decision `Check(user,
+/// relation, object)` over the network, and modelling that as a blocking call
+/// would stall a runtime thread. Local authorizers ([`AllowAll`],
+/// [`PolicyAuthorizer`]) simply return without awaiting. Authorization also runs
+/// handler-side, inside the async RPC, so `.await` costs nothing structurally
+/// there — whereas authn runs in the synchronous tonic interceptor.
+#[tonic::async_trait]
 pub trait Authorizer: Send + Sync + 'static {
     /// Renders a [`Decision`] for `principal` attempting `access`.
-    fn authorize(&self, principal: &Principal, access: &Access) -> Decision;
+    async fn authorize(&self, principal: &Principal, access: &Access) -> Decision;
 }
 
 /// Permits every access. Used when a surface requires authentication but not
@@ -477,8 +497,9 @@ pub trait Authorizer: Send + Sync + 'static {
 #[derive(Clone, Debug, Default)]
 pub struct AllowAll;
 
+#[tonic::async_trait]
 impl Authorizer for AllowAll {
-    fn authorize(&self, _principal: &Principal, _access: &Access) -> Decision {
+    async fn authorize(&self, _principal: &Principal, _access: &Access) -> Decision {
         Decision::Allow
     }
 }
@@ -575,8 +596,9 @@ impl PolicyAuthorizer {
     }
 }
 
+#[tonic::async_trait]
 impl Authorizer for PolicyAuthorizer {
-    fn authorize(&self, principal: &Principal, access: &Access) -> Decision {
+    async fn authorize(&self, principal: &Principal, access: &Access) -> Decision {
         let mut matched = false;
         let mut view: Option<Arc<dyn ViewFilter>> = None;
         for role in &principal.roles {
@@ -680,14 +702,17 @@ impl Guard {
 
     /// Authorizes `access` for `principal`, returning any view restriction.
     ///
+    /// Async because [`Authorizer`] may consult an external policy oracle; local
+    /// authorizers resolve without awaiting.
+    ///
     /// # Errors
     /// Returns [`AuthError::Forbidden`] when the authorizer denies the access.
-    pub fn authorize(
+    pub async fn authorize(
         &self,
         principal: &Principal,
         access: &Access,
     ) -> Result<Option<Arc<dyn ViewFilter>>, AuthError> {
-        match self.authorizer.authorize(principal, access) {
+        match self.authorizer.authorize(principal, access).await {
             Decision::Allow => Ok(None),
             Decision::AllowFiltered(filter) => Ok(Some(filter)),
             Decision::Deny(reason) => Err(AuthError::Forbidden(reason)),
@@ -747,8 +772,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn disabled_guard_allows_anonymous_everything() {
+    #[tokio::test]
+    async fn disabled_guard_allows_anonymous_everything() {
         let guard = Guard::disabled();
         assert!(guard.is_disabled());
         let principal = guard.authenticate(&Credentials::default()).unwrap();
@@ -756,6 +781,7 @@ mod tests {
         assert!(
             guard
                 .authorize(&principal, &Access::on(Action::Transact, "people"))
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -853,8 +879,8 @@ mod tests {
             .grant("admin", Grant::new([ActionClass::Admin], Vec::<String>::new()))
     }
 
-    #[test]
-    fn policy_authorizer_enforces_actions_and_databases() {
+    #[tokio::test]
+    async fn policy_authorizer_enforces_actions_and_databases() {
         let policy = sample_policy();
         let reader = Principal::new("t", "r").with_role("reader");
         let writer = Principal::new("t", "w").with_role("writer");
@@ -862,36 +888,36 @@ mod tests {
 
         // Reader may query people but not transact, and not touch other dbs.
         assert!(matches!(
-            policy.authorize(&reader, &Access::on(Action::Query, "people")),
+            policy.authorize(&reader, &Access::on(Action::Query, "people")).await,
             Decision::Allow
         ));
         assert!(matches!(
-            policy.authorize(&reader, &Access::on(Action::Transact, "people")),
+            policy.authorize(&reader, &Access::on(Action::Transact, "people")).await,
             Decision::Deny(_)
         ));
         assert!(matches!(
-            policy.authorize(&reader, &Access::on(Action::Query, "secrets")),
+            policy.authorize(&reader, &Access::on(Action::Query, "secrets")).await,
             Decision::Deny(_)
         ));
 
         // Writer may transact people; admin may create any database.
         assert!(matches!(
-            policy.authorize(&writer, &Access::on(Action::Transact, "people")),
+            policy.authorize(&writer, &Access::on(Action::Transact, "people")).await,
             Decision::Allow
         ));
         assert!(matches!(
-            policy.authorize(&admin, &Access::catalog(Action::CreateDatabase)),
+            policy.authorize(&admin, &Access::catalog(Action::CreateDatabase)).await,
             Decision::Allow
         ));
         // Admin grant is admin-only: no read of people.
         assert!(matches!(
-            policy.authorize(&admin, &Access::on(Action::Query, "people")),
+            policy.authorize(&admin, &Access::on(Action::Query, "people")).await,
             Decision::Deny(_)
         ));
     }
 
-    #[test]
-    fn per_principal_view_filter_gives_different_views() {
+    #[tokio::test]
+    async fn per_principal_view_filter_gives_different_views() {
         // Two tenants read the same database through different attribute views.
         let acme_view: Arc<dyn ViewFilter> =
             Arc::new(AttributeAllowlist::new([":person/name", ":person/acme-note"]));
@@ -912,10 +938,12 @@ mod tests {
         let beta = Principal::new("oidc", "bob").with_role("beta");
         let acme_filter = guard
             .authorize(&acme, &Access::on(Action::Query, "people"))
+            .await
             .unwrap()
             .expect("acme is filtered");
         let beta_filter = guard
             .authorize(&beta, &Access::on(Action::Query, "people"))
+            .await
             .unwrap()
             .expect("beta is filtered");
 
@@ -955,8 +983,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn one_guard_serves_two_tenants_with_different_authority() {
+    #[tokio::test]
+    async fn one_guard_serves_two_tenants_with_different_authority() {
         // A single shared guard: static-token issuer + role policy, no anonymous.
         let provider = CompositeProvider::new(vec![Arc::new(
             StaticTokens::new()
@@ -981,10 +1009,45 @@ mod tests {
         let beta = guard.authenticate(&creds("beta-reader")).unwrap();
 
         // acme may write its own db; beta may not read acme's db.
-        assert!(guard.authorize(&acme, &Access::on(Action::Transact, "acme-db")).is_ok());
-        assert!(guard.authorize(&beta, &Access::on(Action::Query, "acme-db")).is_err());
-        assert!(guard.authorize(&beta, &Access::on(Action::Query, "beta-db")).is_ok());
+        assert!(guard.authorize(&acme, &Access::on(Action::Transact, "acme-db")).await.is_ok());
+        assert!(guard.authorize(&beta, &Access::on(Action::Query, "acme-db")).await.is_err());
+        assert!(guard.authorize(&beta, &Access::on(Action::Query, "beta-db")).await.is_ok());
         // beta is read-only even on its own db.
-        assert!(guard.authorize(&beta, &Access::on(Action::Transact, "beta-db")).is_err());
+        assert!(guard.authorize(&beta, &Access::on(Action::Transact, "beta-db")).await.is_err());
+    }
+
+    /// Stand-in for an external relationship-based oracle (`OpenFGA` / `Auth0 FGA`):
+    /// `authorize` awaits a "network" `Check` before deciding. Demonstrates that
+    /// the async `Authorizer` seam is dyn-compatible and composes with `Guard`.
+    struct FakeOracle {
+        allowed: BTreeSet<(String, Action)>,
+    }
+
+    #[tonic::async_trait]
+    impl Authorizer for FakeOracle {
+        async fn authorize(&self, principal: &Principal, access: &Access) -> Decision {
+            // Simulate the round-trip to the policy service.
+            tokio::task::yield_now().await;
+            let key = (principal.subject.clone(), access.action);
+            if self.allowed.contains(&key) {
+                Decision::Allow
+            } else {
+                Decision::Deny("oracle check failed".to_owned())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_async_oracle_authorizer() {
+        let oracle = FakeOracle {
+            allowed: [("alice".to_owned(), Action::Query)].into_iter().collect(),
+        };
+        let guard = Guard::new(Arc::new(AllowAnonymous), Arc::new(oracle));
+        let alice = Principal::new("oidc", "alice");
+        let bob = Principal::new("oidc", "bob");
+
+        assert!(guard.authorize(&alice, &Access::on(Action::Query, "people")).await.is_ok());
+        assert!(guard.authorize(&alice, &Access::on(Action::Transact, "people")).await.is_err());
+        assert!(guard.authorize(&bob, &Access::on(Action::Query, "people")).await.is_err());
     }
 }
