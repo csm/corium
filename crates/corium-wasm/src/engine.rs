@@ -195,10 +195,10 @@ impl Engine {
 /// Schema files wrap their attribute maps in one top-level `[ … ]`; accept
 /// either that or a bare sequence of maps.
 fn unwrap_single_vector(forms: &[Edn]) -> &[Edn] {
-    if let [only] = forms {
-        if let Some(inner) = only.as_seq() {
-            return inner;
-        }
+    if let [only] = forms
+        && let Some(inner) = only.as_seq()
+    {
+        return inner;
     }
     forms
 }

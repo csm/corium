@@ -21,7 +21,7 @@ mod engine;
 use engine::Engine;
 use wasm_bindgen::prelude::*;
 
-/// The MusicBrainz schema (mirrors `examples/musicbrainz/schema.edn`).
+/// The `MusicBrainz` schema (mirrors `examples/musicbrainz/schema.edn`).
 const SCHEMA: &str = include_str!("../assets/schema.edn");
 /// Curated 1997 releases, artists, labels, media, and tracks.
 const DATA: &str = include_str!("../assets/releases-1997.edn");
@@ -40,8 +40,8 @@ impl Mbrainz {
     /// Returns a JS error if the bundled schema or data fail to load (a bug).
     #[wasm_bindgen(constructor)]
     pub fn new() -> Result<Mbrainz, JsError> {
-        let mut engine = Engine::from_schema_edn(SCHEMA).map_err(to_js)?;
-        engine.load_edn(DATA).map_err(to_js)?;
+        let mut engine = Engine::from_schema_edn(SCHEMA)?;
+        engine.load_edn(DATA)?;
         Ok(Mbrainz { engine })
     }
 
@@ -50,7 +50,7 @@ impl Mbrainz {
     /// # Errors
     /// Returns a JS error for unreadable, malformed, or failing queries.
     pub fn q(&self, query: &str) -> Result<String, JsError> {
-        self.engine.q(query).map_err(to_js)
+        Ok(self.engine.q(query)?)
     }
 
     /// Applies one transaction (an EDN vector of ops) and returns an EDN
@@ -61,14 +61,18 @@ impl Mbrainz {
     /// Returns a JS error if the text is unreadable or the transaction is
     /// rejected (schema violation, bad lookup ref, …).
     pub fn transact(&mut self, tx: &str) -> Result<String, JsError> {
-        self.engine.transact(tx).map_err(to_js)
+        Ok(self.engine.transact(tx)?)
     }
 
     /// Current transaction basis (increments once per committed transaction).
     #[wasm_bindgen(js_name = basisT)]
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "basis_t is a small transaction counter; f64 is exact well past \
+                  any value this ephemeral demo reaches, and JS numbers are f64"
+    )]
     pub fn basis_t(&self) -> f64 {
-        // f64 carries the full u64 range this demo will ever reach exactly.
         self.engine.basis_t() as f64
     }
 
@@ -79,6 +83,3 @@ impl Mbrainz {
     }
 }
 
-fn to_js(e: engine::EngineError) -> JsError {
-    JsError::new(&e.0)
-}
