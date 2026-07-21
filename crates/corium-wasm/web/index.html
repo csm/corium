@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>corium · MusicBrainz 1997 · in-browser Datalog</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+           max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.15rem; }
+    p, li { font-family: system-ui, sans-serif; }
+    textarea { width: 100%; box-sizing: border-box; min-height: 6rem;
+               font: inherit; padding: .6rem; }
+    button { font: inherit; padding: .4rem .9rem; margin: .4rem .4rem .4rem 0; cursor: pointer; }
+    pre { background: rgba(127,127,127,.12); padding: .8rem; border-radius: 6px;
+          white-space: pre-wrap; word-break: break-word; }
+    .muted { opacity: .7; }
+    details { margin: .3rem 0; }
+    code { background: rgba(127,127,127,.15); padding: 0 .25em; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>corium — MusicBrainz (1997) — ephemeral, in-browser</h1>
+  <p class="muted">
+    A memory-only corium database compiled to WebAssembly. 20 curated 1997
+    releases with their artists, labels, media, and tracks. Everything runs in
+    this tab; a reload resets it. <code>window.mb</code> is live in the console.
+  </p>
+
+  <p><strong>Query</strong> (EDN Datalog):</p>
+  <textarea id="query">[:find ?name ?year
+ :where [?r :release/year ?year]
+        [?r :release/name ?name]]</textarea>
+  <div>
+    <button id="run">Run query</button>
+    <button data-ex="[:find (count ?r) :where [?r :release/year 1997]]">count releases</button>
+    <button data-ex="[:find ?t ?name :where [?r :release/name &quot;OK Computer&quot;] [?r :release/media ?m] [?m :medium/tracks ?tr] [?tr :track/name ?name] [?tr :track/position ?t]]">OK Computer tracks</button>
+    <button data-ex="[:find ?name :where [?a :artist/country :country/GB] [?a :artist/name ?name]]">GB artists</button>
+  </div>
+
+  <p><strong>Transact</strong> (EDN vector of ops — visible to queries immediately):</p>
+  <textarea id="tx">[{:db/id "new"
+  :artist/gid #uuid "00000000000000000000000000009001"
+  :artist/name "My New Artist"
+  :artist/country :country/US
+  :artist/startYear 1997}]</textarea>
+  <div><button id="apply">Transact</button></div>
+
+  <p><strong>Result</strong></p>
+  <pre id="out">loading wasm…</pre>
+
+  <details>
+    <summary>Try these in the browser console</summary>
+    <pre>mb.q('[:find (count ?t) :where [?t :track/name _]]')
+mb.q('[:find ?n :where [?r :release/name "Homogenic"] [?r :release/artists ?a] [?a :artist/name ?n]]')
+mb.transact('[{:db/id "x" :artist/gid #uuid "…" :artist/name "…"}]')
+mb.stats()</pre>
+  </details>
+
+  <script type="module">
+    import init, { Mbrainz } from "./corium_wasm.js";
+    const out = document.getElementById("out");
+    const show = (s) => { out.textContent = s; };
+    try {
+      await init();
+      window.mb = new Mbrainz();
+      show("ready · " + mb.stats() + "\n\n(window.mb is live in the console)");
+    } catch (e) {
+      show("init failed: " + e);
+      throw e;
+    }
+    const runQuery = (q) => {
+      document.getElementById("query").value = q;
+      try { show(mb.q(q)); } catch (e) { show("error: " + e); }
+    };
+    document.getElementById("run").onclick = () =>
+      runQuery(document.getElementById("query").value);
+    document.getElementById("apply").onclick = () => {
+      try { show(mb.transact(document.getElementById("tx").value)); }
+      catch (e) { show("error: " + e); }
+    };
+    for (const b of document.querySelectorAll("button[data-ex]"))
+      b.onclick = () => runQuery(b.getAttribute("data-ex"));
+  </script>
+</body>
+</html>

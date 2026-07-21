@@ -1,0 +1,21 @@
+[package]
+name = "corium-forms"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Boundary conversion between EDN schema/transaction forms and engine types"
+
+[dependencies]
+corium-core = { workspace = true }
+corium-db = { workspace = true }
+corium-query = { workspace = true }
+corium-tx = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
