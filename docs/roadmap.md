@@ -159,6 +159,21 @@ Scaling and durability (see
   providers that support them. Selectable via the `s3` Cargo feature and the
   transactor's `StoreSpec::S3`.
 
+Security and multi-tenancy:
+
+- **Optional request-scoped authn/authz.** *(Spike.)* The network surfaces
+  today authenticate a connection with one bearer token
+  ([`auth`](../crates/corium-protocol/src/auth.rs)). A spike in
+  [`corium-protocol::authz`](../crates/corium-protocol/src/authz.rs) explores
+  per-request identity, pluggable external identity providers (OIDC/mTLS via a
+  `TokenVerifier` seam), role-based authorization, and per-principal
+  `ViewFilter`s so one transactor or peer server can serve many tenants with
+  different views at once — see [auth.md](design/auth.md) and
+  [ADR-0012](adr/0012-optional-authn-authz.md). Remaining work: adopt `Guard`
+  in the servers and CLI, a concrete OIDC verifier behind a feature flag,
+  externalized policy, and entity/value-level view filtering in the query
+  engine (executor predicate plus query-cache keying).
+
 Engine and API:
 
 - Fulltext (`tantivy`) and tuple value types; excision (design reserved in

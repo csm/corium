@@ -83,6 +83,10 @@ vectors ship with it so third parties can write clients.
 
 - TLS via tonic/rustls everywhere; mTLS or bearer-token auth per endpoint
   (pluggable `Authenticator` trait; static tokens in v1).
+- Request-scoped identity and authorization are a spike in `corium-protocol::authz`
+  (optional per-surface enforcement, external identity providers, per-principal
+  views for multi-tenant serving); see [auth.md](auth.md) and
+  [ADR-0012](../adr/0012-optional-authn-authz.md). Not yet wired into the servers.
 - Peer servers enforce per-request fuel, result-size, and concurrency limits;
   the transactor enforces tx-size and queue limits.
 - The blob store is assumed private to the deployment (peers have direct
