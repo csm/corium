@@ -63,8 +63,11 @@ python3 assets/gen_releases_1997.py > assets/releases-1997.edn
 
 ## Building the web demo
 
-Needs the `wasm32-unknown-unknown` target and
-[`wasm-bindgen-cli`](https://crates.io/crates/wasm-bindgen-cli) (or `wasm-pack`).
+The site lives in the repo-root [`web/`](../../web/) directory
+(`index.html` landing page, `mbrainz.html` demo). The demo page imports the
+wasm bindings from the same directory, so build them there. Needs the
+`wasm32-unknown-unknown` target and
+[`wasm-bindgen-cli`](https://crates.io/crates/wasm-bindgen-cli).
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -73,21 +76,18 @@ cargo install wasm-bindgen-cli          # matching the wasm-bindgen dep version
 # from the repo root:
 cargo build -p corium-wasm --target wasm32-unknown-unknown --release
 wasm-bindgen target/wasm32-unknown-unknown/release/corium_wasm.wasm \
-  --out-dir crates/corium-wasm/web --target web --no-typescript
+  --out-dir web --target web --no-typescript
 
-# serve the web/ dir (module scripts need http, not file://):
-python3 -m http.server -d crates/corium-wasm/web 8080
-# open http://localhost:8080
+# serve the site (module scripts need http, not file://):
+python3 -m http.server -d web 8080
+# open http://localhost:8080  (demo at /mbrainz.html)
 ```
 
-Or with `wasm-pack`:
+Optionally shrink the artifact with `wasm-opt -Oz web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm`.
 
-```sh
-wasm-pack build crates/corium-wasm --target web --out-dir web/pkg
-# then point the import in web/index.html at ./pkg/corium_wasm.js
-```
-
-Optionally shrink the artifact with `wasm-opt -Oz`.
+The generated `corium_wasm.js` / `corium_wasm_bg.wasm` are gitignored;
+`.github/workflows/publish-site.yml` rebuilds them and uploads `web/` over
+SFTP on pushes to `main` (or via manual dispatch).
 
 ## Query examples
 
