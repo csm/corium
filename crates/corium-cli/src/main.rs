@@ -55,6 +55,12 @@ enum StoreKind {
     /// Turso (embeddable `SQLite`) for blobs and roots; the log stays on the
     /// local filesystem under `--data-dir`. Requires the `turso` feature.
     Turso,
+    /// S3 (or an S3-compatible service) for blobs and roots; the log stays on
+    /// the local filesystem under `--data-dir`. Requires the `s3` feature.
+    /// Credentials, region, and endpoint come from the standard AWS
+    /// environment (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, `AWS_ENDPOINT_URL`,
+    /// etc.).
+    S3,
 }
 
 /// Client-side connection flags (endpoint, auth, TLS).
@@ -88,6 +94,12 @@ struct ClientFlags {
     /// `PostgreSQL` connection string for `--peer-store postgres`.
     #[arg(long)]
     peer_postgres_url: Option<String>,
+    /// S3 bucket for `--peer-store s3`.
+    #[arg(long)]
+    peer_s3_bucket: Option<String>,
+    /// S3 key prefix for `--peer-store s3` (defaults to the bucket root).
+    #[arg(long, default_value = "")]
+    peer_s3_prefix: String,
 }
 
 impl ClientFlags {
@@ -132,6 +144,8 @@ impl ClientFlags {
             &self.peer_data_dir,
             self.peer_turso_path.clone(),
             self.peer_postgres_url.clone(),
+            self.peer_s3_bucket.clone(),
+            self.peer_s3_prefix.clone(),
         )?;
         let storage = corium_transactor::NodeStore::open_existing(&spec, &self.peer_data_dir)
             .await
@@ -183,6 +197,12 @@ enum Command {
         /// `PostgreSQL` connection string for `--store postgres`.
         #[arg(long)]
         postgres_url: Option<String>,
+        /// S3 bucket for `--store s3`.
+        #[arg(long)]
+        s3_bucket: Option<String>,
+        /// S3 key prefix for `--store s3` (defaults to the bucket root).
+        #[arg(long, default_value = "")]
+        s3_prefix: String,
         /// Data directory (filesystem store, logs). Ignored by `--store mem`.
         #[arg(long)]
         data_dir: PathBuf,
@@ -459,6 +479,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             store,
             turso_path,
             postgres_url,
+            s3_bucket,
+            s3_prefix,
             data_dir,
             listen,
             owner,
@@ -478,7 +500,14 @@ async fn run(cli: Cli) -> Result<(), String> {
             db_fn_deadline_ms,
             serve,
         } => {
-            let store_spec = store_spec(store, &data_dir, turso_path, postgres_url)?;
+            let store_spec = store_spec(
+                store,
+                &data_dir,
+                turso_path,
+                postgres_url,
+                s3_bucket,
+                s3_prefix,
+            )?;
             let mut config = NodeConfig::new(data_dir);
             config.store = store_spec;
             if let Some(owner) = owner {
@@ -649,6 +678,8 @@ async fn run(cli: Cli) -> Result<(), String> {
                     peer_data_dir: PathBuf::from("./corium-data"),
                     peer_turso_path: None,
                     peer_postgres_url: None,
+                    peer_s3_bucket: None,
+                    peer_s3_prefix: String::new(),
                 };
                 let mut admin = Admin::connect(&flags.primary(), flags.token.clone(), flags.tls()?)
                     .await
@@ -759,12 +790,15 @@ fn store_spec(
     data_dir: &std::path::Path,
     turso_path: Option<PathBuf>,
     postgres_url: Option<String>,
+    s3_bucket: Option<String>,
+    s3_prefix: String,
 ) -> Result<StoreSpec, String> {
     match store {
         StoreKind::Mem => Ok(StoreSpec::Memory),
         StoreKind::Fs => Ok(StoreSpec::Fs),
         StoreKind::Postgres => postgres_spec(postgres_url),
         StoreKind::Turso => turso_spec(data_dir, turso_path),
+        StoreKind::S3 => s3_spec(s3_bucket, s3_prefix),
     }
 }
 
@@ -802,6 +836,20 @@ fn turso_spec(
     _turso_path: Option<PathBuf>,
 ) -> Result<StoreSpec, String> {
     Err("this build lacks the Turso backend; rebuild corium-cli with --features turso".into())
+}
+
+#[cfg(feature = "s3")]
+fn s3_spec(s3_bucket: Option<String>, s3_prefix: String) -> Result<StoreSpec, String> {
+    let bucket = s3_bucket.ok_or_else(|| "--s3-bucket is required with --store s3".to_owned())?;
+    Ok(StoreSpec::S3 {
+        bucket,
+        prefix: s3_prefix,
+    })
+}
+
+#[cfg(not(feature = "s3"))]
+fn s3_spec(_s3_bucket: Option<String>, _s3_prefix: String) -> Result<StoreSpec, String> {
+    Err("this build lacks the S3 backend; rebuild corium-cli with --features s3".into())
 }
 
 fn parse_duration(text: &str) -> Result<Duration, String> {

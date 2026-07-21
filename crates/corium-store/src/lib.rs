@@ -1,7 +1,7 @@
 //! Content-addressed blob and fenced root stores for immutable index segments.
 //!
-//! Enable the `postgres` or `turso` Cargo feature to use
-//! [`PostgresBlobStore`] or [`TursoBlobStore`], respectively.
+//! Enable the `postgres`, `turso`, or `s3` Cargo feature to use
+//! [`PostgresBlobStore`], [`TursoBlobStore`], or [`S3BlobStore`], respectively.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -33,6 +33,10 @@ pub use postgres_store::PostgresBlobStore;
 mod turso_store;
 #[cfg(feature = "turso")]
 pub use turso_store::TursoBlobStore;
+#[cfg(feature = "s3")]
+mod s3_store;
+#[cfg(feature = "s3")]
+pub use s3_store::S3BlobStore;
 
 /// A content identifier for immutable blobs.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -117,6 +121,27 @@ pub enum StoreError {
     #[cfg(feature = "turso")]
     #[error("Turso blob store contains invalid data: {0}")]
     InvalidTursoData(String),
+    /// S3 request failure.
+    #[cfg(feature = "s3")]
+    #[error("S3 store failed: {0}")]
+    S3(String),
+    /// S3 returned invalid store data.
+    #[cfg(feature = "s3")]
+    #[error("S3 store contains invalid data: {0}")]
+    InvalidS3Data(String),
+}
+
+/// Converts any S3 SDK operation error into [`StoreError::S3`]. Generic over
+/// the operation's modeled error type so every `?` on an S3 SDK call
+/// converts without a per-operation `From` impl.
+#[cfg(feature = "s3")]
+impl<E> From<aws_sdk_s3::error::SdkError<E>> for StoreError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn from(error: aws_sdk_s3::error::SdkError<E>) -> Self {
+        StoreError::S3(error.to_string())
+    }
 }
 
 /// Asynchronous stream of blob identifiers produced by [`BlobStore::list`].

@@ -87,11 +87,14 @@ peer does not reconstruct transactions that ceased contributing live facts
 before the snapshot; complete pre-snapshot historical views still require
 full-log replay (or the future history roots described above).
 
-Filesystem, PostgreSQL, and Turso implement the same peer read interface.
+Filesystem, PostgreSQL, Turso, and S3 implement the same peer read interface.
 PostgreSQL readers use ordinary MVCC and do not contend with the root CAS
 writer. Turso 0.7 requires its experimental multi-process WAL for independent
 processes opening one local file; Corium enables it in `TursoBlobStore::open`,
-but every process touching that file must run the same coordinated mode.
+but every process touching that file must run the same coordinated mode. S3
+readers rely on the conditional-write CAS described below and are the
+implementation of the "S3 conditional writes" option anticipated in this
+design.
 
 ## Storage traits
 

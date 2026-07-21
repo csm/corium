@@ -22,6 +22,17 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: s3
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,3 +46,11 @@ jobs:
         env:
           CORIUM_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/corium_test?sslmode=disable
         run: cargo test -p corium-store --features postgres --test postgres
+      - name: Test S3 store
+        env:
+          CORIUM_TEST_S3_BUCKET: corium-test
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://localhost:4566
+        run: cargo test -p corium-store --features s3 --test s3

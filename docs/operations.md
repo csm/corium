@@ -10,11 +10,13 @@ The transactor's blob and root storage is selected with `--store`: `fs` (the
 default, under `--data-dir`), `mem` (in-memory and ephemeral — a single
 process, everything lost on exit; for demos and tests, not production),
 `postgres` (shared PostgreSQL blobs and roots at `--postgres-url`, requiring a
-build with `--features postgres`), or `turso` (blobs and roots in an
+build with `--features postgres`), `turso` (blobs and roots in an
 embeddable-SQLite Turso database at `--turso-path`, requiring a build with
-`--features turso`). The transaction log is appended synchronously by the
+`--features turso`), or `s3` (shared blobs and roots in an S3 or
+S3-compatible bucket at `--s3-bucket`/`--s3-prefix`, requiring a build with
+`--features s3`). The transaction log is appended synchronously by the
 commit pipeline, so it stays on the local filesystem under `--data-dir` for
-`fs`, `postgres`, and `turso`, and in memory for `mem`. A database-backed
+`fs`, `postgres`, `turso`, and `s3`, and in memory for `mem`. A database-backed
 transactor therefore still needs a writable data directory for its logs.
 Backup, restore, and offline GC operate on the filesystem data directory and
 therefore apply to `fs` (and only the local logs of a database-backed
@@ -28,6 +30,25 @@ For example:
 cargo run -p corium-cli --features postgres -- \
   transactor --store postgres \
   --postgres-url 'postgresql://corium@db.example/corium?sslmode=require' \
+  --data-dir /srv/corium
+```
+
+The S3 backend stores blobs under `{prefix}blobs/` and roots under
+`{prefix}roots/` in the target bucket, and fences root publication with S3
+conditional writes (`If-None-Match`/`If-Match`), so the bucket (or
+S3-compatible substitute) must support them. The bucket itself is not
+created automatically — provision it beforehand, since bucket creation
+involves region and ownership choices `corium` should not make for you.
+Credentials, region, and any custom endpoint (for MinIO/LocalStack) come
+from the standard AWS environment (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_PROFILE`,
+etc.), not `corium` flags. For example:
+
+```sh
+AWS_REGION=us-east-1 \
+cargo run -p corium-cli --features s3 -- \
+  transactor --store s3 \
+  --s3-bucket corium-prod --s3-prefix corium/ \
   --data-dir /srv/corium
 ```
 
