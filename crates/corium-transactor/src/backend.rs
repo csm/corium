@@ -310,7 +310,7 @@ pub enum LogBackend {
 impl LogBackend {
     /// The log backend that pairs with `spec`.
     #[must_use]
-    a#[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn for_spec(
         spec: &StoreSpec,
         data_dir: &std::path::Path,
