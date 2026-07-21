@@ -73,12 +73,8 @@ wasm bindings from the same directory, so build them there. Needs the
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli          # matching the wasm-bindgen dep version
 
-# from the repo root. RUSTFLAGS disables the `reference-types`/`multivalue`
-# wasm features (default-on since Rust 1.82) so wasm-bindgen uses its JS-heap
-# `externref` fallback instead of a wasm table it grows at init — otherwise
-# mobile/older Safari fails with "Table.grow could not grow the table".
-RUSTFLAGS="-C target-feature=-reference-types,-multivalue" \
-  cargo build -p corium-wasm --target wasm32-unknown-unknown --release
+# from the repo root:
+cargo build -p corium-wasm --target wasm32-unknown-unknown --release
 wasm-bindgen target/wasm32-unknown-unknown/release/corium_wasm.wasm \
   --out-dir web --target web --no-typescript
 
@@ -87,7 +83,13 @@ python3 -m http.server -d web 8080
 # open http://localhost:8080  (demo at /mbrainz.html)
 ```
 
-Optionally shrink the artifact with `wasm-opt -Oz web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm`.
+Optionally shrink the artifact with `wasm-opt -Oz --enable-reference-types web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm`.
+Use a current [binaryen](https://github.com/WebAssembly/binaryen) (≥ v110 — e.g.
+`npm install binaryen`, **not** Ubuntu's apt v108). Older binaryen has
+[binaryen#4711](https://github.com/WebAssembly/binaryen/issues/4711): it
+mis-points wasm-bindgen's `__wbindgen_externrefs` table export at the funcref
+table, so the demo fails to init in every browser with `WebAssembly.Table.grow …
+could not grow the table`.
 
 The generated `corium_wasm.js` / `corium_wasm_bg.wasm` are gitignored;
 `.github/workflows/publish-site.yml` rebuilds them and uploads `web/` over

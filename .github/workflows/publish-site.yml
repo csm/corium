@@ -46,17 +46,7 @@ jobs:
           key: publish-site
 
       - name: Build wasm
-        # Disable the `reference-types` / `multivalue` wasm features (default-on
-        # since Rust 1.82). With them enabled, wasm-bindgen manages `externref`
-        # via a wasm table it grows at init (`__wbindgen_init_externref_table`);
-        # mobile/older Safari (WebKit) rejects that `Table.grow` with
-        # "could not grow the table", and `wasm-opt` further corrupts the table
-        # unless told the feature is on (binaryen#4711). Turning the features off
-        # makes wasm-bindgen emit its JS-heap `externref` fallback, which never
-        # grows a table — restoring Safari < 15 / older-iOS support.
         run: cargo build -p corium-wasm --target wasm32-unknown-unknown --release
-        env:
-          RUSTFLAGS: "-C target-feature=-reference-types,-multivalue"
 
       - name: Install wasm-bindgen-cli (version pinned to the crate)
         run: |
@@ -71,9 +61,18 @@ jobs:
             --out-dir web --target web --no-typescript
 
       - name: Optimize wasm (wasm-opt)
+        # Do NOT use Ubuntu's apt `binaryen`: on the runner image it is v108,
+        # which has binaryen#4711 — `wasm-opt` mis-points wasm-bindgen's
+        # `__wbindgen_externrefs` table export at the fixed-size funcref table,
+        # so the externref `table.grow(4)` that runs during init throws
+        # "could not grow the table" in every browser (Safari's wording; V8
+        # says "failed to grow table"). That silently broke the mbrainz demo.
+        # The npm `binaryen` package tracks upstream release versions and
+        # carries the fix; pin a known-good one.
         run: |
-          sudo apt-get update && sudo apt-get install -y binaryen
-          wasm-opt -Oz web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm
+          npm install --no-save binaryen@131.0.0
+          ./node_modules/.bin/wasm-opt -Oz --enable-reference-types \
+            web/corium_wasm_bg.wasm -o web/corium_wasm_bg.wasm
           ls -la web/
 
       - name: Upload over SFTP
