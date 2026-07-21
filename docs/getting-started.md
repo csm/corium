@@ -16,13 +16,14 @@ cargo run -p corium-cli -- transactor \
   --metrics-listen 127.0.0.1:9464
 ```
 
-The transactor keeps its blobs and root pointers in one of four stores,
-chosen with `--store`: `fs` (the default, under `--data-dir`), `mem` (fully
+The transactor keeps its blobs, root pointers, and transaction logs in one
+of the selected stores: `fs` (the default, under `--data-dir`), `mem` (fully
 in-memory and ephemeral — handy for demos and tests), `postgres` (build with
 `--features postgres` and pass `--postgres-url`), or `turso` (an
 embeddable-SQLite database; build with `--features turso` and pass
-`--turso-path`). The transaction log stays on the local filesystem for `fs`,
-`postgres`, and `turso`, and in memory for `mem`.
+`--turso-path`). `postgres` and `turso` store their transaction logs
+natively alongside blobs and roots; `fs` uses versioned log files and `mem`
+uses an in-process registry.
 
 ```sh
 cargo run -p corium-cli -- transactor --store mem --data-dir ./corium-data
