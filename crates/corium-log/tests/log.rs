@@ -188,8 +188,9 @@ fn versioned_log_survives_torn_tail_in_an_older_version_file() {
 #[derive(Default)]
 struct TestNativeStorage(std::sync::Mutex<std::collections::BTreeMap<(String, u64, u64), Vec<u8>>>);
 
+#[async_trait::async_trait]
 impl corium_log::NativeLogStorage for TestNativeStorage {
-    fn read_chunk(
+    async fn read_chunk(
         &self,
         name: &str,
         version: u64,
@@ -203,7 +204,7 @@ impl corium_log::NativeLogStorage for TestNativeStorage {
             .cloned())
     }
 
-    fn cas_chunk(
+    async fn cas_chunk(
         &self,
         name: &str,
         version: u64,
@@ -220,7 +221,7 @@ impl corium_log::NativeLogStorage for TestNativeStorage {
         Ok(())
     }
 
-    fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
+    async fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
         Ok(self
             .0
             .lock()
@@ -232,7 +233,7 @@ impl corium_log::NativeLogStorage for TestNativeStorage {
             .collect())
     }
 
-    fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
+    async fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
         self.0
             .lock()
             .expect("lock")
@@ -249,8 +250,9 @@ struct CountingNativeStorage {
     reads: std::sync::atomic::AtomicUsize,
 }
 
+#[async_trait::async_trait]
 impl corium_log::NativeLogStorage for CountingNativeStorage {
-    fn read_chunk(
+    async fn read_chunk(
         &self,
         name: &str,
         version: u64,
@@ -258,10 +260,10 @@ impl corium_log::NativeLogStorage for CountingNativeStorage {
     ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.read_chunk(name, version, chunk)
+        self.inner.read_chunk(name, version, chunk).await
     }
 
-    fn cas_chunk(
+    async fn cas_chunk(
         &self,
         name: &str,
         version: u64,
@@ -269,28 +271,31 @@ impl corium_log::NativeLogStorage for CountingNativeStorage {
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<(), corium_log::LogError> {
-        self.inner.cas_chunk(name, version, chunk, expected, new)
+        self.inner
+            .cas_chunk(name, version, chunk, expected, new)
+            .await
     }
 
-    fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
-        self.inner.list_chunks(name)
+    async fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
+        self.inner.list_chunks(name).await
     }
 
-    fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
-        self.inner.delete_all(name)
+    async fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
+        self.inner.delete_all(name).await
     }
 }
 
-#[test]
-fn native_versioned_log_append_does_not_reread_the_whole_log() {
+#[tokio::test]
+async fn native_versioned_log_append_does_not_reread_the_whole_log() {
     use std::sync::atomic::Ordering;
     let storage = std::sync::Arc::new(CountingNativeStorage::default());
     let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .await
         .expect("open");
     // Opening reads to establish the next `t` and cache the version bytes.
     let opened_reads = storage.reads.load(Ordering::Relaxed);
     for t in 1..=64 {
-        log.append(&record(t)).expect("append");
+        log.append_async(&record(t)).await.expect("append");
     }
     // Every append after open must be self-contained: the writer owns its
     // version key under the lease, so it caches its bytes instead of pulling
@@ -301,64 +306,74 @@ fn native_versioned_log_append_does_not_reread_the_whole_log() {
         "appends must not re-read the version object"
     );
     // The cached appends are durable and replay in order.
-    let replayed = log.replay().expect("replay");
+    let replayed = log.replay_async().await.expect("replay");
     assert_eq!(replayed.len(), 64);
     assert_eq!(replayed.first().expect("first").t, 1);
     assert_eq!(replayed.last().expect("last").t, 64);
     // A fresh open recovers exactly the same durable history from the store.
     let reopened = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .await
         .expect("reopen");
-    assert_eq!(reopened.replay().expect("replay"), replayed);
+    assert_eq!(reopened.replay_async().await.expect("replay"), replayed);
 }
 
-#[test]
-fn native_versioned_log_rolls_to_new_chunks_past_the_size_cap() {
+#[tokio::test]
+async fn native_versioned_log_rolls_to_new_chunks_past_the_size_cap() {
     let storage = std::sync::Arc::new(TestNativeStorage::default());
     let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .await
         .expect("open");
     // Each record is ~200 KiB, so a handful cross the 256 KiB chunk cap and
     // force the writer to roll onto fresh chunks instead of one growing object.
     for t in 1..=6 {
-        log.append(&big_record(t, 200 * 1024)).expect("append");
+        log.append_async(&big_record(t, 200 * 1024))
+            .await
+            .expect("append");
     }
     // Several distinct chunks now hold the version's records.
     let chunks: Vec<(u64, u64)> = {
         use corium_log::NativeLogStorage;
-        storage.list_chunks("db").expect("chunks")
+        storage.list_chunks("db").await.expect("chunks")
     };
     assert!(
         chunks.len() >= 2,
         "expected the log to span multiple chunks, got {chunks:?}"
     );
     // The whole history still replays in order across the chunk boundaries.
-    let replayed = log.replay().expect("replay");
+    let replayed = log.replay_async().await.expect("replay");
     assert_eq!(replayed.len(), 6);
     assert!(replayed.iter().zip(1..).all(|(record, t)| record.t == t));
     // A fresh open resumes on the highest chunk and appends continue in order.
     let reopened = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .await
         .expect("reopen");
-    reopened.append(&big_record(7, 1024)).expect("append 7");
-    let replayed = reopened.replay().expect("replay after reopen");
+    reopened
+        .append_async(&big_record(7, 1024))
+        .await
+        .expect("append 7");
+    let replayed = reopened.replay_async().await.expect("replay after reopen");
     assert_eq!(replayed.len(), 7);
     assert_eq!(replayed.last().expect("last").t, 7);
 }
 
-#[test]
-fn native_versioned_log_uses_store_versions_and_takeover_cutoff() {
+#[tokio::test]
+async fn native_versioned_log_uses_store_versions_and_takeover_cutoff() {
     let storage = std::sync::Arc::new(TestNativeStorage::default());
     let v1 = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .await
         .expect("open v1");
-    v1.append(&record(1)).expect("append 1");
-    v1.append(&record(2)).expect("append 2");
+    v1.append_async(&record(1)).await.expect("append 1");
+    v1.append_async(&record(2)).await.expect("append 2");
 
     let v2 = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 2)
+        .await
         .expect("open v2");
-    v2.append(&record(3)).expect("append 3");
-    v1.append(&record(3)).expect("stale append");
-    v1.append(&record(4)).expect("stale append 4");
+    v2.append_async(&record(3)).await.expect("append 3");
+    v1.append_async(&record(3)).await.expect("stale append");
+    v1.append_async(&record(4)).await.expect("stale append 4");
 
     assert_eq!(
-        v2.replay().expect("replay"),
+        v2.replay_async().await.expect("replay"),
         vec![record(1), record(2), record(3)]
     );
 }
