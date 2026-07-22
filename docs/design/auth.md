@@ -2,15 +2,16 @@
 
 Status: **spike / design exploration.** The prototype lives in
 [`corium-protocol::authz`](../../crates/corium-protocol/src/authz.rs) with unit
-tests; it is not yet wired into the servers. This document records the model, the
-target integration, and the open questions. ADR-0012 records the decision to
-build authz as a request-scoped, optional layer.
+tests; it is not yet wired into the servers. This document records the model,
+the target integration, and the open questions. ADR-0012 records the decision
+to build authz as a request-scoped, optional layer.
 
 ## Problem
 
 The network surfaces — the transactor (`Transactor` + `Catalog` services) and
-the peer server (`PeerServerService`) — ship with connection-level bearer-token
-auth ([`corium-protocol::auth`](../../crates/corium-protocol/src/auth.rs)): an
+the peer server (`PeerServerService`) — ship with connection-level
+bearer-token auth
+([`corium-protocol::auth`](../../crates/corium-protocol/src/auth.rs)): an
 `Authenticator` returns `bool`, one shared secret gates the whole endpoint, and
 no identity reaches the handler. That is a correct v1 for a single-operator
 deployment and nothing here removes it.
@@ -58,7 +59,8 @@ never juggle an `Option` — "auth is off" just means everyone is anonymous.
 deliberately three-way, which is what makes providers **composable** on a shared
 system:
 
-- `Ok(Some(p))` — **accept**: these credentials are valid, here is the identity.
+- `Ok(Some(p))` — **accept**: these credentials are valid, here is the
+  identity.
 - `Ok(None)` — **abstain**: not my credentials; let the next provider try.
 - `Err(_)` — **reject**: addressed to me but invalid (bad signature, expired);
   stop the chain.
@@ -75,8 +77,8 @@ Shipped providers:
 `StaticTokens` *abstaining* rather than rejecting on an unknown token is the key
 composition rule the spike's tests pinned down: it lets `[static-tokens, oidc]`
 accept an internal service token *and* fall through to an OIDC token on the same
-endpoint. The "nobody accepted" outcome — anonymous or rejection — is not the
-provider's call; it belongs to the `Guard`.
+endpoint. The "nobody accepted" outcome — anonymous or rejection — is not
+the provider's call; it belongs to the `Guard`.
 
 `TokenVerifier` is a bare trait on purpose. A real JWT/OIDC verifier pulls in a
 crypto/JWKS dependency and makes network calls to fetch keys; keeping that out
@@ -92,7 +94,8 @@ request, a verifier maps its SAN/CN to a `Principal`, and
 `Action` (one per RPC family) on an optional target `database`. A `Decision` is:
 
 - `Allow` — permit with full visibility.
-- `AllowFiltered(Arc<dyn ViewFilter>)` — permit, but restrict what is returned.
+- `AllowFiltered(Arc<dyn ViewFilter>)` — permit, but restrict what is
+  returned.
 - `Deny(reason)` — refuse.
 
 Shipped authorizers: `AllowAll` (authz off) and `PolicyAuthorizer`, a
@@ -145,24 +148,24 @@ policy is in one place.
 `Guard` bundles an `IdentityProvider` and an `Authorizer` and owns the
 "nobody authenticated" decision via `allow_anonymous`:
 
-- `Guard::disabled()` — anonymous provider + allow-all; behaviourally identical
-  to running with no auth. This is the default every surface keeps.
-- `Guard::new(provider, authorizer)` — requires authentication (unrecognized or
-  absent credentials are rejected).
-- `.allow_anonymous(true)` — optional authn: unrecognized credentials fall back
-  to anonymous, and the authorizer still runs (anonymous simply holds no roles,
-  so "public read, authenticated write" is just a policy).
+- `Guard::disabled()` — anonymous provider + allow-all; behaviourally
+  identical to running with no auth. This is the default every surface keeps.
+- `Guard::new(provider, authorizer)` — requires authentication (unrecognized
+  or absent credentials are rejected).
+- `.allow_anonymous(true)` — optional authn: unrecognized credentials fall
+  back to anonymous, and the authorizer still runs (anonymous simply holds no
+  roles, so "public read, authenticated write" is just a policy).
 
 One `Guard` serves every request on a surface; because identity is derived per
-request, a single guard handles many concurrent callers with different authority
-— the multi-tenant requirement, demonstrated in
+request, a single guard handles many concurrent callers with different
+authority — the multi-tenant requirement, demonstrated in
 `one_guard_serves_two_tenants_with_different_authority`.
 
 ## Integration with the RPC surface
 
-`IdentityInterceptor` replaces `AuthInterceptor` at the tonic layer. It runs per
-request, authenticates the metadata, and — crucially — inserts the `Principal`
-into the request **extensions**, where the handler reads it with
+`IdentityInterceptor` replaces `AuthInterceptor` at the tonic layer. It runs
+per request, authenticates the metadata, and — crucially — inserts the
+`Principal` into the request **extensions**, where the handler reads it with
 `authz::principal(&request)`. The interceptor does authn only; authorization
 happens in the handler, which is the first place that knows the concrete
 `Action` and database.
@@ -172,7 +175,8 @@ The proposed handler shape (peer server `query` as the example):
 ```rust
 let principal = authz::principal(&request);
 let access = Access::on(Action::Query, &spec.db);
-let view = self.guard.authorize(&principal, &access).await?; // Option<Arc<dyn ViewFilter>>
+// view: Option<Arc<dyn ViewFilter>>
+let view = self.guard.authorize(&principal, &access).await?;
 // ... run the query, then apply `view` to the returned datoms/rows ...
 ```
 
@@ -213,31 +217,31 @@ clients keep working; only what the server does with the token changes.
 
 ## Open questions
 
-- **Where does policy live?** For a shared public system the role→grant map and
-  view definitions probably want to be data, not code — a config file, or
-  eventually facts in a control database the transactor reads. The spike hard-codes
-  policies in Rust; externalizing them is the next design step.
-- **View filtering in the query engine.** `AttributeAllowlist` is enforceable in
-  the datom scan, but a `ViewFilter` that hides *entities* or filters by *value*
-  needs a hook inside `corium-query` (a predicate injected into the executor),
+- **Where does policy live?** For a shared public system the role→grant map
+  and view definitions probably want to be data, not code — a config file, or
+  eventually facts in a control database the transactor reads. The spike
+  hard-codes policies in Rust; externalizing them is the next design step.
+- **View filtering in the query engine.** `AttributeAllowlist` is enforceable
+  in the datom scan, but a `ViewFilter` that hides *entities* or filters by
+  *value* needs a hook inside `corium-query` (a predicate in the executor),
   and interacts with the query cache (cache keys must include the filter). This
   is the largest downstream change and is out of scope for the spike.
 - **Auditing.** Every authz decision is a natural audit event; the `Principal`
   and `Access` are exactly what a log line needs. Not prototyped.
-- **mTLS subject extraction.** Needs the tonic peer-certificate plumbing to fill
-  `Credentials::client_cert_subject` inside the service; the field exists, the
-  wiring does not.
+- **mTLS subject extraction.** Needs the tonic peer-certificate plumbing to
+  fill `Credentials::client_cert_subject` inside the service; the field exists,
+  the wiring does not.
 - **Token caching.** OIDC verification (JWKS fetch, signature check) should be
-  cached per token/expiry so it stays off the hot path; the `TokenVerifier` impl
-  owns this.
+  cached per token/expiry so it stays off the hot path; the `TokenVerifier`
+  impl owns this.
 
 ## What the spike delivers
 
 - `corium-protocol::authz`: `Principal`, `Credentials`, `IdentityProvider`
   (+ `AllowAnonymous`, `StaticTokens`, `ExternalTokens`, `CompositeProvider`),
   `TokenVerifier`, `Action`/`Access`, `Authorizer` (+ `AllowAll`,
-  `PolicyAuthorizer`/`Grant`), `ViewFilter` (+ `AttributeAllowlist`), `Decision`,
-  `Guard`, and `IdentityInterceptor`.
+  `PolicyAuthorizer`/`Grant`), `ViewFilter` (+ `AttributeAllowlist`),
+  `Decision`, `Guard`, and `IdentityInterceptor`.
 - Unit tests covering each requirement: optional-off, distinct static-token
   identities, the external-verifier seam, provider composition, role/database
   enforcement, an async external-oracle authorizer, per-principal views,

@@ -806,7 +806,12 @@ mod tests {
 
         // Absent and unknown tokens both abstain, so the table composes ahead
         // of other issuers; the accept/reject call is the Guard's.
-        assert!(provider.authenticate(&Credentials::default()).unwrap().is_none());
+        assert!(
+            provider
+                .authenticate(&Credentials::default())
+                .unwrap()
+                .is_none()
+        );
         assert!(provider.authenticate(&creds("bogus")).unwrap().is_none());
     }
 
@@ -827,7 +832,10 @@ mod tests {
     #[test]
     fn external_token_verifier_seam_produces_principal() {
         let provider = ExternalTokens::new("oidc", FakeJwt);
-        let principal = provider.authenticate(&creds("oidc:alice:acme")).unwrap().unwrap();
+        let principal = provider
+            .authenticate(&creds("oidc:alice:acme"))
+            .unwrap()
+            .unwrap();
         assert_eq!(principal.provider, "oidc");
         assert_eq!(principal.claim("tenant"), Some("acme"));
         assert!(matches!(
@@ -838,8 +846,10 @@ mod tests {
 
     #[test]
     fn composite_provider_tries_in_order_and_abstains() {
-        let statics = StaticTokens::new()
-            .with("svc-secret", Principal::new("static-token", "svc").with_role("writer"));
+        let statics = StaticTokens::new().with(
+            "svc-secret",
+            Principal::new("static-token", "svc").with_role("writer"),
+        );
         let provider = CompositeProvider::new(vec![
             Arc::new(statics),
             Arc::new(ExternalTokens::new("oidc", FakeJwt)),
@@ -847,16 +857,29 @@ mod tests {
 
         // First provider accepts.
         assert_eq!(
-            provider.authenticate(&creds("svc-secret")).unwrap().unwrap().subject,
+            provider
+                .authenticate(&creds("svc-secret"))
+                .unwrap()
+                .unwrap()
+                .subject,
             "svc"
         );
         // Static table abstains, so the request falls through to OIDC.
         assert_eq!(
-            provider.authenticate(&creds("oidc:bob:beta")).unwrap().unwrap().provider,
+            provider
+                .authenticate(&creds("oidc:bob:beta"))
+                .unwrap()
+                .unwrap()
+                .provider,
             "oidc"
         );
         // Absent credentials: both abstain, composite abstains.
-        assert!(provider.authenticate(&Credentials::default()).unwrap().is_none());
+        assert!(
+            provider
+                .authenticate(&Credentials::default())
+                .unwrap()
+                .is_none()
+        );
 
         // A guard requiring auth turns the abstain into a rejection; the same
         // provider under an anonymous-allowing guard yields anonymous.
@@ -866,7 +889,11 @@ mod tests {
             Err(AuthError::Unauthenticated(_))
         ));
         let open = Guard::new(Arc::new(provider), Arc::new(AllowAll)).allow_anonymous(true);
-        assert!(open.authenticate(&Credentials::default()).unwrap().is_anonymous());
+        assert!(
+            open.authenticate(&Credentials::default())
+                .unwrap()
+                .is_anonymous()
+        );
     }
 
     fn sample_policy() -> PolicyAuthorizer {
@@ -876,7 +903,10 @@ mod tests {
                 "writer",
                 Grant::new([ActionClass::Read, ActionClass::Write], ["people"]),
             )
-            .grant("admin", Grant::new([ActionClass::Admin], Vec::<String>::new()))
+            .grant(
+                "admin",
+                Grant::new([ActionClass::Admin], Vec::<String>::new()),
+            )
     }
 
     #[tokio::test]
@@ -888,30 +918,42 @@ mod tests {
 
         // Reader may query people but not transact, and not touch other dbs.
         assert!(matches!(
-            policy.authorize(&reader, &Access::on(Action::Query, "people")).await,
+            policy
+                .authorize(&reader, &Access::on(Action::Query, "people"))
+                .await,
             Decision::Allow
         ));
         assert!(matches!(
-            policy.authorize(&reader, &Access::on(Action::Transact, "people")).await,
+            policy
+                .authorize(&reader, &Access::on(Action::Transact, "people"))
+                .await,
             Decision::Deny(_)
         ));
         assert!(matches!(
-            policy.authorize(&reader, &Access::on(Action::Query, "secrets")).await,
+            policy
+                .authorize(&reader, &Access::on(Action::Query, "secrets"))
+                .await,
             Decision::Deny(_)
         ));
 
         // Writer may transact people; admin may create any database.
         assert!(matches!(
-            policy.authorize(&writer, &Access::on(Action::Transact, "people")).await,
+            policy
+                .authorize(&writer, &Access::on(Action::Transact, "people"))
+                .await,
             Decision::Allow
         ));
         assert!(matches!(
-            policy.authorize(&admin, &Access::catalog(Action::CreateDatabase)).await,
+            policy
+                .authorize(&admin, &Access::catalog(Action::CreateDatabase))
+                .await,
             Decision::Allow
         ));
         // Admin grant is admin-only: no read of people.
         assert!(matches!(
-            policy.authorize(&admin, &Access::on(Action::Query, "people")).await,
+            policy
+                .authorize(&admin, &Access::on(Action::Query, "people"))
+                .await,
             Decision::Deny(_)
         ));
     }
@@ -919,10 +961,14 @@ mod tests {
     #[tokio::test]
     async fn per_principal_view_filter_gives_different_views() {
         // Two tenants read the same database through different attribute views.
-        let acme_view: Arc<dyn ViewFilter> =
-            Arc::new(AttributeAllowlist::new([":person/name", ":person/acme-note"]));
-        let beta_view: Arc<dyn ViewFilter> =
-            Arc::new(AttributeAllowlist::new([":person/name", ":person/beta-note"]));
+        let acme_view: Arc<dyn ViewFilter> = Arc::new(AttributeAllowlist::new([
+            ":person/name",
+            ":person/acme-note",
+        ]));
+        let beta_view: Arc<dyn ViewFilter> = Arc::new(AttributeAllowlist::new([
+            ":person/name",
+            ":person/beta-note",
+        ]));
         let policy = PolicyAuthorizer::new()
             .grant(
                 "acme",
@@ -1009,11 +1055,31 @@ mod tests {
         let beta = guard.authenticate(&creds("beta-reader")).unwrap();
 
         // acme may write its own db; beta may not read acme's db.
-        assert!(guard.authorize(&acme, &Access::on(Action::Transact, "acme-db")).await.is_ok());
-        assert!(guard.authorize(&beta, &Access::on(Action::Query, "acme-db")).await.is_err());
-        assert!(guard.authorize(&beta, &Access::on(Action::Query, "beta-db")).await.is_ok());
+        assert!(
+            guard
+                .authorize(&acme, &Access::on(Action::Transact, "acme-db"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            guard
+                .authorize(&beta, &Access::on(Action::Query, "acme-db"))
+                .await
+                .is_err()
+        );
+        assert!(
+            guard
+                .authorize(&beta, &Access::on(Action::Query, "beta-db"))
+                .await
+                .is_ok()
+        );
         // beta is read-only even on its own db.
-        assert!(guard.authorize(&beta, &Access::on(Action::Transact, "beta-db")).await.is_err());
+        assert!(
+            guard
+                .authorize(&beta, &Access::on(Action::Transact, "beta-db"))
+                .await
+                .is_err()
+        );
     }
 
     /// Stand-in for an external relationship-based oracle (`OpenFGA` / `Auth0 FGA`):
@@ -1046,8 +1112,23 @@ mod tests {
         let alice = Principal::new("oidc", "alice");
         let bob = Principal::new("oidc", "bob");
 
-        assert!(guard.authorize(&alice, &Access::on(Action::Query, "people")).await.is_ok());
-        assert!(guard.authorize(&alice, &Access::on(Action::Transact, "people")).await.is_err());
-        assert!(guard.authorize(&bob, &Access::on(Action::Query, "people")).await.is_err());
+        assert!(
+            guard
+                .authorize(&alice, &Access::on(Action::Query, "people"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            guard
+                .authorize(&alice, &Access::on(Action::Transact, "people"))
+                .await
+                .is_err()
+        );
+        assert!(
+            guard
+                .authorize(&bob, &Access::on(Action::Query, "people"))
+                .await
+                .is_err()
+        );
     }
 }
