@@ -220,6 +220,74 @@ impl corium_log::NativeLogStorage for TestNativeStorage {
     }
 }
 
+/// Wraps a native storage and counts how many times each version object is
+/// read, so a test can assert appends do not re-read the whole log.
+#[derive(Default)]
+struct CountingNativeStorage {
+    inner: TestNativeStorage,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl corium_log::NativeLogStorage for CountingNativeStorage {
+    fn read_version(
+        &self,
+        name: &str,
+        version: u64,
+    ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_version(name, version)
+    }
+
+    fn cas_version(
+        &self,
+        name: &str,
+        version: u64,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), corium_log::LogError> {
+        self.inner.cas_version(name, version, expected, new)
+    }
+
+    fn versions(&self, name: &str) -> Result<Vec<u64>, corium_log::LogError> {
+        self.inner.versions(name)
+    }
+
+    fn delete_versions(&self, name: &str) -> Result<(), corium_log::LogError> {
+        self.inner.delete_versions(name)
+    }
+}
+
+#[test]
+fn native_versioned_log_append_does_not_reread_the_whole_log() {
+    use std::sync::atomic::Ordering;
+    let storage = std::sync::Arc::new(CountingNativeStorage::default());
+    let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .expect("open");
+    // Opening reads to establish the next `t` and cache the version bytes.
+    let opened_reads = storage.reads.load(Ordering::Relaxed);
+    for t in 1..=64 {
+        log.append(&record(t)).expect("append");
+    }
+    // Every append after open must be self-contained: the writer owns its
+    // version key under the lease, so it caches its bytes instead of pulling
+    // the entire history back per transaction (the old quadratic write path).
+    assert_eq!(
+        storage.reads.load(Ordering::Relaxed),
+        opened_reads,
+        "appends must not re-read the version object"
+    );
+    // The cached appends are durable and replay in order.
+    let replayed = log.replay().expect("replay");
+    assert_eq!(replayed.len(), 64);
+    assert_eq!(replayed.first().expect("first").t, 1);
+    assert_eq!(replayed.last().expect("last").t, 64);
+    // A fresh open recovers exactly the same durable history from the store.
+    let reopened = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .expect("reopen");
+    assert_eq!(reopened.replay().expect("replay"), replayed);
+}
+
 #[test]
 fn native_versioned_log_uses_store_versions_and_takeover_cutoff() {
     let storage = std::sync::Arc::new(TestNativeStorage::default());

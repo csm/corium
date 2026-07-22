@@ -310,12 +310,35 @@ pub trait NativeLogStorage: Send + Sync {
     fn delete_versions(&self, name: &str) -> Result<(), LogError>;
 }
 
+/// The mutable append state of a [`NativeVersionedLog`] writer: the next
+/// transaction number it will accept and a cached copy of its own version
+/// object's bytes.
+///
+/// The writer is the sole appender of its version key (the lease fence gives
+/// each active owner its own version file; a deposed writer's stale appends
+/// land in a file the takeover cutoff discards). Caching the version bytes and
+/// tracking `next_t` therefore lets an append extend the buffer in place and
+/// compare-and-swap it, instead of re-reading, re-decoding, and re-copying the
+/// whole log on every transaction — the previous behavior made each append
+/// cost proportional to the entire history, so a growing database's write
+/// throughput fell off quadratically.
+struct WriteState {
+    /// Next `t` this writer will accept.
+    next_t: u64,
+    /// Cached encoded bytes of this writer's version object, kept in lock-step
+    /// with the store by only advancing it after a successful CAS.
+    bytes: Vec<u8>,
+    /// Whether the version object exists in the store yet, so the first append
+    /// inserts (expected `None`) and later ones compare against the prior bytes.
+    exists: bool,
+}
+
 /// Versioned transaction log backed by a native key/value-style store.
 pub struct NativeVersionedLog<S: ?Sized> {
     storage: Arc<S>,
     name: String,
     write_version: u64,
-    next_t: RwLock<u64>,
+    write: Mutex<WriteState>,
 }
 
 impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
@@ -324,38 +347,71 @@ impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
     /// # Errors
     /// Returns an error when stored records cannot be read or decoded.
     pub fn open(storage: Arc<S>, name: &str, write_version: u64) -> Result<Self, LogError> {
+        // The merged view across every version establishes the next `t` (the
+        // takeover cutoff may place it past this writer's own last record).
         let records = read_native_merged(storage.as_ref(), name)?;
+        let next_t = records.last().map_or(1, |r| r.t + 1);
+        // Cache this writer's own version object so appends extend it in place
+        // rather than reading and decoding the whole log every time.
+        let current = storage.read_version(name, write_version)?;
+        let exists = current.is_some();
+        let bytes = current.unwrap_or_default();
         Ok(Self {
             storage,
             name: name.to_owned(),
             write_version,
-            next_t: RwLock::new(records.last().map_or(1, |r| r.t + 1)),
+            write: Mutex::new(WriteState {
+                next_t,
+                bytes,
+                exists,
+            }),
         })
     }
 }
 
 impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedLog<S> {
     fn append(&self, record: &TxRecord) -> Result<(), LogError> {
-        let mut next_t = self.next_t.write().expect("poisoned log lock");
-        if *next_t != record.t {
+        let mut write = self
+            .write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if write.next_t != record.t {
             return Err(LogError::Corrupt);
         }
-        let current = self.storage.read_version(&self.name, self.write_version)?;
-        let current_bytes = current.as_deref().unwrap_or_default();
-        let existing = decode_framed_records(current_bytes)?;
-        if existing.last().map_or(*next_t, |r| r.t + 1) != record.t {
-            return Err(LogError::Corrupt);
+        let old_len = write.bytes.len();
+        append_framed_record(&mut write.bytes, record)?;
+        // Two overlapping shared borrows: `expected` is the pre-append prefix,
+        // `new` the full buffer. When the object is absent the first append
+        // inserts (expected `None`), mirroring the prior read-then-CAS.
+        let expected = if write.exists {
+            Some(&write.bytes[..old_len])
+        } else {
+            None
+        };
+        match self
+            .storage
+            .cas_version(&self.name, self.write_version, expected, &write.bytes)
+        {
+            Ok(()) => {
+                write.exists = true;
+                write.next_t += 1;
+                Ok(())
+            }
+            Err(error) => {
+                // Leave the cache exactly as the store still holds it.
+                write.bytes.truncate(old_len);
+                Err(error)
+            }
         }
-        let mut new = current_bytes.to_vec();
-        append_framed_record(&mut new, record)?;
-        self.storage
-            .cas_version(&self.name, self.write_version, current.as_deref(), &new)?;
-        *next_t += 1;
-        Ok(())
     }
 
     fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
-        let _guard = self.next_t.read().expect("poisoned log lock");
+        // Range/replay must merge every version (for the takeover cutoff), so
+        // they read the store; the lock only serializes them with appends.
+        let _guard = self
+            .write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(read_native_merged(self.storage.as_ref(), &self.name)?
             .into_iter()
             .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
