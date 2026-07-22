@@ -1871,6 +1871,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "corium-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "corium-core",
+ "corium-db",
+ "corium-peer",
+ "corium-protocol",
+ "corium-query",
+ "corium-transactor",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "corium-cljrs"
 version = "0.1.0"
 dependencies = [
