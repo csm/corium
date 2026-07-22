@@ -760,10 +760,8 @@ mod tests {
         // `recorded` is a persistent vector appended via copy-on-write; a
         // derived value must never mutate the log or indexes still observed
         // through the parent (e.g. `db_before` in a `TxReport`).
-        let parent = Db::new(schema()).with_transaction(
-            1,
-            &[datom(1, 1, Value::Str("alice".into()), 1, true)],
-        );
+        let parent = Db::new(schema())
+            .with_transaction(1, &[datom(1, 1, Value::Str("alice".into()), 1, true)]);
         // Materialize the parent's indexes so the child derives incrementally.
         let parent_datoms = parent.datoms();
         let parent_recorded = parent.recorded_len();

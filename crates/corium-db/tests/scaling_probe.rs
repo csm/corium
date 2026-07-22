@@ -6,10 +6,8 @@
 
 use std::time::Instant;
 
-use corium_core::{
-    Cardinality, Datom, EntityId, Partition, Schema, Value, ValueType,
-};
-use corium_db::{attribute, Db};
+use corium_core::{Cardinality, Datom, EntityId, Partition, Schema, Value, ValueType};
+use corium_db::{Db, attribute};
 
 fn attr(id: u64) -> EntityId {
     EntityId::new(Partition::Db as u32, id)
@@ -46,8 +44,20 @@ fn per_tx_cost_is_roughly_flat() {
         let before = db.clone();
         let t = before.basis_t() + 1;
         let datoms = [
-            Datom { e: entity(i), a: attr(1), v: Value::Str("x".into()), tx: tx_entity(t), added: true },
-            Datom { e: entity(i), a: attr(2), v: Value::Long(i as i64), tx: tx_entity(t), added: true },
+            Datom {
+                e: entity(i),
+                a: attr(1),
+                v: Value::Str("x".into()),
+                tx: tx_entity(t),
+                added: true,
+            },
+            Datom {
+                e: entity(i),
+                a: attr(2),
+                v: Value::Long(i as i64),
+                tx: tx_entity(t),
+                added: true,
+            },
         ];
         db = before.with_transaction(t, &datoms);
         // Touch the derived indexes as prepare()/queries would.
@@ -71,8 +81,14 @@ fn per_tx_cost_is_roughly_flat() {
     }
 
     let ratio = last_bucket_ns as f64 / first_bucket_ns as f64;
-    println!("last/first bucket ratio = {ratio:.2} (linear-per-tx would be ~{})", total / bucket);
+    println!(
+        "last/first bucket ratio = {ratio:.2} (linear-per-tx would be ~{})",
+        total / bucket
+    );
     // With the old O(N)-per-tx copy the final bucket is ~8x the first here;
     // structural sharing keeps it within a small logarithmic factor.
-    assert!(ratio < 3.0, "per-tx cost grew {ratio:.2}x — superlinear regression");
+    assert!(
+        ratio < 3.0,
+        "per-tx cost grew {ratio:.2}x — superlinear regression"
+    );
 }
