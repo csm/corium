@@ -17,3 +17,4 @@ reference the old. Format: Context / Decision / Consequences.
 | [0010](0010-ha-later.md) | Single transactor now, lease-based HA designed in | Accepted |
 | [0011](0011-sql-interface.md) | Peer-local read-only SQL over namespace projections | Accepted |
 | [0012](0012-optional-authn-authz.md) | Optional, request-scoped authentication and authorization | Proposed |
+| [0013](0013-postgres-wire-interface.md) | PostgreSQL wire-protocol front end for read-only SQL | Accepted |

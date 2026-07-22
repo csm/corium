@@ -281,6 +281,20 @@ enum Command {
         #[command(flatten)]
         serve: ServeFlags,
     },
+    /// Serve one database over the `PostgreSQL` wire protocol (read-only).
+    PostgresServer {
+        /// Database to host.
+        #[arg(long)]
+        db: String,
+        /// Listen address.
+        #[arg(long, default_value = "127.0.0.1:5432")]
+        listen: SocketAddr,
+        /// Require this cleartext password from clients (trust when omitted).
+        #[arg(long)]
+        password: Option<String>,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
     /// Database catalog operations.
     #[command(subcommand)]
     Db(DbCommand),
@@ -620,6 +634,41 @@ async fn run(cli: Cli) -> Result<(), String> {
             };
             tracing::info!(%listen, "peer server serving");
             corium_peer::server::serve_service(service, listen, authenticator, tls, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
+        Command::PostgresServer {
+            db,
+            listen,
+            password,
+            client,
+        } => {
+            let config = client.connect_config(db).await?;
+            let connection = Arc::new(
+                Connection::connect(config)
+                    .await
+                    .map_err(|error| format!("cannot connect to transactor: {error}"))?,
+            );
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|error| format!("cannot bind {listen}: {error}"))?;
+            let pg_config = corium_pgwire::PgWireConfig {
+                database: connection.db_name().to_owned(),
+                password,
+                ..corium_pgwire::PgWireConfig::default()
+            };
+            let source = {
+                let connection = Arc::clone(&connection);
+                Arc::new(move || connection.db())
+            };
+            tracing::info!(%listen, "postgres server serving");
+            eprintln!(
+                "corium postgres-server: serving {:?} on {listen}",
+                connection.db_name()
+            );
+            corium_pgwire::serve(listener, source, pg_config, async {
                 let _ = tokio::signal::ctrl_c().await;
             })
             .await

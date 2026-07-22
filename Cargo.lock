@@ -1852,6 +1852,7 @@ dependencies = [
  "corium-db",
  "corium-log",
  "corium-peer",
+ "corium-pgwire",
  "corium-protocol",
  "corium-query",
  "corium-sql",
@@ -1981,6 +1982,18 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "corium-pgwire"
+version = "0.1.0"
+dependencies = [
+ "corium-core",
+ "corium-db",
+ "corium-sql",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 

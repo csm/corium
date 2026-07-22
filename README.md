@@ -77,6 +77,7 @@ processes. Each crate has its own README.
 | [`corium-db`](crates/corium-db/README.md) | The immutable `Db` value: time views, covering-index access, naming, stats |
 | [`corium-query`](crates/corium-query/README.md) | EDN Datalog compiler/planner/executor, rules, aggregates, Pull, entity API |
 | [`corium-sql`](crates/corium-sql/README.md) | Read-only DataFusion SQL over peer-local `Db` values |
+| [`corium-pgwire`](crates/corium-pgwire/README.md) | PostgreSQL wire-protocol front end for read-only Corium SQL |
 | [`corium-protocol`](crates/corium-protocol/README.md) | protobuf/gRPC definitions, wire value encoding, generated tonic stubs |
 | [`corium-transactor`](crates/corium-transactor/README.md) | Transactor process: pipeline, indexing job, lease/HA, gRPC server, backup |
 | [`corium-peer`](crates/corium-peer/README.md) | Peer library: connection, tx-report handling, segment cache, peer server |

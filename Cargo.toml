@@ -8,6 +8,7 @@ members = [
     "crates/corium-forms",
     "crates/corium-query",
     "crates/corium-sql",
+    "crates/corium-pgwire",
     "crates/corium-db",
     "crates/corium-transactor",
     "crates/corium-peer",
@@ -44,6 +45,7 @@ corium-forms = { path = "crates/corium-forms", version = "0.1.0" }
 corium-index = { path = "crates/corium-index", version = "0.1.0" }
 corium-log = { path = "crates/corium-log", version = "0.1.0" }
 corium-peer = { path = "crates/corium-peer", version = "0.1.0" }
+corium-pgwire = { path = "crates/corium-pgwire", version = "0.1.0" }
 corium-protocol = { path = "crates/corium-protocol", version = "0.1.0" }
 corium-query = { path = "crates/corium-query", version = "0.1.0" }
 corium-sql = { path = "crates/corium-sql", version = "0.1.0" }

@@ -1,0 +1,29 @@
+[package]
+name = "corium-pgwire"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "PostgreSQL wire-protocol front end for read-only Corium SQL"
+
+[dependencies]
+corium-core = { workspace = true }
+corium-db = { workspace = true }
+corium-sql = { workspace = true }
+thiserror = "2"
+tokio = { version = "1.53.0", features = [
+    "rt",
+    "net",
+    "io-util",
+    "macros",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[lints]
+workspace = true

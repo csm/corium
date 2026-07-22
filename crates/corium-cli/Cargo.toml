@@ -27,6 +27,7 @@ corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-log = { workspace = true }
 corium-peer = { workspace = true }
+corium-pgwire = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-sql = { workspace = true }

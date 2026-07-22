@@ -96,6 +96,31 @@ Interactive statements end with a semicolon. The shell understands:
 Each statement captures a fresh current `Db` value unless a time view is
 selected. Pressing Control-C drops the running query future.
 
+## PostgreSQL wire-protocol server
+
+The same read-only SQL is reachable by standard PostgreSQL clients through the
+`corium-pgwire` crate and the `corium postgres-server` command:
+
+```console
+corium postgres-server --db my-database --listen 127.0.0.1:5432
+psql 'host=127.0.0.1 port=5432 dbname=my-database' \
+  -c "SELECT e, name FROM corium.artist ORDER BY name LIMIT 10"
+```
+
+The server hosts one database, like `corium peer-server`, and runs every query
+through the same `SqlSession` as the shell, so DDL, DML, and session-mutating
+statements are rejected. It speaks the v3 protocol in the text format and
+supports both the simple and extended query sub-protocols; bound parameters and
+the binary result format are not supported and are reported as errors. Stateless
+control statements (`BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `RESET`, `DISCARD`)
+are accepted as no-ops, since each query already sees one immutable snapshot.
+
+Pass `--password` to require a cleartext password; TLS is not terminated by the
+server, so front it with a proxy when transport security is needed. The SQL
+dialect is DataFusion's, not PostgreSQL's — wire compatibility does not imply
+`pg_catalog` or dialect compatibility. See
+[ADR-0013](adr/0013-postgres-wire-interface.md).
+
 ## Engine choice and tradeoffs
 
 The implementation embeds DataFusion. This provides mature SQL semantics,
