@@ -17,6 +17,23 @@ fn record(t: u64) -> TxRecord {
         }],
     }
 }
+
+/// A record whose value string is `bytes` long, for driving the chunked
+/// native log past its per-chunk size cap.
+fn big_record(t: u64, bytes: usize) -> TxRecord {
+    let signed_t = i64::try_from(t).expect("test transaction fits i64");
+    TxRecord {
+        t,
+        tx_instant: 100 + signed_t,
+        datoms: vec![Datom {
+            e: EntityId::from_raw(t),
+            a: EntityId::from_raw(2),
+            v: Value::Str("x".repeat(bytes).into()),
+            tx: EntityId::from_raw(100 + t),
+            added: true,
+        }],
+    }
+}
 #[test]
 fn filesystem_log_replays_and_ranges_after_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -169,31 +186,35 @@ fn versioned_log_survives_torn_tail_in_an_older_version_file() {
 }
 
 #[derive(Default)]
-struct TestNativeStorage(std::sync::Mutex<std::collections::BTreeMap<(String, u64), Vec<u8>>>);
+struct TestNativeStorage(
+    std::sync::Mutex<std::collections::BTreeMap<(String, u64, u64), Vec<u8>>>,
+);
 
 impl corium_log::NativeLogStorage for TestNativeStorage {
-    fn read_version(
+    fn read_chunk(
         &self,
         name: &str,
         version: u64,
+        chunk: u64,
     ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
         Ok(self
             .0
             .lock()
             .expect("lock")
-            .get(&(name.to_owned(), version))
+            .get(&(name.to_owned(), version, chunk))
             .cloned())
     }
 
-    fn cas_version(
+    fn cas_chunk(
         &self,
         name: &str,
         version: u64,
+        chunk: u64,
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<(), corium_log::LogError> {
         let mut guard = self.0.lock().expect("lock");
-        let key = (name.to_owned(), version);
+        let key = (name.to_owned(), version, chunk);
         if guard.get(&key).map(Vec::as_slice) != expected {
             return Err(corium_log::LogError::Corrupt);
         }
@@ -201,21 +222,23 @@ impl corium_log::NativeLogStorage for TestNativeStorage {
         Ok(())
     }
 
-    fn versions(&self, name: &str) -> Result<Vec<u64>, corium_log::LogError> {
+    fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
         Ok(self
             .0
             .lock()
             .expect("lock")
             .keys()
-            .filter_map(|(record_name, version)| (record_name == name).then_some(*version))
+            .filter_map(|(record_name, version, chunk)| {
+                (record_name == name).then_some((*version, *chunk))
+            })
             .collect())
     }
 
-    fn delete_versions(&self, name: &str) -> Result<(), corium_log::LogError> {
+    fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
         self.0
             .lock()
             .expect("lock")
-            .retain(|(record_name, _), _| record_name != name);
+            .retain(|(record_name, _, _), _| record_name != name);
         Ok(())
     }
 }
@@ -229,32 +252,34 @@ struct CountingNativeStorage {
 }
 
 impl corium_log::NativeLogStorage for CountingNativeStorage {
-    fn read_version(
+    fn read_chunk(
         &self,
         name: &str,
         version: u64,
+        chunk: u64,
     ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.read_version(name, version)
+        self.inner.read_chunk(name, version, chunk)
     }
 
-    fn cas_version(
+    fn cas_chunk(
         &self,
         name: &str,
         version: u64,
+        chunk: u64,
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<(), corium_log::LogError> {
-        self.inner.cas_version(name, version, expected, new)
+        self.inner.cas_chunk(name, version, chunk, expected, new)
     }
 
-    fn versions(&self, name: &str) -> Result<Vec<u64>, corium_log::LogError> {
-        self.inner.versions(name)
+    fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
+        self.inner.list_chunks(name)
     }
 
-    fn delete_versions(&self, name: &str) -> Result<(), corium_log::LogError> {
-        self.inner.delete_versions(name)
+    fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
+        self.inner.delete_all(name)
     }
 }
 
@@ -286,6 +311,38 @@ fn native_versioned_log_append_does_not_reread_the_whole_log() {
     let reopened = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
         .expect("reopen");
     assert_eq!(reopened.replay().expect("replay"), replayed);
+}
+
+#[test]
+fn native_versioned_log_rolls_to_new_chunks_past_the_size_cap() {
+    let storage = std::sync::Arc::new(TestNativeStorage::default());
+    let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .expect("open");
+    // Each record is ~200 KiB, so a handful cross the 256 KiB chunk cap and
+    // force the writer to roll onto fresh chunks instead of one growing object.
+    for t in 1..=6 {
+        log.append(&big_record(t, 200 * 1024)).expect("append");
+    }
+    // Several distinct chunks now hold the version's records.
+    let chunks: Vec<(u64, u64)> = {
+        use corium_log::NativeLogStorage;
+        storage.list_chunks("db").expect("chunks")
+    };
+    assert!(
+        chunks.len() >= 2,
+        "expected the log to span multiple chunks, got {chunks:?}"
+    );
+    // The whole history still replays in order across the chunk boundaries.
+    let replayed = log.replay().expect("replay");
+    assert_eq!(replayed.len(), 6);
+    assert!(replayed.iter().zip(1..).all(|(record, t)| record.t == t));
+    // A fresh open resumes on the highest chunk and appends continue in order.
+    let reopened = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .expect("reopen");
+    reopened.append(&big_record(7, 1024)).expect("append 7");
+    let replayed = reopened.replay().expect("replay after reopen");
+    assert_eq!(replayed.len(), 7);
+    assert_eq!(replayed.last().expect("last").t, 7);
 }
 
 #[test]
