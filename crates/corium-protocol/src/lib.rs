@@ -3,6 +3,7 @@
 //! (see `docs/design/protocol.md`).
 
 pub mod auth;
+pub mod authz;
 pub mod codec;
 
 // The EDN schema/transaction boundary conversions live in the pure

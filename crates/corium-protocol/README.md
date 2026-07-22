@@ -15,6 +15,10 @@ Defines how the transactor, peers, and thin clients talk to each other:
 - **`schemaform` / `txforms`** — encode/decode helpers for schema and
   transaction payloads on the wire.
 - **`auth`** — bearer-token interceptors and TLS config helpers.
+- **`authz`** — *(spike)* request-scoped identity and authorization: pluggable
+  `IdentityProvider`/`Authorizer`, per-principal `ViewFilter`, and a `Guard` +
+  interceptor. Not yet wired into the servers; see
+  [`docs/design/auth.md`](../../docs/design/auth.md).
 - `PROTOCOL_VERSION` — the version this crate speaks (currently `1`).
 
 ## Dependencies
