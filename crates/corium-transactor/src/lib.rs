@@ -163,7 +163,7 @@ impl EmbeddedTransactor {
             db = db.with_transaction(record.t, &record.datoms);
             last_instant = last_instant.max(record.tx_instant);
         }
-        let next_user = next_user_id(db.recorded_datoms().iter(), FIRST_USER_ID);
+        let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
         Self {
             log,
             state: Mutex::new(State {
