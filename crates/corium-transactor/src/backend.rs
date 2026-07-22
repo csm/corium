@@ -361,8 +361,8 @@ impl LogBackend {
             Self::Mem(registry) => registry.exists(name),
             #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
             Self::Native(storage) => storage
-                .versions(name)
-                .is_ok_and(|versions| !versions.is_empty()),
+                .list_chunks(name)
+                .is_ok_and(|chunks| !chunks.is_empty()),
         }
     }
 
@@ -378,7 +378,7 @@ impl LogBackend {
                 Ok(())
             }
             #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-            Self::Native(storage) => storage.delete_versions(name),
+            Self::Native(storage) => storage.delete_all(name),
         }
     }
 }
@@ -397,12 +397,29 @@ impl NativeRootLogStore {
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 impl NativeRootLogStore {
-    fn key(name: &str, version: u64) -> String {
-        format!("log:{name}:v{version:020}")
+    /// Object key for one log chunk. Chunk `0` keeps the historical
+    /// unsuffixed key, so logs written by earlier releases read back as their
+    /// chunk `0` without migration.
+    fn key(name: &str, version: u64, chunk: u64) -> String {
+        if chunk == 0 {
+            format!("log:{name}:v{version:020}")
+        } else {
+            format!("log:{name}:v{version:020}:c{chunk:020}")
+        }
     }
 
     fn prefix(name: &str) -> String {
         format!("log:{name}:v")
+    }
+
+    /// Parses a `(version, chunk)` pair out of a listed log key. Chunk `0`
+    /// keys carry no `:c` suffix (see [`Self::key`]).
+    fn parse_key(prefix: &str, key: &str) -> Option<(u64, u64)> {
+        let rest = key.strip_prefix(prefix)?;
+        match rest.split_once(":c") {
+            Some((version, chunk)) => Some((version.parse().ok()?, chunk.parse().ok()?)),
+            None => Some((rest.parse().ok()?, 0)),
+        }
     }
 
     fn block_on<T>(
@@ -419,39 +436,41 @@ impl NativeRootLogStore {
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 impl NativeLogStorage for NativeRootLogStore {
-    fn read_version(&self, name: &str, version: u64) -> Result<Option<Vec<u8>>, LogError> {
-        self.block_on(self.store.get_root(&Self::key(name, version)))
-    }
-
-    fn cas_version(
+    fn read_chunk(
         &self,
         name: &str,
         version: u64,
+        chunk: u64,
+    ) -> Result<Option<Vec<u8>>, LogError> {
+        self.block_on(self.store.get_root(&Self::key(name, version, chunk)))
+    }
+
+    fn cas_chunk(
+        &self,
+        name: &str,
+        version: u64,
+        chunk: u64,
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<(), LogError> {
         self.block_on(
             self.store
-                .cas_root(&Self::key(name, version), expected, new),
+                .cas_root(&Self::key(name, version, chunk), expected, new),
         )
     }
 
-    fn versions(&self, name: &str) -> Result<Vec<u64>, LogError> {
+    fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError> {
         let prefix = Self::prefix(name);
         let names = self.block_on(self.store.list_roots(&prefix))?;
         names
             .into_iter()
-            .map(|key| {
-                key.strip_prefix(&prefix)
-                    .and_then(|version| version.parse::<u64>().ok())
-                    .ok_or(LogError::Corrupt)
-            })
+            .map(|key| Self::parse_key(&prefix, &key).ok_or(LogError::Corrupt))
             .collect()
     }
 
-    fn delete_versions(&self, name: &str) -> Result<(), LogError> {
-        for version in self.versions(name)? {
-            self.block_on(self.store.delete_root(&Self::key(name, version)))?;
+    fn delete_all(&self, name: &str) -> Result<(), LogError> {
+        for (version, chunk) in self.list_chunks(name)? {
+            self.block_on(self.store.delete_root(&Self::key(name, version, chunk)))?;
         }
         Ok(())
     }
