@@ -4,13 +4,37 @@ use corium_core::{
     Cardinality, Datom, EntityId, IndexOrder, KeywordInterner, Partition, Schema, Value, ValueType,
 };
 use corium_db::{Db, Idents, attribute};
-use corium_log::{FileLog, TransactionLog};
+use corium_log::{FileLog, LogError, MemoryLog, TransactionLog, TxRecord};
 use corium_store::{BlobId, BlobStore, DbRoot, FsStore, RootStore};
 use corium_transactor::EmbeddedTransactor;
 use corium_tx::{EntityRef, TxItem, TxOp};
 use std::collections::HashSet;
 use std::{sync::Arc, thread};
 use tokio_stream::StreamExt;
+
+#[derive(Default)]
+struct DelayedAsyncLog {
+    inner: MemoryLog,
+    append_started: tokio::sync::Notify,
+    release_append: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl TransactionLog for DelayedAsyncLog {
+    fn append(&self, _record: &TxRecord) -> Result<(), LogError> {
+        Err(LogError::AsyncOnly)
+    }
+
+    async fn append_async(&self, record: &TxRecord) -> Result<(), LogError> {
+        self.append_started.notify_one();
+        self.release_append.notified().await;
+        self.inner.append(record)
+    }
+
+    fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
+        self.inner.tx_range(start, end)
+    }
+}
 
 /// Materializes the current value at a published index root the way a
 /// transactor recovering from the index root does: read the EAVT snapshot,
@@ -50,6 +74,52 @@ fn schema() -> (Schema, EntityId) {
     let mut schema = Schema::default();
     schema.insert(attribute(100, ValueType::Long, Cardinality::One, None));
     (schema, a)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_durable_append_does_not_hold_database_state_lock() {
+    let (schema, a) = schema();
+    let delayed = Arc::new(DelayedAsyncLog::default());
+    let log: Arc<dyn TransactionLog> = delayed.clone();
+    let tx = Arc::new(
+        EmbeddedTransactor::recover_from_async(Db::new(schema), log)
+            .await
+            .expect("recover"),
+    );
+    let writer = {
+        let tx = Arc::clone(&tx);
+        tokio::spawn(async move {
+            tx.transact_async([TxItem::Op(TxOp::Add(
+                EntityRef::Temp("e".into()),
+                a,
+                Value::Long(1),
+            ))])
+            .await
+        })
+    };
+    delayed.append_started.notified().await;
+
+    // Snapshot readers must remain responsive while storage durability is
+    // deliberately paused. This is the lock inversion that deadlocked the
+    // node when the native log synchronously re-entered Tokio.
+    let reader = {
+        let tx = Arc::clone(&tx);
+        tokio::task::spawn_blocking(move || tx.db().basis_t())
+    };
+    let read = tokio::time::timeout(std::time::Duration::from_millis(250), reader).await;
+    delayed.release_append.notify_one();
+    let report = writer
+        .await
+        .expect("writer task")
+        .expect("durable transaction");
+
+    assert_eq!(
+        read.expect("snapshot read blocked on storage I/O")
+            .expect("reader task"),
+        0
+    );
+    assert_eq!(report.db_after.basis_t(), 1);
+    assert_eq!(tx.db().basis_t(), 1);
 }
 #[tokio::test]
 async fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {

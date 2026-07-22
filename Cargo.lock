@@ -1934,9 +1934,11 @@ dependencies = [
 name = "corium-log"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "corium-core",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
