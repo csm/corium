@@ -904,8 +904,7 @@ impl TransactorNode {
                 if snapshot.basis_t() <= db.index_basis() {
                     continue;
                 }
-                let recorded_len =
-                    u64::try_from(snapshot.recorded_datoms().len()).unwrap_or(u64::MAX);
+                let recorded_len = u64::try_from(snapshot.recorded_len()).unwrap_or(u64::MAX);
                 let pending = published_len.map(|len| recorded_len.saturating_sub(len));
                 if !policy.due(published_at.elapsed(), last_duration, pending) {
                     continue;

@@ -14,6 +14,7 @@ use corium_core::{
     AttrId, Cardinality, Datom, EntityId, IndexOrder, Keyword, KeywordInterner, Partition, Schema,
     Unique, Value, encoding::Encodable,
 };
+use rpds::{RedBlackTreeMapSync, VectorSync};
 
 /// The first user-assignable sequence number. Lower ids are reserved for bootstrap data.
 pub const FIRST_USER_ID: u64 = 1_000;
@@ -104,7 +105,15 @@ impl PlannerStats {
     }
 }
 
-type Index = BTreeMap<Vec<u8>, Datom>;
+/// Covering index for one order.
+///
+/// A persistent (structurally shared) ordered map: cloning is O(1) and shares
+/// every unchanged node with the parent, so applying a transaction to a
+/// materialized index derives a new map that copies only the O(log n) nodes on
+/// the touched paths instead of the whole tree. This is what keeps
+/// `with_transaction` — and the per-operation folding inside `corium-tx` —
+/// from re-cloning the entire index on every write.
+type Index = RedBlackTreeMapSync<Vec<u8>, Datom>;
 
 const ORDERS: [IndexOrder; 4] = [
     IndexOrder::Eavt,
@@ -169,7 +178,7 @@ pub fn key_prefix(
 pub struct Db {
     basis_t: u64,
     schema: Schema,
-    recorded: Arc<Vec<Datom>>,
+    recorded: VectorSync<Datom>,
     idents: Arc<Idents>,
     interner: Arc<KeywordInterner>,
     view: DbView,
@@ -205,7 +214,7 @@ impl Db {
         Self {
             basis_t,
             schema,
-            recorded: Arc::new(datoms),
+            recorded: datoms.into_iter().collect(),
             idents: Arc::new(idents),
             interner: Arc::new(interner),
             view: DbView::Current,
@@ -253,9 +262,14 @@ impl Db {
     }
 
     /// Every recorded assertion and retraction, in transaction order.
+    pub fn recorded_datoms(&self) -> impl Iterator<Item = &Datom> {
+        self.recorded.iter()
+    }
+
+    /// Number of recorded assertions and retractions.
     #[must_use]
-    pub fn recorded_datoms(&self) -> &[Datom] {
-        &self.recorded
+    pub fn recorded_len(&self) -> usize {
+        self.recorded.len()
     }
 
     /// Returns the as-of view at basis `t`: facts as they stood then.
@@ -292,7 +306,7 @@ impl Db {
     #[must_use]
     pub fn tx_range(&self, start: u64, end: Option<u64>) -> Vec<(u64, Vec<Datom>)> {
         let mut by_t: BTreeMap<u64, Vec<Datom>> = BTreeMap::new();
-        for datom in self.recorded.iter() {
+        for datom in &self.recorded {
             let t = datom.tx.sequence();
             if t >= start && end.is_none_or(|end| t < end) {
                 by_t.entry(t).or_default().push(datom.clone());
@@ -405,7 +419,13 @@ impl Db {
         );
         let mut next = self.clone();
         next.basis_t = t;
-        Arc::make_mut(&mut next.recorded).extend_from_slice(datoms);
+        // `recorded` is a persistent vector: this clone shared its whole spine
+        // with the parent, and appending copies only the O(log n) nodes on the
+        // tail path — never the entire log, even while `db_before` keeps the
+        // parent alive.
+        for datom in datoms {
+            next.recorded.push_back_mut(datom.clone());
+        }
         next.indexes = Arc::new(OnceLock::new());
         next.stats = Arc::new(OnceLock::new());
         // Derive indexes incrementally when the parent already built them, so
@@ -458,7 +478,7 @@ impl Db {
             let mut indexes: [Index; 4] = Default::default();
             match self.view {
                 DbView::History => {
-                    for datom in self.recorded.iter() {
+                    for datom in &self.recorded {
                         if self.schema.get(datom.a).is_some_and(|a| a.no_history) {
                             continue;
                         }
@@ -477,7 +497,11 @@ impl Db {
                     apply_current(&mut indexes, filtered, &self.schema);
                     if let DbView::Since(t) = self.view {
                         for index in &mut indexes {
-                            index.retain(|_, datom| datom.tx.sequence() > t);
+                            *index = index
+                                .iter()
+                                .filter(|(_, datom)| datom.tx.sequence() > t)
+                                .map(|(key, datom)| (key.clone(), datom.clone()))
+                                .collect();
                         }
                     }
                 }
@@ -504,7 +528,7 @@ fn apply_current<'a>(
             for order in ORDERS {
                 if covered(schema, order, datom) {
                     let key = key_prefix(order, Some(datom.e), Some(datom.a), Some(&datom.v));
-                    indexes[slot(order)].remove(&key);
+                    indexes[slot(order)].remove_mut(&key);
                 }
             }
         }
@@ -519,7 +543,7 @@ fn insert_datom(indexes: &mut [Index; 4], datom: &Datom, schema: &Schema, with_t
             } else {
                 key_prefix(order, Some(datom.e), Some(datom.a), Some(&datom.v))
             };
-            indexes[slot(order)].insert(key, datom.clone());
+            indexes[slot(order)].insert_mut(key, datom.clone());
         }
     }
 }
@@ -729,6 +753,43 @@ mod tests {
         let incremental = warm.with_transaction(2, &tx2);
         let cold = base.with_transaction(1, &tx1).with_transaction(2, &tx2);
         assert_eq!(incremental.datoms(), cold.datoms());
+    }
+
+    #[test]
+    fn with_transaction_leaves_parent_value_unchanged() {
+        // `recorded` is a persistent vector appended via copy-on-write; a
+        // derived value must never mutate the log or indexes still observed
+        // through the parent (e.g. `db_before` in a `TxReport`).
+        let parent = Db::new(schema()).with_transaction(
+            1,
+            &[datom(1, 1, Value::Str("alice".into()), 1, true)],
+        );
+        // Materialize the parent's indexes so the child derives incrementally.
+        let parent_datoms = parent.datoms();
+        let parent_recorded = parent.recorded_len();
+
+        let child = parent.with_transaction(
+            2,
+            &[
+                datom(1, 1, Value::Str("alice".into()), 2, false),
+                datom(1, 1, Value::Str("alicia".into()), 2, true),
+            ],
+        );
+
+        // Parent is frozen at its own basis, log length, and live facts.
+        assert_eq!(parent.basis_t(), 1);
+        assert_eq!(parent.recorded_len(), parent_recorded);
+        assert_eq!(parent.datoms(), parent_datoms);
+        assert_eq!(
+            parent.values(entity(1), attr(1)),
+            vec![Value::Str("alice".into())]
+        );
+        // Child reflects the new transaction.
+        assert_eq!(child.basis_t(), 2);
+        assert_eq!(
+            child.values(entity(1), attr(1)),
+            vec![Value::Str("alicia".into())]
+        );
     }
 
     #[test]

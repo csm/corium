@@ -106,7 +106,7 @@ impl EmbeddedTransactor {
         // Allocation must resume past every id that ever appeared in the log,
         // not just ids with current datoms; otherwise a fully retracted
         // entity's id would be reused after a restart.
-        let next_user = next_user_id(db.recorded_datoms().iter(), FIRST_USER_ID);
+        let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
         Ok(Self {
             log,
             state: Mutex::new(State {
