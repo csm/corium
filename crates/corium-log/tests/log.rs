@@ -186,9 +186,7 @@ fn versioned_log_survives_torn_tail_in_an_older_version_file() {
 }
 
 #[derive(Default)]
-struct TestNativeStorage(
-    std::sync::Mutex<std::collections::BTreeMap<(String, u64, u64), Vec<u8>>>,
-);
+struct TestNativeStorage(std::sync::Mutex<std::collections::BTreeMap<(String, u64, u64), Vec<u8>>>);
 
 impl corium_log::NativeLogStorage for TestNativeStorage {
     fn read_chunk(

@@ -423,10 +423,13 @@ impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedL
         } else {
             None
         };
-        match self
-            .storage
-            .cas_chunk(&self.name, self.write_version, chunk, expected, &write.bytes)
-        {
+        match self.storage.cas_chunk(
+            &self.name,
+            self.write_version,
+            chunk,
+            expected,
+            &write.bytes,
+        ) {
             Ok(()) => {
                 write.exists = true;
                 write.next_t += 1;
@@ -469,7 +472,9 @@ fn read_native_merged<S: NativeLogStorage + ?Sized>(
             per_version.push(Vec::new());
             current_version = Some(version);
         }
-        let bytes = storage.read_chunk(name, version, chunk)?.unwrap_or_default();
+        let bytes = storage
+            .read_chunk(name, version, chunk)?
+            .unwrap_or_default();
         per_version
             .last_mut()
             .expect("a version group was pushed")
