@@ -8,12 +8,18 @@ homepage.workspace = true
 description = "Corium transactor"
 
 [features]
-default = []
+default = ["cljrs"]
+# Built-in Clojure transaction-function runtime (`:db/fn`) on the bounded,
+# GC-less `cljrs-tx` interpreter. Enables the cljrs stack's global `no-gc`
+# mode, which feature-unifies onto every cljrs crate in the same build.
+cljrs = ["dep:cljrs-tx", "dep:cljrs-value"]
 postgres = ["corium-store/postgres"]
 turso = ["corium-store/turso"]
 s3 = ["corium-store/s3"]
 
 [dependencies]
+cljrs-tx = { workspace = true, features = ["no-gc"], optional = true }
+cljrs-value = { workspace = true, optional = true }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-index = { workspace = true }

@@ -12,7 +12,10 @@ name = "corium"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["cljrs"]
+# Built-in Clojure transaction-function runtime for `corium transactor`
+# (`:db/fn` expansion on the bounded `cljrs-tx` interpreter).
+cljrs = ["corium-transactor/cljrs"]
 # Enables the PostgreSQL storage backend for `corium transactor --store postgres`.
 postgres = ["corium-transactor/postgres"]
 # Enables the Turso storage backend for `corium transactor --store turso`.
@@ -23,7 +26,6 @@ s3 = ["corium-transactor/s3"]
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
-corium-cljrs = { workspace = true }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-log = { workspace = true }

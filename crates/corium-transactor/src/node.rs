@@ -30,9 +30,9 @@ use crate::metrics::Metrics;
 use crate::{DbRoot, EmbeddedTransactor, TransactError, db_root_name};
 
 /// Expands user database-function invocations in boundary EDN transaction
-/// forms before native conversion. Implemented by `corium-cljrs` (the
-/// sandboxed Clojurust host, ADR-0008) and injected by the process wiring;
-/// the transactor itself stays free of cljrs dependencies.
+/// forms before native conversion. The built-in implementation is
+/// [`crate::txfn::DbFnExpander`] on the bounded `cljrs-tx` runtime (feature
+/// `cljrs`, on by default, ADR-0008); embedders may inject their own.
 pub trait TxFnExpander: Send + Sync {
     /// Rewrites `forms` with every `[:my/fn arg…]` invocation replaced by
     /// the function's returned tx-data (recursively).
@@ -132,6 +132,9 @@ impl NodeConfig {
             heartbeat_interval: Duration::from_secs(10),
             gc_interval: Some(Duration::from_secs(60 * 60)),
             gc_retention: Duration::from_secs(72 * 60 * 60),
+            #[cfg(feature = "cljrs")]
+            tx_fn_expander: Some(Arc::new(crate::txfn::DbFnExpander::default())),
+            #[cfg(not(feature = "cljrs"))]
             tx_fn_expander: None,
         }
     }
