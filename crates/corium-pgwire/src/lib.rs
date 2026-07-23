@@ -2,9 +2,16 @@
 //!
 //! [`serve`] accepts `PostgreSQL` client connections and answers their queries
 //! by running them through [`corium_sql::SqlSession`] against an immutable
-//! [`corium_db::Db`] value supplied by a [`DbSource`]. Because every query
+//! [`corium_db::Db`] value obtained from a [`DbCatalog`]. Because every query
 //! goes through `SqlSession`, the same read-only guarantee holds: DDL, DML,
 //! and session-mutating statements are rejected.
+//!
+//! One server exposes every database the catalog offers (subject to the
+//! catalog's own whitelist). A connection selects its database with the
+//! standard startup `database` parameter and can switch at any time with
+//! `USE <database>`; `SHOW DATABASES` lists what is available. The catalog is
+//! expected to open and cache databases lazily and share them across
+//! connections.
 //!
 //! Both the simple and extended query sub-protocols are supported, in the
 //! text wire format. Bound parameters and the binary format are not
@@ -20,34 +27,49 @@ use std::future::Future;
 use std::sync::Arc;
 
 use corium_db::Db;
-use corium_sql::{SqlColumn, SqlError, SqlSession};
+use corium_sql::{SqlColumn, SqlError, SqlSession, SqlType};
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
-use protocol::{BackendWriter, ErrorFields, FieldDescription, Frontend, FrontendReader, Startup};
+use protocol::{BackendWriter, ErrorFields, FieldDescription, Frontend, FrontendReader};
 
-/// Supplies the immutable database value a query should run against.
-///
-/// The server calls [`DbSource::db`] to capture a fresh view per query, the
-/// same way the `corium sql` shell captures a current `Db` for each
-/// statement. A closure returning a `Db` implements this trait directly.
-pub trait DbSource: Send + Sync + 'static {
-    /// Returns the current local database value to query.
-    fn db(&self) -> Db;
+/// A database the catalog cannot hand back.
+#[derive(Debug, Error)]
+pub enum CatalogError {
+    /// No such database, or it is not permitted by the catalog's whitelist.
+    #[error("database {0:?} is not available")]
+    NotFound(String),
+    /// The database exists but could not be reached or opened.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
-impl<F: Fn() -> Db + Send + Sync + 'static> DbSource for F {
-    fn db(&self) -> Db {
-        self()
-    }
+/// Supplies the databases the server exposes.
+///
+/// Implementations are expected to open databases lazily and cache them so a
+/// database is shared across all client connections. [`db`](DbCatalog::db)
+/// returns a fresh immutable snapshot each call, the same way the `corium sql`
+/// shell captures a current `Db` per statement.
+#[async_trait::async_trait]
+pub trait DbCatalog: Send + Sync + 'static {
+    /// Names of the databases clients may connect to.
+    ///
+    /// # Errors
+    /// Returns [`CatalogError`] when the catalog cannot be enumerated.
+    async fn list(&self) -> Result<Vec<String>, CatalogError>;
+
+    /// A current snapshot of the database named `name`.
+    ///
+    /// # Errors
+    /// Returns [`CatalogError::NotFound`] when the database is unknown or not
+    /// permitted, and [`CatalogError::Unavailable`] when it cannot be opened.
+    async fn db(&self, name: &str) -> Result<Db, CatalogError>;
 }
 
 /// Server-wide configuration for the `PostgreSQL` front end.
 #[derive(Clone, Debug)]
 pub struct PgWireConfig {
-    /// Database name advertised to clients (informational only; the server
-    /// serves whatever [`DbSource`] returns).
-    pub database: String,
     /// If set, clients must send this cleartext password to connect. When
     /// `None`, connections are trusted.
     pub password: Option<String>,
@@ -58,7 +80,6 @@ pub struct PgWireConfig {
 impl Default for PgWireConfig {
     fn default() -> Self {
         Self {
-            database: "corium".to_owned(),
             password: None,
             server_version: concat!("16.0 (corium ", env!("CARGO_PKG_VERSION"), ")").to_owned(),
         }
@@ -72,14 +93,14 @@ impl Default for PgWireConfig {
 ///
 /// # Errors
 /// Returns an error only if accepting a connection fails fatally.
-pub async fn serve<S, F>(
+pub async fn serve<C, F>(
     listener: TcpListener,
-    source: Arc<S>,
+    catalog: Arc<C>,
     config: PgWireConfig,
     shutdown: F,
 ) -> std::io::Result<()>
 where
-    S: DbSource,
+    C: DbCatalog,
     F: Future<Output = ()>,
 {
     let config = Arc::new(config);
@@ -89,14 +110,14 @@ where
             () = &mut shutdown => return Ok(()),
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                let source = Arc::clone(&source);
+                let catalog = Arc::clone(&catalog);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     let (read, write) = stream.into_split();
                     let mut session = ConnectionSession::new(
                         FrontendReader::new(read),
                         BackendWriter::new(write),
-                        source,
+                        catalog,
                         config,
                     );
                     if let Err(error) = session.run().await {
@@ -108,18 +129,42 @@ where
     }
 }
 
-/// A bound portal: the SQL to run and the database snapshot to run it against.
+/// A bound portal: the SQL to run and the database it was bound against.
 struct Portal {
     sql: String,
-    db: Db,
+    database: Option<String>,
+}
+
+/// How a statement should be handled before it ever reaches `SqlSession`.
+enum Statement {
+    /// A stateless control statement accepted as a no-op with this tag.
+    Control(&'static str),
+    /// `USE <database>` — switch the connection's active database.
+    Use(String),
+    /// `SHOW DATABASES` — list the catalog.
+    ShowDatabases,
+    /// An ordinary read-only query for `SqlSession`.
+    Query,
+}
+
+/// A failure while dispatching one statement.
+enum Dispatch {
+    /// No database is selected for a query.
+    NoDatabase,
+    /// The catalog could not provide the database.
+    Catalog(CatalogError),
+    /// `SqlSession` rejected or failed the query.
+    Sql(SqlError),
 }
 
 /// The per-connection protocol state machine.
-struct ConnectionSession<R, W, S> {
+struct ConnectionSession<R, W, C> {
     reader: FrontendReader<R>,
     writer: BackendWriter<W>,
-    source: Arc<S>,
+    catalog: Arc<C>,
     config: Arc<PgWireConfig>,
+    /// The connection's active database, chosen at startup or by `USE`.
+    current_db: Option<String>,
     statements: HashMap<String, String>,
     portals: HashMap<String, Portal>,
     /// Set after an extended-protocol error; frontend messages are ignored
@@ -127,23 +172,24 @@ struct ConnectionSession<R, W, S> {
     failed: bool,
 }
 
-impl<R, W, S> ConnectionSession<R, W, S>
+impl<R, W, C> ConnectionSession<R, W, C>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    S: DbSource,
+    C: DbCatalog,
 {
     fn new(
         reader: FrontendReader<R>,
         writer: BackendWriter<W>,
-        source: Arc<S>,
+        catalog: Arc<C>,
         config: Arc<PgWireConfig>,
     ) -> Self {
         Self {
             reader,
             writer,
-            source,
+            catalog,
             config,
+            current_db: None,
             statements: HashMap::new(),
             portals: HashMap::new(),
             failed: false,
@@ -155,7 +201,14 @@ where
         if !self.authenticate().await? {
             return Ok(());
         }
-        self.send_ready_banner(&startup).await?;
+        // The database is validated lazily on first use, so a client may
+        // connect with an unknown default and then `USE` a real database.
+        self.current_db = startup
+            .get("database")
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        self.send_ready_banner(startup.get("application_name").unwrap_or(""))
+            .await?;
 
         while let Some(message) = self.reader.read_message().await? {
             match message {
@@ -230,7 +283,7 @@ where
 
     /// Sends the post-authentication parameter status, key data, and the
     /// first `ReadyForQuery`.
-    async fn send_ready_banner(&mut self, startup: &Startup) -> std::io::Result<()> {
+    async fn send_ready_banner(&mut self, application_name: &str) -> std::io::Result<()> {
         self.writer
             .parameter_status("server_version", &self.config.server_version);
         self.writer.parameter_status("server_encoding", "UTF8");
@@ -240,10 +293,8 @@ where
         self.writer.parameter_status("integer_datetimes", "on");
         self.writer
             .parameter_status("standard_conforming_strings", "on");
-        self.writer.parameter_status(
-            "application_name",
-            startup.get("application_name").unwrap_or(""),
-        );
+        self.writer
+            .parameter_status("application_name", application_name);
         self.writer.backend_key_data(0, 0);
         self.writer.ready_for_query(b'I');
         self.writer.flush().await
@@ -259,21 +310,59 @@ where
             return Ok(());
         }
         for statement in statements {
-            if let Some(tag) = control_tag(&statement) {
-                self.writer.command_complete(tag);
-                continue;
-            }
-            let db = self.source.db();
-            match self.run_statement(&db, &statement, true).await {
-                Ok(rows) => self.writer.command_complete(&command_tag(&statement, rows)),
-                Err(error) => {
-                    self.report_sql_error(&error);
-                    break;
-                }
+            if !self.run_simple_statement(&statement).await? {
+                break;
             }
         }
         self.writer.ready_for_query(b'I');
         Ok(())
+    }
+
+    /// Runs one simple-protocol statement. Returns `false` when an error was
+    /// reported and the rest of the query string should be abandoned.
+    async fn run_simple_statement(&mut self, sql: &str) -> std::io::Result<bool> {
+        match classify(sql) {
+            Statement::Control(tag) => {
+                self.writer.command_complete(tag);
+                Ok(true)
+            }
+            Statement::Use(name) => match self.use_database(&name).await {
+                Ok(()) => {
+                    self.writer.command_complete("USE");
+                    Ok(true)
+                }
+                Err(error) => {
+                    self.report_dispatch(&error);
+                    Ok(false)
+                }
+            },
+            Statement::ShowDatabases => match self.show_databases().await {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    self.report_dispatch(&error);
+                    Ok(false)
+                }
+            },
+            Statement::Query => {
+                let db = match self.snapshot(None).await {
+                    Ok(db) => db,
+                    Err(error) => {
+                        self.report_dispatch(&error);
+                        return Ok(false);
+                    }
+                };
+                match self.run_statement(&db, sql, true).await {
+                    Ok(rows) => {
+                        self.writer.command_complete(&command_tag(sql, rows));
+                        Ok(true)
+                    }
+                    Err(error) => {
+                        self.report_dispatch(&Dispatch::Sql(error));
+                        Ok(false)
+                    }
+                }
+            }
+        }
     }
 
     fn handle_parse(&mut self, name: String, query: String, parameter_count: usize) {
@@ -314,7 +403,7 @@ where
             portal.to_owned(),
             Portal {
                 sql: sql.clone(),
-                db: self.source.db(),
+                database: self.current_db.clone(),
             },
         );
         self.writer.bind_complete();
@@ -325,27 +414,36 @@ where
             return Ok(());
         }
         // `Describe` of a prepared statement first reports its parameters.
-        let (sql, db) = if kind == b'S' {
+        let (sql, database) = if kind == b'S' {
             self.writer.parameter_description_empty();
             let Some(sql) = self.statements.get(name) else {
                 self.fail_extended("26000", "prepared statement does not exist");
                 return Ok(());
             };
-            (sql.clone(), self.source.db())
+            (sql.clone(), self.current_db.clone())
         } else {
             let Some(portal) = self.portals.get(name) else {
                 self.fail_extended("34000", "portal does not exist");
                 return Ok(());
             };
-            (portal.sql.clone(), portal.db.clone())
+            (portal.sql.clone(), portal.database.clone())
         };
-        if control_tag(&sql).is_some() || sql.trim().is_empty() {
-            self.writer.no_data();
-            return Ok(());
-        }
-        match self.describe_columns(&db, &sql).await {
-            Ok(fields) => self.writer.row_description(&fields),
-            Err(error) => self.fail_sql(&error),
+        match classify(&sql) {
+            Statement::ShowDatabases => self.writer.row_description(&[database_field()]),
+            Statement::Query if !sql.trim().is_empty() => {
+                let db = match self.snapshot(database.as_deref()).await {
+                    Ok(db) => db,
+                    Err(error) => {
+                        self.fail_dispatch(&error);
+                        return Ok(());
+                    }
+                };
+                match self.describe_columns(&db, &sql).await {
+                    Ok(fields) => self.writer.row_description(&fields),
+                    Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
+                }
+            }
+            _ => self.writer.no_data(),
         }
         Ok(())
     }
@@ -354,26 +452,73 @@ where
         if self.failed {
             return Ok(());
         }
-        let Some(Portal { sql, db }) = self.portals.get(portal).map(|portal| Portal {
-            sql: portal.sql.clone(),
-            db: portal.db.clone(),
-        }) else {
+        let Some((sql, database)) = self
+            .portals
+            .get(portal)
+            .map(|portal| (portal.sql.clone(), portal.database.clone()))
+        else {
             self.fail_extended("34000", "portal does not exist");
             return Ok(());
         };
-        if let Some(tag) = control_tag(&sql) {
-            self.writer.command_complete(tag);
-            return Ok(());
-        }
         if sql.trim().is_empty() {
             self.writer.empty_query_response();
             return Ok(());
         }
-        match self.run_statement(&db, &sql, false).await {
-            Ok(rows) => self.writer.command_complete(&command_tag(&sql, rows)),
-            Err(error) => self.fail_sql(&error),
+        match classify(&sql) {
+            Statement::Control(tag) => self.writer.command_complete(tag),
+            Statement::Use(name) => match self.use_database(&name).await {
+                Ok(()) => self.writer.command_complete("USE"),
+                Err(error) => self.fail_dispatch(&error),
+            },
+            Statement::ShowDatabases => {
+                if let Err(error) = self.show_databases().await {
+                    self.fail_dispatch(&error);
+                }
+            }
+            Statement::Query => {
+                let db = match self.snapshot(database.as_deref()).await {
+                    Ok(db) => db,
+                    Err(error) => {
+                        self.fail_dispatch(&error);
+                        return Ok(());
+                    }
+                };
+                match self.run_statement(&db, &sql, false).await {
+                    Ok(rows) => self.writer.command_complete(&command_tag(&sql, rows)),
+                    Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Validates and activates `name` as the connection's database, warming
+    /// the catalog cache in the process.
+    async fn use_database(&mut self, name: &str) -> Result<(), Dispatch> {
+        self.snapshot(Some(name)).await?;
+        self.current_db = Some(name.to_owned());
+        Ok(())
+    }
+
+    /// Emits a one-column `database` result listing the catalog.
+    async fn show_databases(&mut self) -> Result<(), Dispatch> {
+        let names = self.catalog.list().await.map_err(Dispatch::Catalog)?;
+        self.writer.row_description(&[database_field()]);
+        for name in &names {
+            self.writer.data_row(&[Some(name.clone().into_bytes())]);
+        }
+        self.writer.command_complete("SHOW");
+        Ok(())
+    }
+
+    /// Resolves an immutable snapshot for `database`, falling back to the
+    /// connection's active database.
+    async fn snapshot(&self, database: Option<&str>) -> Result<Db, Dispatch> {
+        let name = database
+            .map(str::to_owned)
+            .or_else(|| self.current_db.clone())
+            .ok_or(Dispatch::NoDatabase)?;
+        self.catalog.db(&name).await.map_err(Dispatch::Catalog)
     }
 
     /// Plans a query and returns its result columns without streaming rows.
@@ -417,18 +562,18 @@ where
         Ok(count)
     }
 
-    /// Emits an `ErrorResponse` for a simple-query failure.
-    fn report_sql_error(&mut self, error: &SqlError) {
+    /// Emits an `ErrorResponse` for a simple-query dispatch failure.
+    fn report_dispatch(&mut self, error: &Dispatch) {
+        let (code, message) = dispatch_error_fields(error);
         self.writer.error_response(&ErrorFields {
-            code: sqlstate_for(error),
-            message: &error.to_string(),
+            code,
+            message: &message,
         });
     }
 
-    /// Emits an `ErrorResponse` for an extended-protocol SQL failure and
-    /// enters the skip-until-`Sync` state.
-    fn fail_sql(&mut self, error: &SqlError) {
-        self.report_sql_error(error);
+    /// Emits an `ErrorResponse` and enters the skip-until-`Sync` state.
+    fn fail_dispatch(&mut self, error: &Dispatch) {
+        self.report_dispatch(error);
         self.failed = true;
     }
 
@@ -440,6 +585,16 @@ where
     }
 }
 
+/// The `RowDescription` field for the `SHOW DATABASES` result column.
+fn database_field() -> FieldDescription {
+    let type_oid = types::type_oid(&SqlType::Text);
+    FieldDescription {
+        name: "database".to_owned(),
+        type_oid,
+        type_len: types::type_len(type_oid),
+    }
+}
+
 /// Builds a `RowDescription` field from a result column.
 fn field_of(column: &SqlColumn) -> FieldDescription {
     let type_oid = types::type_oid(&column.data_type);
@@ -447,6 +602,19 @@ fn field_of(column: &SqlColumn) -> FieldDescription {
         name: column.name.clone(),
         type_oid,
         type_len: types::type_len(type_oid),
+    }
+}
+
+/// The `SQLSTATE` code and message an error is reported with.
+fn dispatch_error_fields(error: &Dispatch) -> (&'static str, String) {
+    match error {
+        Dispatch::NoDatabase => (
+            "3D000",
+            "no database selected; run \"USE <database>\" first".to_owned(),
+        ),
+        Dispatch::Catalog(error @ CatalogError::NotFound(_)) => ("3D000", error.to_string()),
+        Dispatch::Catalog(error @ CatalogError::Unavailable(_)) => ("08006", error.to_string()),
+        Dispatch::Sql(error) => (sqlstate_for(error), error.to_string()),
     }
 }
 
@@ -469,17 +637,57 @@ fn command_tag(sql: &str, rows: usize) -> String {
     }
 }
 
-/// If `sql` is a stateless control statement this server accepts as a no-op,
-/// returns the `CommandComplete` tag to report for it.
-fn control_tag(sql: &str) -> Option<&'static str> {
-    match first_keyword(sql).to_ascii_uppercase().as_str() {
-        "BEGIN" | "START" => Some("BEGIN"),
-        "COMMIT" | "END" => Some("COMMIT"),
-        "ROLLBACK" | "ABORT" => Some("ROLLBACK"),
-        "SET" => Some("SET"),
-        "RESET" => Some("RESET"),
-        "DISCARD" => Some("DISCARD ALL"),
-        _ => None,
+/// Classifies a statement so `USE`, `SHOW DATABASES`, and no-op control
+/// statements are handled before reaching `SqlSession`.
+fn classify(sql: &str) -> Statement {
+    let mut words = sql.split_whitespace();
+    let first = words.next().unwrap_or("").to_ascii_uppercase();
+    match first.as_str() {
+        "USE" => parse_use_target(sql).map_or(Statement::Query, Statement::Use),
+        "SHOW"
+            if words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("databases")) =>
+        {
+            Statement::ShowDatabases
+        }
+        "BEGIN" | "START" => Statement::Control("BEGIN"),
+        "COMMIT" | "END" => Statement::Control("COMMIT"),
+        "ROLLBACK" | "ABORT" => Statement::Control("ROLLBACK"),
+        "SET" => Statement::Control("SET"),
+        "RESET" => Statement::Control("RESET"),
+        "DISCARD" => Statement::Control("DISCARD ALL"),
+        _ => Statement::Query,
+    }
+}
+
+/// Extracts the database name from a `USE <database>` statement.
+fn parse_use_target(sql: &str) -> Option<String> {
+    let trimmed = sql.trim();
+    // `classify` matched `USE` as the first word, so the keyword is exactly
+    // the first three bytes.
+    let rest = trimmed.get(3..)?.trim().trim_end_matches(';').trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(unquote(rest))
+}
+
+/// Strips one layer of SQL single- or double-quoting, else takes the first
+/// whitespace-delimited token.
+fn unquote(value: &str) -> String {
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        inner.replace("\"\"", "\"")
+    } else if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        inner.replace("''", "'")
+    } else {
+        value.split_whitespace().next().unwrap_or("").to_owned()
     }
 }
 
@@ -611,10 +819,31 @@ mod tests {
 
     #[test]
     fn control_statements_are_recognized_case_insensitively() {
-        assert_eq!(control_tag("begin"), Some("BEGIN"));
-        assert_eq!(control_tag("  SET client_encoding TO 'UTF8'"), Some("SET"));
-        assert_eq!(control_tag("COMMIT"), Some("COMMIT"));
-        assert_eq!(control_tag("SELECT 1"), None);
+        assert!(matches!(classify("begin"), Statement::Control("BEGIN")));
+        assert!(matches!(
+            classify("  SET client_encoding TO 'UTF8'"),
+            Statement::Control("SET")
+        ));
+        assert!(matches!(classify("COMMIT"), Statement::Control("COMMIT")));
+        assert!(matches!(classify("SELECT 1"), Statement::Query));
+    }
+
+    #[test]
+    fn use_and_show_are_recognized() {
+        assert!(matches!(
+            classify("show databases"),
+            Statement::ShowDatabases
+        ));
+        match classify("USE \"my-db\"") {
+            Statement::Use(name) => assert_eq!(name, "my-db"),
+            _ => panic!("expected USE"),
+        }
+        match classify("use people;") {
+            Statement::Use(name) => assert_eq!(name, "people"),
+            _ => panic!("expected USE"),
+        }
+        // A bare `USE` with no target is left to fail as an ordinary query.
+        assert!(matches!(classify("USE"), Statement::Query));
     }
 
     #[test]

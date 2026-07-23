@@ -17,9 +17,20 @@ storage model and query location unchanged.
 
 A new crate, `corium-pgwire`, implements the PostgreSQL v3 frontend/backend
 protocol and answers every query by running it through a `corium_sql::SqlSession`
-built from a `Db` value supplied by a `DbSource`. The read-only guarantee is
+built from a `Db` value obtained from a `DbCatalog`. The read-only guarantee is
 inherited rather than re-implemented: `SqlSession` already rejects DDL, DML,
 and session-mutating statements, so the wire server adds no write path.
+
+One server exposes the transactor's whole catalog rather than a single
+database. `DbCatalog` is an async trait — `list()` enumerates the databases and
+`db(name)` returns a fresh immutable snapshot — that implementations back with
+lazily opened, cached peer connections, so a database and its segment cache are
+shared across all client connections that use it. A connection selects its
+database with the standard startup `database` parameter and switches with
+`USE <database>`; `SHOW DATABASES` lists the catalog. The database is validated
+lazily on first use, so a client may connect with an unknown conventional
+default and then `USE` a real one. The CLI can restrict the exposed set with a
+whitelist.
 
 Scope of the first implementation:
 
@@ -48,11 +59,11 @@ Scope of the first implementation:
   `timestamptz` in UTC, bytes to hex `bytea`, and cardinality-many lists to the
   matching array type.
 
-The crate depends only on `corium-sql`, `corium-db`, `corium-core`, and
-`tokio`; it does not depend on `corium-peer`, so the database source is a
-trait. The `corium postgres-server` CLI command connects a peer and serves the
-protocol with `move || connection.db()` as the source, mirroring how
-`corium peer-server` hosts one database.
+The crate depends only on `corium-sql`, `corium-db`, `corium-core`, `tokio`,
+and `async-trait`; it does not depend on `corium-peer`, so the catalog is a
+trait. The `corium postgres-server` CLI command supplies a `PeerCatalog` that
+lists databases through the transactor's admin API and opens each one as a
+cached peer `Connection` on first use.
 
 ## Consequences
 

@@ -11,8 +11,10 @@ Ships the `corium` command. Subcommands:
   `fs`, `postgres`, `turso`, `s3`), with lease/HA (`--ha`, `--advertise`) and
   indexing options.
 - **`peer-server`** — host a peer as a gRPC endpoint for thin clients.
-- **`postgres-server`** — host one database over the PostgreSQL wire protocol
-  (read-only) for standard PostgreSQL clients and drivers.
+- **`postgres-server`** — serve the database catalog over the PostgreSQL wire
+  protocol (read-only) for standard PostgreSQL clients and drivers; clients
+  pick a database with `USE`/the startup parameter and list them with
+  `SHOW DATABASES`.
 - **`db create` / `delete` / `fork` / `list` / `stats`** — database
   administration, including restore-as-clone forks.
 - **`db request-index` / `index-policy`** — drive and tune background indexing.
@@ -41,9 +43,9 @@ Ships the `corium` command. Subcommands:
 This crate is a thin composition layer — it wires the library crates into
 runnable processes and interactive tools but holds little logic of its own. The
 transactor and peer-server subcommands construct and run `corium-transactor` and
-`corium-peer` servers; `postgres-server` drives a peer `Connection` through the
-`corium-pgwire` protocol server; the `console`, `tui`, `sql`, and `db *`
-subcommands drive a peer `Connection` and render results. Storage-backend selection and TLS/token
+`corium-peer` servers; `postgres-server` serves the `corium-pgwire` protocol
+over a catalog of lazily cached peer connections; the `console`, `tui`, `sql`,
+and `db *` subcommands drive a peer `Connection` and render results. Storage-backend selection and TLS/token
 auth are surfaced as flags and forwarded down to the relevant crate. See
 [`docs/getting-started.md`](../../docs/getting-started.md) and
 [`docs/operations.md`](../../docs/operations.md).

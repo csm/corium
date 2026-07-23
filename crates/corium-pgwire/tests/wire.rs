@@ -9,9 +9,30 @@ use corium_core::{
     Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, Schema, Value, ValueType,
 };
 use corium_db::{Db, Idents};
-use corium_pgwire::{PgWireConfig, serve};
+use corium_pgwire::{CatalogError, DbCatalog, PgWireConfig, serve};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
+
+/// A catalog serving one fixture database under several names.
+struct TestCatalog {
+    db: Db,
+    names: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl DbCatalog for TestCatalog {
+    async fn list(&self) -> Result<Vec<String>, CatalogError> {
+        Ok(self.names.clone())
+    }
+
+    async fn db(&self, name: &str) -> Result<Db, CatalogError> {
+        if self.names.iter().any(|known| known == name) {
+            Ok(self.db.clone())
+        } else {
+            Err(CatalogError::NotFound(name.to_owned()))
+        }
+    }
+}
 
 /// Builds a small two-artist database mirroring the `corium-sql` fixture.
 fn fixture() -> Db {
@@ -94,9 +115,12 @@ fn fixture() -> Db {
 async fn start_server(config: PgWireConfig) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let source = Arc::new(fixture);
+    let catalog = Arc::new(TestCatalog {
+        db: fixture(),
+        names: vec!["corium".to_owned(), "people".to_owned()],
+    });
     tokio::spawn(async move {
-        let _ = serve(listener, source, config, std::future::pending::<()>()).await;
+        let _ = serve(listener, catalog, config, std::future::pending::<()>()).await;
     });
     address
 }
@@ -279,7 +303,9 @@ async fn simple_query_returns_rows_and_ready() {
 async fn cardinality_many_renders_as_array_literal() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
-    client.startup(&[("user", "postgres")]).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
     client.read_until_ready().await;
 
     client
@@ -298,7 +324,9 @@ async fn cardinality_many_renders_as_array_literal() {
 async fn writes_are_rejected_but_the_session_survives() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
-    client.startup(&[("user", "postgres")]).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
     client.read_until_ready().await;
 
     client
@@ -363,7 +391,9 @@ async fn cleartext_password_is_required_when_configured() {
 async fn extended_protocol_runs_a_parameterless_query() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
-    client.startup(&[("user", "postgres")]).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
     client.read_until_ready().await;
 
     // Parse (unnamed statement, no parameter types).
@@ -398,4 +428,73 @@ async fn extended_protocol_runs_a_parameterless_query() {
     // ParseComplete, BindComplete, RowDescription, 2x DataRow,
     // CommandComplete, ReadyForQuery.
     assert_eq!(tags, vec![b'1', b'2', b'T', b'D', b'D', b'C', b'Z']);
+}
+
+#[tokio::test]
+async fn show_databases_lists_the_catalog() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client.query("SHOW DATABASES").await;
+    let response = client.read_until_ready().await;
+
+    let description = response
+        .iter()
+        .find(|message| message.tag == b'T')
+        .expect("row description");
+    assert_eq!(
+        row_description_names(&description.body),
+        vec!["database".to_owned()]
+    );
+    let names: Vec<Option<String>> = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .flat_map(|message| data_row_values(&message.body))
+        .collect();
+    assert_eq!(
+        names,
+        vec![Some("corium".to_owned()), Some("people".to_owned())]
+    );
+    let complete = response
+        .iter()
+        .find(|message| message.tag == b'C')
+        .expect("command complete");
+    assert_eq!(cstrings(&complete.body), vec!["SHOW".to_owned()]);
+}
+
+#[tokio::test]
+async fn use_switches_the_active_database() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    // Connect without a database; queries fail until one is selected.
+    client.startup(&[("user", "postgres")]).await;
+    client.read_until_ready().await;
+
+    client.query("SELECT 1").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(response.first().unwrap().tag, b'E');
+
+    // Switching to a known database makes queries work.
+    client.query("USE people").await;
+    let response = client.read_until_ready().await;
+    let complete = response
+        .iter()
+        .find(|message| message.tag == b'C')
+        .expect("command complete");
+    assert_eq!(cstrings(&complete.body), vec!["USE".to_owned()]);
+
+    client
+        .query("SELECT name FROM corium.artist ORDER BY name")
+        .await;
+    let response = client.read_until_ready().await;
+    assert!(response.iter().any(|message| message.tag == b'D'));
+
+    // Switching to an unknown database is an error.
+    client.query("USE nope").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(response.first().unwrap().tag, b'E');
 }

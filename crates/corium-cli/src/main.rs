@@ -3,6 +3,7 @@
 
 mod console;
 mod metrics_http;
+mod pg_catalog;
 mod sql;
 mod tui;
 
@@ -281,11 +282,14 @@ enum Command {
         #[command(flatten)]
         serve: ServeFlags,
     },
-    /// Serve one database over the `PostgreSQL` wire protocol (read-only).
+    /// Serve the database catalog over the `PostgreSQL` wire protocol
+    /// (read-only). Clients pick a database with the startup `database`
+    /// parameter or `USE <db>`, and list them with `SHOW DATABASES`.
     PostgresServer {
-        /// Database to host.
-        #[arg(long)]
-        db: String,
+        /// Restrict the databases clients may reach (repeatable). When
+        /// omitted, every database in the transactor's catalog is exposed.
+        #[arg(long = "database")]
+        databases: Vec<String>,
         /// Listen address.
         #[arg(long, default_value = "127.0.0.1:5432")]
         listen: SocketAddr,
@@ -640,35 +644,22 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|error| error.to_string())
         }
         Command::PostgresServer {
-            db,
+            databases,
             listen,
             password,
             client,
         } => {
-            let config = client.connect_config(db).await?;
-            let connection = Arc::new(
-                Connection::connect(config)
-                    .await
-                    .map_err(|error| format!("cannot connect to transactor: {error}"))?,
-            );
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|error| format!("cannot bind {listen}: {error}"))?;
+            let catalog = Arc::new(pg_catalog::PeerCatalog::new(client, databases));
             let pg_config = corium_pgwire::PgWireConfig {
-                database: connection.db_name().to_owned(),
                 password,
                 ..corium_pgwire::PgWireConfig::default()
             };
-            let source = {
-                let connection = Arc::clone(&connection);
-                Arc::new(move || connection.db())
-            };
             tracing::info!(%listen, "postgres server serving");
-            eprintln!(
-                "corium postgres-server: serving {:?} on {listen}",
-                connection.db_name()
-            );
-            corium_pgwire::serve(listener, source, pg_config, async {
+            eprintln!("corium postgres-server: serving the database catalog on {listen}");
+            corium_pgwire::serve(listener, catalog, pg_config, async {
                 let _ = tokio::signal::ctrl_c().await;
             })
             .await

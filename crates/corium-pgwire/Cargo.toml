@@ -8,6 +8,7 @@ homepage.workspace = true
 description = "PostgreSQL wire-protocol front end for read-only Corium SQL"
 
 [dependencies]
+async-trait = "0.1"
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-sql = { workspace = true }

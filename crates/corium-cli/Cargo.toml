@@ -21,6 +21,7 @@ turso = ["corium-transactor/turso"]
 s3 = ["corium-transactor/s3"]
 
 [dependencies]
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 corium-cljrs = { workspace = true }
 corium-core = { workspace = true }
