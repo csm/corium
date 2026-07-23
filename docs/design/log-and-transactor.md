@@ -111,17 +111,26 @@ tx N+1 may overlap the log flush of tx N, but log append order defines t.
 > same state they would one-at-a-time), makes the batch durable with **one**
 > `append_batch_async` (on native backends, one object / one row — see the
 > log status note above), installs it in memory, runs **one** post-append
-> ownership fence for the batch, then answers every queued caller. The whole
+> ownership fence for the batch, then answers every queued caller. That fence
+> is the batch's *only* lease check on the common path — the pre-append check
+> is skipped, since a deposed leader's append lands harmlessly under its old
+> lease version (discarded by the successor's cutoff) and the fence refuses to
+> acknowledge it; a batch that interns new keywords is the one exception and
+> re-checks ownership before publishing the unfenced metadata root. The whole
 > batch is one atomic log object, so a takeover's cutoff keeps all or none of
 > it. A transaction that interns new keywords ends the batch (its names must
 > be durable in metadata before the next transaction can reference them); the
 > remainder is requeued. A rejected transaction (validation error) fails alone
-> and its batchmates still commit. Under no contention a batch is size 1, so
-> low-load latency is unchanged; under load the expensive durable write and
-> fence amortize across the batch, lifting the single-writer throughput
-> ceiling. Still open: **optimistic-apply overlap** (validating tx N+1's CPU
-> work concurrently with tx N's flush across *separate* batches) and an
-> explicit **bounded queue with fast-fail backpressure** (below).
+> and its batchmates still commit. Batch size is capped by count and encoded
+> bytes (`NodeConfig::max_commit_batch` / `max_commit_batch_bytes`), so a
+> larger cap trades a bigger per-batch log object for higher peak throughput.
+> Under no contention a batch is size 1, so low-load latency is unchanged;
+> under load the expensive durable write and fence amortize across the batch,
+> lifting the single-writer throughput ceiling. Still open: **optimistic-apply
+> overlap** (validating tx N+1's CPU work concurrently with tx N's flush
+> across *separate* batches), **pipelined flushes** (more than one batch's
+> durable write in flight at once), and an explicit **bounded queue with
+> fast-fail backpressure** (below).
 
 Backpressure: a bounded queue in front of the pipeline; transact calls beyond
 it fail fast with a busy error (clients retry with backoff).

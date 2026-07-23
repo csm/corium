@@ -84,6 +84,17 @@ pub struct NodeConfig {
     pub gc_interval: Option<Duration>,
     /// Minimum age of an unreachable blob before scheduled/manual online GC.
     pub gc_retention: Duration,
+    /// Most transactions grouped into one commit batch (group commit). A batch
+    /// commits under one durable append and one ownership fence, so a larger
+    /// cap raises peak write throughput under high concurrency at the cost of a
+    /// larger log object per batch; `1` effectively disables batching. Ignored
+    /// once [`Self::max_commit_batch_bytes`] is reached first.
+    pub max_commit_batch: usize,
+    /// Byte budget for one commit batch: it stops accepting more transactions
+    /// once their combined encoded size reaches this, bounding the per-batch
+    /// log object even when transactions are large. At least one transaction
+    /// always commits, so a single oversized transaction is not blocked.
+    pub max_commit_batch_bytes: usize,
     /// Optional database-function expander (`:db/fn` support).
     pub tx_fn_expander: Option<Arc<dyn TxFnExpander>>,
 }
@@ -105,6 +116,8 @@ impl std::fmt::Debug for NodeConfig {
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("gc_interval", &self.gc_interval)
             .field("gc_retention", &self.gc_retention)
+            .field("max_commit_batch", &self.max_commit_batch)
+            .field("max_commit_batch_bytes", &self.max_commit_batch_bytes)
             .field("tx_fn_expander", &self.tx_fn_expander.is_some())
             .finish()
     }
@@ -132,6 +145,8 @@ impl NodeConfig {
             heartbeat_interval: Duration::from_secs(10),
             gc_interval: Some(Duration::from_secs(60 * 60)),
             gc_retention: Duration::from_secs(72 * 60 * 60),
+            max_commit_batch: 256,
+            max_commit_batch_bytes: 4 * 1024 * 1024,
             #[cfg(feature = "cljrs")]
             tx_fn_expander: Some(Arc::new(crate::txfn::DbFnExpander::default())),
             #[cfg(not(feature = "cljrs"))]
@@ -1398,8 +1413,8 @@ impl TransactorNode {
     /// unprepared remainder is requeued for the next flush.
     #[allow(clippy::too_many_lines)]
     async fn flush_commit_batch(&self, state: &Arc<DbState>) {
-        /// Most transactions prepared into one batch.
-        const MAX_BATCH: usize = 64;
+        let max_count = self.config.max_commit_batch.max(1);
+        let max_bytes = self.config.max_commit_batch_bytes;
 
         let mut batch: VecDeque<CommitRequest> = {
             let mut pending = state
@@ -1411,29 +1426,22 @@ impl TransactorNode {
         if batch.is_empty() {
             return;
         }
-        // Pre-batch ownership check: a fast-fail, and it gates the unfenced
-        // metadata CAS below.
-        if let Err(error) = state.check_lease(self.store.as_ref()).await {
-            if matches!(error, NodeError::Deposed(_)) {
-                self.depose(state, "write lease lost before commit");
-            }
-            for request in batch {
-                let _ = request
-                    .resp
-                    .send(Err(batch_abort_error(&state.name, &error)));
-            }
-            return;
-        }
+        // No pre-append ownership check on the common path: the post-append
+        // fence below is the safety-critical one, and skipping the pre-check
+        // removes a lease round trip per batch. A deposed leader still prepares
+        // and appends (harmlessly, under its old lease version, which the
+        // successor's cutoff discards), then the fence refuses to acknowledge.
+        // The one exception is a batch that interns new keywords, which
+        // publishes the unfenced metadata root — that path re-checks ownership
+        // before writing it, below.
         let now_ms = now_unix_ms();
         let mut cursor = state.transactor.batch_cursor();
         let mut resps: Vec<oneshot::Sender<Result<pb::TransactResponse, NodeError>>> = Vec::new();
         let mut prepared: Vec<Prepared> = Vec::new();
+        let mut batch_bytes: usize = 0;
+        let mut measure = Vec::new();
         let mut naming_changed = false;
         while let Some(request) = batch.pop_front() {
-            if prepared.len() >= MAX_BATCH {
-                batch.push_front(request);
-                break;
-            }
             // Expand `:db/fn` against the staging value, so each transaction
             // sees the earlier ones in the batch. The expander blocks up to
             // its budget, so it runs off the async workers.
@@ -1476,6 +1484,9 @@ impl TransactorNode {
             };
             match cursor.prepare(items, now_ms) {
                 Ok(prep) => {
+                    measure.clear();
+                    let _ = corium_log::append_framed_record(&mut measure, &prep.record);
+                    batch_bytes += measure.len();
                     resps.push(request.resp);
                     prepared.push(prep);
                 }
@@ -1486,6 +1497,12 @@ impl TransactorNode {
             }
             if this_changed {
                 naming_changed = true;
+                break;
+            }
+            // Cap the batch by transaction count or accumulated encoded size.
+            // The transaction that crosses the byte budget is already included,
+            // so at least one — even a single oversized transaction — commits.
+            if prepared.len() >= max_count || batch_bytes >= max_bytes {
                 break;
             }
         }
@@ -1512,6 +1529,18 @@ impl TransactorNode {
             naming.interner.clone()
         };
         let changed_idents = if naming_changed {
+            // Publishing new keyword names writes the metadata root, which is
+            // not lease-fenced, so verify ownership before writing it. This is
+            // the one lease check the common (no-new-keyword) path skips.
+            if let Err(error) = state.check_lease(self.store.as_ref()).await {
+                if matches!(error, NodeError::Deposed(_)) {
+                    self.depose(state, "write lease lost before metadata publish");
+                }
+                for resp in resps {
+                    let _ = resp.send(Err(batch_abort_error(&state.name, &error)));
+                }
+                return;
+            }
             let (idents, schema) = {
                 let naming = state
                     .naming

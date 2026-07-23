@@ -96,7 +96,8 @@ known to enforce them — corium's CI uses LocalStack 4; recent MinIO and
 Garage v1.x also qualify. `--json` emits one JSON object
 per concurrency level for archiving. Other flags: `--transactions`,
 `--warmup`, `--concurrency a,b,c`, `--datoms-per-tx`, `--worker-threads`,
-`--index-interval-secs` (see `--help`).
+`--index-interval-secs`, `--max-batch` (group-commit batch cap — sweep it
+against high concurrency to find where batching stops helping) (see `--help`).
 
 For a *truly independent* remote target (e.g. a separate box running
 PostgreSQL/MinIO), run the benchmark on a different machine from the store so

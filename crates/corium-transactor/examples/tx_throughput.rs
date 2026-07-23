@@ -83,6 +83,9 @@ struct Args {
     /// Background index publication interval; large keeps the store bandwidth
     /// for the write path so the measurement isolates commits.
     index_interval_secs: u64,
+    /// Group-commit batch cap (`NodeConfig::max_commit_batch`); `None` keeps
+    /// the node default.
+    max_batch: Option<usize>,
 }
 
 impl Args {
@@ -101,6 +104,7 @@ impl Args {
             worker_threads: num_cpus(),
             json: false,
             index_interval_secs: 3_600,
+            max_batch: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -144,6 +148,9 @@ impl Args {
                     args.index_interval_secs =
                         value()?.parse().map_err(|_| "bad --index-interval-secs")?;
                 }
+                "--max-batch" => {
+                    args.max_batch = Some(value()?.parse().map_err(|_| "bad --max-batch")?);
+                }
                 "--json" => args.json = true,
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("unknown flag {other}\n\n{}", usage())),
@@ -168,6 +175,7 @@ fn usage() -> String {
      \x20 --datoms-per-tx <n>        payload datoms per transaction (default 2)\n\
      \x20 --worker-threads <n>       tokio workers (default: logical CPUs)\n\
      \x20 --index-interval-secs <n>  background indexing interval (default 3600)\n\
+     \x20 --max-batch <n>            group-commit batch cap (default: node default)\n\
      \x20 --json                     emit JSON lines instead of a table"
         .into()
 }
@@ -443,6 +451,9 @@ async fn run(args: Args) -> Result<(), String> {
     config.index_interval = Duration::from_secs(args.index_interval_secs);
     config.gc_interval = None;
     config.heartbeat_interval = Duration::from_secs(args.index_interval_secs);
+    if let Some(max_batch) = args.max_batch {
+        config.max_commit_batch = max_batch;
+    }
 
     let node = TransactorNode::open(config)
         .await
