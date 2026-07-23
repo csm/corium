@@ -1418,7 +1418,9 @@ impl TransactorNode {
                 self.depose(state, "write lease lost before commit");
             }
             for request in batch {
-                let _ = request.resp.send(Err(batch_abort_error(&state.name, &error)));
+                let _ = request
+                    .resp
+                    .send(Err(batch_abort_error(&state.name, &error)));
             }
             return;
         }

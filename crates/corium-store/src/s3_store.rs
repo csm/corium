@@ -189,7 +189,10 @@ impl S3BlobStore {
 
         // `If-None-Match: *`: the first create must succeed, and a second
         // create against the now-present key must be refused.
-        if !self.put_conditional(&key, b"1".to_vec(), None, true).await? {
+        if !self
+            .put_conditional(&key, b"1".to_vec(), None, true)
+            .await?
+        {
             return Err(StoreError::S3(
                 "conditional-write probe: initial If-None-Match:* create was rejected".into(),
             ));
@@ -200,7 +203,10 @@ impl S3BlobStore {
                  unsafe on it (a deposed writer's publish would not be fenced)"
             ))
         };
-        if self.put_conditional(&key, b"2".to_vec(), None, true).await? {
+        if self
+            .put_conditional(&key, b"2".to_vec(), None, true)
+            .await?
+        {
             let _ = self.delete_root(&name).await;
             return Err(unenforced("If-None-Match:* (create-only)"));
         }

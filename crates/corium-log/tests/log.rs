@@ -250,9 +250,7 @@ impl corium_log::NativeLogStorage for TestNativeStorage {
             .lock()
             .expect("lock")
             .keys()
-            .filter_map(|(record_name, version, t)| {
-                (record_name == name).then_some((*version, *t))
-            })
+            .filter_map(|(record_name, version, t)| (record_name == name).then_some((*version, *t)))
             .collect())
     }
 
@@ -426,7 +424,10 @@ async fn native_versioned_log_batches_a_run_into_one_object() {
     // A batch of four is written as one object, keyed by its last `t`.
     let batch: Vec<_> = (1..=4).map(record).collect();
     log.append_batch_async(&batch).await.expect("append batch");
-    assert_eq!(storage.list_records("db").await.expect("records"), vec![(1, 4)]);
+    assert_eq!(
+        storage.list_records("db").await.expect("records"),
+        vec![(1, 4)]
+    );
     // A single append and a second batch continue the contiguous run.
     log.append_async(&record(5)).await.expect("append 5");
     log.append_batch_async(&[record(6), record(7)])
@@ -485,7 +486,11 @@ async fn native_versioned_log_replays_legacy_chunks_then_appends_records() {
     // The new records are per-record objects; the legacy chunks are untouched.
     assert_eq!(storage.list_records("db").await.expect("records").len(), 2);
     assert_eq!(
-        storage.list_legacy_chunks("db").await.expect("chunks").len(),
+        storage
+            .list_legacy_chunks("db")
+            .await
+            .expect("chunks")
+            .len(),
         2
     );
 }

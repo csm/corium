@@ -17,7 +17,10 @@ fn schema() -> Vec<u8> {
             Edn::keyword("db/cardinality"),
             Edn::keyword("db.cardinality/one"),
         ),
-        (Edn::keyword("db/unique"), Edn::keyword("db.unique/identity")),
+        (
+            Edn::keyword("db/unique"),
+            Edn::keyword("db.unique/identity"),
+        ),
     ])]))
 }
 
