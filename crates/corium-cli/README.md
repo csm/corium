@@ -32,11 +32,13 @@ Ships the `corium` command. Subcommands:
 
 - Every Corium library crate (`corium-core`, `corium-db`, `corium-peer`,
   `corium-pgwire`, `corium-protocol`, `corium-query`, `corium-sql`,
-  `corium-store`, `corium-transactor`, `corium-cljrs`, `corium-log`).
+  `corium-store`, `corium-transactor`, `corium-log`).
 - `clap` (arg parsing), `tokio` + `tonic` + `rustls` (networking/TLS),
   `ratatui` + `rustyline` (TUI/console line editing), `tracing`-subscriber
   (human/JSON logs).
-- Storage backends are feature-forwarded: `postgres`, `turso`, `s3`.
+- Storage backends are feature-forwarded: `postgres`, `turso`, `s3`. The
+  `cljrs` feature (default) forwards the transactor's built-in `:db/fn`
+  runtime; `--db-fn-fuel` and `--db-fn-memory-bytes` set its budgets.
 
 ## Architecture
 

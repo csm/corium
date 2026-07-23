@@ -103,3 +103,15 @@ Query predicate/function clauses reuse the same sandbox host through the
 `ExternCall` seam in `corium-query` (wired at M5; registration is explicit —
 `:db/fn`-style user query fns remain post-v1), with the same fuel
 discipline.
+
+**Superseded on the transactor path (2026-07, ADR-0008 addendum).** The
+transactor's built-in `:db/fn` runtime is now `corium-transactor::txfn` on
+upstream `cljrs-tx`: a tree-walker-only interpreter whose every invocation
+runs in a fresh bounded arena (no GC, no worker thread, no watchdog) under
+gas/memory/call-depth budgets. Only pure boundary data crosses the arena
+boundary; functions receive an opaque db *token* and the read-only
+`corium.api` operations are host functions that interpret the token against
+the database value they close over. The GC-mode sandbox described above
+remains in `corium-cljrs` for client-side embeddings, which is why that
+crate builds standalone (the `no-gc` cargo feature `cljrs-tx` requires
+unifies globally across a build's cljrs stack).

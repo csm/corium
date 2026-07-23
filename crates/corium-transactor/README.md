@@ -8,9 +8,9 @@ transactor process (lease, gRPC services, indexing job, HA).
 Corium's write side. Two layers:
 
 - **Embedded pipeline** — serialize transactions, expand/validate them (via
-  `corium-tx`, including sandboxed `:db/fn` through `corium-cljrs`), assign the
-  tx entity and timestamp, append to the durable log, ack the caller, and emit
-  a `TxReport`.
+  `corium-tx`, including `:db/fn` database functions through the built-in
+  `txfn` runtime), assign the tx entity and timestamp, append to the durable
+  log, ack the caller, and emit a `TxReport`.
 - **Networked node** — the standalone transactor process: acquire and renew the
   write **lease** (CAS-fenced in the root record), serve the Transactor/Catalog
   gRPC services, stream tx-reports to peers with gapless backfill, and run the
@@ -29,6 +29,14 @@ takeover-as-crash-recovery, depose-to-standby).
 - `tracing` for observability; `thiserror` for errors.
 - Feature-gated storage backends: `postgres`, `turso`, `s3` (forwarded to
   `corium-store`).
+- `cljrs` (default): the built-in `:db/fn` transaction-function runtime
+  (`txfn` module) on the bounded, GC-less `cljrs-tx` interpreter — gas,
+  managed-memory, and call-depth budgets per invocation, read-only
+  `corium.api` host functions over an opaque db token, wired as
+  `NodeConfig`'s default `tx_fn_expander` (ADR-0008 addendum). Enabling it
+  turns on the cljrs stack's global `no-gc` feature, which unifies onto
+  every cljrs crate in the same build — the reason `corium-cljrs` builds
+  standalone.
 
 ## Architecture
 

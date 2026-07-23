@@ -20,8 +20,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # GC-mode cljrs crates build standalone so they keep GC mode (see ci.yml).
+      - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
+      - run: |
+          cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
+          cargo test -p corium-cljrs -p corium-mbrainz
 
   publish:
     name: "Publish to crates.io"
