@@ -53,6 +53,9 @@ pub enum TransactError {
     /// An index-building worker failed before returning its result.
     #[error("index task failed: {0}")]
     IndexTask(String),
+    /// A synchronous caller raced an asynchronous transaction in progress.
+    #[error("an asynchronous transaction is already in progress")]
+    AsyncTransactionPending,
     /// A newer lease version owns the database root; this writer is deposed.
     #[error("deposed: database root is owned by lease version {published}")]
     Deposed {
@@ -66,6 +69,23 @@ struct State {
     next_user: u64,
     last_instant: i64,
     subscribers: Vec<mpsc::Sender<TxReport>>,
+    async_pending: bool,
+}
+
+struct AsyncPending<'a> {
+    state: &'a Mutex<State>,
+    active: bool,
+}
+
+impl Drop for AsyncPending<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .async_pending = false;
+        }
+    }
 }
 
 /// The next free user-partition entity id given a run of datoms and a floor,
@@ -81,6 +101,7 @@ fn next_user_id<'a>(datoms: impl Iterator<Item = &'a corium_core::Datom>, floor:
 pub struct EmbeddedTransactor {
     log: Arc<dyn TransactionLog>,
     state: Mutex<State>,
+    async_commit: tokio::sync::Mutex<()>,
 }
 impl EmbeddedTransactor {
     /// Recovers a transactor by replaying the durable log exactly once.
@@ -106,7 +127,7 @@ impl EmbeddedTransactor {
         // Allocation must resume past every id that ever appeared in the log,
         // not just ids with current datoms; otherwise a fully retracted
         // entity's id would be reused after a restart.
-        let next_user = next_user_id(db.recorded_datoms().iter(), FIRST_USER_ID);
+        let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
         Ok(Self {
             log,
             state: Mutex::new(State {
@@ -114,8 +135,46 @@ impl EmbeddedTransactor {
                 next_user,
                 last_instant,
                 subscribers: Vec::new(),
+                async_pending: false,
             }),
+            async_commit: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Recovers a transactor through the log's asynchronous storage path.
+    ///
+    /// # Errors
+    /// Returns an error when the durable log cannot be replayed.
+    pub async fn recover_from_async(
+        base: Db,
+        log: Arc<dyn TransactionLog>,
+    ) -> Result<Self, TransactError> {
+        let records = log.replay_async().await?;
+        Ok(Self::recover_from_records(base, log, records))
+    }
+
+    fn recover_from_records(
+        mut db: Db,
+        log: Arc<dyn TransactionLog>,
+        records: Vec<TxRecord>,
+    ) -> Self {
+        let mut last_instant = i64::MIN;
+        for record in records {
+            db = db.with_transaction(record.t, &record.datoms);
+            last_instant = last_instant.max(record.tx_instant);
+        }
+        let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
+        Self {
+            log,
+            state: Mutex::new(State {
+                db,
+                next_user,
+                last_instant,
+                subscribers: Vec::new(),
+                async_pending: false,
+            }),
+            async_commit: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Recovers from a published current-state snapshot plus the log tail,
@@ -166,7 +225,43 @@ impl EmbeddedTransactor {
                 next_user,
                 last_instant,
                 subscribers: Vec::new(),
+                async_pending: false,
             }),
+            async_commit: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Recovers from a published snapshot plus an asynchronously read log
+    /// tail.
+    ///
+    /// # Errors
+    /// Returns an error when the log tail cannot be replayed.
+    pub async fn recover_from_snapshot_async(
+        snapshot: Db,
+        next_entity_id: u64,
+        last_tx_instant: i64,
+        log: Arc<dyn TransactionLog>,
+    ) -> Result<Self, TransactError> {
+        let index_basis = snapshot.basis_t();
+        let records = log.tx_range_async(index_basis + 1, None).await?;
+        let mut db = snapshot;
+        let mut last_instant = last_tx_instant;
+        let mut next_user = next_entity_id.max(FIRST_USER_ID);
+        for record in records {
+            db = db.with_transaction(record.t, &record.datoms);
+            last_instant = last_instant.max(record.tx_instant);
+            next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
+        }
+        Ok(Self {
+            log,
+            state: Mutex::new(State {
+                db,
+                next_user,
+                last_instant,
+                subscribers: Vec::new(),
+                async_pending: false,
+            }),
+            async_commit: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -212,6 +307,9 @@ impl EmbeddedTransactor {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.async_pending {
+            return Err(TransactError::AsyncTransactionPending);
+        }
         let before = state.db.clone();
         let t = before.basis_t() + 1;
         let tx_id = EntityId::new(Partition::Tx as u32, t);
@@ -239,6 +337,84 @@ impl EmbeddedTransactor {
             .max()
             .unwrap_or(state.next_user)
             .max(state.next_user);
+        let report = TxReport {
+            db_before: before,
+            db_after: state.db.clone(),
+            tx: prepared,
+            tx_instant,
+        };
+        state
+            .subscribers
+            .retain(|subscriber| subscriber.send(report.clone()).is_ok());
+        Ok(report)
+    }
+
+    /// Validates under a short state lock, awaits durability without holding
+    /// that lock, then atomically publishes the durable transaction in memory.
+    /// Async calls are serialized here so standalone callers have the same
+    /// single-writer guarantee as node-hosted callers.
+    ///
+    /// # Errors
+    /// Returns an error for rejected transaction data, clock failure, or when
+    /// the durable append fails. No report is sent on error.
+    pub async fn transact_async(
+        &self,
+        items: impl IntoIterator<Item = TxItem>,
+    ) -> Result<TxReport, TransactError> {
+        let _commit = self.async_commit.lock().await;
+        let (before, prepared, t, tx_instant) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.async_pending {
+                return Err(TransactError::AsyncTransactionPending);
+            }
+            let before = state.db.clone();
+            let t = before.basis_t() + 1;
+            let tx_id = EntityId::new(Partition::Tx as u32, t);
+            let prepared = prepare(&before, items, tx_id, state.next_user)?;
+            let millis = i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| TransactError::Clock)?
+                    .as_millis(),
+            )
+            .unwrap_or(i64::MAX);
+            let tx_instant = millis.max(state.last_instant.saturating_add(1));
+            state.async_pending = true;
+            (before, prepared, t, tx_instant)
+        };
+        let record = TxRecord {
+            t,
+            tx_instant,
+            datoms: prepared.datoms.clone(),
+        };
+        let mut pending = AsyncPending {
+            state: &self.state,
+            active: true,
+        };
+        self.log.append_async(&record).await?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert_eq!(state.db.basis_t() + 1, t);
+        // Apply to the live value so a naming-only update that ran while the
+        // append was pending is preserved; transaction-bearing state cannot
+        // change while `async_pending` is set.
+        state.db = state.db.clone().with_transaction(t, &prepared.datoms);
+        state.last_instant = tx_instant;
+        state.next_user = prepared
+            .tempids
+            .values()
+            .filter(|e| e.partition() == Partition::User as u32)
+            .map(|e| e.sequence() + 1)
+            .max()
+            .unwrap_or(state.next_user)
+            .max(state.next_user);
+        state.async_pending = false;
+        pending.active = false;
         let report = TxReport {
             db_before: before,
             db_after: state.db.clone(),

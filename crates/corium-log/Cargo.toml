@@ -9,10 +9,13 @@ description = "Durable append-only transaction logs with replay and range scans"
 
 [dependencies]
 corium-core = { workspace = true }
+async-trait = "0.1"
 thiserror = "2"
+tokio = { version = "1.53.0", features = ["sync"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread"] }

@@ -9,6 +9,7 @@ description = "Immutable database values"
 
 [dependencies]
 corium-core = { workspace = true }
+rpds = { workspace = true }
 
 [lints]
 workspace = true

@@ -22,12 +22,17 @@ chunks by the indexing job). The `corium-log` crate hides this behind
 > **Status:** the filesystem layout (per-lease-version files under the data
 > directory) and the shared-storage layout are both implemented. The native
 > backends (PostgreSQL, Turso, S3) store the log through the root store as a
-> `(db, lease-version, t)` record per commit (`corium-log`'s
-> `NativeVersionedLog`), so log durability is the storage service's and HA
-> no longer needs a shared data directory. The object-store *chunk-sealing*
-> optimization below (compacting the tail under a `log-root`) is still
-> future work; the per-transaction record layout carries the same
-> lease-version fencing in the meantime.
+> sequence of chunk objects keyed `(db, lease-version, chunk)` (`corium-log`'s
+> `NativeVersionedLog`): a writer appends framed records to its highest chunk
+> and rolls to a fresh one once it reaches `LOG_CHUNK_MAX_BYTES`, so log
+> durability is the storage service's, HA no longer needs a shared data
+> directory, and per-append rewrite cost stays bounded instead of growing with
+> the whole log (chunk `0` is the single whole-log object earlier releases
+> wrote, so existing logs need no migration). Readers concatenate a version's
+> chunks in order and apply the same lease-version merge cutoff. The
+> object-store *chunk-sealing / compaction* optimization below (linking sealed
+> chunks under a `log-root` and reclaiming superseded objects) is still future
+> work.
 
 ### Object-store log layout (future)
 

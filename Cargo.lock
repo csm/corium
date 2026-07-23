@@ -1846,12 +1846,14 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "corium-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "corium-cljrs",
  "corium-core",
  "corium-db",
  "corium-log",
  "corium-peer",
+ "corium-pgwire",
  "corium-protocol",
  "corium-query",
  "corium-sql",
@@ -1925,6 +1927,7 @@ name = "corium-db"
 version = "0.1.0"
 dependencies = [
  "corium-core",
+ "rpds",
 ]
 
 [[package]]
@@ -1951,9 +1954,11 @@ dependencies = [
 name = "corium-log"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "corium-core",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1995,6 +2000,19 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "corium-pgwire"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "corium-core",
+ "corium-db",
+ "corium-sql",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 

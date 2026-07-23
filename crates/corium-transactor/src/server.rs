@@ -77,21 +77,10 @@ pub(crate) fn subscription_stream(
         }
         let mut last_sent = from_basis_t;
         if from_basis_t < basis {
-            let backfill = {
-                let state = Arc::clone(&state);
-                tokio::task::spawn_blocking(move || {
-                    state.tx_range(from_basis_t + 1, Some(basis + 1))
-                })
-                .await
-            };
-            let records = match backfill {
-                Ok(Ok(records)) => records,
-                Ok(Err(error)) => {
-                    let _ = tx.send(Err(to_status(&error))).await;
-                    return;
-                }
+            let records = match state.tx_range(from_basis_t + 1, Some(basis + 1)).await {
+                Ok(records) => records,
                 Err(error) => {
-                    let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                    let _ = tx.send(Err(to_status(&error))).await;
                     return;
                 }
             };

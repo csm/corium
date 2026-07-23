@@ -1,5 +1,6 @@
 //! Durable append-only transaction logs with replay and range scans.
 
+use async_trait::async_trait;
 use corium_core::{
     Datom, EntityId,
     encoding::{decode_value, encode_value},
@@ -36,26 +37,57 @@ pub enum LogError {
     /// Native store backend failure.
     #[error("native transaction log store failed: {0}")]
     Native(String),
+    /// The operation requires the asynchronous log interface.
+    #[error("this transaction log requires asynchronous access")]
+    AsyncOnly,
 }
 
 /// Common transaction log interface.
+#[async_trait]
 pub trait TransactionLog: Send + Sync {
     /// Durably appends exactly the next transaction.
     ///
     /// # Errors
     /// Returns an error for I/O failure, corruption, or a non-contiguous `t`.
     fn append(&self, record: &TxRecord) -> Result<(), LogError>;
+    /// Durably appends exactly the next transaction without blocking an async
+    /// runtime worker. Synchronous logs use [`Self::append`] by default;
+    /// storage-backed logs override this method and await their backend.
+    ///
+    /// # Errors
+    /// Returns an error for I/O failure, corruption, or a non-contiguous `t`.
+    async fn append_async(&self, record: &TxRecord) -> Result<(), LogError> {
+        self.append(record)
+    }
     /// Returns records in the half-open transaction range `[start, end)`.
     ///
     /// # Errors
     /// Returns an error when stored records cannot be read or decoded.
     fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError>;
+    /// Asynchronous form of [`Self::tx_range`].
+    ///
+    /// # Errors
+    /// Returns an error when stored records cannot be read or decoded.
+    async fn tx_range_async(
+        &self,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<TxRecord>, LogError> {
+        self.tx_range(start, end)
+    }
     /// Replays every committed record.
     ///
     /// # Errors
     /// Returns an error when stored records cannot be read or decoded.
     fn replay(&self) -> Result<Vec<TxRecord>, LogError> {
         self.tx_range(0, None)
+    }
+    /// Asynchronously replays every committed record.
+    ///
+    /// # Errors
+    /// Returns an error when stored records cannot be read or decoded.
+    async fn replay_async(&self) -> Result<Vec<TxRecord>, LogError> {
+        self.tx_range_async(0, None).await
     }
 }
 
@@ -274,40 +306,85 @@ fn merge_versions(mut per_version: Vec<Vec<TxRecord>>) -> Vec<TxRecord> {
     per_version.into_iter().flatten().collect()
 }
 
-/// Synchronous byte store for versioned transaction-log objects.
+/// Target maximum size of a live log chunk. Once the chunk a writer is
+/// appending to reaches this size, the next append rolls to a fresh chunk, so
+/// per-append rewrite cost stays bounded by this constant instead of growing
+/// with the whole log. A large individual record still fits in its own chunk.
+pub(crate) const LOG_CHUNK_MAX_BYTES: usize = 256 * 1024;
+
+/// Asynchronous byte store for chunked transaction-log objects.
 ///
-/// Implementations usually adapt the same native storage system used for
-/// blobs and roots. Each object is one lease-version log for one database.
+/// Implementations usually adapt the same native storage system used for blobs
+/// and roots. A database's log for one lease version is a sequence of chunk
+/// objects `(name, version, chunk)`, each a run of framed records; a writer
+/// appends to the highest chunk and rolls to the next once it fills, so no
+/// single object grows without bound. Chunk `0` of a version is the whole-log
+/// object earlier releases wrote, so existing logs read back as their chunk `0`.
+#[async_trait]
 pub trait NativeLogStorage: Send + Sync {
-    /// Reads the encoded bytes for `name` and `version`.
+    /// Reads the encoded bytes for one `(name, version, chunk)` object.
     ///
     /// # Errors
-    /// Returns an error when the native backend cannot read the version
-    /// object or when backend data cannot be represented as log bytes.
-    fn read_version(&self, name: &str, version: u64) -> Result<Option<Vec<u8>>, LogError>;
-    /// Compare-and-swap writes encoded bytes for `name` and `version`.
-    ///
-    /// # Errors
-    /// Returns an error when the compare-and-swap fails, the native backend
-    /// cannot publish the version object, or the backend reports invalid data.
-    fn cas_version(
+    /// Returns an error when the native backend cannot read the chunk object
+    /// or when backend data cannot be represented as log bytes.
+    async fn read_chunk(
         &self,
         name: &str,
         version: u64,
+        chunk: u64,
+    ) -> Result<Option<Vec<u8>>, LogError>;
+    /// Compare-and-swap writes encoded bytes for one `(name, version, chunk)`
+    /// object.
+    ///
+    /// # Errors
+    /// Returns an error when the compare-and-swap fails, the native backend
+    /// cannot publish the chunk object, or the backend reports invalid data.
+    async fn cas_chunk(
+        &self,
+        name: &str,
+        version: u64,
+        chunk: u64,
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<(), LogError>;
-    /// Lists versions present for `name`, sorted ascending.
+    /// Lists every `(version, chunk)` pair present for `name`.
     ///
     /// # Errors
-    /// Returns an error when the native backend cannot enumerate version
-    /// objects or returns an invalid version identifier.
-    fn versions(&self, name: &str) -> Result<Vec<u64>, LogError>;
-    /// Deletes all versions for `name`.
+    /// Returns an error when the native backend cannot enumerate log objects
+    /// or returns an invalid identifier.
+    async fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError>;
+    /// Deletes every chunk of every version for `name`.
     ///
     /// # Errors
-    /// Returns an error when the native backend cannot remove a version object.
-    fn delete_versions(&self, name: &str) -> Result<(), LogError>;
+    /// Returns an error when the native backend cannot remove a chunk object.
+    async fn delete_all(&self, name: &str) -> Result<(), LogError>;
+}
+
+/// The mutable append state of a [`NativeVersionedLog`] writer: the next
+/// transaction number it will accept and a cached copy of the live chunk it is
+/// currently appending to.
+///
+/// The writer is the sole appender of its version's chunks (the lease fence
+/// gives each active owner its own version; a deposed writer's stale appends
+/// land in a version the takeover cutoff discards). Caching the live chunk and
+/// tracking `next_t` lets an append extend the buffer in place and
+/// compare-and-swap it, instead of re-reading, re-decoding, and re-copying the
+/// whole log on every transaction — the original behavior made each append cost
+/// proportional to the entire history, so write throughput fell off
+/// quadratically as the database grew. Rolling to a new chunk once the live one
+/// fills additionally bounds the per-append rewrite to [`LOG_CHUNK_MAX_BYTES`].
+struct WriteState {
+    /// Next `t` this writer will accept.
+    next_t: u64,
+    /// Index of the chunk currently being appended to.
+    chunk: u64,
+    /// Cached encoded bytes of the live chunk, kept in lock-step with the store
+    /// by only advancing it after a successful CAS.
+    bytes: Vec<u8>,
+    /// Whether the live chunk object exists in the store yet, so the first
+    /// append to it inserts (expected `None`) and later ones compare against
+    /// the prior bytes.
+    exists: bool,
 }
 
 /// Versioned transaction log backed by a native key/value-style store.
@@ -315,7 +392,7 @@ pub struct NativeVersionedLog<S: ?Sized> {
     storage: Arc<S>,
     name: String,
     write_version: u64,
-    next_t: RwLock<u64>,
+    write: tokio::sync::Mutex<WriteState>,
 }
 
 impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
@@ -323,54 +400,124 @@ impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
     ///
     /// # Errors
     /// Returns an error when stored records cannot be read or decoded.
-    pub fn open(storage: Arc<S>, name: &str, write_version: u64) -> Result<Self, LogError> {
-        let records = read_native_merged(storage.as_ref(), name)?;
+    pub async fn open(storage: Arc<S>, name: &str, write_version: u64) -> Result<Self, LogError> {
+        // The merged view across every version establishes the next `t` (the
+        // takeover cutoff may place it past this writer's own last record).
+        let records = read_native_merged(storage.as_ref(), name).await?;
+        let next_t = records.last().map_or(1, |r| r.t + 1);
+        // Resume at this version's highest existing chunk (0 when none exists),
+        // caching it so appends extend it in place rather than reading and
+        // decoding the whole log every time.
+        let chunk = storage
+            .list_chunks(name)
+            .await?
+            .into_iter()
+            .filter_map(|(version, chunk)| (version == write_version).then_some(chunk))
+            .max()
+            .unwrap_or(0);
+        let current = storage.read_chunk(name, write_version, chunk).await?;
+        let exists = current.is_some();
+        let bytes = current.unwrap_or_default();
         Ok(Self {
             storage,
             name: name.to_owned(),
             write_version,
-            next_t: RwLock::new(records.last().map_or(1, |r| r.t + 1)),
+            write: tokio::sync::Mutex::new(WriteState {
+                next_t,
+                chunk,
+                bytes,
+                exists,
+            }),
         })
     }
 }
 
+#[async_trait]
 impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedLog<S> {
     fn append(&self, record: &TxRecord) -> Result<(), LogError> {
-        let mut next_t = self.next_t.write().expect("poisoned log lock");
-        if *next_t != record.t {
+        let _ = record;
+        Err(LogError::AsyncOnly)
+    }
+
+    async fn append_async(&self, record: &TxRecord) -> Result<(), LogError> {
+        let mut write = self.write.lock().await;
+        if write.next_t != record.t {
             return Err(LogError::Corrupt);
         }
-        let current = self.storage.read_version(&self.name, self.write_version)?;
-        let current_bytes = current.as_deref().unwrap_or_default();
-        let existing = decode_framed_records(current_bytes)?;
-        if existing.last().map_or(*next_t, |r| r.t + 1) != record.t {
-            return Err(LogError::Corrupt);
+        // Prepare a candidate without changing the cached durable state. In
+        // particular, cancellation while the backend future is pending must
+        // not leave the in-process cache claiming bytes were committed.
+        let roll = write.exists && write.bytes.len() >= LOG_CHUNK_MAX_BYTES;
+        let chunk = write.chunk + u64::from(roll);
+        let exists = write.exists && !roll;
+        let mut candidate = if roll {
+            Vec::new()
+        } else {
+            write.bytes.clone()
+        };
+        let old_len = candidate.len();
+        append_framed_record(&mut candidate, record)?;
+        let expected = exists.then_some(&candidate[..old_len]);
+        match self
+            .storage
+            .cas_chunk(&self.name, self.write_version, chunk, expected, &candidate)
+            .await
+        {
+            Ok(()) => {
+                write.chunk = chunk;
+                write.exists = true;
+                write.bytes = candidate;
+                write.next_t += 1;
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
-        let mut new = current_bytes.to_vec();
-        append_framed_record(&mut new, record)?;
-        self.storage
-            .cas_version(&self.name, self.write_version, current.as_deref(), &new)?;
-        *next_t += 1;
-        Ok(())
     }
 
     fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
-        let _guard = self.next_t.read().expect("poisoned log lock");
-        Ok(read_native_merged(self.storage.as_ref(), &self.name)?
+        let _ = (start, end);
+        Err(LogError::AsyncOnly)
+    }
+
+    async fn tx_range_async(
+        &self,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<TxRecord>, LogError> {
+        // Range/replay must merge every version (for the takeover cutoff), so
+        // they read the store; the lock only serializes them with appends.
+        let _guard = self.write.lock().await;
+        Ok(read_native_merged(self.storage.as_ref(), &self.name)
+            .await?
             .into_iter()
             .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
             .collect())
     }
 }
 
-fn read_native_merged<S: NativeLogStorage + ?Sized>(
+async fn read_native_merged<S: NativeLogStorage + ?Sized>(
     storage: &S,
     name: &str,
 ) -> Result<Vec<TxRecord>, LogError> {
-    let mut per_version = Vec::new();
-    for version in storage.versions(name)? {
-        let bytes = storage.read_version(name, version)?.unwrap_or_default();
-        per_version.push(decode_framed_records(&bytes)?);
+    // Read every chunk, ordered by (version, chunk) so a version's chunks
+    // concatenate in transaction order, then group them per version.
+    let mut chunks = storage.list_chunks(name).await?;
+    chunks.sort_unstable();
+    let mut per_version: Vec<Vec<TxRecord>> = Vec::new();
+    let mut current_version: Option<u64> = None;
+    for (version, chunk) in chunks {
+        if current_version != Some(version) {
+            per_version.push(Vec::new());
+            current_version = Some(version);
+        }
+        let bytes = storage
+            .read_chunk(name, version, chunk)
+            .await?
+            .unwrap_or_default();
+        per_version
+            .last_mut()
+            .expect("a version group was pushed")
+            .extend(decode_framed_records(&bytes)?);
     }
     let merged = merge_versions(per_version);
     for pair in merged.windows(2) {

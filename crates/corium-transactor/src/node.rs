@@ -368,8 +368,8 @@ impl DbState {
     ///
     /// # Errors
     /// Returns an error when the log cannot be read.
-    pub fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, NodeError> {
-        Ok(self.log.tx_range(start, end)?)
+    pub async fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, NodeError> {
+        Ok(self.log.tx_range_async(start, end).await?)
     }
 
     /// Verifies this node still owns the write lease (identity check on
@@ -606,7 +606,7 @@ impl TransactorNode {
         let held = self.acquire_lease(name).await?;
         // The log tail replay below happens strictly after the fence, so it
         // observes every record a previous owner could ever have acked.
-        let log = self.log_backend.open(name, held.version)?;
+        let log = self.log_backend.open(name, held.version).await?;
         let post_fence = self
             .store
             .get_root(&root_name)
@@ -673,12 +673,13 @@ impl TransactorNode {
                 .await
             {
                 Ok(snapshot) => {
-                    return Ok(EmbeddedTransactor::recover_from_snapshot(
+                    return Ok(EmbeddedTransactor::recover_from_snapshot_async(
                         snapshot,
                         root.next_entity_id,
                         root.last_tx_instant,
                         Arc::clone(log),
-                    )?);
+                    )
+                    .await?);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -690,7 +691,7 @@ impl TransactorNode {
             }
         }
         let base = Db::new(schema.clone()).with_naming(idents.clone(), interner.clone());
-        Ok(EmbeddedTransactor::recover_from(base, Arc::clone(log))?)
+        Ok(EmbeddedTransactor::recover_from_async(base, Arc::clone(log)).await?)
     }
 
     /// Materializes the current database value at a published index root from
@@ -904,8 +905,7 @@ impl TransactorNode {
                 if snapshot.basis_t() <= db.index_basis() {
                     continue;
                 }
-                let recorded_len =
-                    u64::try_from(snapshot.recorded_datoms().len()).unwrap_or(u64::MAX);
+                let recorded_len = u64::try_from(snapshot.recorded_len()).unwrap_or(u64::MAX);
                 let pending = published_len.map(|len| recorded_len.saturating_sub(len));
                 if !policy.due(published_at.elapsed(), last_duration, pending) {
                     continue;
@@ -1138,7 +1138,7 @@ impl TransactorNode {
                 .get_root(&meta_root_name(target))
                 .await?
                 .is_some()
-            || self.log_backend.exists(target)
+            || self.log_backend.exists(target).await
         {
             return Ok(None);
         }
@@ -1147,7 +1147,7 @@ impl TransactorNode {
         // always a sufficient decode dictionary for the captured prefix.
         // Transaction numbers are contiguous from 1, so the prefix through
         // `t` is exactly the source's state at that basis.
-        let records = state.log.tx_range(0, Some(t + 1))?;
+        let records = state.log.tx_range_async(0, Some(t + 1)).await?;
         let meta = self
             .store
             .get_root(&meta_root_name(source))
@@ -1157,9 +1157,9 @@ impl TransactorNode {
         // lease-versioned file the target's first open creates, and publish
         // meta last — it is the catalog entry, so a crash mid-fork never
         // catalogs a target without its log.
-        let log = self.log_backend.open(target, 0)?;
+        let log = self.log_backend.open(target, 0).await?;
         for record in &records {
-            log.append(record)?;
+            log.append_async(record).await?;
         }
         drop(log);
         match self
@@ -1170,7 +1170,7 @@ impl TransactorNode {
             Ok(()) => {}
             Err(StoreError::CasFailed { .. }) => {
                 // Another node claimed the name first; discard our log copy.
-                self.log_backend.delete_all(target)?;
+                self.log_backend.delete_all(target).await?;
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -1204,7 +1204,7 @@ impl TransactorNode {
             .remove(name);
         self.store.delete_root(&db_root_name(name)).await?;
         self.store.delete_root(&meta_root_name(name)).await?;
-        self.log_backend.delete_all(name)?;
+        self.log_backend.delete_all(name).await?;
         Ok(true)
     }
 
@@ -1358,10 +1358,7 @@ impl TransactorNode {
             }
             state.transactor.update_naming(idents, interner.clone());
         }
-        let worker = Arc::clone(&state);
-        let report = tokio::task::spawn_blocking(move || worker.transactor.transact(items))
-            .await
-            .map_err(|error| NodeError::BadRequest(format!("transact task failed: {error}")))??;
+        let report = state.transactor.transact_async(items).await?;
         // Post-append fence: acknowledge only if ownership was intact after
         // the record became durable. A takeover that raced the append will
         // have replayed the log *after* rewriting the root record, so a
