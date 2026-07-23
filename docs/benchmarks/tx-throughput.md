@@ -68,7 +68,32 @@ cargo run --release -p corium-transactor --features s3 --example tx_throughput -
 ```
 
 Secrets can come from `CORIUM_BENCH_POSTGRES_URL`, `CORIUM_BENCH_S3_BUCKET`,
-and `CORIUM_BENCH_S3_PREFIX` instead of flags. `--json` emits one JSON object
+and `CORIUM_BENCH_S3_PREFIX` instead of flags.
+
+### Self-hosted S3 (MinIO, Garage, LocalStack)
+
+Point the S3 backend at a self-hosted, S3-compatible server with the standard
+AWS environment — no code change needed:
+
+```sh
+export AWS_ENDPOINT_URL=http://<host>:9000 \
+       AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+cargo run --release -p corium-transactor --features s3 --example tx_throughput -- \
+    --store s3 --s3-bucket corium-bench
+```
+
+When `AWS_ENDPOINT_URL` is set, the S3 store switches to **path-style**
+addressing (`S3BlobStore::connect`), since local servers are reached by
+host/IP where virtual-hosted addressing would fold the bucket into a
+subdomain that does not resolve.
+
+corium fences root CAS with S3 **conditional writes** (`If-None-Match: *` and
+`If-Match: <etag>`). A server that accepts but ignores them silently breaks
+lease safety, so for `--store s3` the benchmark runs a one-shot
+enforcement probe (`S3BlobStore::verify_conditional_writes`) on startup and
+refuses to run if either precondition is not enforced. Use a server version
+known to enforce them — corium's CI uses LocalStack 4; recent MinIO and
+Garage v1.x also qualify. `--json` emits one JSON object
 per concurrency level for archiving. Other flags: `--transactions`,
 `--warmup`, `--concurrency a,b,c`, `--datoms-per-tx`, `--worker-threads`,
 `--index-interval-secs` (see `--help`).

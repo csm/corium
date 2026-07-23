@@ -440,6 +440,22 @@ async fn run(args: Args) -> Result<(), String> {
     let node = TransactorNode::open(config)
         .await
         .map_err(|e| format!("open node: {e}"))?;
+
+    // The S3 backend fences root CAS with conditional writes; an endpoint that
+    // accepts but ignores them would silently break lease safety, so confirm
+    // enforcement before trusting an unfamiliar (self-hosted) target.
+    #[cfg(feature = "s3")]
+    if matches!(spec, StoreSpec::S3 { .. }) {
+        use corium_transactor::NodeStore;
+        if let NodeStore::S3(s3) = node.store().as_ref() {
+            eprintln!("verifying S3 conditional-write enforcement…");
+            s3.verify_conditional_writes()
+                .await
+                .map_err(|e| format!("S3 conditional-write self-check failed: {e}"))?;
+            eprintln!("  ok: endpoint enforces If-None-Match and If-Match");
+        }
+    }
+
     let db = "bench";
     let filler = args.datoms_per_tx.saturating_sub(1);
     node.create_db(db, &schema_edn(filler))
