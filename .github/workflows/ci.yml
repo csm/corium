@@ -42,6 +42,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: examples/postgres-jdbc/pom.xml
       - run: cargo fmt --all -- --check
       # corium-cljrs and the musicbrainz example are excluded from
       # workspace-wide builds: unified with the cljrs-featured transactor
@@ -53,6 +59,8 @@ jobs:
         run: |
           cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
           cargo test -p corium-cljrs -p corium-mbrainz
+      - name: Test PostgreSQL wire protocol with JDBC
+        run: examples/postgres-jdbc/run.sh
       - name: Test PostgreSQL store
         env:
           CORIUM_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/corium_test?sslmode=disable
