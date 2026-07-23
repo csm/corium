@@ -1844,7 +1844,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corium-cli"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "clap",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "corium-cljrs"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "cljrs-builtins",
  "cljrs-env",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "corium-core"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "proptest",
  "thiserror",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "corium-db"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
  "rpds",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "corium-forms"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
  "corium-db",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "corium-index"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
  "proptest",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "corium-log"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "corium-core",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "corium-mbrainz"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "clap",
  "cljrs-env",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "corium-peer"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "corium-core",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "corium-pgwire"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "corium-core",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "corium-protocol"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
  "corium-db",
@@ -2022,7 +2022,7 @@ dependencies = [
 
 [[package]]
 name = "corium-query"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
  "corium-db",
@@ -2035,14 +2035,14 @@ dependencies = [
 
 [[package]]
 name = "corium-sim"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
 ]
 
 [[package]]
 name = "corium-sql"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "corium-store"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2076,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "corium-transactor"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "corium-core",
@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "corium-tx"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
  "corium-db",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "corium-wasm"
-version = "0.1.0"
+version = "0.1.30"
 dependencies = [
  "corium-core",
  "corium-db",
