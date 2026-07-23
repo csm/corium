@@ -208,19 +208,25 @@ impl TestNativeStorage {
 
 #[async_trait::async_trait]
 impl corium_log::NativeLogStorage for TestNativeStorage {
-    async fn put_record(
+    async fn put_batch(
         &self,
         name: &str,
         version: u64,
-        t: u64,
-        bytes: &[u8],
+        records: &[(u64, Vec<u8>)],
     ) -> Result<bool, corium_log::LogError> {
+        let Some((last_t, _)) = records.last() else {
+            return Ok(true);
+        };
         let mut guard = self.records.lock().expect("lock");
-        let key = (name.to_owned(), version, t);
+        let key = (name.to_owned(), version, *last_t);
         if guard.contains_key(&key) {
             return Ok(false);
         }
-        guard.insert(key, bytes.to_vec());
+        let mut bytes = Vec::new();
+        for (_, framed) in records {
+            bytes.extend_from_slice(framed);
+        }
+        guard.insert(key, bytes);
         Ok(true)
     }
 
@@ -302,14 +308,13 @@ struct CountingNativeStorage {
 
 #[async_trait::async_trait]
 impl corium_log::NativeLogStorage for CountingNativeStorage {
-    async fn put_record(
+    async fn put_batch(
         &self,
         name: &str,
         version: u64,
-        t: u64,
-        bytes: &[u8],
+        records: &[(u64, Vec<u8>)],
     ) -> Result<bool, corium_log::LogError> {
-        self.inner.put_record(name, version, t, bytes).await
+        self.inner.put_batch(name, version, records).await
     }
 
     async fn read_record(
@@ -409,6 +414,38 @@ async fn native_versioned_log_writes_one_object_per_record() {
     let replayed = reopened.replay_async().await.expect("replay after reopen");
     assert_eq!(replayed.len(), 7);
     assert_eq!(replayed.last().expect("last").t, 7);
+}
+
+#[tokio::test]
+async fn native_versioned_log_batches_a_run_into_one_object() {
+    use corium_log::NativeLogStorage;
+    let storage = std::sync::Arc::new(TestNativeStorage::default());
+    let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .await
+        .expect("open");
+    // A batch of four is written as one object, keyed by its last `t`.
+    let batch: Vec<_> = (1..=4).map(record).collect();
+    log.append_batch_async(&batch).await.expect("append batch");
+    assert_eq!(storage.list_records("db").await.expect("records"), vec![(1, 4)]);
+    // A single append and a second batch continue the contiguous run.
+    log.append_async(&record(5)).await.expect("append 5");
+    log.append_batch_async(&[record(6), record(7)])
+        .await
+        .expect("append batch 2");
+    assert_eq!(
+        log.replay_async().await.expect("replay"),
+        (1..=7).map(record).collect::<Vec<_>>()
+    );
+    // One object per write: the two batches (keyed 4 and 7) and the single (5).
+    let mut keys = storage.list_records("db").await.expect("records");
+    keys.sort_unstable();
+    assert_eq!(keys, vec![(1, 4), (1, 5), (1, 7)]);
+    // A batch that does not start at the next `t` is rejected.
+    assert!(
+        log.append_batch_async(&[record(9), record(10)])
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

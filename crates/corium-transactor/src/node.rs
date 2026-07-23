@@ -2,7 +2,7 @@
 //! lease acquisition/renewal, background indexing, tx-report fan-out, and
 //! high-availability standby takeover.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,13 +21,13 @@ use corium_store::{
     is_index_manifest, mark_and_sweep_retained, meta_root_name,
 };
 use thiserror::Error;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tracing::Instrument;
 
 use crate::backend::{LogBackend, NodeStore, StoreSpec};
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
-use crate::{DbRoot, EmbeddedTransactor, TransactError, db_root_name};
+use crate::{DbRoot, EmbeddedTransactor, Prepared, TransactError, db_root_name};
 
 /// Expands user database-function invocations in boundary EDN transaction
 /// forms before native conversion. The built-in implementation is
@@ -280,6 +280,12 @@ pub enum NodeError {
     /// Malformed request.
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// A group-commit batch aborted after preparation (durable append,
+    /// ownership fence, or metadata publish failed); every batched caller
+    /// receives this so it retries. Carries the originating error's text
+    /// because the underlying store/log errors are not cloneable.
+    #[error("group commit aborted: {0}")]
+    GroupCommit(String),
 }
 
 struct Naming {
@@ -288,13 +294,25 @@ struct Naming {
     interner: KeywordInterner,
 }
 
+/// One caller's queued transaction, awaiting a group-commit flush. The
+/// leader that flushes the queue answers `resp`.
+struct CommitRequest {
+    forms: Vec<Edn>,
+    resp: oneshot::Sender<Result<pb::TransactResponse, NodeError>>,
+}
+
 /// Per-database state hosted by a node.
 pub struct DbState {
     name: String,
     transactor: EmbeddedTransactor,
     log: Arc<dyn TransactionLog>,
     naming: Mutex<Naming>,
+    /// Held by the batch leader while it flushes the pending queue; also taken
+    /// by lease renewal so a renewal never interleaves with a commit's
+    /// ownership checks.
     commit: tokio::sync::Mutex<()>,
+    /// Transactions queued for the next group-commit flush.
+    pending: Mutex<VecDeque<CommitRequest>>,
     broadcast: broadcast::Sender<pb::subscribe_item::Item>,
     basis: watch::Sender<u64>,
     index_basis: AtomicU64,
@@ -418,6 +436,18 @@ fn now_unix_ms() -> i64 {
             .as_millis(),
     )
     .unwrap_or(i64::MAX)
+}
+
+/// The error a group-commit batch hands every one of its callers when it
+/// aborts after preparation. `Deposed` is preserved structurally so callers
+/// fail over; other store/log errors (not cloneable) surface as
+/// [`NodeError::GroupCommit`], which carries the text and maps to the same
+/// retriable status the single-transaction path returned.
+fn batch_abort_error(name: &str, error: &NodeError) -> NodeError {
+    match error {
+        NodeError::Deposed(_) => NodeError::Deposed(name.to_owned()),
+        other => NodeError::GroupCommit(other.to_string()),
+    }
 }
 
 fn valid_db_name(name: &str) -> bool {
@@ -631,6 +661,7 @@ impl TransactorNode {
                 interner,
             }),
             commit: tokio::sync::Mutex::new(()),
+            pending: Mutex::new(VecDeque::new()),
             broadcast: broadcast::channel(1024).0,
             basis: watch::channel(basis_t).0,
             index_basis: AtomicU64::new(index_basis),
@@ -1307,106 +1338,290 @@ impl TransactorNode {
             .as_seq()
             .ok_or_else(|| NodeError::BadRequest("tx-data must be a vector".into()))?
             .to_vec();
+        // Enqueue for the next group-commit flush, then contend to lead one.
+        // Whichever caller holds `commit` drains the queue and commits the
+        // whole run under one durable append and one ownership fence, then
+        // answers every queued caller — so batching is invisible to clients:
+        // each transaction keeps its own `t`, report, and ack.
+        let (resp_tx, mut resp_rx) = oneshot::channel();
+        state
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(CommitRequest {
+                forms,
+                resp: resp_tx,
+            });
         let queued = self.metrics.queue_waiter();
-        let commit = state.commit.lock().await;
-        drop(queued);
-        let _commit = commit;
-        state.check_lease(self.store.as_ref()).await?;
-        // Expand user database-function invocations against the
-        // db-in-transaction (the value under the commit lock) before native
-        // conversion. The expander blocks up to its budget deadline, so it
-        // runs off the async workers.
-        let forms = if let Some(expander) = &self.config.tx_fn_expander {
-            let expander = Arc::clone(expander);
-            let db = state.transactor.db();
-            tokio::task::spawn_blocking(move || expander.expand(&db, forms))
-                .await
-                .map_err(|error| NodeError::BadRequest(format!("expander task failed: {error}")))?
-                .map_err(NodeError::BadRequest)?
-        } else {
-            forms
+        loop {
+            let commit = state.commit.lock().await;
+            // A prior leader may already have committed this request.
+            match resp_rx.try_recv() {
+                Ok(result) => {
+                    drop(commit);
+                    drop(queued);
+                    return result;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    drop(commit);
+                    drop(queued);
+                    return Err(NodeError::GroupCommit("commit response dropped".into()));
+                }
+            }
+            // Lead a flush of the pending queue (which contains this request).
+            self.flush_commit_batch(&state).await;
+            drop(commit);
+            match resp_rx.try_recv() {
+                Ok(result) => {
+                    drop(queued);
+                    return result;
+                }
+                // A naming change ends a batch before this request; the
+                // remainder was requeued, so loop and lead the next flush.
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    drop(queued);
+                    return Err(NodeError::GroupCommit("commit response dropped".into()));
+                }
+            }
+        }
+    }
+
+    /// Group-commit flush, run by the batch leader while it holds
+    /// `state.commit`: drains the pending queue, prepares the run against a
+    /// staging value (so each transaction still validates against its
+    /// predecessors), makes the whole run durable with one batched append and
+    /// one post-append ownership fence, then installs it and answers every
+    /// caller. A transaction that interns new keywords ends the batch — so a
+    /// later transaction never depends on names not yet durable — and the
+    /// unprepared remainder is requeued for the next flush.
+    #[allow(clippy::too_many_lines)]
+    async fn flush_commit_batch(&self, state: &Arc<DbState>) {
+        /// Most transactions prepared into one batch.
+        const MAX_BATCH: usize = 64;
+
+        let mut batch: VecDeque<CommitRequest> = {
+            let mut pending = state
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *pending)
         };
-        // Convert forms, interning any new keyword values.
-        let (items, naming_changed, idents, interner, schema) = {
-            let mut naming = state
+        if batch.is_empty() {
+            return;
+        }
+        // Pre-batch ownership check: a fast-fail, and it gates the unfenced
+        // metadata CAS below.
+        if let Err(error) = state.check_lease(self.store.as_ref()).await {
+            if matches!(error, NodeError::Deposed(_)) {
+                self.depose(state, "write lease lost before commit");
+            }
+            for request in batch {
+                let _ = request.resp.send(Err(batch_abort_error(&state.name, &error)));
+            }
+            return;
+        }
+        let now_ms = now_unix_ms();
+        let mut cursor = state.transactor.batch_cursor();
+        let mut resps: Vec<oneshot::Sender<Result<pb::TransactResponse, NodeError>>> = Vec::new();
+        let mut prepared: Vec<Prepared> = Vec::new();
+        let mut naming_changed = false;
+        while let Some(request) = batch.pop_front() {
+            if prepared.len() >= MAX_BATCH {
+                batch.push_front(request);
+                break;
+            }
+            // Expand `:db/fn` against the staging value, so each transaction
+            // sees the earlier ones in the batch. The expander blocks up to
+            // its budget, so it runs off the async workers.
+            let forms = if let Some(expander) = &self.config.tx_fn_expander {
+                let expander = Arc::clone(expander);
+                let db = cursor.db().clone();
+                let forms = request.forms;
+                match tokio::task::spawn_blocking(move || expander.expand(&db, forms)).await {
+                    Ok(Ok(forms)) => forms,
+                    Ok(Err(message)) => {
+                        let _ = request.resp.send(Err(NodeError::BadRequest(message)));
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = request.resp.send(Err(NodeError::BadRequest(format!(
+                            "expander task failed: {error}"
+                        ))));
+                        continue;
+                    }
+                }
+            } else {
+                request.forms
+            };
+            // Convert forms, interning new keyword values into the shared
+            // naming, against the staging value.
+            let (items, this_changed) = {
+                let mut naming = state
+                    .naming
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let before = naming.interner.len();
+                match tx_items_from_edn(cursor.db(), &mut naming.interner, &forms) {
+                    Ok(items) => (items, naming.interner.len() > before),
+                    Err(error) => {
+                        drop(naming);
+                        let _ = request.resp.send(Err(error.into()));
+                        continue;
+                    }
+                }
+            };
+            match cursor.prepare(items, now_ms) {
+                Ok(prep) => {
+                    resps.push(request.resp);
+                    prepared.push(prep);
+                }
+                Err(error) => {
+                    let _ = request.resp.send(Err(NodeError::Transact(error.into())));
+                    continue;
+                }
+            }
+            if this_changed {
+                naming_changed = true;
+                break;
+            }
+        }
+        // Requeue the unprepared remainder at the front of the queue, in order.
+        if !batch.is_empty() {
+            let mut pending = state
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while let Some(request) = batch.pop_back() {
+                pending.push_front(request);
+            }
+        }
+        if prepared.is_empty() {
+            return;
+        }
+        // Snapshot the interner for response encoding; capture the idents only
+        // when naming changed, to carry into `update_naming` after install.
+        let interner = {
+            let naming = state
                 .naming
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let db = state.transactor.db();
-            let before = naming.interner.len();
-            let items = tx_items_from_edn(&db, &mut naming.interner, &forms)?;
-            (
-                items,
-                naming.interner.len() > before,
-                naming.idents.clone(),
-                naming.interner.clone(),
-                naming.schema.clone(),
-            )
+            naming.interner.clone()
         };
-        if naming_changed {
+        let changed_idents = if naming_changed {
+            let (idents, schema) = {
+                let naming = state
+                    .naming
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (naming.idents.clone(), naming.schema.clone())
+            };
             // New keyword names must be durable before the datoms that
             // reference them; recovery decodes the log against this meta.
             let meta = codec::encode_metadata(&schema, &idents, &interner);
             loop {
-                let current = self.store.get_root(&meta_root_name(name)).await?;
-                match self
-                    .store
-                    .cas_root(&meta_root_name(name), current.as_deref(), &meta)
-                    .await
-                {
+                let cas = match self.store.get_root(&meta_root_name(&state.name)).await {
+                    Ok(current) => {
+                        self.store
+                            .cas_root(&meta_root_name(&state.name), current.as_deref(), &meta)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match cas {
                     Ok(()) => break,
                     Err(StoreError::CasFailed { .. }) => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        let error = NodeError::Store(error);
+                        for resp in resps {
+                            let _ = resp.send(Err(batch_abort_error(&state.name, &error)));
+                        }
+                        return;
+                    }
                 }
             }
+            Some(idents)
+        } else {
+            None
+        };
+        // One durable append for the whole batch — the commit point.
+        let records: Vec<TxRecord> = prepared.iter().map(|prep| prep.record.clone()).collect();
+        if let Err(error) = state.log.append_batch_async(&records).await {
+            let error = NodeError::Log(error);
+            for resp in resps {
+                let _ = resp.send(Err(batch_abort_error(&state.name, &error)));
+            }
+            return;
+        }
+        // Install in memory now — while still holding `commit`, before the
+        // fence — so the live value stays in lock-step with the durable log
+        // regardless of the fence outcome (exactly as the single-transaction
+        // path applied before its fence). Installing advances the value and
+        // notifies in-process subscribers; it does not acknowledge callers.
+        let reports = state.transactor.install_batch(cursor, prepared);
+        if let Some(idents) = changed_idents {
             state.transactor.update_naming(idents, interner.clone());
         }
-        let report = state.transactor.transact_async(items).await?;
-        // Post-append fence: acknowledge only if ownership was intact after
-        // the record became durable. A takeover that raced the append will
-        // have replayed the log *after* rewriting the root record, so a
-        // record we acked here is provably in the successor's replay, and a
-        // record we refuse here lands in our version's log file where the
-        // successor's cutoff discards it (see log-and-transactor.md).
+        // Post-append fence gates only the acknowledgement and the peer
+        // stream: ack a batch only if ownership was intact after it became
+        // durable. A takeover that raced the append replayed the log *after*
+        // rewriting the root record, so a batch we ack is provably in the
+        // successor's replay; one we refuse is discarded by the successor's
+        // cutoff — and because the whole batch is one atomic object, the cutoff
+        // keeps all or none of it. One fence covers the batch (see
+        // log-and-transactor.md).
         if let Err(error) = state.check_lease(self.store.as_ref()).await {
             if matches!(error, NodeError::Deposed(_)) {
-                self.depose(&state, "write lease lost after durable append");
+                self.depose(state, "write lease lost after durable append");
             }
-            // Either way the transaction is not acknowledged; a transient
-            // store failure here is ambiguous to the caller, exactly like a
-            // crash between append and reply.
-            return Err(error);
+            for resp in resps {
+                let _ = resp.send(Err(batch_abort_error(&state.name, &error)));
+            }
+            return;
         }
-        let t = report.db_after.basis_t();
-        let datoms = codec::encode_datoms(&report.tx.datoms, &interner)?;
-        let tempids = codec::encode_edn(&Edn::Map(
-            report
-                .tx
-                .tempids
-                .iter()
-                .map(|(tempid, eid)| {
-                    (
-                        Edn::Str(tempid.clone()),
-                        Edn::Long(i64::try_from(eid.raw()).unwrap_or(i64::MAX)),
-                    )
-                })
-                .collect(),
-        ));
-        let _ = state
-            .broadcast
-            .send(pb::subscribe_item::Item::Report(pb::TxReport {
-                t,
+        let mut last_t = 0;
+        for (resp, report) in resps.into_iter().zip(reports) {
+            let t = report.db_after.basis_t();
+            last_t = last_t.max(t);
+            let datoms = match codec::encode_datoms(&report.tx.datoms, &interner) {
+                Ok(datoms) => datoms,
+                Err(error) => {
+                    let _ = resp.send(Err(NodeError::Codec(error)));
+                    continue;
+                }
+            };
+            let tempids = codec::encode_edn(&Edn::Map(
+                report
+                    .tx
+                    .tempids
+                    .iter()
+                    .map(|(tempid, eid)| {
+                        (
+                            Edn::Str(tempid.clone()),
+                            Edn::Long(i64::try_from(eid.raw()).unwrap_or(i64::MAX)),
+                        )
+                    })
+                    .collect(),
+            ));
+            let _ = state
+                .broadcast
+                .send(pb::subscribe_item::Item::Report(pb::TxReport {
+                    t,
+                    tx_instant: report.tx_instant,
+                    datoms: datoms.clone(),
+                }));
+            let _ = resp.send(Ok(pb::TransactResponse {
+                basis_before: report.db_before.basis_t(),
+                basis_t: t,
                 tx_instant: report.tx_instant,
-                datoms: datoms.clone(),
+                tempids,
+                tx_data: datoms,
             }));
-        let _ = state.basis.send(t);
-        Ok(pb::TransactResponse {
-            basis_before: report.db_before.basis_t(),
-            basis_t: t,
-            tx_instant: report.tx_instant,
-            tempids,
-            tx_data: datoms,
-        })
+        }
+        if last_t > 0 {
+            let _ = state.basis.send(last_t);
+        }
     }
 
     /// Current status for a database.

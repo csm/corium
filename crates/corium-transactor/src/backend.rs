@@ -506,19 +506,29 @@ impl NativeRootLogStore {
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 #[async_trait]
 impl NativeLogStorage for NativeRootLogStore {
-    async fn put_record(
+    async fn put_batch(
         &self,
         name: &str,
         version: u64,
-        t: u64,
-        bytes: &[u8],
+        records: &[(u64, Vec<u8>)],
     ) -> Result<bool, LogError> {
-        // A create-only root CAS (expected `None`) is a row insert on SQL
-        // backends and a create-only `PUT` on object stores; a lost race
-        // surfaces as `CasFailed`, which the caller maps to `false`.
+        let Some((last_t, _)) = records.last() else {
+            return Ok(true);
+        };
+        // The whole batch is one immutable object keyed by its last `t`,
+        // holding the batch's framed records concatenated — the same encoding
+        // a multi-record chunk uses, so the reader decodes it unchanged. On
+        // SQL backends this is one row insert (one fsync for the batch); on an
+        // object store, one create-only `PUT`. A create-only root CAS
+        // (expected `None`) makes it atomic and fenced; a lost race surfaces
+        // as `CasFailed`, which the caller maps to `false`.
+        let mut bytes = Vec::new();
+        for (_, framed) in records {
+            bytes.extend_from_slice(framed);
+        }
         match self
             .store
-            .cas_root(&Self::record_key(name, version, t), None, bytes)
+            .cas_root(&Self::record_key(name, version, *last_t), None, &bytes)
             .await
         {
             Ok(()) => Ok(true),

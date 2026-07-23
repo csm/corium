@@ -59,6 +59,21 @@ pub trait TransactionLog: Send + Sync {
     async fn append_async(&self, record: &TxRecord) -> Result<(), LogError> {
         self.append(record)
     }
+    /// Durably appends a contiguous run of transactions under a single
+    /// durability boundary where the backend supports one (one `fsync`, one
+    /// object, one database transaction), so group commit amortizes the
+    /// per-append cost across the batch. `records` must be contiguous in `t`
+    /// starting at the log's next expected `t`; an empty slice is a no-op. The
+    /// default appends them one at a time; batching backends override this.
+    ///
+    /// # Errors
+    /// Returns an error for I/O failure, corruption, or a non-contiguous `t`.
+    async fn append_batch_async(&self, records: &[TxRecord]) -> Result<(), LogError> {
+        for record in records {
+            self.append_async(record).await?;
+        }
+        Ok(())
+    }
     /// Returns records in the half-open transaction range `[start, end)`.
     ///
     /// # Errors
@@ -323,22 +338,26 @@ fn merge_versions(mut per_version: Vec<Vec<TxRecord>>) -> Vec<TxRecord> {
 /// are always written in the per-transaction layout.
 #[async_trait]
 pub trait NativeLogStorage: Send + Sync {
-    /// Create-only write of the single framed record for `(name, version, t)`.
-    /// Returns `Ok(true)` when the object was written and `Ok(false)` when one
-    /// already exists for that `(version, t)` — a lost create race or a
-    /// duplicate. The create-only condition is the log's fence: a given
-    /// `(version, t)` is written at most once.
+    /// Create-only, atomic write of one contiguous batch of transactions as a
+    /// single object, keyed by the batch's last `t`. Each element is
+    /// `(t, framed_bytes)` in ascending `t`; the object holds their framed
+    /// bytes concatenated (the same encoding a multi-record chunk uses).
+    /// Returns `Ok(true)` when written and `Ok(false)` when an object already
+    /// exists for that last-`t` — a lost create race or a retry of an
+    /// already-durable batch. The create-only condition is the log's fence: a
+    /// given `(version, last t)` is written at most once, and the batch is
+    /// durable in full or not at all.
     ///
     /// # Errors
     /// Returns an error when the native backend cannot publish the object.
-    async fn put_record(
+    async fn put_batch(
         &self,
         name: &str,
         version: u64,
-        t: u64,
-        bytes: &[u8],
+        records: &[(u64, Vec<u8>)],
     ) -> Result<bool, LogError>;
-    /// Reads the bytes of the single record object for `(name, version, t)`.
+    /// Reads the bytes of the batch object keyed by last-`t` `t` for
+    /// `(name, version)`.
     ///
     /// # Errors
     /// Returns an error when the native backend cannot read the object.
@@ -348,7 +367,7 @@ pub trait NativeLogStorage: Send + Sync {
         version: u64,
         t: u64,
     ) -> Result<Option<Vec<u8>>, LogError>;
-    /// Lists every `(version, t)` record object present for `name`.
+    /// Lists every `(version, last-t)` batch object present for `name`.
     ///
     /// # Errors
     /// Returns an error when the native backend cannot enumerate log objects
@@ -424,24 +443,40 @@ impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedL
     }
 
     async fn append_async(&self, record: &TxRecord) -> Result<(), LogError> {
-        let mut next_t = self.next_t.lock().await;
-        if *next_t != record.t {
-            return Err(LogError::Corrupt);
+        self.append_batch_async(std::slice::from_ref(record)).await
+    }
+
+    async fn append_batch_async(&self, records: &[TxRecord]) -> Result<(), LogError> {
+        if records.is_empty() {
+            return Ok(());
         }
-        let mut framed = Vec::new();
-        append_framed_record(&mut framed, record)?;
-        // Create-only write of this transaction's own object. As the sole
+        let mut next_t = self.next_t.lock().await;
+        // The batch must be exactly the next contiguous run of transactions.
+        for (offset, record) in records.iter().enumerate() {
+            if record.t != *next_t + offset as u64 {
+                return Err(LogError::Corrupt);
+            }
+        }
+        let framed = records
+            .iter()
+            .map(|record| {
+                let mut bytes = Vec::new();
+                append_framed_record(&mut bytes, record)?;
+                Ok((record.t, bytes))
+            })
+            .collect::<Result<Vec<_>, LogError>>()?;
+        // Create-only write of the whole batch as one object. As the sole
         // appender under this lease version, an object that already exists for
-        // `(version, t)` is a duplicate or a racing writer under our version —
+        // this last-`t` is a duplicate or a racing writer under our version —
         // never a legitimate append — so reject it rather than overwrite.
         if !self
             .storage
-            .put_record(&self.name, self.write_version, record.t, &framed)
+            .put_batch(&self.name, self.write_version, &framed)
             .await?
         {
             return Err(LogError::Corrupt);
         }
-        *next_t += 1;
+        *next_t += records.len() as u64;
         Ok(())
     }
 

@@ -100,6 +100,29 @@ Steps up to validation are pure functions in `corium-tx`, taking a `Db` value;
 the pipeline is a thin loop around them. Pipelining: expansion/validation of
 tx N+1 may overlap the log flush of tx N, but log append order defines t.
 
+> **Status — group commit (implemented).** Concurrent transactions to one
+> database are committed as a **batch under a single durability boundary**,
+> keeping each transaction's external boundary intact — every transaction
+> still gets its own `t`, report, and acknowledgement. A `transact` call
+> enqueues its work and then contends to *lead* a flush; whichever caller
+> holds the per-database commit lock drains the queue and, for the whole run:
+> validates each transaction against a staging value that already includes its
+> predecessors (so uniqueness, cardinality-one retraction, and CAS see the
+> same state they would one-at-a-time), makes the batch durable with **one**
+> `append_batch_async` (on native backends, one object / one row — see the
+> log status note above), installs it in memory, runs **one** post-append
+> ownership fence for the batch, then answers every queued caller. The whole
+> batch is one atomic log object, so a takeover's cutoff keeps all or none of
+> it. A transaction that interns new keywords ends the batch (its names must
+> be durable in metadata before the next transaction can reference them); the
+> remainder is requeued. A rejected transaction (validation error) fails alone
+> and its batchmates still commit. Under no contention a batch is size 1, so
+> low-load latency is unchanged; under load the expensive durable write and
+> fence amortize across the batch, lifting the single-writer throughput
+> ceiling. Still open: **optimistic-apply overlap** (validating tx N+1's CPU
+> work concurrently with tx N's flush across *separate* batches) and an
+> explicit **bounded queue with fast-fail backpressure** (below).
+
 Backpressure: a bounded queue in front of the pipeline; transact calls beyond
 it fail fast with a busy error (clients retry with backoff).
 

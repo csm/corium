@@ -43,6 +43,14 @@
 //! `CORIUM_BENCH_POSTGRES_URL`, `CORIUM_BENCH_S3_BUCKET`,
 //! `CORIUM_BENCH_S3_PREFIX`.
 
+// Benchmark statistics convert freely between integers and floats (percentiles,
+// rates, counts), where precision loss and truncation are acceptable.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -421,12 +429,11 @@ async fn run(args: Args) -> Result<(), String> {
     // A fresh data directory for the fs/turso local files unless the caller
     // named one; native backends ignore it.
     let owned_dir;
-    let data_dir = match &args.data_dir {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => {
-            owned_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-            owned_dir.path().to_path_buf()
-        }
+    let data_dir = if let Some(dir) = &args.data_dir {
+        std::path::PathBuf::from(dir)
+    } else {
+        owned_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        owned_dir.path().to_path_buf()
     };
 
     let mut config = NodeConfig::new(data_dir);
