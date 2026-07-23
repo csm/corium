@@ -21,18 +21,24 @@ chunks by the indexing job). The `corium-log` crate hides this behind
 
 > **Status:** the filesystem layout (per-lease-version files under the data
 > directory) and the shared-storage layout are both implemented. The native
-> backends (PostgreSQL, Turso, S3) store the log through the root store as a
-> sequence of chunk objects keyed `(db, lease-version, chunk)` (`corium-log`'s
-> `NativeVersionedLog`): a writer appends framed records to its highest chunk
-> and rolls to a fresh one once it reaches `LOG_CHUNK_MAX_BYTES`, so log
-> durability is the storage service's, HA no longer needs a shared data
-> directory, and per-append rewrite cost stays bounded instead of growing with
-> the whole log (chunk `0` is the single whole-log object earlier releases
-> wrote, so existing logs need no migration). Readers concatenate a version's
-> chunks in order and apply the same lease-version merge cutoff. The
-> object-store *chunk-sealing / compaction* optimization below (linking sealed
-> chunks under a `log-root` and reclaiming superseded objects) is still future
-> work.
+> backends (PostgreSQL, Turso, S3) store the log through the root store as
+> **one object per transaction**, keyed `(db, lease-version, t)`
+> (`corium-log`'s `NativeVersionedLog`): each commit is a single create-only
+> write — a row insert on the SQL backends, a create-only `PUT`
+> (`If-None-Match: *`) on S3 — whose success is the durability point, so an
+> append is O(1) instead of a read-modify-write of a growing object. The
+> create-only condition is the log's fence: a `(lease-version, t)` is written
+> at most once. Log durability is the storage service's and HA needs no shared
+> data directory. Readers merge every version's records and apply the
+> lease-version takeover cutoff. Logs written by earlier releases used a
+> different layout — a sequence of chunk objects keyed `(db, lease-version,
+> chunk)`, each packing framed records up to a size cap — and are still read
+> back **read-only** (`NativeVersionedLog` reads both layouts and continues
+> appending in the per-transaction one), so existing databases keep replaying
+> after an upgrade with no migration. The object-store *sealing / compaction*
+> step below — concatenating the per-transaction tail into content-addressed
+> `log-root` chunks and reclaiming the small objects, which bounds replay and
+> list cost as the tail grows — is still future work.
 
 ### Object-store log layout (future)
 
@@ -44,7 +50,9 @@ using conditional writes:
   (`If-None-Match`) at `log/<db>/v<lease-version>/<t>` (`t` zero-padded so
   listings sort). The PUT returning is the durability point; **no
   per-transaction root CAS is needed**, so commits never contend with the
-  DbRoot record.
+  DbRoot record. *(Implemented — see the Status note above; this is now the
+  live-tail layout for every native backend, not only object stores. The
+  group-commit micro-batch and the sealing step below remain future work.)*
 - **Fencing carries over:** the version prefix is the object-store image of
   the per-lease-version log files. Readers list every version prefix and
   apply the same merge cutoff rule, discarding a deposed writer's stale

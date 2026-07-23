@@ -185,45 +185,91 @@ fn versioned_log_survives_torn_tail_in_an_older_version_file() {
     assert_eq!(new.replay().expect("replay"), vec![record(1), record(2)]);
 }
 
+type ObjectMap = std::sync::Mutex<std::collections::BTreeMap<(String, u64, u64), Vec<u8>>>;
+
 #[derive(Default)]
-struct TestNativeStorage(std::sync::Mutex<std::collections::BTreeMap<(String, u64, u64), Vec<u8>>>);
+struct TestNativeStorage {
+    /// Per-transaction record objects, keyed `(name, version, t)`.
+    records: ObjectMap,
+    /// Legacy chunk objects, keyed `(name, version, chunk)`.
+    legacy: ObjectMap,
+}
+
+impl TestNativeStorage {
+    /// Seeds a legacy chunk object as an older binary would have written it,
+    /// for exercising read-only backward compatibility.
+    fn seed_legacy_chunk(&self, name: &str, version: u64, chunk: u64, bytes: Vec<u8>) {
+        self.legacy
+            .lock()
+            .expect("lock")
+            .insert((name.to_owned(), version, chunk), bytes);
+    }
+}
 
 #[async_trait::async_trait]
 impl corium_log::NativeLogStorage for TestNativeStorage {
-    async fn read_chunk(
+    async fn put_record(
+        &self,
+        name: &str,
+        version: u64,
+        t: u64,
+        bytes: &[u8],
+    ) -> Result<bool, corium_log::LogError> {
+        let mut guard = self.records.lock().expect("lock");
+        let key = (name.to_owned(), version, t);
+        if guard.contains_key(&key) {
+            return Ok(false);
+        }
+        guard.insert(key, bytes.to_vec());
+        Ok(true)
+    }
+
+    async fn read_record(
+        &self,
+        name: &str,
+        version: u64,
+        t: u64,
+    ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
+        Ok(self
+            .records
+            .lock()
+            .expect("lock")
+            .get(&(name.to_owned(), version, t))
+            .cloned())
+    }
+
+    async fn list_records(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
+        Ok(self
+            .records
+            .lock()
+            .expect("lock")
+            .keys()
+            .filter_map(|(record_name, version, t)| {
+                (record_name == name).then_some((*version, *t))
+            })
+            .collect())
+    }
+
+    async fn read_legacy_chunk(
         &self,
         name: &str,
         version: u64,
         chunk: u64,
     ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
         Ok(self
-            .0
+            .legacy
             .lock()
             .expect("lock")
             .get(&(name.to_owned(), version, chunk))
             .cloned())
     }
 
-    async fn cas_chunk(
+    async fn list_legacy_chunks(
         &self,
         name: &str,
-        version: u64,
-        chunk: u64,
-        expected: Option<&[u8]>,
-        new: &[u8],
-    ) -> Result<(), corium_log::LogError> {
-        let mut guard = self.0.lock().expect("lock");
-        let key = (name.to_owned(), version, chunk);
-        if guard.get(&key).map(Vec::as_slice) != expected {
-            return Err(corium_log::LogError::Corrupt);
-        }
-        guard.insert(key, new.to_vec());
-        Ok(())
-    }
-
-    async fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
+    ) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
         Ok(self
-            .0
+            .legacy
             .lock()
             .expect("lock")
             .keys()
@@ -234,7 +280,11 @@ impl corium_log::NativeLogStorage for TestNativeStorage {
     }
 
     async fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
-        self.0
+        self.records
+            .lock()
+            .expect("lock")
+            .retain(|(record_name, _, _), _| record_name != name);
+        self.legacy
             .lock()
             .expect("lock")
             .retain(|(record_name, _, _), _| record_name != name);
@@ -252,7 +302,32 @@ struct CountingNativeStorage {
 
 #[async_trait::async_trait]
 impl corium_log::NativeLogStorage for CountingNativeStorage {
-    async fn read_chunk(
+    async fn put_record(
+        &self,
+        name: &str,
+        version: u64,
+        t: u64,
+        bytes: &[u8],
+    ) -> Result<bool, corium_log::LogError> {
+        self.inner.put_record(name, version, t, bytes).await
+    }
+
+    async fn read_record(
+        &self,
+        name: &str,
+        version: u64,
+        t: u64,
+    ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_record(name, version, t).await
+    }
+
+    async fn list_records(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
+        self.inner.list_records(name).await
+    }
+
+    async fn read_legacy_chunk(
         &self,
         name: &str,
         version: u64,
@@ -260,24 +335,14 @@ impl corium_log::NativeLogStorage for CountingNativeStorage {
     ) -> Result<Option<Vec<u8>>, corium_log::LogError> {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.read_chunk(name, version, chunk).await
+        self.inner.read_legacy_chunk(name, version, chunk).await
     }
 
-    async fn cas_chunk(
+    async fn list_legacy_chunks(
         &self,
         name: &str,
-        version: u64,
-        chunk: u64,
-        expected: Option<&[u8]>,
-        new: &[u8],
-    ) -> Result<(), corium_log::LogError> {
-        self.inner
-            .cas_chunk(name, version, chunk, expected, new)
-            .await
-    }
-
-    async fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
-        self.inner.list_chunks(name).await
+    ) -> Result<Vec<(u64, u64)>, corium_log::LogError> {
+        self.inner.list_legacy_chunks(name).await
     }
 
     async fn delete_all(&self, name: &str) -> Result<(), corium_log::LogError> {
@@ -292,18 +357,18 @@ async fn native_versioned_log_append_does_not_reread_the_whole_log() {
     let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
         .await
         .expect("open");
-    // Opening reads to establish the next `t` and cache the version bytes.
+    // Opening reads the tail to establish the next `t`.
     let opened_reads = storage.reads.load(Ordering::Relaxed);
     for t in 1..=64 {
         log.append_async(&record(t)).await.expect("append");
     }
-    // Every append after open must be self-contained: the writer owns its
-    // version key under the lease, so it caches its bytes instead of pulling
-    // the entire history back per transaction (the old quadratic write path).
+    // Every append is a single create-only write of its own object: it reads
+    // nothing, so per-transaction cost never grows with the history (the old
+    // quadratic write path re-read and re-copied the whole log each append).
     assert_eq!(
         storage.reads.load(Ordering::Relaxed),
         opened_reads,
-        "appends must not re-read the version object"
+        "appends must not read any log object"
     );
     // The cached appends are durable and replay in order.
     let replayed = log.replay_async().await.expect("replay");
@@ -318,42 +383,74 @@ async fn native_versioned_log_append_does_not_reread_the_whole_log() {
 }
 
 #[tokio::test]
-async fn native_versioned_log_rolls_to_new_chunks_past_the_size_cap() {
+async fn native_versioned_log_writes_one_object_per_record() {
+    use corium_log::NativeLogStorage;
     let storage = std::sync::Arc::new(TestNativeStorage::default());
     let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
         .await
         .expect("open");
-    // Each record is ~200 KiB, so a handful cross the 256 KiB chunk cap and
-    // force the writer to roll onto fresh chunks instead of one growing object.
     for t in 1..=6 {
-        log.append_async(&big_record(t, 200 * 1024))
-            .await
-            .expect("append");
+        log.append_async(&record(t)).await.expect("append");
     }
-    // Several distinct chunks now hold the version's records.
-    let chunks: Vec<(u64, u64)> = {
-        use corium_log::NativeLogStorage;
-        storage.list_chunks("db").await.expect("chunks")
-    };
-    assert!(
-        chunks.len() >= 2,
-        "expected the log to span multiple chunks, got {chunks:?}"
-    );
-    // The whole history still replays in order across the chunk boundaries.
+    // One object per transaction — no chunking, whatever the record size.
+    let records = storage.list_records("db").await.expect("records");
+    assert_eq!(records.len(), 6);
     let replayed = log.replay_async().await.expect("replay");
     assert_eq!(replayed.len(), 6);
     assert!(replayed.iter().zip(1..).all(|(record, t)| record.t == t));
-    // A fresh open resumes on the highest chunk and appends continue in order.
+    // A large record still fits: there is no size cap to cross.
     let reopened = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
         .await
         .expect("reopen");
     reopened
-        .append_async(&big_record(7, 1024))
+        .append_async(&big_record(7, 512 * 1024))
         .await
         .expect("append 7");
     let replayed = reopened.replay_async().await.expect("replay after reopen");
     assert_eq!(replayed.len(), 7);
     assert_eq!(replayed.last().expect("last").t, 7);
+}
+
+#[tokio::test]
+async fn native_versioned_log_replays_legacy_chunks_then_appends_records() {
+    use corium_log::NativeLogStorage;
+    // An older binary wrote records 1..=3 as a single legacy chunk 0 under
+    // version 1, then record 4 into a rolled chunk 1 — the pre-per-record
+    // layout, several framed records packed per chunk object.
+    let storage = std::sync::Arc::new(TestNativeStorage::default());
+    let mut chunk0 = Vec::new();
+    for t in 1..=3 {
+        corium_log::append_framed_record(&mut chunk0, &record(t)).expect("frame");
+    }
+    storage.seed_legacy_chunk("db", 1, 0, chunk0);
+    let mut chunk1 = Vec::new();
+    corium_log::append_framed_record(&mut chunk1, &record(4)).expect("frame");
+    storage.seed_legacy_chunk("db", 1, 1, chunk1);
+
+    // The upgraded binary opens under a fresh lease version and replays the
+    // legacy log read-only.
+    let log = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 2)
+        .await
+        .expect("open");
+    assert_eq!(
+        log.replay_async().await.expect("replay legacy"),
+        (1..=4).map(record).collect::<Vec<_>>()
+    );
+
+    // It continues appending in the per-record layout under its own version;
+    // the merged history stays contiguous across the format boundary.
+    log.append_async(&record(5)).await.expect("append 5");
+    log.append_async(&record(6)).await.expect("append 6");
+    assert_eq!(
+        log.replay_async().await.expect("replay merged"),
+        (1..=6).map(record).collect::<Vec<_>>()
+    );
+    // The new records are per-record objects; the legacy chunks are untouched.
+    assert_eq!(storage.list_records("db").await.expect("records").len(), 2);
+    assert_eq!(
+        storage.list_legacy_chunks("db").await.expect("chunks").len(),
+        2
+    );
 }
 
 #[tokio::test]

@@ -306,93 +306,94 @@ fn merge_versions(mut per_version: Vec<Vec<TxRecord>>) -> Vec<TxRecord> {
     per_version.into_iter().flatten().collect()
 }
 
-/// Target maximum size of a live log chunk. Once the chunk a writer is
-/// appending to reaches this size, the next append rolls to a fresh chunk, so
-/// per-append rewrite cost stays bounded by this constant instead of growing
-/// with the whole log. A large individual record still fits in its own chunk.
-pub(crate) const LOG_CHUNK_MAX_BYTES: usize = 256 * 1024;
-
-/// Asynchronous byte store for chunked transaction-log objects.
+/// Asynchronous object store for transaction-log records.
 ///
-/// Implementations usually adapt the same native storage system used for blobs
-/// and roots. A database's log for one lease version is a sequence of chunk
-/// objects `(name, version, chunk)`, each a run of framed records; a writer
-/// appends to the highest chunk and rolls to the next once it fills, so no
-/// single object grows without bound. Chunk `0` of a version is the whole-log
-/// object earlier releases wrote, so existing logs read back as their chunk `0`.
+/// Implementations adapt the same native storage system used for blobs and
+/// roots. The live log is written **one object per transaction** — a
+/// create-only write keyed `(name, version, t)` whose success is the
+/// durability point — so an append is O(1) (a small insert) instead of a
+/// read-modify-write of a growing chunk. On a SQL backend that is a
+/// row-per-commit insert; on an object store, a create-only `PUT`.
+///
+/// Earlier releases wrote a different layout: a sequence of *chunk* objects
+/// `(name, version, chunk)`, each a run of framed records, appended in place
+/// and rolled at a size cap. Those objects are still read, read-only, through
+/// [`Self::list_legacy_chunks`] / [`Self::read_legacy_chunk`], so a log
+/// written by an older binary keeps replaying after an upgrade; new records
+/// are always written in the per-transaction layout.
 #[async_trait]
 pub trait NativeLogStorage: Send + Sync {
-    /// Reads the encoded bytes for one `(name, version, chunk)` object.
+    /// Create-only write of the single framed record for `(name, version, t)`.
+    /// Returns `Ok(true)` when the object was written and `Ok(false)` when one
+    /// already exists for that `(version, t)` — a lost create race or a
+    /// duplicate. The create-only condition is the log's fence: a given
+    /// `(version, t)` is written at most once.
     ///
     /// # Errors
-    /// Returns an error when the native backend cannot read the chunk object
-    /// or when backend data cannot be represented as log bytes.
-    async fn read_chunk(
+    /// Returns an error when the native backend cannot publish the object.
+    async fn put_record(
+        &self,
+        name: &str,
+        version: u64,
+        t: u64,
+        bytes: &[u8],
+    ) -> Result<bool, LogError>;
+    /// Reads the bytes of the single record object for `(name, version, t)`.
+    ///
+    /// # Errors
+    /// Returns an error when the native backend cannot read the object.
+    async fn read_record(
+        &self,
+        name: &str,
+        version: u64,
+        t: u64,
+    ) -> Result<Option<Vec<u8>>, LogError>;
+    /// Lists every `(version, t)` record object present for `name`.
+    ///
+    /// # Errors
+    /// Returns an error when the native backend cannot enumerate log objects
+    /// or returns an invalid identifier.
+    async fn list_records(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError>;
+    /// Reads one legacy chunk object (pre-per-record layout), for read-only
+    /// replay of logs written by older binaries.
+    ///
+    /// # Errors
+    /// Returns an error when the native backend cannot read the chunk object.
+    async fn read_legacy_chunk(
         &self,
         name: &str,
         version: u64,
         chunk: u64,
     ) -> Result<Option<Vec<u8>>, LogError>;
-    /// Compare-and-swap writes encoded bytes for one `(name, version, chunk)`
-    /// object.
-    ///
-    /// # Errors
-    /// Returns an error when the compare-and-swap fails, the native backend
-    /// cannot publish the chunk object, or the backend reports invalid data.
-    async fn cas_chunk(
-        &self,
-        name: &str,
-        version: u64,
-        chunk: u64,
-        expected: Option<&[u8]>,
-        new: &[u8],
-    ) -> Result<(), LogError>;
-    /// Lists every `(version, chunk)` pair present for `name`.
+    /// Lists every legacy `(version, chunk)` object present for `name`, for
+    /// read-only replay of older logs. Returns an empty list on a store that
+    /// only ever wrote the per-record layout.
     ///
     /// # Errors
     /// Returns an error when the native backend cannot enumerate log objects
     /// or returns an invalid identifier.
-    async fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError>;
-    /// Deletes every chunk of every version for `name`.
+    async fn list_legacy_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError>;
+    /// Deletes every log object for `name`, in both layouts.
     ///
     /// # Errors
-    /// Returns an error when the native backend cannot remove a chunk object.
+    /// Returns an error when the native backend cannot remove an object.
     async fn delete_all(&self, name: &str) -> Result<(), LogError>;
 }
 
-/// The mutable append state of a [`NativeVersionedLog`] writer: the next
-/// transaction number it will accept and a cached copy of the live chunk it is
-/// currently appending to.
-///
-/// The writer is the sole appender of its version's chunks (the lease fence
-/// gives each active owner its own version; a deposed writer's stale appends
-/// land in a version the takeover cutoff discards). Caching the live chunk and
-/// tracking `next_t` lets an append extend the buffer in place and
-/// compare-and-swap it, instead of re-reading, re-decoding, and re-copying the
-/// whole log on every transaction — the original behavior made each append cost
-/// proportional to the entire history, so write throughput fell off
-/// quadratically as the database grew. Rolling to a new chunk once the live one
-/// fills additionally bounds the per-append rewrite to [`LOG_CHUNK_MAX_BYTES`].
-struct WriteState {
-    /// Next `t` this writer will accept.
-    next_t: u64,
-    /// Index of the chunk currently being appended to.
-    chunk: u64,
-    /// Cached encoded bytes of the live chunk, kept in lock-step with the store
-    /// by only advancing it after a successful CAS.
-    bytes: Vec<u8>,
-    /// Whether the live chunk object exists in the store yet, so the first
-    /// append to it inserts (expected `None`) and later ones compare against
-    /// the prior bytes.
-    exists: bool,
-}
-
 /// Versioned transaction log backed by a native key/value-style store.
+///
+/// Each transaction is written as its own create-only object keyed
+/// `(name, write_version, t)`, so an append is a single small insert with no
+/// read and no growing buffer. The writer is the sole appender under its lease
+/// version (the fence gives each active owner its own version; a deposed
+/// writer's stale appends land in a version the takeover cutoff discards), so
+/// tracking `next_t` in memory is all the append state required.
 pub struct NativeVersionedLog<S: ?Sized> {
     storage: Arc<S>,
     name: String,
     write_version: u64,
-    write: tokio::sync::Mutex<WriteState>,
+    /// Next `t` this writer will accept; also serializes concurrent appends.
+    next_t: tokio::sync::Mutex<u64>,
 }
 
 impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
@@ -401,33 +402,16 @@ impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
     /// # Errors
     /// Returns an error when stored records cannot be read or decoded.
     pub async fn open(storage: Arc<S>, name: &str, write_version: u64) -> Result<Self, LogError> {
-        // The merged view across every version establishes the next `t` (the
-        // takeover cutoff may place it past this writer's own last record).
+        // The merged view across every version and both layouts establishes the
+        // next `t` — the takeover cutoff may place it past this writer's own
+        // last record.
         let records = read_native_merged(storage.as_ref(), name).await?;
         let next_t = records.last().map_or(1, |r| r.t + 1);
-        // Resume at this version's highest existing chunk (0 when none exists),
-        // caching it so appends extend it in place rather than reading and
-        // decoding the whole log every time.
-        let chunk = storage
-            .list_chunks(name)
-            .await?
-            .into_iter()
-            .filter_map(|(version, chunk)| (version == write_version).then_some(chunk))
-            .max()
-            .unwrap_or(0);
-        let current = storage.read_chunk(name, write_version, chunk).await?;
-        let exists = current.is_some();
-        let bytes = current.unwrap_or_default();
         Ok(Self {
             storage,
             name: name.to_owned(),
             write_version,
-            write: tokio::sync::Mutex::new(WriteState {
-                next_t,
-                chunk,
-                bytes,
-                exists,
-            }),
+            next_t: tokio::sync::Mutex::new(next_t),
         })
     }
 }
@@ -440,38 +424,25 @@ impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedL
     }
 
     async fn append_async(&self, record: &TxRecord) -> Result<(), LogError> {
-        let mut write = self.write.lock().await;
-        if write.next_t != record.t {
+        let mut next_t = self.next_t.lock().await;
+        if *next_t != record.t {
             return Err(LogError::Corrupt);
         }
-        // Prepare a candidate without changing the cached durable state. In
-        // particular, cancellation while the backend future is pending must
-        // not leave the in-process cache claiming bytes were committed.
-        let roll = write.exists && write.bytes.len() >= LOG_CHUNK_MAX_BYTES;
-        let chunk = write.chunk + u64::from(roll);
-        let exists = write.exists && !roll;
-        let mut candidate = if roll {
-            Vec::new()
-        } else {
-            write.bytes.clone()
-        };
-        let old_len = candidate.len();
-        append_framed_record(&mut candidate, record)?;
-        let expected = exists.then_some(&candidate[..old_len]);
-        match self
+        let mut framed = Vec::new();
+        append_framed_record(&mut framed, record)?;
+        // Create-only write of this transaction's own object. As the sole
+        // appender under this lease version, an object that already exists for
+        // `(version, t)` is a duplicate or a racing writer under our version —
+        // never a legitimate append — so reject it rather than overwrite.
+        if !self
             .storage
-            .cas_chunk(&self.name, self.write_version, chunk, expected, &candidate)
-            .await
+            .put_record(&self.name, self.write_version, record.t, &framed)
+            .await?
         {
-            Ok(()) => {
-                write.chunk = chunk;
-                write.exists = true;
-                write.bytes = candidate;
-                write.next_t += 1;
-                Ok(())
-            }
-            Err(error) => Err(error),
+            return Err(LogError::Corrupt);
         }
+        *next_t += 1;
+        Ok(())
     }
 
     fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
@@ -486,7 +457,7 @@ impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedL
     ) -> Result<Vec<TxRecord>, LogError> {
         // Range/replay must merge every version (for the takeover cutoff), so
         // they read the store; the lock only serializes them with appends.
-        let _guard = self.write.lock().await;
+        let _guard = self.next_t.lock().await;
         Ok(read_native_merged(self.storage.as_ref(), &self.name)
             .await?
             .into_iter()
@@ -499,26 +470,53 @@ async fn read_native_merged<S: NativeLogStorage + ?Sized>(
     storage: &S,
     name: &str,
 ) -> Result<Vec<TxRecord>, LogError> {
-    // Read every chunk, ordered by (version, chunk) so a version's chunks
-    // concatenate in transaction order, then group them per version.
-    let mut chunks = storage.list_chunks(name).await?;
+    use std::collections::BTreeMap;
+
+    // Gather every version's records from both layouts, keyed by version so the
+    // cross-version takeover cutoff below sees them in ascending version order.
+    let mut per_version: BTreeMap<u64, Vec<TxRecord>> = BTreeMap::new();
+
+    // Legacy chunk objects (read-only): a version's chunks concatenate in chunk
+    // order, which is the order they were filled — i.e. transaction order.
+    // Empty on a store that only ever wrote the per-record layout.
+    let mut chunks = storage.list_legacy_chunks(name).await?;
     chunks.sort_unstable();
-    let mut per_version: Vec<Vec<TxRecord>> = Vec::new();
-    let mut current_version: Option<u64> = None;
     for (version, chunk) in chunks {
-        if current_version != Some(version) {
-            per_version.push(Vec::new());
-            current_version = Some(version);
-        }
         let bytes = storage
-            .read_chunk(name, version, chunk)
+            .read_legacy_chunk(name, version, chunk)
             .await?
             .unwrap_or_default();
         per_version
-            .last_mut()
-            .expect("a version group was pushed")
+            .entry(version)
+            .or_default()
             .extend(decode_framed_records(&bytes)?);
     }
+
+    // Per-record objects, one framed record each.
+    let mut records = storage.list_records(name).await?;
+    records.sort_unstable();
+    for (version, t) in records {
+        let bytes = storage
+            .read_record(name, version, t)
+            .await?
+            .unwrap_or_default();
+        per_version
+            .entry(version)
+            .or_default()
+            .extend(decode_framed_records(&bytes)?);
+    }
+
+    // Order each version's records by `t` (a version is written in a single
+    // layout in practice; sorting keeps even a version that carries both — a
+    // legacy tail then per-record appends — correct), then apply the takeover
+    // cutoff across versions.
+    let per_version: Vec<Vec<TxRecord>> = per_version
+        .into_values()
+        .map(|mut records| {
+            records.sort_by_key(|record| record.t);
+            records
+        })
+        .collect();
     let merged = merge_versions(per_version);
     for pair in merged.windows(2) {
         if pair[1].t != pair[0].t + 1 {

@@ -407,10 +407,16 @@ impl LogBackend {
             }
             Self::Mem(registry) => registry.exists(name),
             #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-            Self::Native(storage) => storage
-                .list_chunks(name)
-                .await
-                .is_ok_and(|chunks| !chunks.is_empty()),
+            Self::Native(storage) => {
+                storage
+                    .list_records(name)
+                    .await
+                    .is_ok_and(|records| !records.is_empty())
+                    || storage
+                        .list_legacy_chunks(name)
+                        .await
+                        .is_ok_and(|chunks| !chunks.is_empty())
+            }
         }
     }
 
@@ -449,12 +455,28 @@ impl NativeRootLogStore {
     }
 }
 
+/// A parsed log object key: either a per-transaction record or a legacy chunk
+/// written by the pre-per-record layout.
+#[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+enum LogKey {
+    /// Per-transaction record object `(version, t)`.
+    Record(u64, u64),
+    /// Legacy chunk object `(version, chunk)`.
+    Legacy(u64, u64),
+}
+
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 impl NativeRootLogStore {
-    /// Object key for one log chunk. Chunk `0` keeps the historical
-    /// unsuffixed key, so logs written by earlier releases read back as their
-    /// chunk `0` without migration.
-    fn key(name: &str, version: u64, chunk: u64) -> String {
+    /// Object key for one per-transaction record: `log:<db>:v<version>:r<t>`,
+    /// with both numbers zero-padded so a listing sorts by `(version, t)`.
+    fn record_key(name: &str, version: u64, t: u64) -> String {
+        format!("log:{name}:v{version:020}:r{t:020}")
+    }
+
+    /// Object key for one legacy chunk. Chunk `0` keeps the historical
+    /// unsuffixed key, so logs written by earlier releases read back without
+    /// migration.
+    fn legacy_key(name: &str, version: u64, chunk: u64) -> String {
         if chunk == 0 {
             format!("log:{name}:v{version:020}")
         } else {
@@ -466,13 +488,17 @@ impl NativeRootLogStore {
         format!("log:{name}:v")
     }
 
-    /// Parses a `(version, chunk)` pair out of a listed log key. Chunk `0`
-    /// keys carry no `:c` suffix (see [`Self::key`]).
-    fn parse_key(prefix: &str, key: &str) -> Option<(u64, u64)> {
+    /// Classifies a listed log key. A `:r` suffix marks a per-record object; a
+    /// `:c` suffix or a bare version marks a legacy chunk (chunk `0` when
+    /// bare). The version is pure digits, so it never contains either marker.
+    fn parse_key(prefix: &str, key: &str) -> Option<LogKey> {
         let rest = key.strip_prefix(prefix)?;
-        match rest.split_once(":c") {
-            Some((version, chunk)) => Some((version.parse().ok()?, chunk.parse().ok()?)),
-            None => Some((rest.parse().ok()?, 0)),
+        if let Some((version, t)) = rest.split_once(":r") {
+            Some(LogKey::Record(version.parse().ok()?, t.parse().ok()?))
+        } else if let Some((version, chunk)) = rest.split_once(":c") {
+            Some(LogKey::Legacy(version.parse().ok()?, chunk.parse().ok()?))
+        } else {
+            Some(LogKey::Legacy(rest.parse().ok()?, 0))
         }
     }
 }
@@ -480,33 +506,40 @@ impl NativeRootLogStore {
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 #[async_trait]
 impl NativeLogStorage for NativeRootLogStore {
-    async fn read_chunk(
+    async fn put_record(
         &self,
         name: &str,
         version: u64,
-        chunk: u64,
+        t: u64,
+        bytes: &[u8],
+    ) -> Result<bool, LogError> {
+        // A create-only root CAS (expected `None`) is a row insert on SQL
+        // backends and a create-only `PUT` on object stores; a lost race
+        // surfaces as `CasFailed`, which the caller maps to `false`.
+        match self
+            .store
+            .cas_root(&Self::record_key(name, version, t), None, bytes)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(StoreError::CasFailed { .. }) => Ok(false),
+            Err(error) => Err(LogError::Native(error.to_string())),
+        }
+    }
+
+    async fn read_record(
+        &self,
+        name: &str,
+        version: u64,
+        t: u64,
     ) -> Result<Option<Vec<u8>>, LogError> {
         self.store
-            .get_root(&Self::key(name, version, chunk))
+            .get_root(&Self::record_key(name, version, t))
             .await
             .map_err(|error| LogError::Native(error.to_string()))
     }
 
-    async fn cas_chunk(
-        &self,
-        name: &str,
-        version: u64,
-        chunk: u64,
-        expected: Option<&[u8]>,
-        new: &[u8],
-    ) -> Result<(), LogError> {
-        self.store
-            .cas_root(&Self::key(name, version, chunk), expected, new)
-            .await
-            .map_err(|error| LogError::Native(error.to_string()))
-    }
-
-    async fn list_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError> {
+    async fn list_records(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError> {
         let prefix = Self::prefix(name);
         let names = self
             .store
@@ -515,14 +548,53 @@ impl NativeLogStorage for NativeRootLogStore {
             .map_err(|error| LogError::Native(error.to_string()))?;
         names
             .into_iter()
-            .map(|key| Self::parse_key(&prefix, &key).ok_or(LogError::Corrupt))
+            .filter_map(|key| match Self::parse_key(&prefix, &key) {
+                Some(LogKey::Record(version, t)) => Some(Ok((version, t))),
+                Some(LogKey::Legacy(..)) => None,
+                None => Some(Err(LogError::Corrupt)),
+            })
+            .collect()
+    }
+
+    async fn read_legacy_chunk(
+        &self,
+        name: &str,
+        version: u64,
+        chunk: u64,
+    ) -> Result<Option<Vec<u8>>, LogError> {
+        self.store
+            .get_root(&Self::legacy_key(name, version, chunk))
+            .await
+            .map_err(|error| LogError::Native(error.to_string()))
+    }
+
+    async fn list_legacy_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError> {
+        let prefix = Self::prefix(name);
+        let names = self
+            .store
+            .list_roots(&prefix)
+            .await
+            .map_err(|error| LogError::Native(error.to_string()))?;
+        names
+            .into_iter()
+            .filter_map(|key| match Self::parse_key(&prefix, &key) {
+                Some(LogKey::Legacy(version, chunk)) => Some(Ok((version, chunk))),
+                Some(LogKey::Record(..)) => None,
+                None => Some(Err(LogError::Corrupt)),
+            })
             .collect()
     }
 
     async fn delete_all(&self, name: &str) -> Result<(), LogError> {
-        for (version, chunk) in self.list_chunks(name).await? {
+        let prefix = Self::prefix(name);
+        let names = self
+            .store
+            .list_roots(&prefix)
+            .await
+            .map_err(|error| LogError::Native(error.to_string()))?;
+        for key in names {
             self.store
-                .delete_root(&Self::key(name, version, chunk))
+                .delete_root(&key)
                 .await
                 .map_err(|error| LogError::Native(error.to_string()))?;
         }
@@ -536,7 +608,7 @@ mod tests {
     use corium_core::{Datom, EntityId, Value};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_root_log_crosses_chunk_boundaries_on_the_runtime() {
+    async fn native_root_log_writes_one_object_per_record_on_the_runtime() {
         let run = async {
             let dir = tempfile::tempdir().expect("tempdir");
             let store = Arc::new(
@@ -548,6 +620,8 @@ mod tests {
             let log = NativeVersionedLog::open(Arc::clone(&storage), "db", 1)
                 .await
                 .expect("open native log");
+            // Large records too: each transaction is its own object, so there
+            // is no chunk cap to cross.
             for t in 1..=3 {
                 log.append_async(&TxRecord {
                     t,
@@ -563,8 +637,15 @@ mod tests {
                 .await
                 .expect("append");
             }
-            let chunks = storage.list_chunks("db").await.expect("list chunks");
-            assert_eq!(chunks.len(), 3);
+            let records = storage.list_records("db").await.expect("list records");
+            assert_eq!(records.len(), 3);
+            assert!(
+                storage
+                    .list_legacy_chunks("db")
+                    .await
+                    .expect("list legacy")
+                    .is_empty()
+            );
             assert_eq!(log.replay_async().await.expect("replay").len(), 3);
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), run)
