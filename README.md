@@ -91,3 +91,6 @@ processes. Each crate has its own README.
   the Datomic MusicBrainz sample: schema, a streaming data loader, and a
   Clojurust query REPL, with one-command scripts for in-memory, filesystem,
   and Turso storage.
+- [`examples/postgres-jdbc`](examples/postgres-jdbc/README.md) — a Java/Maven
+  client that starts an in-memory transactor, loads the 20-release MusicBrainz
+  wasm fixture, and checks SQL queries through the PostgreSQL JDBC driver.
