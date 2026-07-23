@@ -907,6 +907,22 @@ impl Admin {
             tail_deadline_ms: Some(response.tail_deadline_ms),
         })
     }
+
+    /// Fixes a database backup checkpoint and returns an independent
+    /// connection to the transactor's underlying storage service.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for an unknown database or transport failure.
+    pub async fn get_backup_info(
+        &mut self,
+        db: &str,
+    ) -> Result<pb::GetBackupInfoResponse, PeerError> {
+        Ok(self
+            .client
+            .get_backup_info(pb::GetBackupInfoRequest { db: db.to_owned() })
+            .await?
+            .into_inner())
+    }
 }
 
 /// Index-publication pacing fields for [`Admin::set_index_policy`]: `None`

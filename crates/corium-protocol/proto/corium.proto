@@ -213,6 +213,52 @@ message SetIndexPolicyResponse {
   uint64 tail_deadline_ms = 4;
 }
 
+// Connection details returned once to a storage-aware administrative client.
+// PostgreSQL and S3 currently carry the transactor's read/write connection
+// configuration; these fields can become read-only credentials/configuration
+// without changing the backup protocol.
+message StorageConnection {
+  oneof backend {
+    MemoryStorage memory = 1;
+    FilesystemStorage filesystem = 2;
+    PostgreSqlStorage postgres = 3;
+    TursoStorage turso = 4;
+    S3Storage s3 = 5;
+  }
+}
+
+message MemoryStorage {}
+
+message FilesystemStorage {
+  // Absolute transactor data directory containing store/ and logs/.
+  string data_dir = 1;
+}
+
+message PostgreSqlStorage {
+  string connection_string = 1;
+}
+
+message TursoStorage {
+  // Absolute path to the local Turso database.
+  string path = 1;
+}
+
+message S3Storage {
+  string bucket = 1;
+  string prefix = 2;
+}
+
+message GetBackupInfoRequest {
+  string db = 1;
+}
+
+message GetBackupInfoResponse {
+  // Fixed upper bound for this backup. The storage log may continue growing,
+  // but the backup reads records only through this transaction.
+  uint64 basis_t = 1;
+  StorageConnection storage = 2;
+}
+
 service Catalog {
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc DeleteDatabase(DeleteDatabaseRequest) returns (DeleteDatabaseResponse);
@@ -225,6 +271,9 @@ service Catalog {
   rpc RequestIndex(RequestIndexRequest) returns (RequestIndexResponse);
   // Adjusts (or reads) the database's index-publication pacing at runtime.
   rpc SetIndexPolicy(SetIndexPolicyRequest) returns (SetIndexPolicyResponse);
+  // Fixes a backup checkpoint and hands the client an independent connection
+  // to the underlying storage service.
+  rpc GetBackupInfo(GetBackupInfoRequest) returns (GetBackupInfoResponse);
 }
 
 // ---------------------------------------------------------------------------

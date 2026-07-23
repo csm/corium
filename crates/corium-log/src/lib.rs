@@ -240,7 +240,7 @@ impl VersionedLog {
         })
     }
 
-    /// Opens the log read-only (offline inspection, backup); appends fail.
+    /// Opens the log read-only (independent inspection or backup); appends fail.
     ///
     /// # Errors
     /// Returns an error when the directory cannot be read or a fully
@@ -411,6 +411,7 @@ pub struct NativeVersionedLog<S: ?Sized> {
     storage: Arc<S>,
     name: String,
     write_version: u64,
+    read_only: bool,
     /// Next `t` this writer will accept; also serializes concurrent appends.
     next_t: tokio::sync::Mutex<u64>,
 }
@@ -430,8 +431,22 @@ impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
             storage,
             name: name.to_owned(),
             write_version,
+            read_only: false,
             next_t: tokio::sync::Mutex::new(next_t),
         })
+    }
+
+    /// Opens the log for read-only range replay without first scanning it to
+    /// initialize writer state.
+    #[must_use]
+    pub fn open_read_only(storage: Arc<S>, name: &str) -> Self {
+        Self {
+            storage,
+            name: name.to_owned(),
+            write_version: 0,
+            read_only: true,
+            next_t: tokio::sync::Mutex::new(0),
+        }
     }
 }
 
@@ -447,6 +462,9 @@ impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedL
     }
 
     async fn append_batch_async(&self, records: &[TxRecord]) -> Result<(), LogError> {
+        if self.read_only {
+            return Err(LogError::Native("transaction log is read-only".into()));
+        }
         if records.is_empty() {
             return Ok(());
         }

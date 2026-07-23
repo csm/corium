@@ -323,6 +323,17 @@ impl Catalog for CatalogSvc {
             tail_deadline_ms: millis(policy.tail_deadline),
         }))
     }
+
+    async fn get_backup_info(
+        &self,
+        request: Request<pb::GetBackupInfoRequest>,
+    ) -> Result<Response<pb::GetBackupInfoResponse>, Status> {
+        self.0
+            .backup_info(&request.into_inner().db)
+            .await
+            .map(Response::new)
+            .map_err(|error| to_status(&error))
+    }
 }
 
 fn requested_gc_retention(request: pb::GcDeletedDatabasesRequest) -> Option<std::time::Duration> {

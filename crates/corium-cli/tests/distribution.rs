@@ -597,6 +597,33 @@ async fn cli_admin_commands_round_trip() {
 
     index_control_round_trip(&run, &endpoint);
 
+    // Backup discovers storage through the live transactor, then replays it
+    // independently. Reusing the destination fetches only the new range.
+    let backup_file = dir.path().join("backup.corium");
+    let backed_up = run(vec![
+        "backup".into(),
+        "--transactor".into(),
+        endpoint.clone(),
+        "clidb".into(),
+        backup_file.display().to_string(),
+    ]);
+    assert!(
+        backed_up.contains(":basis-t 1") && backed_up.contains(":replayed-transactions 1"),
+        "{backed_up}"
+    );
+    peer.transact(add_value(8)).await.expect("second transact");
+    let incremental = run(vec![
+        "backup".into(),
+        "--transactor".into(),
+        endpoint.clone(),
+        "clidb".into(),
+        backup_file.display().to_string(),
+    ]);
+    assert!(
+        incremental.contains(":basis-t 2") && incremental.contains(":replayed-transactions 1"),
+        "{incremental}"
+    );
+
     // Offline log inspection sees the committed record.
     let logged = run(vec![
         "log".into(),
