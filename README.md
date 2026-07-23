@@ -81,6 +81,7 @@ processes. Each crate has its own README.
 | [`corium-protocol`](crates/corium-protocol/README.md) | protobuf/gRPC definitions, wire value encoding, generated tonic stubs |
 | [`corium-transactor`](crates/corium-transactor/README.md) | Transactor process: pipeline, indexing job, lease/HA, gRPC server, backup |
 | [`corium-peer`](crates/corium-peer/README.md) | Peer library: connection, tx-report handling, segment cache, peer server |
+| [`corium-client`](crates/corium-client/README.md) | Fluent async Datomic-style API over the peer library and peer-server gRPC; typesafe Datalog/Pull builders |
 | [`corium-cljrs`](crates/corium-cljrs/README.md) | Clojurust bindings: value conversion, `corium.api`, `:db/fn` sandbox host |
 | [`corium-cli`](crates/corium-cli/README.md) | `corium` binary: launchers, admin commands, console, TUI, SQL shell |
 | [`corium-sim`](crates/corium-sim/README.md) | Deterministic simulation harness for fault-injection tests (not published) |

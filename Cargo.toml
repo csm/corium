@@ -10,6 +10,7 @@ members = [
     "crates/corium-sql",
     "crates/corium-pgwire",
     "crates/corium-db",
+    "crates/corium-client",
     "crates/corium-transactor",
     "crates/corium-peer",
     "crates/corium-protocol",
@@ -62,6 +63,7 @@ pedantic = "warn"
 
 [workspace.dependencies]
 corium-cli = { path = "crates/corium-cli", version = "0.1.0" }
+corium-client = { path = "crates/corium-client", version = "0.1.0" }
 corium-cljrs = { path = "crates/corium-cljrs", version = "0.1.0" }
 corium-core = { path = "crates/corium-core", version = "0.1.0" }
 corium-db = { path = "crates/corium-db", version = "0.1.0" }
