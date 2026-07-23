@@ -130,7 +130,9 @@ tx N+1 may overlap the log flush of tx N, but log append order defines t.
 > overlap** (validating tx N+1's CPU work concurrently with tx N's flush
 > across *separate* batches), **pipelined flushes** (more than one batch's
 > durable write in flight at once), and an explicit **bounded queue with
-> fast-fail backpressure** (below).
+> fast-fail backpressure** (below). See
+> [write-path-scaling.md](write-path-scaling.md) for the measured performance
+> arc and the prioritized next steps.
 
 Backpressure: a bounded queue in front of the pipeline; transact calls beyond
 it fail fast with a busy error (clients retry with backoff).
