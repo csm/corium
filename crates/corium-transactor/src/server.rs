@@ -32,9 +32,10 @@ pub fn to_status(error: &NodeError) -> Status {
             crate::TransactError::Deposed { .. } => Status::failed_precondition(inner.to_string()),
             _ => Status::internal(inner.to_string()),
         },
-        NodeError::Store(_) | NodeError::Log(_) | NodeError::Lease(_) => {
-            Status::internal(error.to_string())
-        }
+        NodeError::Store(_)
+        | NodeError::Log(_)
+        | NodeError::Lease(_)
+        | NodeError::GroupCommit(_) => Status::internal(error.to_string()),
     }
 }
 

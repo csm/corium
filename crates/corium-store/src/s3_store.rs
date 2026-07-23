@@ -42,7 +42,17 @@ impl S3BlobStore {
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .load()
             .await;
-        Self::from_client(Client::new(&config), bucket, prefix).await
+        // Local S3-compatible servers (MinIO, Garage, LocalStack) are reached
+        // by host/IP, where virtual-hosted addressing would fold the bucket
+        // into a subdomain that does not resolve; they need path-style keys.
+        // A configured `AWS_ENDPOINT_URL` is the signal for such a target, the
+        // same heuristic the crate's S3 test harness uses. AWS itself ignores
+        // the setting (its endpoints are DNS-addressable).
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
+        if std::env::var_os("AWS_ENDPOINT_URL").is_some() {
+            s3_config = s3_config.force_path_style(true);
+        }
+        Self::from_client(Client::from_conf(s3_config.build()), bucket, prefix).await
     }
 
     /// Creates a store from an existing S3 client, verifying the bucket is
@@ -149,6 +159,87 @@ impl S3BlobStore {
             Err(error) if is_precondition_conflict(&error, if_match.is_some()) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Verifies the target actually *enforces* the two conditional writes
+    /// corium's root fencing depends on: `If-None-Match: *` (create-only) and
+    /// `If-Match: <etag>` (compare-and-swap). Many S3-compatible servers
+    /// accept these headers but ignore them; on such a server every root CAS
+    /// silently succeeds, so a deposed writer's publish is no longer fenced
+    /// and lease safety is lost. This runs a throwaway probe against a
+    /// dedicated key and reports which precondition, if any, is not enforced,
+    /// so an operator pointing at an unfamiliar endpoint can find out before
+    /// trusting it rather than after a split-brain. The probe key is removed
+    /// on every exit path.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::S3`] naming the unenforced precondition, or a
+    /// store error if the probe itself cannot run.
+    pub async fn verify_conditional_writes(&self) -> Result<(), StoreError> {
+        let name = format!(
+            "__corium-condwrite-probe-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        let key = self.root_key(&name);
+        // Start from a clean slate even if a previous probe leaked its key.
+        let _ = self.delete_root(&name).await;
+
+        // `If-None-Match: *`: the first create must succeed, and a second
+        // create against the now-present key must be refused.
+        if !self
+            .put_conditional(&key, b"1".to_vec(), None, true)
+            .await?
+        {
+            return Err(StoreError::S3(
+                "conditional-write probe: initial If-None-Match:* create was rejected".into(),
+            ));
+        }
+        let unenforced = |which: &str| {
+            StoreError::S3(format!(
+                "S3 endpoint does not enforce {which} writes; corium root fencing would be \
+                 unsafe on it (a deposed writer's publish would not be fenced)"
+            ))
+        };
+        if self
+            .put_conditional(&key, b"2".to_vec(), None, true)
+            .await?
+        {
+            let _ = self.delete_root(&name).await;
+            return Err(unenforced("If-None-Match:* (create-only)"));
+        }
+
+        // `If-Match: <etag>`: a stale etag must be refused, and the current
+        // etag must be accepted.
+        let stale = "\"corium-condwrite-probe-stale-etag\"";
+        if self
+            .put_conditional(&key, b"3".to_vec(), Some(stale), false)
+            .await?
+        {
+            let _ = self.delete_root(&name).await;
+            return Err(unenforced("If-Match:<etag> (compare-and-swap)"));
+        }
+        let etag = match self.get_root_with_etag(&name).await? {
+            Some((_, etag)) => etag,
+            None => {
+                return Err(StoreError::S3(
+                    "conditional-write probe: probe key vanished mid-check".into(),
+                ));
+            }
+        };
+        if !self
+            .put_conditional(&key, b"4".to_vec(), Some(&etag), false)
+            .await?
+        {
+            let _ = self.delete_root(&name).await;
+            return Err(StoreError::S3(
+                "conditional-write probe: If-Match with the current etag was rejected".into(),
+            ));
+        }
+
+        self.delete_root(&name).await
     }
 }
 

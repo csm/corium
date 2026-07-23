@@ -21,18 +21,24 @@ chunks by the indexing job). The `corium-log` crate hides this behind
 
 > **Status:** the filesystem layout (per-lease-version files under the data
 > directory) and the shared-storage layout are both implemented. The native
-> backends (PostgreSQL, Turso, S3) store the log through the root store as a
-> sequence of chunk objects keyed `(db, lease-version, chunk)` (`corium-log`'s
-> `NativeVersionedLog`): a writer appends framed records to its highest chunk
-> and rolls to a fresh one once it reaches `LOG_CHUNK_MAX_BYTES`, so log
-> durability is the storage service's, HA no longer needs a shared data
-> directory, and per-append rewrite cost stays bounded instead of growing with
-> the whole log (chunk `0` is the single whole-log object earlier releases
-> wrote, so existing logs need no migration). Readers concatenate a version's
-> chunks in order and apply the same lease-version merge cutoff. The
-> object-store *chunk-sealing / compaction* optimization below (linking sealed
-> chunks under a `log-root` and reclaiming superseded objects) is still future
-> work.
+> backends (PostgreSQL, Turso, S3) store the log through the root store as
+> **one object per transaction**, keyed `(db, lease-version, t)`
+> (`corium-log`'s `NativeVersionedLog`): each commit is a single create-only
+> write — a row insert on the SQL backends, a create-only `PUT`
+> (`If-None-Match: *`) on S3 — whose success is the durability point, so an
+> append is O(1) instead of a read-modify-write of a growing object. The
+> create-only condition is the log's fence: a `(lease-version, t)` is written
+> at most once. Log durability is the storage service's and HA needs no shared
+> data directory. Readers merge every version's records and apply the
+> lease-version takeover cutoff. Logs written by earlier releases used a
+> different layout — a sequence of chunk objects keyed `(db, lease-version,
+> chunk)`, each packing framed records up to a size cap — and are still read
+> back **read-only** (`NativeVersionedLog` reads both layouts and continues
+> appending in the per-transaction one), so existing databases keep replaying
+> after an upgrade with no migration. The object-store *sealing / compaction*
+> step below — concatenating the per-transaction tail into content-addressed
+> `log-root` chunks and reclaiming the small objects, which bounds replay and
+> list cost as the tail grows — is still future work.
 
 ### Object-store log layout (future)
 
@@ -44,7 +50,9 @@ using conditional writes:
   (`If-None-Match`) at `log/<db>/v<lease-version>/<t>` (`t` zero-padded so
   listings sort). The PUT returning is the durability point; **no
   per-transaction root CAS is needed**, so commits never contend with the
-  DbRoot record.
+  DbRoot record. *(Implemented — see the Status note above; this is now the
+  live-tail layout for every native backend, not only object stores. The
+  group-commit micro-batch and the sealing step below remain future work.)*
 - **Fencing carries over:** the version prefix is the object-store image of
   the per-lease-version log files. Readers list every version prefix and
   apply the same merge cutoff rule, discarding a deposed writer's stale
@@ -91,6 +99,40 @@ receive tx-data (wire or in-proc)
 Steps up to validation are pure functions in `corium-tx`, taking a `Db` value;
 the pipeline is a thin loop around them. Pipelining: expansion/validation of
 tx N+1 may overlap the log flush of tx N, but log append order defines t.
+
+> **Status — group commit (implemented).** Concurrent transactions to one
+> database are committed as a **batch under a single durability boundary**,
+> keeping each transaction's external boundary intact — every transaction
+> still gets its own `t`, report, and acknowledgement. A `transact` call
+> enqueues its work and then contends to *lead* a flush; whichever caller
+> holds the per-database commit lock drains the queue and, for the whole run:
+> validates each transaction against a staging value that already includes its
+> predecessors (so uniqueness, cardinality-one retraction, and CAS see the
+> same state they would one-at-a-time), makes the batch durable with **one**
+> `append_batch_async` (on native backends, one object / one row — see the
+> log status note above), installs it in memory, runs **one** post-append
+> ownership fence for the batch, then answers every queued caller. That fence
+> is the batch's *only* lease check on the common path — the pre-append check
+> is skipped, since a deposed leader's append lands harmlessly under its old
+> lease version (discarded by the successor's cutoff) and the fence refuses to
+> acknowledge it; a batch that interns new keywords is the one exception and
+> re-checks ownership before publishing the unfenced metadata root. The whole
+> batch is one atomic log object, so a takeover's cutoff keeps all or none of
+> it. A transaction that interns new keywords ends the batch (its names must
+> be durable in metadata before the next transaction can reference them); the
+> remainder is requeued. A rejected transaction (validation error) fails alone
+> and its batchmates still commit. Batch size is capped by count and encoded
+> bytes (`NodeConfig::max_commit_batch` / `max_commit_batch_bytes`), so a
+> larger cap trades a bigger per-batch log object for higher peak throughput.
+> Under no contention a batch is size 1, so low-load latency is unchanged;
+> under load the expensive durable write and fence amortize across the batch,
+> lifting the single-writer throughput ceiling. Still open: **optimistic-apply
+> overlap** (validating tx N+1's CPU work concurrently with tx N's flush
+> across *separate* batches), **pipelined flushes** (more than one batch's
+> durable write in flight at once), and an explicit **bounded queue with
+> fast-fail backpressure** (below). See
+> [write-path-scaling.md](write-path-scaling.md) for the measured performance
+> arc and the prioritized next steps.
 
 Backpressure: a bounded queue in front of the pipeline; transact calls beyond
 it fail fast with a busy error (clients retry with backoff).

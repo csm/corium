@@ -99,6 +99,83 @@ fn next_user_id<'a>(datoms: impl Iterator<Item = &'a corium_core::Datom>, floor:
         .fold(floor, u64::max)
 }
 
+/// A transaction prepared against a [`BatchCursor`] but not yet durable,
+/// carrying its log record and the pieces needed to build a [`TxReport`] once
+/// the batch is durable.
+pub struct Prepared {
+    /// The record to make durable in the log.
+    pub record: TxRecord,
+    db_before: Db,
+    db_after: Db,
+    tx: PreparedTx,
+    tx_instant: i64,
+}
+
+/// A cursor for preparing a group-commit batch against an evolving in-memory
+/// value without touching the live one. Each [`Self::prepare`] validates
+/// against the effects of the earlier transactions in the batch (uniqueness,
+/// cardinality-one retraction, CAS), so a batch commits with exactly the
+/// semantics of committing the transactions one at a time. The caller makes
+/// the batch's records durable, then publishes the cursor with
+/// [`EmbeddedTransactor::install_batch`]; a batch that never installs leaves
+/// the live value untouched.
+pub struct BatchCursor {
+    db: Db,
+    next_user: u64,
+    last_instant: i64,
+}
+
+impl BatchCursor {
+    /// The value including every transaction prepared into this batch so far,
+    /// for expanding and converting the next transaction against it.
+    #[must_use]
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// Prepares one transaction against the cursor, advancing the cursor's
+    /// in-memory value by it. `now_ms` is the wall clock in Unix milliseconds;
+    /// `:db/txInstant` stays monotone via `max(now, last + 1)`. On error the
+    /// cursor is unchanged, so a rejected transaction leaves the rest of the
+    /// batch unaffected.
+    ///
+    /// # Errors
+    /// Returns [`TxError`] when the transaction fails resolution or validation.
+    pub fn prepare(
+        &mut self,
+        items: impl IntoIterator<Item = TxItem>,
+        now_ms: i64,
+    ) -> Result<Prepared, TxError> {
+        let before = self.db.clone();
+        let t = before.basis_t() + 1;
+        let tx_id = EntityId::new(Partition::Tx as u32, t);
+        let prepared = prepare(&before, items, tx_id, self.next_user)?;
+        let tx_instant = now_ms.max(self.last_instant.saturating_add(1));
+        let after = before.clone().with_transaction(t, &prepared.datoms);
+        self.next_user = prepared
+            .tempids
+            .values()
+            .filter(|e| e.partition() == Partition::User as u32)
+            .map(|e| e.sequence() + 1)
+            .max()
+            .unwrap_or(self.next_user)
+            .max(self.next_user);
+        self.last_instant = tx_instant;
+        self.db = after.clone();
+        Ok(Prepared {
+            record: TxRecord {
+                t,
+                tx_instant,
+                datoms: prepared.datoms.clone(),
+            },
+            db_before: before,
+            db_after: after,
+            tx: prepared,
+            tx_instant,
+        })
+    }
+}
+
 /// A serialized, in-process transactor. The log append is the commit point.
 pub struct EmbeddedTransactor {
     log: Arc<dyn TransactionLog>,
@@ -428,6 +505,54 @@ impl EmbeddedTransactor {
             .retain(|subscriber| subscriber.send(report.clone()).is_ok());
         Ok(report)
     }
+    /// Snapshots the live value and allocation watermarks for preparing a
+    /// group-commit batch. The returned [`BatchCursor`] evolves privately;
+    /// [`Self::install_batch`] publishes it after the batch is durable.
+    #[must_use]
+    pub fn batch_cursor(&self) -> BatchCursor {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        BatchCursor {
+            db: state.db.clone(),
+            next_user: state.next_user,
+            last_instant: state.last_instant,
+        }
+    }
+
+    /// Publishes a durably-committed batch: installs the cursor's value as the
+    /// live value, advances the allocation and transaction-time watermarks,
+    /// fans the reports out to subscribers, and returns them in batch order.
+    /// The caller must have made every record in `prepared` durable and
+    /// verified ownership first. The cursor was snapshotted from, and advanced
+    /// past, the live value under the same single-writer serialization, so
+    /// installing it cannot lose a concurrent commit.
+    pub fn install_batch(&self, cursor: BatchCursor, prepared: Vec<Prepared>) -> Vec<TxReport> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.db = cursor.db;
+        state.next_user = state.next_user.max(cursor.next_user);
+        state.last_instant = state.last_instant.max(cursor.last_instant);
+        let reports: Vec<TxReport> = prepared
+            .into_iter()
+            .map(|p| TxReport {
+                db_before: p.db_before,
+                db_after: p.db_after,
+                tx: p.tx,
+                tx_instant: p.tx_instant,
+            })
+            .collect();
+        for report in &reports {
+            state
+                .subscribers
+                .retain(|subscriber| subscriber.send(report.clone()).is_ok());
+        }
+        reports
+    }
+
     /// Replaces the ident/keyword naming attached to the current database
     /// value (used when the boundary interns new keywords).
     pub fn update_naming(&self, idents: Idents, interner: KeywordInterner) {
