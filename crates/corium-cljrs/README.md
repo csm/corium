@@ -13,9 +13,16 @@ EDN/Clojure is the language at the API boundary and inside database functions:
 - **`api`** — the `corium.api` namespace bound to `corium-peer`:
   `connect`/`transact`/`q`/`pull`/`entity`/`datoms`/`as-of`/`since`/`history`/
   `tx-range`/`tx-report-queue`/`sync`.
-- **`dbfn` / `sandbox`** — the host that runs `:db/fn` code on the transactor in
-  a restricted interpreter: allowlisted environment, fuel/allocation/
-  call-depth budgets, and a watchdog deadline.
+- **`dbfn` / `sandbox`** — a host that runs `:db/fn` code in a restricted
+  interpreter: allowlisted environment, fuel/allocation/call-depth budgets,
+  and a watchdog deadline. *No longer the transactor path*: the transactor's
+  built-in `:db/fn` runtime is `corium-transactor::txfn` on the GC-less
+  `cljrs-tx` interpreter (ADR-0008 addendum); this host remains for GC-mode
+  embeddings.
+- **Build note** — this crate needs the cljrs stack in its default GC mode,
+  while the `cljrs`-featured transactor enables the global `no-gc` feature.
+  It is therefore excluded from default workspace builds; build and test it
+  standalone (`cargo test -p corium-cljrs`).
 - **`query`** — fills `corium-query`'s function/predicate resolution seam with
   sandboxed cljrs evaluation.
 

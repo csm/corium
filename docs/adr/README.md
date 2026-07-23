@@ -12,7 +12,7 @@ reference the old. Format: Context / Decision / Consequences.
 | [0005](0005-full-time-model.md) | Full time model in the first milestone set | Accepted |
 | [0006](0006-grpc-protocol.md) | gRPC control plane + custom tagged value encoding | Accepted |
 | [0007](0007-initial-backends.md) | In-memory + filesystem backends first | Accepted |
-| [0008](0008-sandboxed-db-functions.md) | Sandboxed Clojurust database functions | Accepted |
+| [0008](0008-sandboxed-db-functions.md) | Sandboxed Clojurust database functions | Accepted, amended (`cljrs-tx` runtime) |
 | [0009](0009-schema-scope.md) | Core Datomic schema scope for v1 | Accepted |
 | [0010](0010-ha-later.md) | Single transactor now, lease-based HA designed in | Accepted |
 | [0011](0011-sql-interface.md) | Peer-local read-only SQL over namespace projections | Accepted |

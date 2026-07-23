@@ -7,6 +7,8 @@ pub mod lease;
 pub mod metrics;
 pub mod node;
 pub mod server;
+#[cfg(feature = "cljrs")]
+pub mod txfn;
 
 pub use backend::{LogBackend, NodeStore, StoreSpec};
 

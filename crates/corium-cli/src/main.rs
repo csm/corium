@@ -254,12 +254,12 @@ enum Command {
         /// Retain unreachable blobs for at least this long.
         #[arg(long, default_value = "72h")]
         gc_window: String,
-        /// Fuel budget per database-function invocation (function applications).
+        /// Fuel budget per database-function invocation (execution credits).
         #[arg(long, default_value_t = 1_000_000)]
         db_fn_fuel: u64,
-        /// Wall-clock deadline per database-function invocation (ms).
-        #[arg(long, default_value_t = 5_000)]
-        db_fn_deadline_ms: u64,
+        /// Managed-memory budget per database-function invocation (bytes).
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        db_fn_memory_bytes: usize,
         #[command(flatten)]
         serve: ServeFlags,
     },
@@ -515,7 +515,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             gc_interval,
             gc_window,
             db_fn_fuel,
-            db_fn_deadline_ms,
+            db_fn_memory_bytes,
             serve,
         } => {
             let store_spec = store_spec(
@@ -546,13 +546,20 @@ async fn run(cli: Cli) -> Result<(), String> {
                 Some(parse_duration(&gc_interval)?)
             };
             config.gc_retention = parse_duration(&gc_window)?;
-            config.tx_fn_expander = Some(Arc::new(corium_cljrs::dbfn::DbFnExpander::new(
-                corium_cljrs::sandbox::SandboxBudget {
-                    fuel: db_fn_fuel,
-                    deadline: Duration::from_millis(db_fn_deadline_ms),
-                    ..corium_cljrs::sandbox::SandboxBudget::default()
-                },
-            )));
+            // The built-in `cljrs-tx` runtime is wired by `NodeConfig::new`
+            // when the `cljrs` feature is on; apply the flag budgets here.
+            #[cfg(feature = "cljrs")]
+            {
+                config.tx_fn_expander = Some(Arc::new(corium_transactor::txfn::DbFnExpander::new(
+                    corium_transactor::txfn::DbFnBudget {
+                        fuel: db_fn_fuel,
+                        memory_bytes: db_fn_memory_bytes,
+                        ..corium_transactor::txfn::DbFnBudget::default()
+                    },
+                )));
+            }
+            #[cfg(not(feature = "cljrs"))]
+            let _ = (db_fn_fuel, db_fn_memory_bytes);
             let tls = serve.tls()?;
             let authenticator = serve.authenticator();
             let node = TransactorNode::open(config)
