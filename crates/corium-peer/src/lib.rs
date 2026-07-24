@@ -7,6 +7,7 @@
 //! block on the transactor. On disconnect it reconnects and resubscribes
 //! from its basis, and the server backfills the gap from the durable log.
 
+pub mod authz;
 pub mod metrics;
 pub mod segment;
 pub mod server;

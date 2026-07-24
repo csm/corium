@@ -1,14 +1,16 @@
 # Authentication & Authorization
 
-Status: **wired in (permissive default).** The model lives in
-[`corium-protocol::authz`](../../crates/corium-protocol/src/authz.rs); the
-transactor and peer server enforce it through an
+Status: **wired in (permissive default), with a self-hosted authorizer.** The
+model lives in [`corium-protocol::authz`](../../crates/corium-protocol/src/authz.rs);
+the transactor and peer server enforce it through an
 [`IdentityInterceptor`](../../crates/corium-protocol/src/authz.rs) plus a
 per-handler authorization check, and the CLI builds the [`Guard`] each server
 runs from its flags. A concrete OIDC/JWT identity provider ships in
 [`corium-protocol::oidc`](../../crates/corium-protocol/src/oidc.rs) behind the
-`oidc` feature. Authorization is permit-all ([`AllowAll`]) by default — the seam
-is in place for a richer authorizer later. ADR-0012 records the decision to
+`oidc` feature. Authorization is permit-all ([`AllowAll`]) by default;
+`--authz-db <name>` switches it to the relationship-based (ReBAC) authorizer in
+[`corium-authz`](../../crates/corium-authz/src/lib.rs), which answers from
+policy stored in an ordinary Corium database. ADR-0012 records the decision to
 build authz as a request-scoped, optional layer. This document records the
 model, the wiring, and the open questions.
 
@@ -251,130 +253,202 @@ keep working; only what the server does with the token changed.
 
 ## Self-hosted ReBAC authorization database
 
+Status: **implemented** in [`corium-authz`](../../crates/corium-authz/src/lib.rs).
+
 Corium's data model is itself a good fit for relationship-based authorization
 (ReBAC): subjects, resources, groups, tenants, and permissions are naturally
 represented as entities and reference attributes. Rather than requiring every
-deployment to run an external policy service such as OpenFGA, Corium should be
-able to host its own small **system authorization database** and answer authz
-questions by querying that database from the transactor and peer servers.
-External authorizers remain possible through the `Authorizer` trait, but the
-first-class self-hosted path keeps single-cluster deployments operationally
-simple.
+deployment to run an external policy service such as OpenFGA, Corium hosts its
+own small **system authorization database** and answers authz questions from a
+compiled snapshot of it, in process, on the transactor and peer servers.
+External authorizers remain possible through the `Authorizer` trait; the
+self-hosted path keeps single-cluster deployments operationally simple.
 
-### System database
-
-A deployment may mark one database as the authorization database (for example,
-`_corium/authz`). It is an ordinary Corium database with a reserved schema and
-normal transaction history, but it is opened through a control-plane handle with
-additional safeguards:
-
-- Only operators or principals granted `authz/admin` may transact policy data.
-- User transactions to application databases cannot modify the system authz
-  database by accident; catalog configuration names it explicitly.
-- Policy reads are snapshot reads. An authz decision records the authz basis `t`
-  it used so decisions can be audited and reproduced.
-- The authz database can be backed up, restored, replicated, and inspected with
-  the same machinery as any other Corium database.
-
-The system database should stay intentionally small. It contains identities,
-resource relationships, permission derivation rules, and view-filter bindings —
-not high-volume application facts. Application databases may mirror stable
-resource identifiers into authz tuples when needed, but the hot data path should
-not require joining against arbitrary application facts for every request.
-
-### Schema shape
-
-The initial schema should be tuple-oriented so it can express common ReBAC
-models directly and can be imported from or exported to OpenFGA-like systems if
-needed:
-
-| Entity | Required attributes | Meaning |
-|---|---|---|
-| Principal | `:authz.principal/id`, `:authz.principal/provider`, optional `:authz.principal/role` | Local subject produced by `IdentityProvider` mapping. |
-| Object | `:authz.object/type`, `:authz.object/id`, optional `:authz.object/database` | Protected database, tenant, collection, entity, or synthetic control-plane object. |
-| Tuple | `:authz.tuple/subject`, `:authz.tuple/relation`, `:authz.tuple/object` | Relationship fact such as `alice member group:eng` or `group:eng writer db:music`. |
-| Permission | `:authz.permission/object-type`, `:authz.permission/action`, `:authz.permission/relation` | Maps a Corium `Action` to one or more relations that satisfy it. |
-| Rewrite | `:authz.rewrite/relation`, `:authz.rewrite/via-relation`, `:authz.rewrite/on-relation` | Optional derived relation edge, e.g. `viewer` through `parent` to a tenant. |
-| View | `:authz.view/name`, `:authz.view/filter-type`, filter parameters | A reusable `ViewFilter` definition returned with `AllowFiltered`. |
-| Binding | `:authz.binding/relation`, `:authz.binding/object`, `:authz.binding/view` | Attaches a view filter to a successful relation. |
-
-The tuple model intentionally mirrors the check shape:
+The check has the shape the tuple model implies:
 
 ```text
 Check(subject, action, object, database, at_authz_t)
-  action -> required relation(s)
-  subject --relation/derived-relation--> object
-  optional binding -> ViewFilter
+  action  -> required relation(s)         (permission map)
+  subject --relation/derived--> object    (tuples + rewrites)
+  optional binding -> ViewFilter          (bindings + views)
 ```
 
+### System database
+
+One database holds policy — `corium_authz` by default (`DEFAULT_AUTHZ_DB`;
+database names are restricted to `[A-Za-z0-9_-]`, so the reserved name spells
+`_corium/authz` as `corium_authz`). It is an ordinary Corium database with a
+reserved schema and normal transaction history:
+
+- Policy reads are snapshot reads. Every decision records the authz basis `t`
+  it was made against, so a decision can be audited and reproduced by reading
+  the authz database `as-of` that `t`.
+- The authz database is backed up, restored, forked, replicated, and inspected
+  with exactly the same machinery as any other database — that is the point of
+  keeping it ordinary.
+- Because it *is* a database, access to it is itself authorized by the policy
+  it contains: `corium authz init` grants the administrator `owner` on
+  `database:*`, which covers `database:corium_authz`. Nothing else can read or
+  write policy.
+
+Keep it small. It holds identities, relationships, permission derivation rules,
+and view bindings — not application facts. Application databases may mirror
+stable resource identifiers into authz tuples, but the hot path never joins
+against arbitrary application data.
+
+### Schema shape
+
+The schema is tuple-oriented so it expresses common ReBAC models directly and
+can be imported from, or exported to, an OpenFGA-like system. Every attribute
+is a string (or boolean), and policy entities refer to each other by *name*
+rather than by entity ref, so a policy fragment transacts without first
+resolving what it points at.
+
+| Entity | Attributes | Meaning |
+|---|---|---|
+| Principal | `:authz.principal/id`, `:authz.principal/provider`, `:authz.principal/role` | Registers a subject id, optionally pinned to the provider that may vouch for it, with roles granted by policy. |
+| Object | `:authz.object/type`, `:authz.object/id`, `:authz.object/database` | Names a protected object; `:authz.object/database` makes it an additional target for accesses on that Corium database. |
+| Tuple | `:authz.tuple/subject`, `:authz.tuple/relation`, `:authz.tuple/object` | The relationship fact, e.g. `user:alice member group:eng`. |
+| Permission | `:authz.permission/object-type`, `:authz.permission/action`, `:authz.permission/relation` | Maps an action (or action class) on an object type onto the relations that satisfy it. |
+| Rewrite | `:authz.rewrite/relation`, `:authz.rewrite/via-relation`, `:authz.rewrite/on-relation`, `:authz.rewrite/object-type` | Derived relation: `relation` holds on an object when `on-relation` holds on whatever its `via-relation` points at. |
+| View | `:authz.view/name`, `:authz.view/filter-type`, `:authz.view/attribute` | A reusable `ViewFilter` (`attribute-allowlist` / `attribute-denylist`). |
+| Binding | `:authz.binding/relation`, `:authz.binding/object`, `:authz.binding/view`, `:authz.binding/unfiltered` | Attaches a view to a successful relation, or marks that relation as granting full visibility. |
+
+Names follow a `type:id` convention. `type:*` is a wildcard: `database:*` is
+every database, `user:*` is every caller (including anonymous),
+`authenticated:*` is every caller who authenticated. A subject may also name a
+**userset**, `object#relation` — `group:eng#member` is "everyone with `member`
+on `group:eng`" — and the shorthand `group:eng` expands through the configured
+membership relations (`member` by default) so both spellings work.
+
 Concrete relation names are data, not Rust enums. The built-in action classes
-(`Read`, `Write`, `Admin`) remain the coarse API contract, while deployments can
-define relations such as `owner`, `writer`, `viewer`, `member`, `parent`, and
-`impersonator` in policy data.
+(`Read`, `Write`, `Admin`) remain the coarse API contract, and a permission may
+name an exact action (`query`, `transact`, `create-database`), a class
+(`read`, `write`, `admin`), or `*`.
 
 ### Query and evaluation model
 
-The self-hosted implementation should be an `Authorizer` named something like
-`SystemDbAuthorizer`. It receives `(Principal, Access)` and evaluates a bounded
-ReBAC query against a snapshot of the authz database:
+[`SystemDbAuthorizer`](../../crates/corium-authz/src/authorizer.rs) implements
+`Authorizer`. It receives `(Principal, Access)` and evaluates a bounded ReBAC
+query against a compiled snapshot:
 
-1. Map the request `Principal` to one or more subject object ids. OIDC groups or
-   static roles may be materialized as tuples, but request claims can also add
-   ephemeral subjects (for example, `provider:oidc/group:eng`) for the duration
-   of the check.
-2. Map `Access` to a target object. Database-scoped actions target
-   `database:<name>`; catalog-wide actions target reserved objects such as
-   `catalog:*`; future entity-level checks can target `entity:<db>/<eid>`.
-3. Resolve the configured action to candidate relations, then search
-   relationship tuples and rewrites with bounded recursion. The evaluator must
-   enforce maximum depth, maximum visited nodes, and cycle detection.
-4. Return `Allow`, `AllowFiltered(view)`, or `Deny`. If multiple successful
-   paths produce filters, combine them conservatively: the effective filter is
-   the intersection of visibility constraints, unless a policy explicitly marks
-   one relation as unfiltered.
+1. **Subjects.** The principal becomes a set of subject objects:
+   `user:<id>` and the provider-qualified `user:<provider>/<id>`,
+   `authenticated:<id>` when not anonymous, `role:<r>` for each role (from the
+   credential *and* from a principal registration), and claim-derived subjects
+   (`groups` → `group:eng`, `tenant` → `tenant:acme`). A principal registered
+   against a different provider does not get the bare `user:<id>` form, so one
+   issuer cannot mint an identity another issuer's tuples were written for.
+2. **Objects.** A database-scoped access targets `database:<name>` plus any
+   object registered against that database; a catalog-wide access targets
+   `catalog:*`. An *admin* action on a database also targets the catalog
+   object, so catalog ownership covers creating and deleting databases that
+   have no object of their own yet.
+3. **Relations.** The permission map resolves the action to candidate
+   relations, widening from the exact action name to its class to `*`, each
+   against the object's own type and `*`.
+4. **Search.** A breadth-first walk over `(relation, object)` goals follows
+   tuples, usersets, group expansion, and rewrites. It is bounded by maximum
+   depth (8), maximum visited goals (10,000), and a visited set that doubles as
+   cycle detection — policy data is user-authored, so a `parent` loop must cost
+   a bounded amount, not hang a request. Exhausting the budget is reported
+   distinctly from "no path", because it is an operational signal rather than a
+   policy answer.
+5. **Decision.** `Allow`, `AllowFiltered(view)`, or `Deny(reason)`. When
+   several relations succeed, their bound views **intersect** — holding one
+   more relation never reveals more than holding it alone — unless a binding is
+   explicitly marked `:authz.binding/unfiltered`, the documented escape hatch
+   for relations like `owner` that must see everything.
 
-The first production version can support database-level checks and
-attribute-allowlist views only. Entity-level checks and predicate views need the
-query-engine hooks already called out below.
+Denials carry the reason (`no permission maps action …`, `no relationship path
+grants …`), and grants carry the matched path
+(`database:music#writer -> group:eng#member -> user:bob`), which is what
+`corium authz check` prints and what the audit line records.
+
+The first version supports database- and catalog-level checks with
+attribute-level views. Entity-level checks and predicate views need the
+query-engine hooks called out under [Open questions](#open-questions).
 
 ### Caching and invalidation
 
-Because policy data is expected to be much smaller and less frequently changed
-than application data, peer servers and transactors should cache aggressively:
+Policy is small and changes rarely, so the surfaces cache aggressively:
 
-- Maintain an in-memory, immutable compiled policy snapshot keyed by authz
-  database basis `t`. The compiled form should include tuple indexes by
-  `(object, relation)`, subject memberships, action-to-relation mappings, and
-  prebuilt `ViewFilter` values.
-- Subscribe to the authz database log or poll its latest basis `t`. When `t`
-  advances, build the next compiled snapshot off the request path and atomically
-  swap it in.
-- Negative and positive check-result caches may be layered on top, keyed by
-  `(principal fingerprint, action, object, authz_t)`. Including `authz_t` makes
-  invalidation trivial: advancing policy basis naturally misses old entries.
-- Fail closed when the configured authz database cannot be loaded, except for an
-  explicit break-glass configuration intended only for operator recovery.
+- An immutable compiled snapshot ([`Policy`](../../crates/corium-authz/src/policy.rs))
+  keyed by the authz database's basis `t`, holding tuples indexed by
+  `(object, relation)`, the action-to-relation map, rewrites, and prebuilt
+  `ViewFilter` values.
+- A refresh task waits on the source's change signal — the transactor's basis
+  watch, a peer connection's tx-report broadcast — recompiles **off the request
+  path**, and swaps the new snapshot in atomically. A snapshot that fails to
+  compile never replaces the last good one: the process keeps deciding from the
+  policy it has, and logs.
+- A check-result cache keyed by `(principal fingerprint, action, object,
+  authz_t)`. Including `authz_t` makes invalidation free — advancing the policy
+  basis drops every entry under the old one.
+- **Fail closed.** No policy means no access. The only exception is an explicit
+  break-glass configuration (`--authz-break-glass-role`) for operator recovery,
+  which applies when the policy cannot be *read* — never to override a policy
+  that denies — and is audited at `warn` every time it grants.
 
-This keeps the common path local and lock-free: authenticate the request, read
-the current compiled authz snapshot, perform a bounded graph walk in memory, and
-return a decision.
+The common path is therefore local and lock-light: authenticate in the
+interceptor, read the current snapshot pointer, walk it in memory, decide.
 
 ### Consistency choices
 
-Authorization consistency should be explicit per deployment or per surface:
+- **Pinned snapshot (default).** Checks use the newest compiled basis this
+  process holds. Fastest; propagation across a fleet is eventually consistent
+  (in practice, as fast as the change signal — the end-to-end test asserts a
+  new grant takes effect on a running transactor without a restart).
+- **Require fresh basis.** `--authz-fresh-writes` makes write and admin actions
+  re-read the source before deciding, so a control-plane change is never
+  decided from a stale snapshot. Reads stay pinned. A fresh check that cannot
+  reach the source denies rather than falling back to the pinned snapshot —
+  the caller asked for the newest policy precisely because stale is not good
+  enough.
+- **Transactor-owned checks.** The transactor authorizes writes from its own
+  local snapshot of the database it leads, so write admission is consistent at
+  the serialization point even when read-serving peers lag.
 
-- **Pinned snapshot (default):** all checks use the latest compiled authz basis
-  known to that process. This is fastest and gives monotonic local updates after
-  cache refresh, but propagation to all peers is eventually consistent.
-- **Require fresh basis:** sensitive control-plane operations may require the
-  server to observe at least a specified authz `t` before deciding, returning a
-  retryable error if it is behind.
-- **Transactor-owned checks:** writes can be authorized by the transactor using
-  its local authz snapshot, making write admission consistent at the serialization
-  point even if read-serving peers lag slightly.
+Audit events ([`corium_authz::audit`](../../crates/corium-authz/src/audit.rs))
+carry the principal, provider, action, target object, decision, authz basis
+`t`, matched relation path, and view names. The default sink is `tracing` under
+the `corium_authz::audit` target — denials at `info`, grants at `debug` — and
+`AuditSink` lets a deployment route them elsewhere.
 
-Audit entries should include the principal, action, target, decision, authz
-basis `t`, matched relation path when available, and filter name.
+### Operating it
+
+```sh
+# 1. Create the policy database (against a transactor started without --authz-db).
+corium authz init --admin alice --provider oidc
+
+# 2. Write policy.
+corium authz grant alice owner catalog:*
+corium authz grant 'group:eng#member' writer database:music
+corium authz grant bob member group:eng
+
+# 3. Ask what it decides, before enforcing it.
+corium authz check bob transact --database music
+# {:decision :allow … :path "database:music#writer -> group:eng#member -> user:bob"}
+
+# 4. Enforce it.
+corium transactor  --data-dir … --authz-db corium_authz
+corium peer-server --db music    --authz-db corium_authz
+```
+
+`corium authz init` installs the reserved schema and the default permission map
+(`read`→`viewer`/`writer`/`owner`, `write`→`writer`/`owner`, `admin`→`owner`,
+and the same for `catalog`), then grants a first administrator `owner` on
+`catalog:*` and `database:*`. That administrator defaults to the identity a
+`--serve-token` client presents (`operator`, pinned to `static-token`), so the
+CLI that created the database can still administer it once enforcement is on;
+`--admin`/`--provider` point it at a real identity, and `--no-admin` grants
+nobody anything. `corium authz status` prints the compiled basis and entity
+counts; `corium authz revoke` retracts a tuple.
+
+Bootstrap is deliberately a two-step: create the policy, *then* enable
+`--authz-db`. A server started with `--authz-db` before the database exists does
+not fail to start — it denies every request (fail closed), logs the remedy, and
+recovers on its own once the database appears.
 
 ### External compatibility
 
@@ -385,20 +459,26 @@ an external service. Keeping the schema tuple-shaped makes that bridge
 straightforward while allowing Corium-only deployments to avoid another
 service, another consistency boundary, and another cache layer.
 
+
 ## Open questions
 
-- **Bootstrapping and operating the system authz database.** The ReBAC section
-  proposes a control database, but the concrete bootstrap flow is still open:
-  how an operator creates the first `authz/admin`, how break-glass access is
-  represented, and how catalog configuration pins the database identity across
-  backup/restore and fork operations.
-- **View filtering in the query engine.** `AttributeAllowlist` is enforceable
-  in the datom scan, but a `ViewFilter` that hides *entities* or filters by
-  *value* needs a hook inside `corium-query` (a predicate in the executor),
-  and interacts with the query cache (cache keys must include the filter). This
-  is the largest downstream change and is out of scope for the spike.
-- **Auditing.** Every authz decision is a natural audit event; the `Principal`
-  and `Access` are exactly what a log line needs. Not prototyped.
+- **View filtering in the query engine.** This is now the gap that matters: an
+  authorizer *can* return `AllowFiltered`, but no read path applies a filter
+  yet, so the peer server rejects a filtered decision with `UNIMPLEMENTED`
+  rather than returning unfiltered data. Attribute-level visibility is
+  enforceable in the datom scan; a `ViewFilter` that hides *entities* or
+  filters by *value* needs a hook inside `corium-query` (a predicate in the
+  executor) and interacts with the query cache (cache keys must include the
+  filter). Until then, policies that bind views are expressible and testable
+  but not servable.
+- **Pinning the authz database across fork and restore.** The database is named
+  by configuration (`--authz-db`), not recorded in the catalog, so a restore
+  under a different name or a fork of the policy database is an operator
+  concern rather than something the catalog enforces.
+- **Cross-process policy propagation lag.** Each surface refreshes from its own
+  change signal, so two peers can briefly decide from different bases.
+  `--authz-fresh-writes` closes this for control-plane actions; a
+  `require at least authz_t` request option for readers is not implemented.
 - **mTLS subject extraction.** Needs the tonic peer-certificate plumbing to
   fill `Credentials::client_cert_subject` inside the service; the field exists,
   the wiring does not.
@@ -421,15 +501,39 @@ service, another consistency boundary, and another cache layer.
   it offline. Unit tests sign and verify real tokens against an embedded test
   key and cover tampering, expiry, wrong issuer/audience, and unsupported
   algorithms.
+- `corium-authz`: the self-hosted ReBAC authorizer. `schema` (the reserved
+  attributes and the EDN that installs them), `model` (objects, tuples,
+  permissions, rewrites, views, bindings), `policy::Policy` (the compiled
+  snapshot and its indexes), `eval` (the bounded, cycle-safe search),
+  `subject` (principal → subjects), `view` (filters and their conservative
+  combination), `source::PolicySource` (+ `MemoryPolicySource`), `audit`
+  (`AuditEvent`/`AuditSink`/`TracingAudit`), `bootstrap` (in-process policy
+  databases and the grant/revoke transaction forms), and `SystemDbAuthorizer`
+  with snapshot caching, a refresh task, result caching, consistency modes,
+  fail-closed behaviour, and break-glass.
+- Policy sources per surface: `corium_transactor::authz::NodePolicySource`
+  (the node's own `DbState`, woken by its basis watch) and
+  `corium_peer::authz::ConnectionPolicySource` (a second peer connection, woken
+  by its tx-report broadcast).
 - Server wiring: the transactor (`Transactor` + `Catalog`) and peer server
   authenticate every request in the interceptor and authorize the concrete
-  `Access` in each handler. Authorization defaults to `AllowAll`.
+  `Access` in each handler. Authorization defaults to `AllowAll`, or to the
+  relationship policy when `--authz-db` names one.
 - CLI: a shared development token defaulted across every program, `ServeFlags`
   that build the server `Guard` (`--serve-token`, `--require-auth`,
-  `--serve-open`, `--oidc-issuer`/`--oidc-audience`/`--oidc-jwks-file`), and
-  `CORIUM_TOKEN` / `CORIUM_SERVE_TOKEN` environment overrides.
+  `--serve-open`, `--oidc-issuer`/`--oidc-audience`/`--oidc-jwks-file`,
+  `--authz-db`, `--authz-fresh-writes`, `--authz-break-glass-role`,
+  `--authz-max-depth`), `CORIUM_TOKEN` / `CORIUM_SERVE_TOKEN` /
+  `CORIUM_AUTHZ_DB` environment overrides, and
+  `corium authz init|grant|revoke|check|status`.
 - Unit tests covering each model requirement: optional-off, distinct
   static-token identities, the external-verifier seam, provider composition,
   role/database enforcement, an async external-oracle authorizer, per-principal
   views, interceptor extension propagation, and one guard serving two tenants
   with different authority.
+- ReBAC tests: 20 behavioural tests over the compiled policy (usersets, group
+  shorthand, rewrites, wildcards, view intersection and the unfiltered escape,
+  unmapped actions, cycles, depth and visit budgets, cache invalidation, fresh
+  consistency, fail-closed with break-glass, provider pinning, audit), plus two
+  end-to-end tests that enforce a policy over a live transactor's gRPC surface
+  and a peer server, including a grant taking effect without a restart.

@@ -1,26 +1,26 @@
 [package]
-name = "corium-peer"
+name = "corium-authz"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Corium peer library"
+description = "Self-hosted relationship-based (ReBAC) authorization over a Corium system database"
 
 [dependencies]
-async-trait = "0.1"
-corium-authz = { workspace = true }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
-corium-log = { workspace = true }
+corium-forms = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
-corium-store = { workspace = true }
+corium-tx = { workspace = true }
 thiserror = "2"
-tracing = "0.1"
-tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-stream = "0.1.18"
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.14.5", features = ["tls-ring"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]
 workspace = true

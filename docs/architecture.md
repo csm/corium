@@ -99,7 +99,8 @@ A single Cargo workspace. Dependency edges point strictly downward.
 | `corium-sql` | Read-only DataFusion SQL over peer-local `Db` values; namespace projections and system relations |
 | `corium-transactor` | Transactor process: pipeline, indexing job, lease, gRPC server |
 | `corium-peer` | Peer library: connection, tx-report handling, segment cache, `Connection`/`Db` public API |
-| `corium-protocol` | protobuf definitions, wire value encoding, generated tonic stubs |
+| `corium-protocol` | protobuf definitions, wire value encoding, generated tonic stubs, request identity/authorization model |
+| `corium-authz` | Self-hosted relationship-based (ReBAC) authorization: reserved policy schema, compiled policy snapshots, bounded relationship search, `SystemDbAuthorizer` |
 | `corium-cljrs` | Clojurust bindings: value conversion, `(d/q …)` API, db-function sandbox host |
 | `corium-cli` | `corium` binary: admin commands, query console, standalone transactor/peer-server launchers |
 | `corium-sim` | Deterministic simulation harness for tests (not published) |

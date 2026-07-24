@@ -31,6 +31,7 @@ oidc-discovery = ["oidc", "corium-protocol/oidc-discovery"]
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
+corium-authz = { workspace = true }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-log = { workspace = true }

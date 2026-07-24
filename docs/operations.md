@@ -374,6 +374,53 @@ corium gc --data-dir /srv/corium --window 72h
 
 Use a zero window only when no stale root or in-flight reader can exist.
 
+## Authorization (self-hosted ReBAC)
+
+Servers authorize every request permit-all by default. `--authz-db <name>`
+switches them to the relationship policy stored in a Corium database — see
+[docs/design/auth.md](design/auth.md) for the model. Bootstrap is two steps,
+in this order:
+
+```sh
+# 1. Against a transactor started WITHOUT --authz-db:
+corium authz init --admin alice --provider oidc     # schema + permissions + first owner
+corium authz grant 'group:eng#member' writer database:music
+corium authz grant bob member group:eng
+corium authz check bob transact --database music    # dry-run the decision
+
+# 2. Restart the surfaces with enforcement on:
+corium transactor  --data-dir /srv/corium --authz-db corium_authz
+corium peer-server --db music --authz-db corium_authz
+```
+
+`authz init` grants its administrator `owner` on `catalog:*` and `database:*`.
+It defaults to the identity a `--serve-token` client presents (`operator`,
+pinned to `static-token`), so the CLI keeps working after enforcement is on;
+pass `--admin`/`--provider` for a real identity, or `--no-admin` to grant
+nobody anything.
+
+Operating notes:
+
+- **Fail closed.** A surface that cannot read or compile the policy denies
+  every request. It does not refuse to start: it logs the remedy and recovers
+  on its own once the database appears, so ordering mistakes are not fatal.
+- **Changes propagate without a restart.** Each server watches the policy
+  database and recompiles off the request path; a `grant` takes effect in
+  milliseconds. `corium authz status` shows the compiled basis (`:authz-t`) and
+  entity counts, and every decision logs the basis it used under the
+  `corium_authz::audit` tracing target (denials at `info`, grants at `debug`).
+- **`--authz-fresh-writes`** makes write and admin actions re-read the policy
+  before deciding, at the cost of a snapshot read per such request.
+- **Locked yourself out?** Break-glass (`--authz-break-glass-role admin`) only
+  applies when the policy is *unreadable*, never to override a deny. The
+  recovery path for a policy that denies everyone is to restart the transactor
+  without `--authz-db`, fix the tuples with `corium authz grant`, and restart
+  with it again.
+- The policy database is an ordinary database: back it up, restore it, and
+  inspect it (`corium console corium_authz`) like any other. Access to it is
+  itself governed by the policy it holds — the administrator's `database:*`
+  ownership is what keeps `corium authz grant` working.
+
 ## Recovery checklist
 
 1. Stop the affected transactor and preserve its data directory.
