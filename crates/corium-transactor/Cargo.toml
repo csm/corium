@@ -20,6 +20,7 @@ s3 = ["corium-store/s3"]
 [dependencies]
 cljrs-tx = { workspace = true, features = ["no-gc"], optional = true }
 cljrs-value = { workspace = true, optional = true }
+corium-authz = { workspace = true }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-index = { workspace = true }

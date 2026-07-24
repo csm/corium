@@ -162,18 +162,25 @@ Scaling and durability (see
 
 Security and multi-tenancy:
 
-- **Optional request-scoped authn/authz.** *(Spike.)* The network surfaces
-  today authenticate a connection with one bearer token
-  ([`auth`](../crates/corium-protocol/src/auth.rs)). A spike in
-  [`corium-protocol::authz`](../crates/corium-protocol/src/authz.rs) explores
-  per-request identity, pluggable external identity providers (OIDC/mTLS via a
-  `TokenVerifier` seam), authorization (a role→grant policy or an async external
-  oracle such as OpenFGA / Auth0 FGA), and per-principal `ViewFilter`s so one
-  transactor or peer server can serve many tenants with different views at once — see [auth.md](design/auth.md) and
-  [ADR-0012](adr/0012-optional-authn-authz.md). Remaining work: adopt `Guard`
-  in the servers and CLI, a concrete OIDC verifier behind a feature flag,
-  externalized policy, and entity/value-level view filtering in the query
-  engine (executor predicate plus query-cache keying).
+- **Optional request-scoped authn/authz.** *(Landed.)* The network surfaces
+  derive a `Principal` per request
+  ([`corium-protocol::authz`](../crates/corium-protocol/src/authz.rs)),
+  authenticate it in the interceptor (static tokens, OIDC/JWT behind the `oidc`
+  feature, an mTLS-shaped `TokenVerifier` seam), and authorize the concrete
+  `Access` in each handler. Policy is either permit-all (the default), a
+  role→grant table, an external async oracle (OpenFGA / Auth0 FGA), or
+  Corium's own relationship database — see [auth.md](design/auth.md) and
+  [ADR-0012](adr/0012-optional-authn-authz.md).
+- **Self-hosted ReBAC authorization.** *(Landed.)*
+  [`corium-authz`](../crates/corium-authz/src/lib.rs) stores relationship
+  policy — principals, tuples, permissions, rewrites, views — in an ordinary
+  Corium database, compiles it into an immutable snapshot keyed by its basis
+  `t`, and answers checks with a bounded, cycle-safe graph walk in memory.
+  Transactor and peer server enable it with `--authz-db`; `corium authz
+  init|grant|revoke|check|status` operates it. Remaining work: entity- and
+  value-level view filtering in the query engine (executor predicate plus
+  query-cache keying), which is what an `AllowFiltered` decision needs before a
+  read path can serve it, and mTLS subject extraction.
 
 Engine and API:
 

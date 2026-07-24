@@ -1858,11 +1858,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "corium-authz"
+version = "0.1.0"
+dependencies = [
+ "corium-core",
+ "corium-db",
+ "corium-forms",
+ "corium-protocol",
+ "corium-query",
+ "corium-tx",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "corium-cli"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "corium-authz",
  "corium-core",
  "corium-db",
  "corium-log",
@@ -2004,6 +2021,7 @@ name = "corium-peer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "corium-authz",
  "corium-core",
  "corium-db",
  "corium-log",
@@ -2117,6 +2135,7 @@ dependencies = [
  "async-trait",
  "cljrs-tx",
  "cljrs-value",
+ "corium-authz",
  "corium-core",
  "corium-db",
  "corium-index",

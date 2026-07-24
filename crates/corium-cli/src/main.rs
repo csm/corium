@@ -1,6 +1,7 @@
 //! `corium` — launchers and admin commands for the distributed topology:
 //! `transactor`, `peer-server`, `db *`, `console`, backup/restore, `gc`, and `log`.
 
+mod authz;
 mod console;
 mod metrics_http;
 mod pg_catalog;
@@ -14,12 +15,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
 use corium_peer::server::PeerServerConfig;
 use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings};
 use corium_protocol::auth::{DEFAULT_DEV_TOKEN, client_tls, server_tls};
 use corium_protocol::authz::{
-    AllowAll, CompositeProvider, Guard, IdentityProvider, Principal, StaticTokens,
+    ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, Principal,
+    StaticTokens,
 };
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
@@ -167,7 +170,9 @@ impl ClientFlags {
 /// `--serve-token`, requiring the default token with `--require-auth`, or
 /// configuring an OIDC issuer all switch the server to strict mode, where an
 /// unrecognized or absent credential is rejected. Authorization defaults to
-/// permit-all ([`AllowAll`]).
+/// permit-all ([`AllowAll`]) unless `--authz-db` names a policy database, in
+/// which case every request is authorized against the relationship policy it
+/// holds.
 #[derive(Args, Clone)]
 struct ServeFlags {
     /// Require this exact bearer token from clients (strict: rejects anonymous
@@ -195,6 +200,24 @@ struct ServeFlags {
     /// works with the `oidc` feature alone).
     #[arg(long)]
     oidc_jwks_file: Option<PathBuf>,
+    /// Authorize every request against the self-hosted relationship policy in
+    /// this database (create it with `corium authz init`). Without it,
+    /// authorization is permit-all.
+    #[arg(long, env = "CORIUM_AUTHZ_DB")]
+    authz_db: Option<String>,
+    /// Re-read the policy database before deciding write and admin actions, so
+    /// a control-plane change is never decided from a stale snapshot. Reads
+    /// keep using the pinned snapshot either way.
+    #[arg(long, requires = "authz_db")]
+    authz_fresh_writes: bool,
+    /// Role admitted while the policy database cannot be read at all
+    /// (repeatable). Break-glass is for operator recovery: it does not
+    /// override a policy that denies, only one that is unavailable.
+    #[arg(long = "authz-break-glass-role", requires = "authz_db")]
+    authz_break_glass_roles: Vec<String>,
+    /// Maximum relation hops one authorization check may walk.
+    #[arg(long, default_value_t = 8, requires = "authz_db")]
+    authz_max_depth: usize,
     /// PEM certificate chain for TLS.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -213,9 +236,49 @@ impl ServeFlags {
         }
     }
 
-    /// Builds the request [`Guard`] this server enforces from the auth flags.
-    async fn guard(&self) -> Result<Guard, String> {
+    /// The authorization database and tuning the `--authz-*` flags select.
+    ///
+    /// # Errors
+    /// Rejects `--authz-db` together with `--serve-open`, which would
+    /// authorize requests whose identity was never established.
+    fn authz(&self) -> Result<Option<(String, AuthzConfig)>, String> {
+        let Some(db) = self.authz_db.clone() else {
+            return Ok(None);
+        };
         if self.serve_open {
+            return Err(
+                "--serve-open disables authentication; it cannot be combined with --authz-db"
+                    .to_owned(),
+            );
+        }
+        let mut config = AuthzConfig {
+            limits: corium_authz::Limits {
+                max_depth: self.authz_max_depth,
+                ..corium_authz::Limits::default()
+            },
+            ..AuthzConfig::default()
+        };
+        if self.authz_fresh_writes {
+            config.fresh_for = [ActionClass::Write, ActionClass::Admin]
+                .into_iter()
+                .collect();
+        }
+        if !self.authz_break_glass_roles.is_empty() {
+            config.break_glass = Some(BreakGlass {
+                roles: self.authz_break_glass_roles.iter().cloned().collect(),
+                ..BreakGlass::default()
+            });
+        }
+        Ok(Some((db, config)))
+    }
+
+    /// Builds the request [`Guard`] this server enforces from the auth flags.
+    ///
+    /// `authorizer` is the policy the surface wired up from `--authz-db`;
+    /// `None` leaves authorization permit-all.
+    async fn guard_with(&self, authorizer: Option<Arc<dyn Authorizer>>) -> Result<Guard, String> {
+        if self.serve_open {
+            debug_assert!(authorizer.is_none(), "ServeFlags::authz rejects the pair");
             return Ok(Guard::disabled());
         }
         // The static-token provider recognizes either an explicit `--serve-token`
@@ -236,9 +299,13 @@ impl ServeFlags {
             Some(oidc) => Arc::new(CompositeProvider::new(vec![Arc::new(statics), oidc])),
             None => Arc::new(statics),
         };
-        // Authorization is permit-all by default; the seam is in place for a
-        // richer authorizer (role policy, external oracle) later.
-        Ok(Guard::new(provider, Arc::new(AllowAll)).allow_anonymous(!strict))
+        // Authorization is permit-all unless `--authz-db` supplied a
+        // relationship policy. Anonymous callers are still admitted in
+        // permissive mode: with an authorizer in place they simply arrive as
+        // `user:anonymous`, so "public read, authenticated write" stays a
+        // policy question rather than a flag.
+        let authorizer = authorizer.unwrap_or_else(|| Arc::new(AllowAll));
+        Ok(Guard::new(provider, authorizer).allow_anonymous(!strict))
     }
 
     /// Builds the OIDC identity provider when `--oidc-issuer` is set.
@@ -403,6 +470,10 @@ enum Command {
     /// Database catalog operations.
     #[command(subcommand)]
     Db(DbCommand),
+    /// Self-hosted authorization database: create it, grant and revoke
+    /// relationships, and ask what the policy decides.
+    #[command(subcommand)]
+    Authz(authz::AuthzCommand),
     /// Sweep blobs unreachable from any live database root.
     Gc {
         /// Operate offline over a data directory (transactor must be stopped).
@@ -673,10 +744,28 @@ async fn run(cli: Cli) -> Result<(), String> {
             #[cfg(not(feature = "cljrs"))]
             let _ = (db_fn_fuel, db_fn_memory_bytes);
             let tls = serve.tls()?;
-            let guard = serve.guard().await?;
             let node = TransactorNode::open(config)
                 .await
                 .map_err(|error| format!("cannot open node: {error}"))?;
+            // The node leads the authz database like any other, so the
+            // authorizer reads a local snapshot and the node's basis watch is
+            // its change signal — no extra connection, and write admission is
+            // decided at the serialization point.
+            let authorizer = match serve.authz()? {
+                Some((authz_db, authz_config)) => Some(
+                    start_authorizer(
+                        Arc::new(corium_transactor::authz::NodePolicySource::new(
+                            Arc::clone(&node),
+                            authz_db.clone(),
+                        )),
+                        authz_config,
+                        &authz_db,
+                    )
+                    .await,
+                ),
+                None => None,
+            };
+            let guard = serve.guard_with(authorizer).await?;
             let _metrics = if let Some(address) = metrics_listen {
                 let metrics_node = Arc::clone(&node);
                 Some(
@@ -731,13 +820,40 @@ async fn run(cli: Cli) -> Result<(), String> {
             serve,
         } => {
             let tls = serve.tls()?;
-            let guard = serve.guard().await?;
             let config = client.connect_config(db).await?;
             let connection = Arc::new(
                 Connection::connect(config)
                     .await
                     .map_err(|error| format!("cannot connect to transactor: {error}"))?,
             );
+            // A second peer connection keeps the policy database in sync
+            // locally, so checks stay in-process: no per-request round trip to
+            // the transactor.
+            let authorizer = match serve.authz()? {
+                Some((authz_db, authz_config)) => {
+                    let authz_config_client = client.connect_config(authz_db.clone()).await?;
+                    let authz_connection =
+                        Arc::new(Connection::connect(authz_config_client).await.map_err(
+                            |error| {
+                                format!(
+                                    "cannot connect to authorization database {authz_db:?}: {error}"
+                                )
+                            },
+                        )?);
+                    Some(
+                        start_authorizer(
+                            Arc::new(corium_peer::authz::ConnectionPolicySource::new(
+                                authz_connection,
+                            )),
+                            authz_config,
+                            &authz_db,
+                        )
+                        .await,
+                    )
+                }
+                None => None,
+            };
+            let guard = serve.guard_with(authorizer).await?;
             eprintln!(
                 "corium peer-server: hosting {:?} on {listen}",
                 connection.db_name()
@@ -786,6 +902,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|error| error.to_string())
         }
         Command::Db(command) => run_db(command).await,
+        Command::Authz(command) => authz::run(command).await,
         Command::Gc {
             data_dir,
             transactor,
@@ -1057,6 +1174,47 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
         }
     };
     Ok(Duration::from_secs(seconds))
+}
+
+/// Builds the self-hosted authorizer over `source` and starts its refresh task.
+///
+/// Startup does not fail when the policy cannot be compiled yet: the authorizer
+/// denies every request until it can (that is the fail-closed contract), and
+/// the refresh task keeps trying, so a transactor started before
+/// `corium authz init` recovers on its own instead of crash-looping.
+async fn start_authorizer(
+    source: Arc<dyn corium_authz::PolicySource>,
+    config: AuthzConfig,
+    authz_db: &str,
+) -> Arc<dyn Authorizer> {
+    let authorizer = Arc::new(SystemDbAuthorizer::with_config(source, config));
+    match authorizer.refresh().await {
+        Ok(policy) => {
+            tracing::info!(
+                authz_db,
+                authz_t = policy.basis_t(),
+                stats = ?policy.stats(),
+                "authorization policy loaded"
+            );
+            eprintln!(
+                "corium: authorizing from {authz_db:?} at authz-t {}",
+                policy.basis_t()
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                authz_db,
+                %error,
+                "authorization policy is unavailable; denying every request until it loads"
+            );
+            eprintln!(
+                "corium: cannot load the authorization database {authz_db:?} ({error}); \
+                 every request will be denied until it loads — run `corium authz init --db {authz_db}`"
+            );
+        }
+    }
+    authorizer.spawn_refresh();
+    authorizer
 }
 
 async fn admin_client(client: &ClientFlags) -> Result<Admin, String> {
