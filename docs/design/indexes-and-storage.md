@@ -144,8 +144,11 @@ Design constraints on the traits (so future backends fit without change):
   - **FileStore** — segments as `objects/ab/cdef…` files (write-temp +
     rename), roots as files updated by lock-file-guarded atomic rename.
 
-A read-through, size-bounded **segment cache** (in-memory ARC/LRU, optional
-disk tier) wraps any `BlobStore` on the peer and transactor side.
+A read-through, size-bounded **segment cache** wraps `BlobStore` reads. The
+peer's optional SSD tier, LRU and capacity semantics, crash behavior, operator
+configuration, and metrics are specified in
+[peer-segment-cache.md](peer-segment-cache.md). The cache never covers mutable
+roots and is not part of storage durability.
 
 ## Garbage collection
 
