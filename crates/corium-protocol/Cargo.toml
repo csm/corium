@@ -21,6 +21,23 @@ tokio-stream = "0.1.18"
 tonic = { version = "0.14.5", features = ["tls-ring"] }
 tonic-prost = "0.14.5"
 
+# OIDC/JWT bearer-token verification (feature `oidc`). Kept optional so the
+# default build stays free of the crypto/HTTP stack; `oidc-discovery` adds the
+# HTTP client used to fetch a live issuer's JWKS.
+base64 = { version = "0.22.1", optional = true }
+ring = { version = "0.17.14", optional = true }
+serde = { version = "1.0.228", optional = true, features = ["derive"] }
+serde_json = { version = "1.0.150", optional = true }
+reqwest = { version = "0.13.4", optional = true, default-features = false, features = [
+    "rustls",
+    "http2",
+    "json",
+] }
+
+[features]
+oidc = ["dep:base64", "dep:ring", "dep:serde", "dep:serde_json"]
+oidc-discovery = ["oidc", "dep:reqwest"]
+
 [dev-dependencies]
 proptest = "1"
 

@@ -908,12 +908,13 @@ impl Admin {
         })
     }
 
-    /// Fixes a database backup checkpoint and returns an independent
-    /// connection to the transactor's underlying storage service.
+    /// Fixes the current transaction basis and returns an independent
+    /// connection to the transactor's underlying storage service, for a
+    /// backup client or a storage-aware peer bootstrapping from storage.
     ///
     /// # Errors
     /// Returns [`PeerError`] for an unknown database or transport failure.
-    pub async fn get_backup_info(
+    pub async fn get_storage_info(
         &mut self,
         db: &str,
     ) -> Result<pb::GetStorageInfoResponse, PeerError> {

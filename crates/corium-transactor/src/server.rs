@@ -3,7 +3,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use corium_protocol::auth::{AuthInterceptor, Authenticator};
+use corium_protocol::authz::{self, Access, Action, Guard, IdentityInterceptor, Principal};
 use corium_protocol::codec;
 use corium_protocol::pb;
 use corium_protocol::pb::catalog_server::{Catalog, CatalogServer};
@@ -137,7 +137,21 @@ pub(crate) fn subscription_stream(
 }
 
 /// Transactor gRPC service over a node.
-pub struct TransactorSvc(pub Arc<TransactorNode>);
+pub struct TransactorSvc(pub Arc<TransactorNode>, pub Guard);
+
+/// Authorizes `access` for the request's [`Principal`], mapping the guard's
+/// decision onto a gRPC status. A returned [`ViewFilter`](authz::ViewFilter) is
+/// rejected for now: no transactor/catalog surface applies one yet, so honoring
+/// a filtered decision by returning full data would be an authorization bypass.
+async fn authorize(guard: &Guard, principal: &Principal, access: Access) -> Result<(), Status> {
+    match guard.authorize(principal, &access).await {
+        Ok(None) => Ok(()),
+        Ok(Some(_filter)) => Err(Status::unimplemented(
+            "view filtering is not enforced on this surface yet",
+        )),
+        Err(error) => Err(error.to_status()),
+    }
+}
 
 #[tonic::async_trait]
 impl Transactor for TransactorSvc {
@@ -145,8 +159,15 @@ impl Transactor for TransactorSvc {
         &self,
         request: Request<pb::TransactRequest>,
     ) -> Result<Response<pb::TransactResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
         check_version(request.protocol_version)?;
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Transact, &request.db),
+        )
+        .await?;
         self.0
             .transact(&request.db, &request.tx_data)
             .await
@@ -160,8 +181,15 @@ impl Transactor for TransactorSvc {
         &self,
         request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
         check_version(request.protocol_version)?;
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Subscribe, &request.db),
+        )
+        .await?;
         let state = self
             .0
             .db_state(&request.db)
@@ -180,7 +208,14 @@ impl Transactor for TransactorSvc {
         &self,
         request: Request<pb::SyncRequest>,
     ) -> Result<Response<pb::SyncResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Inspect, &request.db),
+        )
+        .await?;
         let basis_t = self
             .0
             .sync(&request.db, request.t)
@@ -193,7 +228,14 @@ impl Transactor for TransactorSvc {
         &self,
         request: Request<pb::StatusRequest>,
     ) -> Result<Response<pb::StatusResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Inspect, &request.db),
+        )
+        .await?;
         self.0
             .status(&request.db)
             .await
@@ -214,7 +256,7 @@ fn check_version(version: u32) -> Result<(), Status> {
 }
 
 /// Catalog gRPC service over a node.
-pub struct CatalogSvc(pub Arc<TransactorNode>);
+pub struct CatalogSvc(pub Arc<TransactorNode>, pub Guard);
 
 #[tonic::async_trait]
 impl Catalog for CatalogSvc {
@@ -222,7 +264,14 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::CreateDatabaseRequest>,
     ) -> Result<Response<pb::CreateDatabaseResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::CreateDatabase, &request.db),
+        )
+        .await?;
         let created = self
             .0
             .create_db(&request.db, &request.schema)
@@ -235,7 +284,14 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::DeleteDatabaseRequest>,
     ) -> Result<Response<pb::DeleteDatabaseResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::DeleteDatabase, &request.db),
+        )
+        .await?;
         let deleted = self
             .0
             .delete_db(&request.db)
@@ -248,7 +304,14 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::ForkDatabaseRequest>,
     ) -> Result<Response<pb::ForkDatabaseResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::ForkDatabase, &request.target),
+        )
+        .await?;
         let forked = self
             .0
             .fork_db(&request.db, &request.target, request.as_of_t)
@@ -262,8 +325,10 @@ impl Catalog for CatalogSvc {
 
     async fn list_databases(
         &self,
-        _request: Request<pb::ListDatabasesRequest>,
+        request: Request<pb::ListDatabasesRequest>,
     ) -> Result<Response<pb::ListDatabasesResponse>, Status> {
+        let principal = authz::principal(&request);
+        authorize(&self.1, &principal, Access::catalog(Action::ListDatabases)).await?;
         Ok(Response::new(pb::ListDatabasesResponse {
             dbs: self.0.list_dbs(),
         }))
@@ -273,6 +338,8 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::GcDeletedDatabasesRequest>,
     ) -> Result<Response<pb::GcDeletedDatabasesResponse>, Status> {
+        let principal = authz::principal(&request);
+        authorize(&self.1, &principal, Access::catalog(Action::GarbageCollect)).await?;
         let swept = match requested_gc_retention(request.into_inner()) {
             None => self.0.gc_deleted().await,
             Some(retention) => self.0.gc_deleted_with_retention(retention).await,
@@ -287,7 +354,14 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::RequestIndexRequest>,
     ) -> Result<Response<pb::RequestIndexResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::ManageIndex, &request.db),
+        )
+        .await?;
         let index_basis_t = self
             .0
             .request_index(&request.db)
@@ -300,7 +374,14 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::SetIndexPolicyRequest>,
     ) -> Result<Response<pb::SetIndexPolicyResponse>, Status> {
+        let principal = authz::principal(&request);
         let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::ManageIndex, &request.db),
+        )
+        .await?;
         let update = IndexPolicyUpdate {
             interval: request.interval_ms.map(std::time::Duration::from_millis),
             backoff: request.backoff,
@@ -328,8 +409,16 @@ impl Catalog for CatalogSvc {
         &self,
         request: Request<pb::GetStorageInfoRequest>,
     ) -> Result<Response<pb::GetStorageInfoResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Inspect, &request.db),
+        )
+        .await?;
         self.0
-            .backup_info(&request.into_inner().db)
+            .backup_info(&request.db)
             .await
             .map(Response::new)
             .map_err(|error| to_status(&error))
@@ -349,22 +438,24 @@ fn requested_gc_retention(request: pb::GcDeletedDatabasesRequest) -> Option<std:
 pub async fn serve(
     node: Arc<TransactorNode>,
     addr: std::net::SocketAddr,
-    authenticator: Arc<dyn Authenticator>,
+    guard: Guard,
     tls: Option<tonic::transport::ServerTlsConfig>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
-    let interceptor = AuthInterceptor::new(authenticator);
+    // The interceptor authenticates each request and attaches its `Principal`;
+    // the services carry the same guard to authorize the concrete access.
+    let interceptor = IdentityInterceptor::new(guard.clone());
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
     builder
         .add_service(TransactorServer::with_interceptor(
-            TransactorSvc(Arc::clone(&node)),
+            TransactorSvc(Arc::clone(&node), guard.clone()),
             interceptor.clone(),
         ))
         .add_service(CatalogServer::with_interceptor(
-            CatalogSvc(node),
+            CatalogSvc(node, guard),
             interceptor,
         ))
         .serve_with_shutdown(addr, shutdown)

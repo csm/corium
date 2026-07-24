@@ -14,7 +14,7 @@ use corium_client::tx::{EntityMap, TxBuilder, lookup, tempid};
 use corium_client::{Args, Index, LocalPeer, Peer, RemotePeer};
 use corium_peer::server::{PeerServerConfig, serve as serve_peer};
 use corium_peer::{Admin, ConnectConfig, Connection};
-use corium_protocol::auth::StaticToken;
+use corium_protocol::authz::Guard;
 use corium_query::edn::read_all;
 use corium_transactor::node::{NodeConfig, TransactorNode};
 
@@ -48,12 +48,11 @@ async fn start_transactor() -> (String, tokio::sync::oneshot::Sender<()>, tempfi
     config.heartbeat_interval = Duration::from_secs(600);
     let node = TransactorNode::open(config).await.expect("open node");
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", free_port()).parse().expect("addr");
-    let auth = Arc::new(StaticToken::new(None));
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(corium_transactor::server::serve(
         node,
         addr,
-        auth,
+        Guard::disabled(),
         None,
         async move {
             let _ = stop_rx.await;
@@ -213,7 +212,7 @@ async fn local_and_remote_backends_agree() {
     tokio::spawn(serve_peer(
         hosted,
         peer_addr,
-        Arc::new(StaticToken::new(None)),
+        Guard::disabled(),
         None,
         PeerServerConfig::default(),
         async move {
