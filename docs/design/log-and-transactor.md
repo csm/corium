@@ -222,6 +222,22 @@ process-level battery kill -9s the active under load and asserts the
 standby serves writes within the lease-expiry bound with peers failing
 over transparently.
 
+### Future fleet topology
+
+The implemented HA topology has each process consider the whole catalog and
+asks peers to list active/standby endpoints. That is appropriate for a pair
+but does not place many databases across many machines or provide one stable
+client address.
+
+The future [transactor fleet design](transactor-fleet.md) retains every safety
+mechanism above and applies it per database. A small candidate set hosts each
+database; nodes can be active for some databases and standby for others.
+Clients use one load-balanced fleet endpoint. Database-aware load-balancer
+affinity spreads first contact, while an ingress node verifies the lease and
+forwards owner-dependent work directly to the current holder. Affinity and
+placement are hints; the root-store lease and post-append fence remain the
+authority.
+
 ## Process embedding
 
 `corium-transactor` is a library with a `main` wrapper in `corium-cli`. In

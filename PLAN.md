@@ -16,6 +16,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/data-model.md](docs/design/data-model.md) | Values, sortable encoding, datoms, schema |
 | [docs/design/indexes-and-storage.md](docs/design/indexes-and-storage.md) | Covering indexes, immutable segments, blob store, roots, GC |
 | [docs/design/log-and-transactor.md](docs/design/log-and-transactor.md) | Transaction log, transaction pipeline, background indexing, HA design |
+| [docs/design/transactor-fleet.md](docs/design/transactor-fleet.md) | Future multi-database placement, single-endpoint routing, forwarding, and fleet HA |
 | [docs/design/time-model.md](docs/design/time-model.md) | as-of, since, history, log API, tx-report queue |
 | [docs/design/query-engine.md](docs/design/query-engine.md) | Datalog compiler/planner, rules, aggregates, Pull, entity API |
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |

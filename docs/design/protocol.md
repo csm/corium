@@ -48,6 +48,24 @@ service Transactor {
 - All requests carry the database name and a protocol version; the transactor
   rejects mismatched `format-version` roots with a clear upgrade error.
 
+#### Future fleet routing
+
+The current peer connects to an ordered transactor endpoint list. The proposed
+[transactor fleet design](transactor-fleet.md) replaces that deployment
+contract with one fleet endpoint while preserving the database field as the
+authoritative request target.
+
+The SDK will duplicate a canonical database routing key in gRPC metadata so an
+L7 load balancer can apply advisory consistent-hash affinity. Any transactor
+ingress may receive the request; owner-dependent work is executed locally or
+forwarded once to the lease holder. Structured `NotOwner` details replace
+parsing `standby`/`deposed` message text. Affinity never grants ownership.
+
+Transparent retry after a request reaches the owner additionally requires a
+durable transaction request ID and result deduplication. Until that protocol
+exists, an in-flight connection loss remains ambiguous exactly as it is
+today.
+
 ### CatalogService (admin)
 
 `CreateDatabase`, `DeleteDatabase`, `ForkDatabase`, `ListDatabases`,
