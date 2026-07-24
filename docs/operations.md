@@ -189,6 +189,12 @@ corium transactor --data-dir /srv/corium --ha \
   --owner txor-b --advertise http://txor-b:4334 --listen 0.0.0.0:4334
 ```
 
+This section describes the implemented pair topology. The proposed
+[transactor fleet](design/transactor-fleet.md) keeps the same lease and
+failover guarantees but distributes databases across overlapping candidate
+sets and gives clients one load-balanced address. It does not change the
+current commands or runbook yet.
+
 Whichever starts first becomes active; the other stands by, rescans the
 catalog every lease-renewal interval (so databases created on the active are
 picked up), and rejects client work with a `standby` FAILED_PRECONDITION

@@ -135,16 +135,17 @@ Scaling and durability (see
   [indexes-and-storage.md](design/indexes-and-storage.md)) — published v1
   segments carry current facts only, so those views still require full-log
   replay.
-- **Transactor hosting policy.** Host a configured subset of the catalog
-  (filter flags or a placement map in the root store) so concurrent
-  transactors partition many databases; per-database leases and peer
-  lease-holder rediscovery already suffice for routing. Includes
-  open-on-demand with idle eviction — acquire the lease and replay on first
-  client touch, release the lease and drop in-memory state after an idle
-  window — so a cold database costs only its root records, and lease
-  renewals (a root CAS per hosted database every TTL/3) stop dominating
-  root-store traffic at large catalog sizes. Cross-machine placement
-  depends on the durable-log item.
+- **Transactor fleet placement and routing.** Pursue the
+  [fleet design](design/transactor-fleet.md): assign each database a small
+  candidate set so nodes are active for some databases and standby for
+  others; put one load-balanced address in client configuration; use a
+  database routing header for advisory affinity; and have any ingress
+  forward owner-dependent work once to the CAS-fenced lease holder.
+  Structured owner hints replace message-text parsing. Durable transaction
+  request IDs are required before an ingress can retry ambiguous in-flight
+  failures transparently. Open-on-demand with idle eviction bounds memory
+  and root-store lease-renewal traffic for cold databases. The shared durable
+  log and recovery-from-index work above are already the prerequisites.
 - **Copy-free fork.** `db fork` currently copies the log prefix and
   rebuilds indexes; share the parent's index roots behind an as-of ceiling
   in the DbRoot (format bump) to make fork cost independent of database

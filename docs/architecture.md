@@ -54,7 +54,10 @@ caller, and streams tx-reports to connected peers. A background indexing job
 periodically folds the log tail into fresh covering-index trees and publishes a
 new index root. Exactly one transactor holds the write lease for a database at
 a time; the lease lives in the root store (see
-[design/log-and-transactor.md](design/log-and-transactor.md)).
+[design/log-and-transactor.md](design/log-and-transactor.md)). The future
+fleet topology preserves that per-database serialization point while placing
+different databases on different nodes behind one service address; see
+[design/transactor-fleet.md](design/transactor-fleet.md).
 
 ### Peer
 
