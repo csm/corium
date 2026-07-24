@@ -10,7 +10,7 @@ pub mod server;
 #[cfg(feature = "cljrs")]
 pub mod txfn;
 
-pub use backend::{LogBackend, NodeStore, StoreSpec};
+pub use backend::{LogBackend, NodeStore, StorageConnectionError, StoreSpec};
 
 use corium_core::{EntityId, IndexOrder, KeywordInterner, Partition, Schema};
 use corium_db::{Db, FIRST_USER_ID, Idents};

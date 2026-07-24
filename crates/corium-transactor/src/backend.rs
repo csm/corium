@@ -81,7 +81,98 @@ impl fmt::Debug for StoreSpec {
     }
 }
 
+/// Failure translating a transactor's advertised [`StorageConnection`] into a
+/// [`StoreSpec`] the client can open directly.
+///
+/// [`StorageConnection`]: corium_protocol::pb::StorageConnection
+#[derive(Debug, thiserror::Error)]
+pub enum StorageConnectionError {
+    /// The response carried no storage backend.
+    #[error("transactor returned no storage backend")]
+    Missing,
+    /// The backend cannot be opened by another process (memory), or this
+    /// build lacks support for it.
+    #[error("{0}")]
+    Unsupported(String),
+}
+
 impl StoreSpec {
+    /// Reconstructs a spec (and the filesystem data directory, empty for
+    /// backends that carry their own location) from the connection info a
+    /// transactor advertises through `GetStorageInfo`. The inverse of
+    /// [`Self::connection_info`], letting a client open the transactor's
+    /// storage service directly from just the transactor address.
+    ///
+    /// # Errors
+    /// Returns an error for a missing backend, an in-memory backend (confined
+    /// to the transactor process), or a backend omitted from this build.
+    pub fn from_connection(
+        connection: corium_protocol::pb::StorageConnection,
+    ) -> Result<(Self, PathBuf), StorageConnectionError> {
+        use corium_protocol::pb::storage_connection::Backend;
+
+        let backend = connection.backend.ok_or(StorageConnectionError::Missing)?;
+        let resolved = match backend {
+            Backend::Memory(_) => {
+                return Err(StorageConnectionError::Unsupported(
+                    "memory storage is confined to the transactor process".into(),
+                ));
+            }
+            Backend::Filesystem(storage) => (Self::Fs, PathBuf::from(storage.data_dir)),
+            Backend::Postgres(storage) => {
+                #[cfg(feature = "postgres")]
+                {
+                    (
+                        Self::Postgres {
+                            connection_string: storage.connection_string,
+                        },
+                        PathBuf::new(),
+                    )
+                }
+                #[cfg(not(feature = "postgres"))]
+                {
+                    let _ = storage;
+                    return Err(StorageConnectionError::Unsupported(
+                        "this build lacks PostgreSQL support".into(),
+                    ));
+                }
+            }
+            Backend::Turso(storage) => {
+                #[cfg(feature = "turso")]
+                {
+                    (Self::Turso { path: storage.path }, PathBuf::new())
+                }
+                #[cfg(not(feature = "turso"))]
+                {
+                    let _ = storage;
+                    return Err(StorageConnectionError::Unsupported(
+                        "this build lacks Turso support".into(),
+                    ));
+                }
+            }
+            Backend::S3(storage) => {
+                #[cfg(feature = "s3")]
+                {
+                    (
+                        Self::S3 {
+                            bucket: storage.bucket,
+                            prefix: storage.prefix,
+                        },
+                        PathBuf::new(),
+                    )
+                }
+                #[cfg(not(feature = "s3"))]
+                {
+                    let _ = storage;
+                    return Err(StorageConnectionError::Unsupported(
+                        "this build lacks S3 support".into(),
+                    ));
+                }
+            }
+        };
+        Ok(resolved)
+    }
+
     /// Describes how an administrative client can independently open this
     /// node's storage service.
     ///
