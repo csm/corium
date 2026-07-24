@@ -162,7 +162,12 @@ impl Transactor for TransactorSvc {
         let principal = authz::principal(&request);
         let request = request.into_inner();
         check_version(request.protocol_version)?;
-        authorize(&self.1, &principal, Access::on(Action::Transact, &request.db)).await?;
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Transact, &request.db),
+        )
+        .await?;
         self.0
             .transact(&request.db, &request.tx_data)
             .await
@@ -179,7 +184,12 @@ impl Transactor for TransactorSvc {
         let principal = authz::principal(&request);
         let request = request.into_inner();
         check_version(request.protocol_version)?;
-        authorize(&self.1, &principal, Access::on(Action::Subscribe, &request.db)).await?;
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Subscribe, &request.db),
+        )
+        .await?;
         let state = self
             .0
             .db_state(&request.db)
@@ -200,7 +210,12 @@ impl Transactor for TransactorSvc {
     ) -> Result<Response<pb::SyncResponse>, Status> {
         let principal = authz::principal(&request);
         let request = request.into_inner();
-        authorize(&self.1, &principal, Access::on(Action::Inspect, &request.db)).await?;
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Inspect, &request.db),
+        )
+        .await?;
         let basis_t = self
             .0
             .sync(&request.db, request.t)
@@ -215,7 +230,12 @@ impl Transactor for TransactorSvc {
     ) -> Result<Response<pb::StatusResponse>, Status> {
         let principal = authz::principal(&request);
         let request = request.into_inner();
-        authorize(&self.1, &principal, Access::on(Action::Inspect, &request.db)).await?;
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Inspect, &request.db),
+        )
+        .await?;
         self.0
             .status(&request.db)
             .await
@@ -391,7 +411,12 @@ impl Catalog for CatalogSvc {
     ) -> Result<Response<pb::GetStorageInfoResponse>, Status> {
         let principal = authz::principal(&request);
         let request = request.into_inner();
-        authorize(&self.1, &principal, Access::on(Action::Inspect, &request.db)).await?;
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::Inspect, &request.db),
+        )
+        .await?;
         self.0
             .backup_info(&request.db)
             .await

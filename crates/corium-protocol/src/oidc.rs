@@ -84,10 +84,7 @@ impl OidcConfig {
 
     /// Sets the claims copied onto the principal (builder style).
     #[must_use]
-    pub fn with_copy_claims(
-        mut self,
-        claims: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn with_copy_claims(mut self, claims: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.copy_claims = claims.into_iter().map(Into::into).collect();
         self
     }
@@ -142,9 +139,9 @@ impl OidcVerifier {
             let n = URL_SAFE_NO_PAD
                 .decode(n)
                 .map_err(|error| AuthError::Unauthenticated(format!("bad JWK modulus: {error}")))?;
-            let e = URL_SAFE_NO_PAD
-                .decode(e)
-                .map_err(|error| AuthError::Unauthenticated(format!("bad JWK exponent: {error}")))?;
+            let e = URL_SAFE_NO_PAD.decode(e).map_err(|error| {
+                AuthError::Unauthenticated(format!("bad JWK exponent: {error}"))
+            })?;
             keys.push(RsaKey { kid: jwk.kid, n, e });
         }
         if keys.is_empty() {
@@ -177,9 +174,7 @@ impl OidcVerifier {
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| {
-                AuthError::Unauthenticated(format!("OIDC discovery failed: {error}"))
-            })?
+            .map_err(|error| AuthError::Unauthenticated(format!("OIDC discovery failed: {error}")))?
             .json()
             .await
             .map_err(|error| {
@@ -227,9 +222,12 @@ impl OidcVerifier {
                 _ => true,
             })
             .any(|key| {
-                signature::RsaPublicKeyComponents { n: &key.n, e: &key.e }
-                    .verify(algorithm, signing_input, sig)
-                    .is_ok()
+                signature::RsaPublicKeyComponents {
+                    n: &key.n,
+                    e: &key.e,
+                }
+                .verify(algorithm, signing_input, sig)
+                .is_ok()
             })
     }
 
@@ -416,7 +414,12 @@ mod tests {
         let rng = ring::rand::SystemRandom::new();
         let mut sig = vec![0u8; key_pair.public().modulus_len()];
         key_pair
-            .sign(&signature::RSA_PKCS1_SHA256, &rng, signing_input.as_bytes(), &mut sig)
+            .sign(
+                &signature::RSA_PKCS1_SHA256,
+                &rng,
+                signing_input.as_bytes(),
+                &mut sig,
+            )
             .unwrap();
         format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig))
     }
@@ -455,8 +458,8 @@ mod tests {
     #[test]
     fn scope_style_string_roles_expand() {
         let verifier = {
-            let config = OidcConfig::new("https://issuer.example", ["corium"])
-                .with_role_claim("scope");
+            let config =
+                OidcConfig::new("https://issuer.example", ["corium"]).with_role_claim("scope");
             OidcVerifier::from_jwks_json(config, &jwks_json()).unwrap()
         };
         let token = sign_jwt(&serde_json::json!({
@@ -520,8 +523,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_algorithm() {
         // An HS256 token (no RSA signature) must not verify against the JWKS.
-        let header_b64 =
-            URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT","kid":"test-key"}"#);
+        let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT","kid":"test-key"}"#);
         let claims_b64 = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&serde_json::json!({
                 "iss": "https://issuer.example", "sub": "a", "aud": "corium", "exp": future(),

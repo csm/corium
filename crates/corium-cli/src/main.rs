@@ -864,9 +864,10 @@ async fn run(cli: Cli) -> Result<(), String> {
                         .map_err(|error| format!("cannot load CA certificate: {error}"))?,
                 )
             };
-            let mut admin = Admin::connect(&transactor, resolve_client_token(token.as_deref()), tls)
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut admin =
+                Admin::connect(&transactor, resolve_client_token(token.as_deref()), tls)
+                    .await
+                    .map_err(|error| error.to_string())?;
             let info = admin
                 .get_storage_info(&db)
                 .await
