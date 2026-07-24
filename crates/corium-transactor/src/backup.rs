@@ -136,12 +136,15 @@ impl BackupSource {
         let storage = info
             .storage
             .ok_or_else(|| BackupError::Invalid("transactor returned no storage backend".into()))?;
-        let (store, data_dir) = StoreSpec::from_connection(storage).map_err(|error| match error {
-            StorageConnectionError::Missing => {
-                BackupError::Invalid("transactor returned no storage backend".into())
-            }
-            StorageConnectionError::Unsupported(detail) => BackupError::UnsupportedSource(detail),
-        })?;
+        let (store, data_dir) =
+            StoreSpec::from_connection(storage).map_err(|error| match error {
+                StorageConnectionError::Missing => {
+                    BackupError::Invalid("transactor returned no storage backend".into())
+                }
+                StorageConnectionError::Unsupported(detail) => {
+                    BackupError::UnsupportedSource(detail)
+                }
+            })?;
         Ok(Self {
             store,
             data_dir,
