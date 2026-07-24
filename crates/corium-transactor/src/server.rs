@@ -324,10 +324,10 @@ impl Catalog for CatalogSvc {
         }))
     }
 
-    async fn get_backup_info(
+    async fn get_storage_info(
         &self,
-        request: Request<pb::GetBackupInfoRequest>,
-    ) -> Result<Response<pb::GetBackupInfoResponse>, Status> {
+        request: Request<pb::GetStorageInfoRequest>,
+    ) -> Result<Response<pb::GetStorageInfoResponse>, Status> {
         self.0
             .backup_info(&request.into_inner().db)
             .await

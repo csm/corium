@@ -248,11 +248,11 @@ message S3Storage {
   string prefix = 2;
 }
 
-message GetBackupInfoRequest {
+message GetStorageInfoRequest {
   string db = 1;
 }
 
-message GetBackupInfoResponse {
+message GetStorageInfoResponse {
   // Fixed upper bound for this backup. The storage log may continue growing,
   // but the backup reads records only through this transaction.
   uint64 basis_t = 1;
@@ -271,9 +271,8 @@ service Catalog {
   rpc RequestIndex(RequestIndexRequest) returns (RequestIndexResponse);
   // Adjusts (or reads) the database's index-publication pacing at runtime.
   rpc SetIndexPolicy(SetIndexPolicyRequest) returns (SetIndexPolicyResponse);
-  // Fixes a backup checkpoint and hands the client an independent connection
-  // to the underlying storage service.
-  rpc GetBackupInfo(GetBackupInfoRequest) returns (GetBackupInfoResponse);
+  // Fetch storage connection info along with the current basis t.
+  rpc GetStorageInfo(GetStorageInfoRequest) returns (GetStorageInfoResponse);
 }
 
 // ---------------------------------------------------------------------------

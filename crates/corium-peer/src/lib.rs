@@ -916,10 +916,10 @@ impl Admin {
     pub async fn get_backup_info(
         &mut self,
         db: &str,
-    ) -> Result<pb::GetBackupInfoResponse, PeerError> {
+    ) -> Result<pb::GetStorageInfoResponse, PeerError> {
         Ok(self
             .client
-            .get_backup_info(pb::GetBackupInfoRequest { db: db.to_owned() })
+            .get_storage_info(pb::GetStorageInfoRequest { db: db.to_owned() })
             .await?
             .into_inner())
     }

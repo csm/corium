@@ -1692,7 +1692,7 @@ impl TransactorNode {
     /// # Errors
     /// Returns [`NodeError::UnknownDb`] when absent, or a bad-request error
     /// when local connection details cannot be represented on the wire.
-    pub async fn backup_info(&self, name: &str) -> Result<pb::GetBackupInfoResponse, NodeError> {
+    pub async fn backup_info(&self, name: &str) -> Result<pb::GetStorageInfoResponse, NodeError> {
         let state = self.db_state(name).await?;
         // Serialize with the tiny commit critical section so the checkpoint
         // cannot observe a batch after its durable append but before its
@@ -1705,7 +1705,7 @@ impl TransactorNode {
             .store
             .connection_info(&self.config.data_dir)
             .map_err(NodeError::BadRequest)?;
-        Ok(pb::GetBackupInfoResponse {
+        Ok(pb::GetStorageInfoResponse {
             basis_t,
             storage: Some(storage),
         })

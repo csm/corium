@@ -132,7 +132,7 @@ impl BackupSource {
     /// # Errors
     /// Returns an error for missing connection details, an in-memory backend,
     /// or a backend omitted from this build.
-    pub fn from_info(info: pb::GetBackupInfoResponse) -> Result<Self, BackupError> {
+    pub fn from_info(info: pb::GetStorageInfoResponse) -> Result<Self, BackupError> {
         use pb::storage_connection::Backend;
 
         let storage = info
