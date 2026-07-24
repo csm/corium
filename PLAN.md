@@ -20,6 +20,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/time-model.md](docs/design/time-model.md) | as-of, since, history, log API, tx-report queue |
 | [docs/design/query-engine.md](docs/design/query-engine.md) | Datalog compiler/planner, rules, aggregates, Pull, entity API |
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |
+| [docs/design/auth.md](docs/design/auth.md) | Request-scoped identity, the authorization seam, and the self-hosted ReBAC policy database |
 | [docs/design/clojurust-integration.md](docs/design/clojurust-integration.md) | Boundary conversion, sandboxed database functions, cljrs client API |
 | [docs/design/clients-and-ops.md](docs/design/clients-and-ops.md) | CLI, query console, backup/restore, metrics |
 | [docs/design/backup-format.md](docs/design/backup-format.md) | Versioned binary backup container and checkpoint framing |
@@ -135,3 +136,16 @@ asserting zero acked-transaction loss, no duplicates, and no post-takeover
 publishes — plus a process-level battery that kill -9s the active under
 load and verifies the standby serves writes within the lease-expiry bound
 while peers fail over without losing their subscriptions.
+
+Beyond the milestones, the network surfaces gained request-scoped
+authentication and authorization ([ADR-0012](docs/adr/0012-optional-authn-authz.md)):
+a per-request `Principal` from static tokens or an OIDC issuer, and an
+`Authorizer` seam each surface enforces per operation. Authorization is
+permit-all by default; `--authz-db` points it at a self-hosted
+relationship-based (ReBAC) policy kept in an ordinary Corium database
+([`corium-authz`](crates/corium-authz/src/lib.rs),
+[ADR-0014](docs/adr/0014-self-hosted-rebac-authz.md)), compiled into an
+immutable snapshot keyed by its basis `t` and evaluated with a bounded,
+cycle-safe graph walk in memory. `corium authz init|grant|revoke|check|status`
+operates it; [docs/design/auth.md](docs/design/auth.md) records the model and
+[docs/operations.md](docs/operations.md) the runbook.
