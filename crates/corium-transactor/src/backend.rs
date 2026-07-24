@@ -81,6 +81,61 @@ impl fmt::Debug for StoreSpec {
     }
 }
 
+impl StoreSpec {
+    /// Describes how an administrative client can independently open this
+    /// node's storage service.
+    ///
+    /// Local paths are made absolute because the client need not share the
+    /// transactor's working directory. The memory backend is described too,
+    /// but cannot be opened by another process.
+    ///
+    /// # Errors
+    /// Returns an error when a local path cannot be represented on the wire.
+    pub fn connection_info(
+        &self,
+        data_dir: &std::path::Path,
+    ) -> Result<corium_protocol::pb::StorageConnection, String> {
+        use corium_protocol::pb;
+        use pb::storage_connection::Backend;
+
+        fn absolute(path: &std::path::Path) -> Result<String, String> {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| error.to_string())?
+                    .join(path)
+            };
+            path.into_os_string()
+                .into_string()
+                .map_err(|_| "storage path is not valid UTF-8".to_owned())
+        }
+
+        let backend = match self {
+            Self::Memory => Backend::Memory(pb::MemoryStorage {}),
+            Self::Fs => Backend::Filesystem(pb::FilesystemStorage {
+                data_dir: absolute(data_dir)?,
+            }),
+            #[cfg(feature = "postgres")]
+            Self::Postgres { connection_string } => Backend::Postgres(pb::PostgreSqlStorage {
+                connection_string: connection_string.clone(),
+            }),
+            #[cfg(feature = "turso")]
+            Self::Turso { path } => Backend::Turso(pb::TursoStorage {
+                path: absolute(std::path::Path::new(path))?,
+            }),
+            #[cfg(feature = "s3")]
+            Self::S3 { bucket, prefix } => Backend::S3(pb::S3Storage {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+            }),
+        };
+        Ok(pb::StorageConnection {
+            backend: Some(backend),
+        })
+    }
+}
+
 /// The blob + root storage service a [`crate::node::TransactorNode`] runs
 /// over, chosen by [`StoreSpec`]. Dispatch is an enum rather than a trait
 /// object so every existing `impl BlobStore + RootStore` / `&dyn RootStore`
@@ -341,6 +396,29 @@ impl TransactionLog for BlockingTransactionLog {
     }
 }
 
+/// Prevents a storage handle opened for replay from being used to append even
+/// when its concrete implementation also supports writes.
+struct ReadOnlyTransactionLog(Arc<dyn TransactionLog>);
+
+#[async_trait]
+impl TransactionLog for ReadOnlyTransactionLog {
+    fn append(&self, _record: &TxRecord) -> Result<(), LogError> {
+        Err(LogError::Native("transaction log is read-only".into()))
+    }
+
+    fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
+        self.0.tx_range(start, end)
+    }
+
+    async fn tx_range_async(
+        &self,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<TxRecord>, LogError> {
+        self.0.tx_range_async(start, end).await
+    }
+}
+
 impl LogBackend {
     /// The log backend that pairs with `spec`.
     #[must_use]
@@ -391,6 +469,37 @@ impl LogBackend {
             Self::Native(storage) => Ok(Arc::new(
                 NativeVersionedLog::open(Arc::clone(storage), name, write_version).await?,
             )),
+        }
+    }
+
+    /// Opens the named log for independent read-only replay.
+    ///
+    /// Native logs use a non-writing versioned-log handle; filesystem logs
+    /// use the explicit read-only opener so this path never creates or
+    /// truncates a source log.
+    ///
+    /// # Errors
+    /// Returns an error when a transaction log cannot be opened.
+    pub async fn open_read_only(&self, name: &str) -> Result<Arc<dyn TransactionLog>, LogError> {
+        match self {
+            Self::Fs(dir) => {
+                let dir = dir.clone();
+                let name = name.to_owned();
+                let log =
+                    tokio::task::spawn_blocking(move || VersionedLog::open_read_only(dir, &name))
+                        .await
+                        .map_err(|error| LogError::Native(format!("log task failed: {error}")))??;
+                Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
+                    BlockingTransactionLog(Arc::new(log)),
+                ))))
+            }
+            Self::Mem(registry) => Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
+                registry.open(name, 0),
+            )))),
+            #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+            Self::Native(storage) => Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
+                NativeVersionedLog::open_read_only(Arc::clone(storage), name),
+            )))),
         }
     }
 

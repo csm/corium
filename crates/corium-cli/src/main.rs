@@ -323,19 +323,28 @@ enum Command {
         #[arg(long, default_value = "72h")]
         window: String,
     },
-    /// Create or incrementally refresh an offline database backup.
+    /// Create or incrementally refresh a database backup from a live transactor.
     Backup {
-        /// Source transactor data directory (transactor must be stopped).
+        /// Running transactor used to discover the source storage service.
+        #[arg(long, default_value = "http://127.0.0.1:4334")]
+        transactor: String,
+        /// Bearer token for the transactor.
         #[arg(long)]
-        data_dir: PathBuf,
+        token: Option<String>,
+        /// PEM file with a CA certificate to trust (enables TLS).
+        #[arg(long)]
+        ca: Option<PathBuf>,
+        /// Domain name expected on the server certificate.
+        #[arg(long)]
+        tls_domain: Option<String>,
         /// Database name.
         db: String,
-        /// Backup directory; reusing it performs an incremental backup.
+        /// Binary backup file; reusing it appends an incremental checkpoint.
         destination: PathBuf,
     },
     /// Restore a backup, optionally under a new database name (clone).
     Restore {
-        /// Backup directory.
+        /// Binary backup file.
         source: PathBuf,
         /// Target transactor data directory (transactor must be stopped).
         #[arg(long)]
@@ -741,16 +750,42 @@ async fn run(cli: Cli) -> Result<(), String> {
             _ => Err("pass exactly one of --data-dir (offline) or --transactor".into()),
         },
         Command::Backup {
-            data_dir,
+            transactor,
+            token,
+            ca,
+            tls_domain,
             db,
             destination,
         } => {
-            let report = corium_transactor::backup::backup(data_dir, &db, destination)
+            let tls = if ca.is_none() && tls_domain.is_none() {
+                None
+            } else {
+                Some(
+                    client_tls(ca.as_deref(), tls_domain.as_deref())
+                        .map_err(|error| format!("cannot load CA certificate: {error}"))?,
+                )
+            };
+            let mut admin = Admin::connect(&transactor, token, tls)
+                .await
+                .map_err(|error| error.to_string())?;
+            let info = admin
+                .get_backup_info(&db)
+                .await
+                .map_err(|error| error.to_string())?;
+            let source = corium_transactor::backup::BackupSource::from_info(info)
+                .map_err(|error| error.to_string())?;
+            let report = corium_transactor::backup::backup(&source, &db, destination)
                 .await
                 .map_err(|error| error.to_string())?;
             println!(
-                "{{:db {db:?} :basis-t {} :index-basis-t {} :copied-blobs {} :reused-blobs {}}}",
-                report.basis_t, report.index_basis_t, report.copied_blobs, report.reused_blobs
+                "{{:db {db:?} :backup-format {} :writer-version {:?} :basis-t {} :index-basis-t {} :replayed-transactions {} :copied-blobs {} :reused-blobs {}}}",
+                report.backup_format_version,
+                report.writer_version,
+                report.basis_t,
+                report.index_basis_t,
+                report.replayed_transactions,
+                report.copied_blobs,
+                report.reused_blobs
             );
             Ok(())
         }
@@ -763,9 +798,11 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(|error| error.to_string())?;
             println!(
-                "{{:source-db {:?} :db {:?} :basis-t {} :copied-blobs {} :reused-blobs {}}}",
+                "{{:source-db {:?} :db {:?} :backup-format {} :writer-version {:?} :basis-t {} :copied-blobs {} :reused-blobs {}}}",
                 report.source_db,
                 report.target_db,
+                report.backup_format_version,
+                report.writer_version,
                 report.basis_t,
                 report.copied_blobs,
                 report.reused_blobs

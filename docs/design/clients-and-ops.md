@@ -64,13 +64,25 @@ the basis and registered relations, and enable timing. SQL is read-only; see
 
 ## Backup and restore
 
-Backups exploit immutability: a backup is (a copy of every segment reachable
-from a DbRoot) + (that root), written to a directory/object tree in blob-store
-layout. Incremental backups copy only hashes absent from the destination —
-structural sharing makes dailies cheap. Restore = copy back + install root
-under a (possibly new) database name; it is also the storage-migration path
-(fs → S3 later) and the fork/clone primitive (restore under a new name into
-the same store is O(root) thanks to sharing).
+The transactor is the sole discovery point for an online backup: it fixes the
+current `t` and returns its storage connection, after which the backup client
+opens the filesystem, Turso, PostgreSQL, or S3 backend directly. It replays the
+native log only through that fixed `t`, so concurrent commits cannot make the
+backup's checkpoint move. An existing destination supplies the lower `t`;
+only `(backup-t, source-t]` is fetched and appended. The initial backup may
+also copy a published immutable index snapshot as a faster restore base.
+
+The artifact is one appendable binary file, never human text, JSON, or EDN.
+Its fixed prefix contains magic, a backup-format version, and the creating
+Corium version. Immutable snapshot blobs follow as framed binary sections;
+each full or incremental run ends with a committed checkpoint frame carrying
+its writer version, metadata, basis, and framed transaction range. A partial
+trailing frame is ignored and replaced by the next incremental run. The exact
+version 1 layout is specified in [backup-format.md](backup-format.md).
+
+Restore installs the archive's root under a (possibly new) database name. The
+log is authoritative, so a snapshot behind the latest checkpoint basis is
+completed by replay during recovery.
 
 ## Observability
 

@@ -17,7 +17,8 @@ Corium's write side. Two layers:
   background **indexing job** that folds the log tail into fresh covering-index
   trees and publishes a new index root.
 
-Also provides offline **backup**/restore, Prometheus **metrics**, storage
+Also provides online, storage-native **backup** into one versioned binary
+archive plus offline restore, Prometheus **metrics**, storage
 `backend`/`StoreSpec` selection, and `--ha` standby mode (lease polling,
 takeover-as-crash-recovery, depose-to-standby).
 

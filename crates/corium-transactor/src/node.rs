@@ -1685,6 +1685,32 @@ impl TransactorNode {
         })
     }
 
+    /// Fixes the current transaction basis and returns the connection details
+    /// an administrative client needs to replay the underlying storage log
+    /// independently.
+    ///
+    /// # Errors
+    /// Returns [`NodeError::UnknownDb`] when absent, or a bad-request error
+    /// when local connection details cannot be represented on the wire.
+    pub async fn backup_info(&self, name: &str) -> Result<pb::GetStorageInfoResponse, NodeError> {
+        let state = self.db_state(name).await?;
+        // Serialize with the tiny commit critical section so the checkpoint
+        // cannot observe a batch after its durable append but before its
+        // ownership fence and acknowledgement decision.
+        let _commit = state.commit.lock().await;
+        state.check_lease(self.store.as_ref()).await?;
+        let basis_t = state.db().basis_t();
+        let storage = self
+            .config
+            .store
+            .connection_info(&self.config.data_dir)
+            .map_err(NodeError::BadRequest)?;
+        Ok(pb::GetStorageInfoResponse {
+            basis_t,
+            storage: Some(storage),
+        })
+    }
+
     /// Releases every held write lease (graceful shutdown): the record is
     /// expired in place so a standby's next poll takes over immediately
     /// instead of waiting out the TTL. Hosted databases stop accepting

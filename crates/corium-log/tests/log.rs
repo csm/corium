@@ -386,6 +386,34 @@ async fn native_versioned_log_append_does_not_reread_the_whole_log() {
 }
 
 #[tokio::test]
+async fn native_read_only_open_defers_the_scan_and_rejects_appends() {
+    use std::sync::atomic::Ordering;
+
+    let storage = std::sync::Arc::new(CountingNativeStorage::default());
+    let writer = corium_log::NativeVersionedLog::open(std::sync::Arc::clone(&storage), "db", 1)
+        .await
+        .expect("writer");
+    writer.append_async(&record(1)).await.expect("append");
+
+    let reads = storage.reads.load(Ordering::Relaxed);
+    let reader =
+        corium_log::NativeVersionedLog::open_read_only(std::sync::Arc::clone(&storage), "db");
+    assert_eq!(
+        storage.reads.load(Ordering::Relaxed),
+        reads,
+        "read-only open should not initialize writer state"
+    );
+    assert!(matches!(
+        reader.append_async(&record(2)).await,
+        Err(corium_log::LogError::Native(message)) if message.contains("read-only")
+    ));
+    assert_eq!(
+        reader.replay_async().await.expect("replay"),
+        vec![record(1)]
+    );
+}
+
+#[tokio::test]
 async fn native_versioned_log_writes_one_object_per_record() {
     use corium_log::NativeLogStorage;
     let storage = std::sync::Arc::new(TestNativeStorage::default());
