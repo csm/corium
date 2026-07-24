@@ -22,7 +22,7 @@ use corium_store::{
 };
 use thiserror::Error;
 
-use crate::{LogBackend, NodeStore, StoreSpec};
+use crate::{LogBackend, NodeStore, StorageConnectionError, StoreSpec};
 
 /// Binary backup container version written by this release.
 pub const BACKUP_FORMAT_VERSION: u32 = 1;
@@ -133,70 +133,18 @@ impl BackupSource {
     /// Returns an error for missing connection details, an in-memory backend,
     /// or a backend omitted from this build.
     pub fn from_info(info: pb::GetStorageInfoResponse) -> Result<Self, BackupError> {
-        use pb::storage_connection::Backend;
-
         let storage = info
             .storage
-            .and_then(|storage| storage.backend)
             .ok_or_else(|| BackupError::Invalid("transactor returned no storage backend".into()))?;
-        let (store, data_dir) = match storage {
-            Backend::Memory(_) => {
-                return Err(BackupError::UnsupportedSource(
-                    "memory storage is confined to the transactor process".into(),
-                ));
-            }
-            Backend::Filesystem(storage) => (StoreSpec::Fs, PathBuf::from(storage.data_dir)),
-            Backend::Postgres(storage) => {
-                #[cfg(feature = "postgres")]
-                {
-                    (
-                        StoreSpec::Postgres {
-                            connection_string: storage.connection_string,
-                        },
-                        PathBuf::new(),
-                    )
+        let (store, data_dir) =
+            StoreSpec::from_connection(storage).map_err(|error| match error {
+                StorageConnectionError::Missing => {
+                    BackupError::Invalid("transactor returned no storage backend".into())
                 }
-                #[cfg(not(feature = "postgres"))]
-                {
-                    let _ = storage;
-                    return Err(BackupError::UnsupportedSource(
-                        "this build lacks PostgreSQL support".into(),
-                    ));
+                StorageConnectionError::Unsupported(detail) => {
+                    BackupError::UnsupportedSource(detail)
                 }
-            }
-            Backend::Turso(storage) => {
-                #[cfg(feature = "turso")]
-                {
-                    (StoreSpec::Turso { path: storage.path }, PathBuf::new())
-                }
-                #[cfg(not(feature = "turso"))]
-                {
-                    let _ = storage;
-                    return Err(BackupError::UnsupportedSource(
-                        "this build lacks Turso support".into(),
-                    ));
-                }
-            }
-            Backend::S3(storage) => {
-                #[cfg(feature = "s3")]
-                {
-                    (
-                        StoreSpec::S3 {
-                            bucket: storage.bucket,
-                            prefix: storage.prefix,
-                        },
-                        PathBuf::new(),
-                    )
-                }
-                #[cfg(not(feature = "s3"))]
-                {
-                    let _ = storage;
-                    return Err(BackupError::UnsupportedSource(
-                        "this build lacks S3 support".into(),
-                    ));
-                }
-            }
-        };
+            })?;
         Ok(Self {
             store,
             data_dir,

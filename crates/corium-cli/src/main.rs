@@ -81,26 +81,12 @@ struct ClientFlags {
     /// Domain name expected on the server certificate.
     #[arg(long)]
     tls_domain: Option<String>,
-    /// Direct storage backend for snapshot bootstrap. Omit to replay the
-    /// transaction log from basis zero.
-    #[arg(long, value_enum)]
-    peer_store: Option<StoreKind>,
-    /// Transactor data directory for `--peer-store fs`, and the default
-    /// Turso database location.
-    #[arg(long, default_value = "./corium-data")]
-    peer_data_dir: PathBuf,
-    /// Turso database path for `--peer-store turso`.
+    /// Bootstrap from the transactor's storage backend directly, discovered
+    /// through its `GetStorageInfo` RPC, instead of replaying the transaction
+    /// log from basis zero. Requires network reach to that backend and a build
+    /// with the matching storage feature.
     #[arg(long)]
-    peer_turso_path: Option<PathBuf>,
-    /// `PostgreSQL` connection string for `--peer-store postgres`.
-    #[arg(long)]
-    peer_postgres_url: Option<String>,
-    /// S3 bucket for `--peer-store s3`.
-    #[arg(long)]
-    peer_s3_bucket: Option<String>,
-    /// S3 key prefix for `--peer-store s3` (defaults to the bucket root).
-    #[arg(long, default_value = "")]
-    peer_s3_prefix: String,
+    peer_bootstrap: bool,
 }
 
 impl ClientFlags {
@@ -131,27 +117,32 @@ impl ClientFlags {
     }
 
     async fn connect_config(&self, db: impl Into<String>) -> Result<ConnectConfig, String> {
-        let mut config = ConnectConfig::with_failover(self.endpoints(), db);
+        let db = db.into();
+        let mut config = ConnectConfig::with_failover(self.endpoints(), db.clone());
         config.token = self.token.clone();
         config.tls = self.tls()?;
-        let Some(kind) = self.peer_store else {
+        if !self.peer_bootstrap {
             return Ok(config);
-        };
-        if matches!(kind, StoreKind::Mem) {
-            return Err("--peer-store mem cannot be shared across processes".into());
         }
-        let spec = store_spec(
-            kind,
-            &self.peer_data_dir,
-            self.peer_turso_path.clone(),
-            self.peer_postgres_url.clone(),
-            self.peer_s3_bucket.clone(),
-            self.peer_s3_prefix.clone(),
-        )?;
-        let storage = corium_transactor::NodeStore::open_existing(&spec, &self.peer_data_dir)
+        // Ask the transactor how its storage service is configured, then open
+        // it directly so the peer bootstraps from the newest published
+        // snapshot. The transactor address is the only thing the client needs.
+        let mut admin = Admin::connect(&self.primary(), self.token.clone(), self.tls()?)
+            .await
+            .map_err(|error| format!("cannot connect to transactor: {error}"))?;
+        let info = admin
+            .get_storage_info(&db)
+            .await
+            .map_err(|error| format!("cannot fetch storage info: {error}"))?;
+        let storage = info
+            .storage
+            .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
+        let (spec, data_dir) = StoreSpec::from_connection(storage)
+            .map_err(|error| format!("cannot use transactor storage backend: {error}"))?;
+        let store = corium_transactor::NodeStore::open_existing(&spec, &data_dir)
             .await
             .map_err(|error| format!("cannot open peer storage: {error}"))?;
-        Ok(config.with_storage(Arc::new(storage)))
+        Ok(config.with_storage(Arc::new(store)))
     }
 }
 
@@ -730,12 +721,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     token,
                     ca,
                     tls_domain,
-                    peer_store: None,
-                    peer_data_dir: PathBuf::from("./corium-data"),
-                    peer_turso_path: None,
-                    peer_postgres_url: None,
-                    peer_s3_bucket: None,
-                    peer_s3_prefix: String::new(),
+                    peer_bootstrap: false,
                 };
                 let mut admin = Admin::connect(&flags.primary(), flags.token.clone(), flags.tls()?)
                     .await
@@ -769,7 +755,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(|error| error.to_string())?;
             let info = admin
-                .get_backup_info(&db)
+                .get_storage_info(&db)
                 .await
                 .map_err(|error| error.to_string())?;
             let source = corium_transactor::backup::BackupSource::from_info(info)
