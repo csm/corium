@@ -17,7 +17,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_core::KeywordInterner;
 use corium_peer::server::PeerServerConfig;
 use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings};
-use corium_protocol::auth::{StaticToken, client_tls, server_tls};
+use corium_protocol::auth::{DEFAULT_DEV_TOKEN, client_tls, server_tls};
+use corium_protocol::authz::{
+    AllowAll, CompositeProvider, Guard, IdentityProvider, Principal, StaticTokens,
+};
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
 use corium_store::{DbRoot, FsStore, RootStore};
@@ -72,8 +75,11 @@ struct ClientFlags {
     /// fail over across it. Admin commands use the first endpoint.
     #[arg(long, default_value = "http://127.0.0.1:4334")]
     transactor: String,
-    /// Bearer token for the transactor.
-    #[arg(long)]
+    /// Bearer token for the transactor. Defaults to the shared development
+    /// token (`corium_protocol::auth::DEFAULT_DEV_TOKEN`) so a local database
+    /// needs no auth flags; pass `--token ""` to connect anonymously, or set
+    /// `CORIUM_TOKEN` to use a different secret everywhere.
+    #[arg(long, env = "CORIUM_TOKEN")]
     token: Option<String>,
     /// PEM file with a CA certificate to trust (enables TLS).
     #[arg(long)]
@@ -99,6 +105,13 @@ impl ClientFlags {
             .collect()
     }
 
+    /// The bearer token to present: the flag/`CORIUM_TOKEN` value when set, the
+    /// shared development token when unset, or `None` when explicitly cleared
+    /// with `--token ""` (connect anonymously).
+    fn token(&self) -> Option<String> {
+        resolve_client_token(self.token.as_deref())
+    }
+
     /// First endpoint (admin commands talk to one transactor).
     fn primary(&self) -> String {
         self.endpoints()
@@ -119,7 +132,7 @@ impl ClientFlags {
     async fn connect_config(&self, db: impl Into<String>) -> Result<ConnectConfig, String> {
         let db = db.into();
         let mut config = ConnectConfig::with_failover(self.endpoints(), db.clone());
-        config.token = self.token.clone();
+        config.token = self.token();
         config.tls = self.tls()?;
         if !self.peer_bootstrap {
             return Ok(config);
@@ -127,7 +140,7 @@ impl ClientFlags {
         // Ask the transactor how its storage service is configured, then open
         // it directly so the peer bootstraps from the newest published
         // snapshot. The transactor address is the only thing the client needs.
-        let mut admin = Admin::connect(&self.primary(), self.token.clone(), self.tls()?)
+        let mut admin = Admin::connect(&self.primary(), self.token(), self.tls()?)
             .await
             .map_err(|error| format!("cannot connect to transactor: {error}"))?;
         let info = admin
@@ -147,11 +160,41 @@ impl ClientFlags {
 }
 
 /// Server-side TLS/auth flags.
+///
+/// Authentication is a permissive default so a local server is usable with no
+/// flags: it recognizes the shared development token (and any client presenting
+/// it) but *also* admits anonymous callers. Naming a real secret with
+/// `--serve-token`, requiring the default token with `--require-auth`, or
+/// configuring an OIDC issuer all switch the server to strict mode, where an
+/// unrecognized or absent credential is rejected. Authorization defaults to
+/// permit-all ([`AllowAll`]).
 #[derive(Args, Clone)]
 struct ServeFlags {
-    /// Require this bearer token from clients.
-    #[arg(long)]
+    /// Require this exact bearer token from clients (strict: rejects anonymous
+    /// and every other credential). Overrides the shared development token.
+    #[arg(long, env = "CORIUM_SERVE_TOKEN")]
     serve_token: Option<String>,
+    /// Require the shared development token (or `--serve-token`) on every
+    /// request: reject anonymous callers without changing the accepted secret.
+    #[arg(long)]
+    require_auth: bool,
+    /// Disable authentication entirely: accept every request as anonymous.
+    #[arg(long, conflicts_with_all = ["serve_token", "require_auth", "oidc_issuer"])]
+    serve_open: bool,
+    /// OIDC issuer URL. Tokens signed by this issuer are accepted (in addition
+    /// to the static token). Requires a build with the `oidc-discovery` feature
+    /// (to fetch the issuer's JWKS) or `--oidc-jwks-file` with the `oidc`
+    /// feature. Enabling OIDC switches the server to strict mode.
+    #[arg(long)]
+    oidc_issuer: Option<String>,
+    /// Accepted OIDC audience (`aud`); repeatable. Strongly recommended when an
+    /// issuer is set.
+    #[arg(long = "oidc-audience")]
+    oidc_audiences: Vec<String>,
+    /// Read the issuer's JWKS from this file instead of fetching it (offline;
+    /// works with the `oidc` feature alone).
+    #[arg(long)]
+    oidc_jwks_file: Option<PathBuf>,
     /// PEM certificate chain for TLS.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -170,8 +213,75 @@ impl ServeFlags {
         }
     }
 
-    fn authenticator(&self) -> Arc<StaticToken> {
-        Arc::new(StaticToken::new(self.serve_token.clone()))
+    /// Builds the request [`Guard`] this server enforces from the auth flags.
+    async fn guard(&self) -> Result<Guard, String> {
+        if self.serve_open {
+            return Ok(Guard::disabled());
+        }
+        // The static-token provider recognizes either an explicit `--serve-token`
+        // (strict) or the shared development token (permissive unless
+        // `--require-auth` / OIDC forces strict mode).
+        let (secret, strict_static) = match &self.serve_token {
+            Some(token) => (token.clone(), true),
+            None => (DEFAULT_DEV_TOKEN.to_owned(), self.require_auth),
+        };
+        let statics = StaticTokens::new().with(
+            secret,
+            Principal::new("static-token", "operator").with_role("admin"),
+        );
+
+        let oidc = self.oidc_provider().await?;
+        let strict = strict_static || oidc.is_some();
+        let provider: Arc<dyn IdentityProvider> = match oidc {
+            Some(oidc) => Arc::new(CompositeProvider::new(vec![Arc::new(statics), oidc])),
+            None => Arc::new(statics),
+        };
+        // Authorization is permit-all by default; the seam is in place for a
+        // richer authorizer (role policy, external oracle) later.
+        Ok(Guard::new(provider, Arc::new(AllowAll)).allow_anonymous(!strict))
+    }
+
+    /// Builds the OIDC identity provider when `--oidc-issuer` is set.
+    #[cfg(feature = "oidc")]
+    async fn oidc_provider(&self) -> Result<Option<Arc<dyn IdentityProvider>>, String> {
+        use corium_protocol::authz::ExternalTokens;
+        use corium_protocol::oidc::{OidcConfig, OidcVerifier};
+
+        let Some(issuer) = &self.oidc_issuer else {
+            return Ok(None);
+        };
+        let config = OidcConfig::new(issuer.clone(), self.oidc_audiences.clone());
+        let verifier = match &self.oidc_jwks_file {
+            Some(path) => {
+                let json = std::fs::read_to_string(path)
+                    .map_err(|error| format!("cannot read JWKS {}: {error}", path.display()))?;
+                OidcVerifier::from_jwks_json(config, &json)
+                    .map_err(|error| format!("cannot load JWKS: {error}"))?
+            }
+            #[cfg(feature = "oidc-discovery")]
+            None => OidcVerifier::from_discovery(config)
+                .await
+                .map_err(|error| format!("OIDC discovery failed: {error}"))?,
+            #[cfg(not(feature = "oidc-discovery"))]
+            None => {
+                return Err("OIDC discovery needs the `oidc-discovery` feature; \
+                     pass --oidc-jwks-file instead, or rebuild with it enabled"
+                    .to_owned());
+            }
+        };
+        Ok(Some(Arc::new(ExternalTokens::new("oidc", verifier))))
+    }
+
+    #[cfg(not(feature = "oidc"))]
+    #[allow(clippy::unused_async)]
+    async fn oidc_provider(&self) -> Result<Option<Arc<dyn IdentityProvider>>, String> {
+        if self.oidc_issuer.is_some() || self.oidc_jwks_file.is_some() {
+            return Err(
+                "OIDC support is not built in; rebuild corium-cli with --features oidc-discovery"
+                    .to_owned(),
+            );
+        }
+        Ok(None)
     }
 }
 
@@ -301,8 +411,9 @@ enum Command {
         /// Or ask a running transactor to collect.
         #[arg(long)]
         transactor: Option<String>,
-        /// Bearer token for the transactor.
-        #[arg(long)]
+        /// Bearer token for the transactor (defaults to the shared development
+        /// token; `--token ""` connects anonymously).
+        #[arg(long, env = "CORIUM_TOKEN")]
         token: Option<String>,
         /// PEM file with a CA certificate to trust (enables TLS).
         #[arg(long)]
@@ -319,8 +430,9 @@ enum Command {
         /// Running transactor used to discover the source storage service.
         #[arg(long, default_value = "http://127.0.0.1:4334")]
         transactor: String,
-        /// Bearer token for the transactor.
-        #[arg(long)]
+        /// Bearer token for the transactor (defaults to the shared development
+        /// token; `--token ""` connects anonymously).
+        #[arg(long, env = "CORIUM_TOKEN")]
         token: Option<String>,
         /// PEM file with a CA certificate to trust (enables TLS).
         #[arg(long)]
@@ -561,7 +673,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             #[cfg(not(feature = "cljrs"))]
             let _ = (db_fn_fuel, db_fn_memory_bytes);
             let tls = serve.tls()?;
-            let authenticator = serve.authenticator();
+            let guard = serve.guard().await?;
             let node = TransactorNode::open(config)
                 .await
                 .map_err(|error| format!("cannot open node: {error}"))?;
@@ -592,7 +704,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let server = corium_transactor::server::serve(
                 Arc::clone(&node),
                 listen,
-                authenticator,
+                guard,
                 tls,
                 async move {
                     tokio::select! {
@@ -619,7 +731,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             serve,
         } => {
             let tls = serve.tls()?;
-            let authenticator = serve.authenticator();
+            let guard = serve.guard().await?;
             let config = client.connect_config(db).await?;
             let connection = Arc::new(
                 Connection::connect(config)
@@ -636,7 +748,8 @@ async fn run(cli: Cli) -> Result<(), String> {
                     max_fuel,
                     ..PeerServerConfig::default()
                 },
-            );
+            )
+            .with_guard(guard);
             let metrics = service.metrics();
             let _metrics = if let Some(address) = metrics_listen {
                 Some(metrics_http::spawn(address, Arc::new(move || metrics.prometheus())).await?)
@@ -644,7 +757,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 None
             };
             tracing::info!(%listen, "peer server serving");
-            corium_peer::server::serve_service(service, listen, authenticator, tls, async {
+            corium_peer::server::serve_service(service, listen, tls, async {
                 let _ = tokio::signal::ctrl_c().await;
             })
             .await
@@ -723,7 +836,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     tls_domain,
                     peer_bootstrap: false,
                 };
-                let mut admin = Admin::connect(&flags.primary(), flags.token.clone(), flags.tls()?)
+                let mut admin = Admin::connect(&flags.primary(), flags.token(), flags.tls()?)
                     .await
                     .map_err(|error| error.to_string())?;
                 let swept = admin
@@ -751,7 +864,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                         .map_err(|error| format!("cannot load CA certificate: {error}"))?,
                 )
             };
-            let mut admin = Admin::connect(&transactor, token, tls)
+            let mut admin = Admin::connect(&transactor, resolve_client_token(token.as_deref()), tls)
                 .await
                 .map_err(|error| error.to_string())?;
             let info = admin
@@ -946,9 +1059,20 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 }
 
 async fn admin_client(client: &ClientFlags) -> Result<Admin, String> {
-    Admin::connect(&client.primary(), client.token.clone(), client.tls()?)
+    Admin::connect(&client.primary(), client.token(), client.tls()?)
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Resolves a client bearer token: the given value when set, the shared
+/// development token ([`DEFAULT_DEV_TOKEN`]) when unset, or `None` when the
+/// value is present but empty (`--token ""`), meaning connect anonymously.
+fn resolve_client_token(token: Option<&str>) -> Option<String> {
+    match token {
+        Some("") => None,
+        Some(value) => Some(value.to_owned()),
+        None => Some(DEFAULT_DEV_TOKEN.to_owned()),
+    }
 }
 
 async fn run_db(command: DbCommand) -> Result<(), String> {

@@ -5,6 +5,8 @@
 pub mod auth;
 pub mod authz;
 pub mod codec;
+#[cfg(feature = "oidc")]
+pub mod oidc;
 
 // The EDN schema/transaction boundary conversions live in the pure
 // `corium-forms` crate (so they compile on wasm, away from tonic/tokio).

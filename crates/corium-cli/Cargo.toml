@@ -22,10 +22,15 @@ postgres = ["corium-transactor/postgres"]
 turso = ["corium-transactor/turso"]
 # Enables the S3 storage backend for `corium transactor --store s3`.
 s3 = ["corium-transactor/s3"]
+# OIDC/JWT bearer-token authentication for the transactor and peer server.
+# `oidc` verifies tokens against a JWKS supplied with `--oidc-jwks-file`;
+# `oidc-discovery` also fetches the issuer's JWKS over HTTP (`--oidc-issuer`).
+oidc = ["corium-protocol/oidc"]
+oidc-discovery = ["oidc", "corium-protocol/oidc-discovery"]
 
 [dependencies]
 async-trait = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-log = { workspace = true }

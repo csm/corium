@@ -10,6 +10,20 @@ use tonic::metadata::MetadataMap;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 
+/// The built-in development bearer token.
+///
+/// Every `corium` CLI program defaults to this token — servers accept it and
+/// clients present it — so a local database works with no auth configuration:
+/// start a transactor, create a database, and open a console without passing a
+/// single credential flag. Override it with `--token` / `--serve-token` or the
+/// `CORIUM_TOKEN` environment variable.
+///
+/// It is deliberately a fixed, well-known string: it exists to make local
+/// experimentation frictionless, **not** to secure anything. Never expose a
+/// surface that accepts it to a network anyone else can reach; set a real
+/// secret (or an OIDC issuer) there instead.
+pub const DEFAULT_DEV_TOKEN: &str = "corium-dev-insecure-token";
+
 /// Pluggable per-request authenticator.
 pub trait Authenticator: Send + Sync + 'static {
     /// Accepts or rejects a request given its bearer token (if any).

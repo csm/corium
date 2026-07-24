@@ -66,12 +66,11 @@ fn api_surface_from_cljrs() {
         .expect("addr")
         .port();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let auth = Arc::new(corium_protocol::auth::StaticToken::new(None));
     let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = runtime.spawn(corium_transactor::server::serve(
         Arc::clone(&node),
         addr,
-        auth,
+        corium_protocol::authz::Guard::disabled(),
         None,
         async move {
             let _ = stop_rx.await;
