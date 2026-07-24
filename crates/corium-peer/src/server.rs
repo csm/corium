@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use corium_core::{EntityId, IndexOrder};
 use corium_db::{Db, key_prefix};
-use corium_protocol::auth::{AuthInterceptor, Authenticator};
+use corium_protocol::authz::{self, Access, Action, Guard, IdentityInterceptor, Principal};
 use corium_protocol::codec;
 use corium_protocol::pb;
 use corium_protocol::pb::peer_server_server::{PeerServer, PeerServerServer};
@@ -49,10 +49,12 @@ pub struct PeerServerSvc {
     cache: QueryCache,
     config: PeerServerConfig,
     metrics: Arc<Metrics>,
+    guard: Guard,
 }
 
 impl PeerServerSvc {
-    /// Hosts `connection` with the given limits.
+    /// Hosts `connection` with the given limits and no auth
+    /// ([`Guard::disabled`]); add a policy with [`PeerServerSvc::with_guard`].
     #[must_use]
     pub fn new(connection: Arc<Connection>, config: PeerServerConfig) -> Self {
         Self {
@@ -60,13 +62,42 @@ impl PeerServerSvc {
             cache: QueryCache::new(),
             config,
             metrics: Arc::new(Metrics::default()),
+            guard: Guard::disabled(),
         }
+    }
+
+    /// Enforces `guard` on every request (builder style).
+    #[must_use]
+    pub fn with_guard(mut self, guard: Guard) -> Self {
+        self.guard = guard;
+        self
     }
 
     /// Process query metrics suitable for a Prometheus endpoint.
     #[must_use]
     pub fn metrics(&self) -> Arc<Metrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Authorizes `access` for the request's [`Principal`], mapping the guard's
+    /// decision onto a gRPC status. A returned
+    /// [`ViewFilter`](authz::ViewFilter) is rejected for now: the query and
+    /// datom paths do not yet apply one, so honoring a filtered decision by
+    /// returning full data would be an authorization bypass.
+    async fn authorize<T>(&self, request: &Request<T>, access: Access) -> Result<(), Status> {
+        let principal: Principal = authz::principal(request);
+        match self.guard.authorize(&principal, &access).await {
+            Ok(None) => Ok(()),
+            Ok(Some(_filter)) => Err(Status::unimplemented(
+                "view filtering is not enforced on this surface yet",
+            )),
+            Err(error) => Err(error.to_status()),
+        }
+    }
+
+    /// The database this peer server hosts, for building an [`Access`].
+    fn db_target(&self) -> String {
+        self.connection.db_name().to_owned()
     }
 
     fn view_db(&self, spec: Option<&pb::DbViewSpec>) -> Result<Db, Status> {
@@ -150,6 +181,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::QueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
+        self.authorize(&request, Access::on(Action::Query, self.db_target()))
+            .await?;
         let request = request.into_inner();
         let query_form = decode_edn(&request.query, "query")?;
         let parsed = self
@@ -251,6 +284,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::PullRequest>,
     ) -> Result<Response<pb::PullResponse>, Status> {
+        self.authorize(&request, Access::on(Action::Pull, self.db_target()))
+            .await?;
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
         let pattern = decode_edn(&request.pattern, "pull pattern")?;
@@ -266,6 +301,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::TransactRequest>,
     ) -> Result<Response<pb::TransactResponse>, Status> {
+        self.authorize(&request, Access::on(Action::Transact, self.db_target()))
+            .await?;
         let request = request.into_inner();
         if request.db != self.connection.db_name() {
             return Err(Status::not_found(format!(
@@ -298,6 +335,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::DatomsRequest>,
     ) -> Result<Response<Self::DatomsStream>, Status> {
+        self.authorize(&request, Access::on(Action::Datoms, self.db_target()))
+            .await?;
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
         let order = match request.index.as_str() {
@@ -392,6 +431,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::TxRangeRequest>,
     ) -> Result<Response<Self::TxRangeStream>, Status> {
+        self.authorize(&request, Access::on(Action::TxRange, self.db_target()))
+            .await?;
         let request = request.into_inner();
         if request.db != self.connection.db_name() {
             return Err(Status::not_found(format!(
@@ -440,6 +481,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::DbStatsRequest>,
     ) -> Result<Response<pb::DbStatsResponse>, Status> {
+        self.authorize(&request, Access::on(Action::Inspect, self.db_target()))
+            .await?;
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
         let stats = db.stats();
@@ -457,6 +500,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        self.authorize(&request, Access::on(Action::Subscribe, self.db_target()))
+            .await?;
         let request = request.into_inner();
         if request.db != self.connection.db_name() {
             return Err(Status::not_found(format!(
@@ -484,15 +529,14 @@ impl PeerServer for PeerServerSvc {
 pub async fn serve(
     connection: Arc<Connection>,
     addr: std::net::SocketAddr,
-    authenticator: Arc<dyn Authenticator>,
+    guard: Guard,
     tls: Option<tonic::transport::ServerTlsConfig>,
     config: PeerServerConfig,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
     serve_service(
-        PeerServerSvc::new(connection, config),
+        PeerServerSvc::new(connection, config).with_guard(guard),
         addr,
-        authenticator,
         tls,
         shutdown,
     )
@@ -507,19 +551,18 @@ pub async fn serve(
 pub async fn serve_service(
     service: PeerServerSvc,
     addr: std::net::SocketAddr,
-    authenticator: Arc<dyn Authenticator>,
     tls: Option<tonic::transport::ServerTlsConfig>,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), tonic::transport::Error> {
+    // The interceptor authenticates each request with the same guard the
+    // service uses to authorize it.
+    let interceptor = IdentityInterceptor::new(service.guard.clone());
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
     builder
-        .add_service(PeerServerServer::with_interceptor(
-            service,
-            AuthInterceptor::new(authenticator),
-        ))
+        .add_service(PeerServerServer::with_interceptor(service, interceptor))
         .serve_with_shutdown(addr, shutdown)
         .await
 }

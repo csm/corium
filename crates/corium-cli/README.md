@@ -23,8 +23,8 @@ Ships the `corium` command. Subcommands:
 - **`tui`** — a full-screen terminal dashboard (query workbench, live store
   metrics, transaction feed, schema browser).
 - **`sql`** — read-only SQL shell over the peer-local database.
-- **`backup` / `restore`** — offline full and hash-incremental backup and
-  guarded restore.
+- **`backup` / `restore`** — one versioned binary archive with online,
+  storage-native full/incremental log backup and guarded offline restore.
 - **`gc`** — retention-aware garbage collection (online or offline).
 - **`log`** — inspect the transaction log.
 

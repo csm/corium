@@ -2034,6 +2034,7 @@ dependencies = [
 name = "corium-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "corium-core",
  "corium-db",
  "corium-forms",
@@ -2043,6 +2044,10 @@ dependencies = [
  "proptest",
  "prost",
  "protox",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -7226,6 +7231,8 @@ dependencies = [
  "rustls 0.23.42",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",

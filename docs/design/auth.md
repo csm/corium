@@ -1,10 +1,39 @@
-# Authentication & Authorization (spike)
+# Authentication & Authorization
 
-Status: **spike / design exploration.** The prototype lives in
-[`corium-protocol::authz`](../../crates/corium-protocol/src/authz.rs) with unit
-tests; it is not yet wired into the servers. This document records the model,
-the target integration, and the open questions. ADR-0012 records the decision
-to build authz as a request-scoped, optional layer.
+Status: **wired in (permissive default).** The model lives in
+[`corium-protocol::authz`](../../crates/corium-protocol/src/authz.rs); the
+transactor and peer server enforce it through an
+[`IdentityInterceptor`](../../crates/corium-protocol/src/authz.rs) plus a
+per-handler authorization check, and the CLI builds the [`Guard`] each server
+runs from its flags. A concrete OIDC/JWT identity provider ships in
+[`corium-protocol::oidc`](../../crates/corium-protocol/src/oidc.rs) behind the
+`oidc` feature. Authorization is permit-all ([`AllowAll`]) by default — the seam
+is in place for a richer authorizer later. ADR-0012 records the decision to
+build authz as a request-scoped, optional layer. This document records the
+model, the wiring, and the open questions.
+
+## Defaults: frictionless local, one shared secret
+
+Every `corium` CLI program defaults its bearer token to a single shared
+development secret, `corium_protocol::auth::DEFAULT_DEV_TOKEN`, so a local
+database needs no auth configuration: start a transactor, create a database, and
+open a console without passing a credential flag. A server started with no auth
+flags recognizes that token *and* also admits anonymous callers, so nothing has
+to line up for local use.
+
+- **Client token** (`--token`, or `CORIUM_TOKEN`): defaults to the shared
+  secret; `--token ""` connects anonymously; set a different value everywhere to
+  use another secret.
+- **Server auth** (`ServeFlags`): permissive by default (recognizes the shared
+  secret, admits anonymous). `--serve-token <secret>` (or `CORIUM_SERVE_TOKEN`)
+  requires that exact token and rejects everything else; `--require-auth`
+  requires the shared secret without changing it; `--serve-open` disables auth;
+  `--oidc-issuer <url>` (with `--oidc-audience`) adds OIDC and switches to strict
+  mode.
+
+The shared secret exists to make experimentation frictionless, **not** to
+secure anything: never expose a surface that accepts it to a network anyone else
+can reach.
 
 ## Problem
 
@@ -205,15 +234,19 @@ Enforcement points differ by surface:
 
 ## Migration from the bool authenticator
 
-The shipped `auth::Authenticator`/`StaticToken`/`AuthInterceptor` stay until the
-servers adopt `Guard`. The migration is mechanical: `StaticToken(Some(secret))`
-becomes a `Guard::new(StaticTokens::with(secret, principal), AllowAll)`, and
-`StaticToken(None)` becomes `Guard::disabled()`. The CLI's `--serve-token`
-maps to the former; new flags (`--auth-config`, an OIDC issuer URL, a token
-file) select richer guards. The wire protocol does not change — credentials
-still travel as `authorization: Bearer …` metadata and the same gRPC status
-codes (`UNAUTHENTICATED`, `PERMISSION_DENIED`) are returned — so existing thin
-clients keep working; only what the server does with the token changes.
+Done for the servers: `corium-transactor::server::serve` and
+`corium-peer::server::{serve, serve_service}` now take a `Guard` and install an
+`IdentityInterceptor` instead of the bool `AuthInterceptor`. `StaticToken(None)`
+became `Guard::disabled()`, and `--serve-token <secret>` became a
+`Guard::new(StaticTokens::with(secret, principal), AllowAll)` (anonymous
+disabled). The client side still attaches the token with
+`auth::TokenInterceptor`, and the shipped `auth::Authenticator`/`StaticToken`
+types remain for out-of-tree embedders — the servers no longer use them.
+
+The wire protocol did not change — credentials still travel as
+`authorization: Bearer …` metadata and the same gRPC status codes
+(`UNAUTHENTICATED`, `PERMISSION_DENIED`) come back — so existing thin clients
+keep working; only what the server does with the token changed.
 
 ## Open questions
 
@@ -221,11 +254,14 @@ clients keep working; only what the server does with the token changes.
   and view definitions probably want to be data, not code — a config file, or
   eventually facts in a control database the transactor reads. The spike
   hard-codes policies in Rust; externalizing them is the next design step.
-- **View filtering in the query engine.** `AttributeAllowlist` is enforceable
-  in the datom scan, but a `ViewFilter` that hides *entities* or filters by
-  *value* needs a hook inside `corium-query` (a predicate in the executor),
-  and interacts with the query cache (cache keys must include the filter). This
-  is the largest downstream change and is out of scope for the spike.
+- **View filtering in the query engine.** Not yet enforced: the wired handlers
+  authorize with `Guard::authorize` but reject an `AllowFiltered` decision with
+  `UNIMPLEMENTED` rather than silently returning unfiltered facts, so a policy
+  that returns a `ViewFilter` fails closed until the read paths apply it.
+  `AttributeAllowlist` is enforceable in the datom scan, but a `ViewFilter` that
+  hides *entities* or filters by *value* needs a hook inside `corium-query` (a
+  predicate in the executor), and interacts with the query cache (cache keys
+  must include the filter). This is the largest remaining downstream change.
 - **Auditing.** Every authz decision is a natural audit event; the `Principal`
   and `Access` are exactly what a log line needs. Not prototyped.
 - **mTLS subject extraction.** Needs the tonic peer-certificate plumbing to
@@ -235,16 +271,30 @@ clients keep working; only what the server does with the token changes.
   cached per token/expiry so it stays off the hot path; the `TokenVerifier`
   impl owns this.
 
-## What the spike delivers
+## What is implemented
 
 - `corium-protocol::authz`: `Principal`, `Credentials`, `IdentityProvider`
   (+ `AllowAnonymous`, `StaticTokens`, `ExternalTokens`, `CompositeProvider`),
   `TokenVerifier`, `Action`/`Access`, `Authorizer` (+ `AllowAll`,
   `PolicyAuthorizer`/`Grant`), `ViewFilter` (+ `AttributeAllowlist`),
   `Decision`, `Guard`, and `IdentityInterceptor`.
-- Unit tests covering each requirement: optional-off, distinct static-token
-  identities, the external-verifier seam, provider composition, role/database
-  enforcement, an async external-oracle authorizer, per-principal views,
-  interceptor extension propagation, and one guard serving two tenants with
-  different authority.
-- No change to the shipped `auth` module, the wire protocol, or server wiring.
+- `corium-protocol::oidc` (feature `oidc`): `OidcVerifier`, a concrete
+  `TokenVerifier` that validates RSA-signed (`RS256`/`RS384`/`RS512`) JWTs
+  against a JWKS and maps `sub`/roles/claims onto a `Principal`, with issuer,
+  audience, and expiry checks. `OidcVerifier::from_discovery` (feature
+  `oidc-discovery`) fetches the issuer's JWKS over HTTP; `from_jwks_json` builds
+  it offline. Unit tests sign and verify real tokens against an embedded test
+  key and cover tampering, expiry, wrong issuer/audience, and unsupported
+  algorithms.
+- Server wiring: the transactor (`Transactor` + `Catalog`) and peer server
+  authenticate every request in the interceptor and authorize the concrete
+  `Access` in each handler. Authorization defaults to `AllowAll`.
+- CLI: a shared development token defaulted across every program, `ServeFlags`
+  that build the server `Guard` (`--serve-token`, `--require-auth`,
+  `--serve-open`, `--oidc-issuer`/`--oidc-audience`/`--oidc-jwks-file`), and
+  `CORIUM_TOKEN` / `CORIUM_SERVE_TOKEN` environment overrides.
+- Unit tests covering each model requirement: optional-off, distinct
+  static-token identities, the external-verifier seam, provider composition,
+  role/database enforcement, an async external-oracle authorizer, per-principal
+  views, interceptor extension propagation, and one guard serving two tenants
+  with different authority.

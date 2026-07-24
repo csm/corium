@@ -17,8 +17,8 @@ embeddable-SQLite Turso database at `--turso-path`, requiring a build with
 keeps its log in the process-shared in-memory registry, `fs` keeps using
 versioned log files under `--data-dir`, and `postgres`, `turso`, and `s3`
 store versioned logs natively in the same backend as their blobs and roots.
-Backup, restore, and offline GC operate on the filesystem data directory and
-therefore apply to `fs`.
+Online backup reads every durable backend; restore and offline GC write a
+filesystem data directory.
 
 The PostgreSQL backend creates `corium_blobs` and `corium_roots` in the
 connection's current schema and stores transaction-log objects as fenced
@@ -286,31 +286,48 @@ never run members against diverged copies of a data directory.
 
 ## Backup and restore
 
-Backup and restore are offline in v1: stop the transactor that owns the data
-directory first. A backup contains the durable log, schema/naming metadata,
-the database root, and every immutable blob reachable from that root.
+Backup is online. It contacts the running transactor once to fix the current
+transaction basis and obtain connection details for the underlying storage,
+then reads the storage log independently only through that basis. Transactions
+committed while the backup runs are left for the next incremental run.
 
 ```sh
-corium backup --data-dir /srv/corium people /backups/people
+corium backup --transactor http://127.0.0.1:4334 people /backups/people.corium
 ```
 
-Run the same command with the same destination for an incremental refresh.
-Only hashes absent from the destination are copied; the report prints
-`:copied-blobs` and `:reused-blobs`. The log and small root/manifest files are
-refreshed atomically each time. Do not combine different source databases in
-one backup directory.
+Run the same command with the same file for an incremental refresh. The backup
+reads only transaction records after its existing checkpoint and appends one
+new checkpoint frame; the report prints `:replayed-transactions`. It retains
+the first backup's index snapshot as a replay base and embeds its immutable
+snapshot blobs only on that first run.
 
-Restore refuses to overwrite a database. Restoring under a new name creates
-a clone:
+A backup has exactly one representation: a binary `.corium` archive. Its
+header carries an independent backup-file format version and the Corium
+version that created it; every incremental checkpoint records the version
+that appended it. Unsupported future formats fail before restore and identify
+their writer. `--log-format human|json` controls diagnostic logging only and
+never changes the backup artifact. Human/JSON/EDN export belongs in a future
+`dump` command rather than in backup or restore.
+
+Filesystem and Turso backups must run where the transactor's absolute local
+storage path is accessible. PostgreSQL and S3 clients connect to the same
+native storage advertised by the transactor (S3 credentials still come from
+the standard AWS environment). Process-local memory storage cannot be opened
+by a separate backup process and is rejected clearly. The advertised
+PostgreSQL connection is read/write in this first version; a future release
+can substitute read-only credentials without changing the replay protocol.
+
+Restore remains offline and refuses to overwrite a database. Restoring under
+a new name creates a clone:
 
 ```sh
-corium restore /backups/people --data-dir /srv/corium-restored --as-db people
-corium restore /backups/people --data-dir /srv/corium --as-db people-staging
+corium restore /backups/people.corium --data-dir /srv/corium-restored --as-db people
+corium restore /backups/people.corium --data-dir /srv/corium --as-db people-staging
 ```
 
 After restore, start the target transactor and compare `corium db stats` with
-the backup report's basis. The manifest and database root carry a format
-version; a newer unsupported format fails clearly before publication.
+the backup report's basis. Backup-container and database-storage versions are
+checked separately before publication.
 
 ## Forking a database
 

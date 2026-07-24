@@ -69,10 +69,14 @@ today.
 ### CatalogService (admin)
 
 `CreateDatabase`, `DeleteDatabase`, `ForkDatabase`, `ListDatabases`,
-`GcDeletedDatabases` — thin wrappers over root-store operations plus
-transactor bootstrap datoms. `ForkDatabase` creates a new database
-duplicating an existing one at a transaction basis by copying the log
-prefix; the fork replays it and publishes indexes of its own.
+`GcDeletedDatabases`, index controls, and `GetBackupInfo`. Most are thin
+wrappers over root-store operations plus transactor bootstrap datoms.
+`ForkDatabase` creates a new database duplicating an existing one at a
+transaction basis by copying the log prefix; the fork replays it and publishes
+indexes of its own. `GetBackupInfo` briefly serializes with commit to return a
+definite current basis and the underlying storage connection; the backup
+client then leaves the transactor and reads the bounded native log range
+directly.
 
 ### PeerServerService (thin clients → peer server)
 

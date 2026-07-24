@@ -907,6 +907,23 @@ impl Admin {
             tail_deadline_ms: Some(response.tail_deadline_ms),
         })
     }
+
+    /// Fixes the current transaction basis and returns an independent
+    /// connection to the transactor's underlying storage service, for a
+    /// backup client or a storage-aware peer bootstrapping from storage.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for an unknown database or transport failure.
+    pub async fn get_storage_info(
+        &mut self,
+        db: &str,
+    ) -> Result<pb::GetStorageInfoResponse, PeerError> {
+        Ok(self
+            .client
+            .get_storage_info(pb::GetStorageInfoRequest { db: db.to_owned() })
+            .await?
+            .into_inner())
+    }
 }
 
 /// Index-publication pacing fields for [`Admin::set_index_policy`]: `None`

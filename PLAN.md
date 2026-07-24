@@ -22,6 +22,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |
 | [docs/design/clojurust-integration.md](docs/design/clojurust-integration.md) | Boundary conversion, sandboxed database functions, cljrs client API |
 | [docs/design/clients-and-ops.md](docs/design/clients-and-ops.md) | CLI, query console, backup/restore, metrics |
+| [docs/design/backup-format.md](docs/design/backup-format.md) | Versioned binary backup container and checkpoint framing |
 | [docs/sql.md](docs/sql.md) | SQL table projection, Rust API, shell, and engine tradeoffs |
 | [docs/getting-started.md](docs/getting-started.md) | Build and first local database walkthrough |
 | [docs/operations.md](docs/operations.md) | Process, console, backup/restore, metrics, GC, recovery runbook |
@@ -104,7 +105,7 @@ deadline exhaustion, and verifies that sandbox escape attempts (I/O,
 interop, namespace manipulation, unbounded loops) all fail safely. M6 adds
 the operations surface: an interactive `corium console` with
 as-of/since/history views, schema/stats/basis inspection, timing, and live
-tx-report watch; full and hash-incremental offline backup plus guarded
+tx-report watch; online storage-native full/incremental backup plus guarded
 restore-as-clone with format-version checks; human/JSON tracing,
 Prometheus endpoints on transactor and peer server, and expanded Status/db
 stats counters; retention-aware GC as both a scheduled transactor duty and
