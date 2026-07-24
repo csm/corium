@@ -14,6 +14,7 @@ members = [
     "crates/corium-transactor",
     "crates/corium-peer",
     "crates/corium-protocol",
+    "crates/corium-authz",
     "crates/corium-cljrs",
     "crates/corium-cli",
     "crates/corium-sim",
@@ -40,6 +41,7 @@ default-members = [
     "crates/corium-transactor",
     "crates/corium-peer",
     "crates/corium-protocol",
+    "crates/corium-authz",
     "crates/corium-cli",
     "crates/corium-sim",
     "crates/corium-wasm",
@@ -62,6 +64,7 @@ all = "warn"
 pedantic = "warn"
 
 [workspace.dependencies]
+corium-authz = { path = "crates/corium-authz", version = "0.1.0" }
 corium-cli = { path = "crates/corium-cli", version = "0.1.0" }
 corium-client = { path = "crates/corium-client", version = "0.1.0" }
 corium-cljrs = { path = "crates/corium-cljrs", version = "0.1.0" }

@@ -1,9 +1,10 @@
 # ADR-0012: Optional, request-scoped authentication and authorization
 
-**Status:** Proposed (2026-07-21); spike in
+**Status:** Accepted (2026-07-21); implemented in
 [`corium-protocol::authz`](../../crates/corium-protocol/src/authz.rs) with the
-design in [`docs/design/auth.md`](../design/auth.md). Not yet wired into the
-servers.
+design in [`docs/design/auth.md`](../design/auth.md). The transactor and peer
+server enforce it; [ADR-0014](0014-self-hosted-rebac-authz.md) fills in the
+`Authorizer` seam with a self-hosted relationship policy.
 
 ## Context
 

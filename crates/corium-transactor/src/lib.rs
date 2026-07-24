@@ -1,6 +1,7 @@
 //! Embedded single-writer transaction pipeline and index publisher, plus the
 //! networked transactor process (lease, gRPC services, indexing job).
 
+pub mod authz;
 pub mod backend;
 pub mod backup;
 pub mod lease;
