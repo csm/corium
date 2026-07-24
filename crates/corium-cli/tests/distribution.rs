@@ -536,6 +536,39 @@ fn index_control_round_trip(run: &impl Fn(Vec<String>) -> String, endpoint: &str
     assert!(requested.contains(":index-basis-t 1"), "{requested}");
 }
 
+async fn backup_round_trip(
+    run: &impl Fn(Vec<String>) -> String,
+    endpoint: &str,
+    backup_file: &Path,
+    peer: &Connection,
+) {
+    // Backup discovers storage through the live transactor, then replays it
+    // independently. Reusing the destination fetches only the new range.
+    let backed_up = run(vec![
+        "backup".into(),
+        "--transactor".into(),
+        endpoint.to_owned(),
+        "clidb".into(),
+        backup_file.display().to_string(),
+    ]);
+    assert!(
+        backed_up.contains(":basis-t 1") && backed_up.contains(":replayed-transactions 1"),
+        "{backed_up}"
+    );
+    peer.transact(add_value(8)).await.expect("second transact");
+    let incremental = run(vec![
+        "backup".into(),
+        "--transactor".into(),
+        endpoint.to_owned(),
+        "clidb".into(),
+        backup_file.display().to_string(),
+    ]);
+    assert!(
+        incremental.contains(":basis-t 2") && incremental.contains(":replayed-transactions 1"),
+        "{incremental}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_admin_commands_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -597,32 +630,8 @@ async fn cli_admin_commands_round_trip() {
 
     index_control_round_trip(&run, &endpoint);
 
-    // Backup discovers storage through the live transactor, then replays it
-    // independently. Reusing the destination fetches only the new range.
     let backup_file = dir.path().join("backup.corium");
-    let backed_up = run(vec![
-        "backup".into(),
-        "--transactor".into(),
-        endpoint.clone(),
-        "clidb".into(),
-        backup_file.display().to_string(),
-    ]);
-    assert!(
-        backed_up.contains(":basis-t 1") && backed_up.contains(":replayed-transactions 1"),
-        "{backed_up}"
-    );
-    peer.transact(add_value(8)).await.expect("second transact");
-    let incremental = run(vec![
-        "backup".into(),
-        "--transactor".into(),
-        endpoint.clone(),
-        "clidb".into(),
-        backup_file.display().to_string(),
-    ]);
-    assert!(
-        incremental.contains(":basis-t 2") && incremental.contains(":replayed-transactions 1"),
-        "{incremental}"
-    );
+    backup_round_trip(&run, &endpoint, &backup_file, &peer).await;
 
     // Offline log inspection sees the committed record.
     let logged = run(vec![
