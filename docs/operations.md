@@ -65,8 +65,12 @@ serve Prometheus text at `/metrics`. Keep this listener on a private
 operations network; it has no application bearer-token authentication.
 Transactor metrics cover transaction count/failures/latency, commit queue
 depth, indexing duration, and GC. Peer metrics cover query count/latency and
-query fuel spent. `corium db stats` and the transactor `Status` RPC provide
-basis, index lag, counts, queue depth, and GC counters on demand.
+query fuel spent. The proposed optional peer SSD segment cache adds bounded
+usage, hit/miss, native-fetch, admission, eviction, and corruption metrics to
+this same endpoint; its configuration and exact metric contract are in
+[peer-segment-cache.md](design/peer-segment-cache.md). `corium db stats` and
+the transactor `Status` RPC provide basis, index lag, counts, queue depth, and
+GC counters on demand.
 
 ## Index publication pacing and bulk loading
 
