@@ -12,8 +12,9 @@ use corium_core::{Datom, IndexOrder, encoding::DecodeError};
 use corium_db::Db;
 use corium_protocol::codec::{self, CodecError};
 use corium_store::{
-    BlobId, BlobStore, DbRoot, FORMAT_VERSION, RootStore, SegmentCache, StoreError, db_root_name,
-    decode_index_manifest, decode_segment_keys, is_index_manifest, meta_root_name,
+    BlobId, BlobStore, DbRoot, FORMAT_VERSION, RootStore, SegmentCache, SegmentCacheConfig,
+    SegmentCacheMetrics, SegmentReader, StoreError, db_root_name, decode_index_manifest,
+    decode_segment_keys, is_index_manifest, meta_root_name,
 };
 use thiserror::Error;
 
@@ -27,6 +28,56 @@ pub trait PeerStorage: Send + Sync {
     async fn get_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError>;
     /// Loads one named root record.
     async fn get_peer_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError>;
+}
+
+/// Storage decorator that caches blob reads while always delegating roots.
+pub struct CachedPeerStorage {
+    storage: Arc<dyn PeerStorage>,
+    cache: SegmentCache,
+}
+
+impl CachedPeerStorage {
+    /// Opens a cache around peer storage.
+    ///
+    /// # Errors
+    /// Returns an error for invalid configuration, inaccessible storage, or
+    /// an already-owned cache directory.
+    pub fn open(
+        storage: Arc<dyn PeerStorage>,
+        config: &SegmentCacheConfig,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            storage,
+            cache: SegmentCache::open(config)?,
+        })
+    }
+
+    /// Returns cache counters for a metrics adapter.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<SegmentCacheMetrics> {
+        self.cache.metrics()
+    }
+}
+
+#[async_trait]
+impl SegmentReader for CachedPeerStorage {
+    async fn read_segment(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.storage.get_blob(id).await
+    }
+}
+
+#[async_trait]
+impl PeerStorage for CachedPeerStorage {
+    async fn get_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .cache
+            .get_or_load(self, id)
+            .await?
+            .map(|bytes| bytes.to_vec()))
+    }
+    async fn get_peer_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.storage.get_peer_root(name).await
+    }
 }
 
 #[async_trait]
