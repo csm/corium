@@ -15,7 +15,7 @@ pub mod oidc;
 pub use corium_forms::{schemaform, txforms};
 
 /// Protocol version spoken by this crate.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Generated protobuf/tonic bindings for `corium.v1`.
 #[allow(

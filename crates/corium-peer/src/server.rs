@@ -313,7 +313,7 @@ impl PeerServer for PeerServerSvc {
         }
         let response = self
             .connection
-            .transact_raw(request.tx_data)
+            .transact_raw_at(request.tx_data, request.expected_basis_t)
             .await
             .map_err(|error| match error {
                 crate::PeerError::Rpc(status) => status,

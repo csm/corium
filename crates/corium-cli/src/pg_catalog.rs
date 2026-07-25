@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 use corium_db::Db;
 use corium_peer::Connection;
-use corium_pgwire::{CatalogError, DbCatalog};
+use corium_peer::PeerError;
+use corium_pgwire::{CatalogError, CatalogTxResult, DbCatalog};
+use corium_query::edn::Edn;
 use tokio::sync::Mutex;
+use tonic::Code;
 
 use crate::ClientFlags;
 
@@ -44,6 +47,32 @@ impl PeerCatalog {
             .as_ref()
             .is_none_or(|allowed| allowed.contains(name))
     }
+
+    async fn connection(&self, name: &str) -> Result<Arc<Connection>, CatalogError> {
+        if !self.allowed(name) {
+            return Err(CatalogError::NotFound(name.to_owned()));
+        }
+        {
+            let cache = self.connections.lock().await;
+            if let Some(connection) = cache.get(name) {
+                return Ok(Arc::clone(connection));
+            }
+        }
+        let config = self
+            .client
+            .connect_config(name.to_owned())
+            .await
+            .map_err(CatalogError::Unavailable)?;
+        let connection = Arc::new(
+            Connection::connect(config)
+                .await
+                .map_err(|error| CatalogError::Unavailable(error.to_string()))?,
+        );
+        let mut cache = self.connections.lock().await;
+        Ok(Arc::clone(
+            cache.entry(name.to_owned()).or_insert(connection),
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -64,30 +93,43 @@ impl DbCatalog for PeerCatalog {
     }
 
     async fn db(&self, name: &str) -> Result<Db, CatalogError> {
-        if !self.allowed(name) {
-            return Err(CatalogError::NotFound(name.to_owned()));
-        }
-        {
-            let cache = self.connections.lock().await;
-            if let Some(connection) = cache.get(name) {
-                return Ok(connection.db());
-            }
-        }
-        // Not cached: connect outside the lock. A concurrent first use may
-        // build a second connection; `or_insert` keeps whichever lands first
-        // and drops the loser.
-        let config = self
-            .client
-            .connect_config(name.to_owned())
+        Ok(self.connection(name).await?.db())
+    }
+
+    async fn transact(
+        &self,
+        name: &str,
+        expected_basis_t: u64,
+        forms: Vec<Edn>,
+    ) -> Result<CatalogTxResult, CatalogError> {
+        let connection = self.connection(name).await?;
+        let result = connection
+            .transact_at(forms, Some(expected_basis_t))
             .await
-            .map_err(CatalogError::Unavailable)?;
-        let connection = Arc::new(
-            Connection::connect(config)
-                .await
-                .map_err(|error| CatalogError::Unavailable(error.to_string()))?,
-        );
-        let mut cache = self.connections.lock().await;
-        let entry = cache.entry(name.to_owned()).or_insert(connection);
-        Ok(entry.db())
+            .map_err(|error| map_write_error(&error))?;
+        Ok(CatalogTxResult {
+            db_after: result.db_after,
+            tempids: result.tempids,
+        })
+    }
+}
+
+fn map_write_error(error: &PeerError) -> CatalogError {
+    match error {
+        PeerError::Rpc(status) if status.code() == Code::Aborted => {
+            CatalogError::Conflict(status.message().to_owned())
+        }
+        PeerError::Rpc(status)
+            if matches!(
+                status.code(),
+                Code::PermissionDenied | Code::Unauthenticated | Code::Unimplemented
+            ) =>
+        {
+            CatalogError::Denied(status.message().to_owned())
+        }
+        PeerError::Rpc(status) if status.code() == Code::InvalidArgument => {
+            CatalogError::Rejected(status.message().to_owned())
+        }
+        _ => CatalogError::Unavailable(error.to_string()),
     }
 }

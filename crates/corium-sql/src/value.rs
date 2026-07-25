@@ -114,6 +114,32 @@ pub enum SqlValue {
 pub type SqlRow = Vec<SqlValue>;
 
 impl SqlValue {
+    pub(crate) fn to_scalar(&self) -> Result<ScalarValue, SqlError> {
+        Ok(match self {
+            Self::Null => ScalarValue::Null,
+            Self::Boolean(value) => ScalarValue::Boolean(Some(*value)),
+            Self::Integer(value) => ScalarValue::Int64(Some(*value)),
+            Self::Unsigned(value) => ScalarValue::UInt64(Some(*value)),
+            Self::Float(value) => ScalarValue::Float64(Some(*value)),
+            Self::TimestampMillis(value) => {
+                ScalarValue::TimestampMillisecond(Some(*value), Some("UTC".into()))
+            }
+            Self::Text(value) | Self::Other(value) => ScalarValue::Utf8(Some(value.clone())),
+            Self::Bytes(value) => ScalarValue::Binary(Some(value.clone())),
+            Self::List(values) => {
+                let scalars = values
+                    .iter()
+                    .map(Self::to_scalar)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let data_type = scalars
+                    .iter()
+                    .find(|value| !value.is_null())
+                    .map_or(DataType::Null, ScalarValue::data_type);
+                ScalarValue::List(ScalarValue::new_list(&scalars, &data_type, true))
+            }
+        })
+    }
+
     pub(crate) fn from_scalar(value: ScalarValue) -> Result<Self, SqlError> {
         Ok(match value {
             ScalarValue::Null

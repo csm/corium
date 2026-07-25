@@ -388,10 +388,26 @@ impl Connection {
     /// # Errors
     /// Returns [`PeerError`] for rejected transactions or transport failure.
     pub async fn transact(&self, forms: Vec<Edn>) -> Result<TxResult, PeerError> {
+        self.transact_at(forms, None).await
+    }
+
+    /// Submits a transaction conditionally against `expected_basis_t`.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for a stale basis, rejected transaction, or
+    /// transport failure.
+    pub async fn transact_at(
+        &self,
+        forms: Vec<Edn>,
+        expected_basis_t: Option<u64>,
+    ) -> Result<TxResult, PeerError> {
         let tx_data = codec::encode_edn(&Edn::Vector(forms));
         let deadline = tokio::time::Instant::now() + self.inner.config.failover_timeout;
         let response = loop {
-            match self.transact_raw(tx_data.clone()).await {
+            match self
+                .transact_raw_at(tx_data.clone(), expected_basis_t)
+                .await
+            {
                 Ok(response) => break response,
                 Err(error) if retry_is_safe(&error) && tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(self.inner.config.reconnect_min).await;
@@ -416,10 +432,24 @@ impl Connection {
     /// # Errors
     /// Returns [`PeerError`] for rejected transactions or transport failure.
     pub async fn transact_raw(&self, tx_data: Vec<u8>) -> Result<pb::TransactResponse, PeerError> {
+        self.transact_raw_at(tx_data, None).await
+    }
+
+    /// Submits already-encoded transaction data with an optional basis fence.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for a stale basis, rejected transaction, or
+    /// transport failure.
+    pub async fn transact_raw_at(
+        &self,
+        tx_data: Vec<u8>,
+        expected_basis_t: Option<u64>,
+    ) -> Result<pb::TransactResponse, PeerError> {
         let request = pb::TransactRequest {
             db: self.inner.config.db.clone(),
             protocol_version: corium_protocol::PROTOCOL_VERSION,
             tx_data,
+            expected_basis_t,
         };
         let mut client = self
             .inner

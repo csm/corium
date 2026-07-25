@@ -24,6 +24,7 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::Codec(_)
         | NodeError::TxForm(_)
         | NodeError::SchemaForm(_) => Status::invalid_argument(error.to_string()),
+        NodeError::BasisMismatch { .. } => Status::aborted(error.to_string()),
         NodeError::Deposed(_) | NodeError::Standby { .. } | NodeError::UnsupportedFormat { .. } => {
             Status::failed_precondition(error.to_string())
         }
@@ -169,7 +170,7 @@ impl Transactor for TransactorSvc {
         )
         .await?;
         self.0
-            .transact(&request.db, &request.tx_data)
+            .transact_at(&request.db, &request.tx_data, request.expected_basis_t)
             .await
             .map(Response::new)
             .map_err(|error| to_status(&error))

@@ -1,7 +1,7 @@
 # PostgreSQL JDBC example
 
-This Maven project runs ordinary Java JDBC queries against Corium's read-only
-PostgreSQL wire-protocol server. Its one-command test harness:
+This Maven project runs ordinary Java JDBC queries against Corium's PostgreSQL
+wire-protocol server. Its one-command test harness:
 
 1. builds `corium` and the MusicBrainz loader;
 2. starts an in-memory transactor;
@@ -42,7 +42,7 @@ CORIUM_JDBC_URL=jdbc:postgresql://127.0.0.1:5432/mbrainz \
 the empty string. If `corium postgres-server` was launched with `--password`,
 set the latter to that password.
 
-The client deliberately uses plain `Statement` queries. Corium currently
-supports JDBC's extended query protocol for statements without bound
-parameters, but PostgreSQL bound parameters and binary result formats are not
-yet implemented.
+The example client still uses plain `Statement` queries, but Corium also
+supports typed bound inputs through JDBC's extended query protocol and guarded
+autocommit `INSERT`/`UPDATE`/`DELETE`. Results are text-only; binary result
+formats are not yet implemented.

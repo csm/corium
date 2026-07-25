@@ -1,8 +1,9 @@
 # SQL interface
 
-Corium's SQL interface executes read-only queries inside a peer, against one
-immutable `Db` value. It does not turn the storage model into tables and it
-does not send SQL to the transactor.
+Corium's SQL interface executes queries inside a peer against immutable `Db`
+values. It does not turn the storage model into tables. A separate mutation
+planner translates a supported DML subset into ordinary transaction forms;
+only a write-capable adapter sends those forms through the transactor.
 
 ## Rust API
 
@@ -24,8 +25,41 @@ while let Some(row) = result.next_row().await? {
 `SqlSession` fixes both the basis and time view. Results stream as Corium-owned
 `SqlColumn`, `SqlType`, and `SqlValue` values, keeping DataFusion and Arrow out
 of the default public compatibility contract. Dropping a result stream cancels
-the remaining execution. DDL, DML, and session-mutating SQL statements are
-rejected.
+the remaining execution. This `query` API rejects DDL, DML, and
+session-mutating SQL statements.
+
+## Mutations
+
+`SqlSession::mutation` and `mutation_params` plan one `INSERT`, `UPDATE`, or
+`DELETE` against a current view. A plan contains ordinary Corium transaction
+forms and the basis they were derived from. The caller submits both through
+the normal authenticated and authorized transactor path, then supplies the
+committed `Db` and tempid map to `SqlMutation::finish` for any `RETURNING`
+rows.
+
+The initial writable subset is intentionally narrow:
+
+- Only existing `corium.<namespace>` wide projections are writable.
+  `corium_sys`, history/as-of/since views, DDL, and schema changes are
+  read-only.
+- Each statement is autocommit. The expected-basis fence rejects a stale
+  read/modify/write plan before commit.
+- `INSERT` requires an explicit column list and supports `VALUES` or a query
+  source. Omit `e` for a Corium tempid; an explicit `e` must not already occur
+  in that namespace projection. A `NULL` input omits that attribute.
+- `UPDATE` supports a single plain target table, predicates, expressions, and
+  `RETURNING`. Assigning `NULL` clears a cardinality-one attribute. Assigning
+  `ARRAY[...]` replaces the full cardinality-many set.
+- `DELETE` supports a single plain target table, predicates, and `RETURNING`.
+  It retracts every attribute in the target namespace, but preserves attributes
+  belonging to other namespaces on the same entity.
+- `RETURNING` is supported for all three operations. Delete rows come from the
+  pre-commit snapshot; insert and update rows come from the committed value.
+
+Joined and multi-table mutations, conflict clauses/upserts, ordered or limited
+mutations, new keyword interning, DDL, and atomic multi-statement transactions
+are deferred. This is relational mutation over Corium's projection, not an
+attempt to make entity namespace membership into a table ownership rule.
 
 ## Relational projection
 
@@ -98,7 +132,7 @@ selected. Pressing Control-C drops the running query future.
 
 ## PostgreSQL wire-protocol server
 
-The same read-only SQL is reachable by standard PostgreSQL clients through the
+The same SQL is reachable by standard PostgreSQL clients through the
 `corium-pgwire` crate and the `corium postgres-server` command:
 
 ```console
@@ -114,19 +148,30 @@ available. Databases are opened lazily and cached, so one peer connection is
 shared across all clients using it. Restrict the exposed set with one or more
 `--database <name>` flags.
 
-Every query runs through the same `SqlSession` as the shell, so DDL, DML, and
-session-mutating statements are rejected. The server speaks the v3 protocol in
-the text format and supports both the simple and extended query sub-protocols;
-bound parameters and the binary result format are not supported and are
-reported as errors. Stateless control statements (`BEGIN`, `COMMIT`,
-`ROLLBACK`, `SET`, `RESET`, `DISCARD`) are accepted as no-ops, since each query
-already sees one immutable snapshot.
+Reads run through the same `SqlSession` as the shell. A write-capable
+`DbCatalog` additionally commits the mutation subset above through its Corium
+transactor connection; a catalog that does not implement `transact` remains
+read-only. The server supports both simple and extended query sub-protocols,
+including PostgreSQL `$1` bound inputs. Common scalar parameters accept text
+and binary input encodings. Results remain text-only; array inputs, text
+`timestamptz` inputs, and binary results are not yet supported.
+
+Explicit `BEGIN` blocks track transaction status and permit reads, but writes
+inside them are rejected instead of silently autocommitting. Use one
+autocommit DML statement per transaction until multi-statement transaction
+support lands. `SET`, `RESET`, and `DISCARD` remain compatibility no-ops.
 
 Pass `--password` to require a cleartext password; TLS is not terminated by the
 server, so front it with a proxy when transport security is needed. The SQL
 dialect is DataFusion's, not PostgreSQL's — wire compatibility does not imply
 `pg_catalog` or dialect compatibility. See
 [ADR-0013](adr/0013-postgres-wire-interface.md).
+
+The CLI server's catalog uses its cached `corium-peer` connection for writes,
+so its configured Corium bearer principal and the transactor's authorization
+gate apply. The PostgreSQL login is currently only a wire-server credential;
+it is not mapped to a distinct Corium principal. Per-user authn/authz parity,
+TLS termination, and PostgreSQL role/catalog semantics remain separate work.
 
 ## Engine choice and tradeoffs
 
@@ -155,4 +200,5 @@ assembly and provider statistics. An optional Arrow batch adapter can then be
 added without changing the row API.
 
 The decisions and longer-term history model are recorded in
-[ADR-0011](adr/0011-sql-interface.md).
+[ADR-0011](adr/0011-sql-interface.md); the guarded write path is recorded in
+[ADR-0015](adr/0015-guarded-autocommit-sql-dml.md).

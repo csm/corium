@@ -1,10 +1,11 @@
-//! Read-only SQL execution over immutable Corium database values.
+//! SQL execution and autocommit mutation planning over Corium database values.
 //!
 //! A [`SqlSession`] captures one [`corium_db::Db`] time view. Current,
 //! as-of, and since views expose one wide table per attribute namespace;
 //! history views expose normalized event relations only.
 
 mod catalog;
+mod mutation;
 mod value;
 
 use arrow::record_batch::RecordBatch;
@@ -15,6 +16,7 @@ use datafusion::prelude::SessionContext;
 use futures::StreamExt as _;
 use thiserror::Error;
 
+pub use mutation::{MutationKind, SqlMutation, SqlMutationResult};
 pub use value::{SqlColumn, SqlRow, SqlType, SqlValue};
 
 /// SQL planning, catalog, or execution failure.
@@ -29,11 +31,18 @@ pub enum SqlError {
     /// A Corium schema cannot be represented by the SQL projection.
     #[error("SQL schema error: {0}")]
     Schema(String),
+    /// SQL is valid but cannot be represented as a Corium mutation.
+    #[error("SQL mutation error: {0}")]
+    Mutation(String),
+    /// SQL parsing failed before `DataFusion` planning.
+    #[error(transparent)]
+    Parser(#[from] sqlparser::parser::ParserError),
 }
 
-/// One read-only SQL environment over a fixed immutable database view.
+/// One SQL environment over a fixed immutable database view.
 pub struct SqlSession {
     context: SessionContext,
+    db: Db,
     basis_t: u64,
     view: DbView,
 }
@@ -51,6 +60,7 @@ impl SqlSession {
         catalog::register(&context, db)?;
         Ok(Self {
             context,
+            db: db.clone(),
             basis_t: db.basis_t(),
             view: db.view(),
         })
@@ -91,17 +101,36 @@ impl SqlSession {
 
     /// Plans and starts a read-only SQL query.
     ///
-    /// DDL, DML, and session-mutating statements are rejected. Dropping the
+    /// DDL, DML, and session-mutating statements are rejected by this method;
+    /// use [`Self::mutation`] to plan supported DML. Dropping the
     /// returned stream cancels unfinished execution.
     ///
     /// # Errors
     /// Returns [`SqlError`] for SQL parsing, planning, or execution failure.
     pub async fn query(&self, sql: &str) -> Result<SqlQuery, SqlError> {
+        self.query_params(sql, &[]).await
+    }
+
+    /// Plans and starts a read-only query with PostgreSQL-style `$1`
+    /// parameters bound as typed values.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] for parameter binding, planning, or execution
+    /// failure.
+    pub async fn query_params(&self, sql: &str, params: &[SqlValue]) -> Result<SqlQuery, SqlError> {
         let options = SQLOptions::new()
             .with_allow_ddl(false)
             .with_allow_dml(false)
             .with_allow_statements(false);
-        let frame = self.context.sql_with_options(sql, options).await?;
+        let mut frame = self.context.sql_with_options(sql, options).await?;
+        if !params.is_empty() {
+            frame = frame.with_param_values(
+                params
+                    .iter()
+                    .map(SqlValue::to_scalar)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?;
+        }
         let stream = frame.execute_stream().await?;
         let columns = stream
             .schema()
@@ -115,6 +144,33 @@ impl SqlSession {
             batch: None,
             row: 0,
         })
+    }
+
+    /// Plans one supported `INSERT`, `UPDATE`, or `DELETE` into Corium
+    /// transaction forms. Returns `None` for read-only statements.
+    ///
+    /// The returned mutation is fenced to this session's basis. Its forms
+    /// must be submitted through the normal transactor path and then
+    /// [`SqlMutation::finish`] called with the committed database value and
+    /// tempid map to produce any `RETURNING` rows.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] for malformed or unsupported mutation shapes.
+    pub async fn mutation(&self, sql: &str) -> Result<Option<SqlMutation>, SqlError> {
+        self.mutation_params(sql, &[]).await
+    }
+
+    /// Plans one supported mutation with PostgreSQL-style `$1` parameters.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] for malformed, unbound, or unsupported mutation
+    /// shapes.
+    pub async fn mutation_params(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> Result<Option<SqlMutation>, SqlError> {
+        mutation::plan(&self.db, sql, params).await
     }
 }
 
@@ -180,9 +236,12 @@ impl SqlQuery {
 #[cfg(test)]
 mod tests {
     use corium_core::{
-        Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, Schema, Value, ValueType,
+        Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, Partition, Schema,
+        Value, ValueType,
     };
     use corium_db::{Db, Idents};
+    use corium_forms::txforms::tx_items_from_edn;
+    use corium_tx::prepare;
 
     use super::*;
 
@@ -274,6 +333,22 @@ mod tests {
                     },
                 ],
             )
+    }
+
+    fn apply_mutation(
+        db: &Db,
+        mutation: &SqlMutation,
+    ) -> (Db, std::collections::BTreeMap<String, EntityId>) {
+        let mut interner = db.interner().clone();
+        let items =
+            tx_items_from_edn(db, &mut interner, mutation.forms()).expect("mutation forms convert");
+        let t = db.basis_t() + 1;
+        let tx = EntityId::new(Partition::Tx as u32, t);
+        let prepared = prepare(db, items, tx, 2_000).expect("mutation prepares");
+        (
+            db.clone().with_transaction(t, &prepared.datoms),
+            prepared.tempids,
+        )
     }
 
     #[tokio::test]
@@ -403,5 +478,89 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn insert_plans_transaction_forms_and_returns_generated_entity() {
+        let db = fixture();
+        let session = SqlSession::new(&db).expect("session");
+        let mutation = session
+            .mutation(
+                "INSERT INTO corium.artist (name, \"release-year\", tags) \
+                 VALUES ('Autechre', 1994, ARRAY['electronic']) \
+                 RETURNING e, name",
+            )
+            .await
+            .expect("plan")
+            .expect("mutation");
+        assert_eq!(mutation.kind(), MutationKind::Insert);
+        assert_eq!(mutation.expected_basis_t(), db.basis_t());
+        assert_eq!(mutation.affected(), 1);
+
+        let (after, tempids) = apply_mutation(&db, &mutation);
+        let returned = mutation.finish(&after, &tempids).await.expect("returning");
+        assert_eq!(returned.rows.len(), 1);
+        assert_eq!(returned.rows[0][1], SqlValue::Text("Autechre".into()));
+    }
+
+    #[tokio::test]
+    async fn update_replaces_scalar_and_many_values() {
+        let db = fixture();
+        let session = SqlSession::new(&db).expect("session");
+        let mutation = session
+            .mutation(
+                "UPDATE corium.artist \
+                 SET name = 'BoC', tags = ARRAY['ambient'] \
+                 WHERE name = 'Boards of Canada' \
+                 RETURNING name, tags",
+            )
+            .await
+            .expect("plan")
+            .expect("mutation");
+        assert_eq!(mutation.kind(), MutationKind::Update);
+        assert_eq!(mutation.affected(), 1);
+
+        let (after, tempids) = apply_mutation(&db, &mutation);
+        let returned = mutation.finish(&after, &tempids).await.expect("returning");
+        assert_eq!(
+            returned.rows,
+            vec![vec![
+                SqlValue::Text("BoC".into()),
+                SqlValue::List(vec![SqlValue::Text("ambient".into())]),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_retracts_only_namespace_attributes_and_returns_old_row() {
+        let db = fixture();
+        let session = SqlSession::new(&db).expect("session");
+        let mutation = session
+            .mutation(
+                "DELETE FROM corium.artist \
+                 WHERE name = 'Tycho' RETURNING e, name",
+            )
+            .await
+            .expect("plan")
+            .expect("mutation");
+        assert_eq!(mutation.kind(), MutationKind::Delete);
+        assert_eq!(mutation.affected(), 1);
+
+        let returned = mutation
+            .finish(&db, &std::collections::BTreeMap::new())
+            .await
+            .expect("pre-delete returning");
+        assert_eq!(returned.rows[0][1], SqlValue::Text("Tycho".into()));
+
+        let (after, _) = apply_mutation(&db, &mutation);
+        let rows = SqlSession::new(&after)
+            .expect("session")
+            .query("SELECT name FROM corium.artist WHERE name = 'Tycho'")
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("rows");
+        assert!(rows.is_empty());
     }
 }

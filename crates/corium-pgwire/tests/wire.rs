@@ -6,16 +6,20 @@
 use std::sync::Arc;
 
 use corium_core::{
-    Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, Schema, Value, ValueType,
+    Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, Partition, Schema, Value,
+    ValueType,
 };
 use corium_db::{Db, Idents};
-use corium_pgwire::{CatalogError, DbCatalog, PgWireConfig, serve};
+use corium_forms::txforms::tx_items_from_edn;
+use corium_pgwire::{CatalogError, CatalogTxResult, DbCatalog, PgWireConfig, serve};
+use corium_query::edn::Edn;
+use corium_tx::prepare;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 /// A catalog serving one fixture database under several names.
 struct TestCatalog {
-    db: Db,
+    db: tokio::sync::Mutex<Db>,
     names: Vec<String>,
 }
 
@@ -27,10 +31,39 @@ impl DbCatalog for TestCatalog {
 
     async fn db(&self, name: &str) -> Result<Db, CatalogError> {
         if self.names.iter().any(|known| known == name) {
-            Ok(self.db.clone())
+            Ok(self.db.lock().await.clone())
         } else {
             Err(CatalogError::NotFound(name.to_owned()))
         }
+    }
+
+    async fn transact(
+        &self,
+        name: &str,
+        expected_basis_t: u64,
+        forms: Vec<Edn>,
+    ) -> Result<CatalogTxResult, CatalogError> {
+        if !self.names.iter().any(|known| known == name) {
+            return Err(CatalogError::NotFound(name.to_owned()));
+        }
+        let mut db = self.db.lock().await;
+        if db.basis_t() != expected_basis_t {
+            return Err(CatalogError::Conflict(format!(
+                "expected {expected_basis_t}, current basis is {}",
+                db.basis_t()
+            )));
+        }
+        let mut interner = db.interner().clone();
+        let items = tx_items_from_edn(&db, &mut interner, &forms)
+            .map_err(|error| CatalogError::Rejected(error.to_string()))?;
+        let t = db.basis_t() + 1;
+        let prepared = prepare(&db, items, EntityId::new(Partition::Tx as u32, t), 2_000)
+            .map_err(|error| CatalogError::Rejected(error.to_string()))?;
+        *db = db.clone().with_transaction(t, &prepared.datoms);
+        Ok(CatalogTxResult {
+            db_after: db.clone(),
+            tempids: prepared.tempids,
+        })
     }
 }
 
@@ -116,7 +149,7 @@ async fn start_server(config: PgWireConfig) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let catalog = Arc::new(TestCatalog {
-        db: fixture(),
+        db: tokio::sync::Mutex::new(fixture()),
         names: vec!["corium".to_owned(), "people".to_owned()],
     });
     tokio::spawn(async move {
@@ -321,7 +354,7 @@ async fn cardinality_many_renders_as_array_literal() {
 }
 
 #[tokio::test]
-async fn writes_are_rejected_but_the_session_survives() {
+async fn unsupported_ddl_is_rejected_but_the_session_survives() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
     client
@@ -329,9 +362,7 @@ async fn writes_are_rejected_but_the_session_survives() {
         .await;
     client.read_until_ready().await;
 
-    client
-        .query("INSERT INTO corium.artist (e) VALUES (1)")
-        .await;
+    client.query("CREATE TABLE nope (e BIGINT)").await;
     let response = client.read_until_ready().await;
     assert_eq!(response.first().unwrap().tag, b'E');
     assert_eq!(response.last().unwrap().tag, b'Z');
@@ -343,7 +374,86 @@ async fn writes_are_rejected_but_the_session_survives() {
 }
 
 #[tokio::test]
-async fn control_statements_are_accepted_as_no_ops() {
+async fn autocommit_insert_update_delete_and_returning_use_the_write_catalog() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query(
+            "INSERT INTO corium.artist (name, \"release-year\") \
+             VALUES ('Autechre', 1994) RETURNING e, name",
+        )
+        .await;
+    let inserted = client.read_until_ready().await;
+    assert_eq!(
+        cstrings(
+            &inserted
+                .iter()
+                .find(|message| message.tag == b'C')
+                .expect("insert tag")
+                .body
+        ),
+        vec!["INSERT 0 1".to_owned()]
+    );
+    let inserted_row = inserted
+        .iter()
+        .find(|message| message.tag == b'D')
+        .expect("insert returning row");
+    assert_eq!(
+        data_row_values(&inserted_row.body)[1],
+        Some("Autechre".to_owned())
+    );
+
+    client
+        .query(
+            "UPDATE corium.artist SET name = 'Autechre!' \
+             WHERE name = 'Autechre' RETURNING name",
+        )
+        .await;
+    let updated = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &updated
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("update returning")
+                .body
+        ),
+        vec![Some("Autechre!".to_owned())]
+    );
+
+    client
+        .query("DELETE FROM corium.artist WHERE name = 'Autechre!' RETURNING name")
+        .await;
+    let deleted = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &deleted
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("delete returning")
+                .body
+        ),
+        vec![Some("Autechre!".to_owned())]
+    );
+    assert_eq!(
+        cstrings(
+            &deleted
+                .iter()
+                .find(|message| message.tag == b'C')
+                .expect("delete tag")
+                .body
+        ),
+        vec!["DELETE 1".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn explicit_transaction_control_updates_wire_status() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
     client.startup(&[("user", "postgres")]).await;
@@ -356,6 +466,34 @@ async fn control_statements_are_accepted_as_no_ops() {
         .find(|message| message.tag == b'C')
         .expect("command complete");
     assert_eq!(cstrings(&complete.body), vec!["BEGIN".to_owned()]);
+    assert_eq!(response.last().unwrap().body, vec![b'T']);
+}
+
+#[tokio::test]
+async fn writes_in_explicit_transaction_blocks_are_rejected_without_committing() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query("BEGIN; INSERT INTO corium.artist (name) VALUES ('Must Not Commit')")
+        .await;
+    let response = client.read_until_ready().await;
+    assert!(response.iter().any(|message| message.tag == b'E'));
+    assert_eq!(response.last().unwrap().body, vec![b'T']);
+
+    client.query("ROLLBACK").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(response.last().unwrap().body, vec![b'I']);
+
+    client
+        .query("SELECT name FROM corium.artist WHERE name = 'Must Not Commit'")
+        .await;
+    let response = client.read_until_ready().await;
+    assert!(!response.iter().any(|message| message.tag == b'D'));
 }
 
 #[tokio::test]
@@ -428,6 +566,62 @@ async fn extended_protocol_runs_a_parameterless_query() {
     // ParseComplete, BindComplete, RowDescription, 2x DataRow,
     // CommandComplete, ReadyForQuery.
     assert_eq!(tags, vec![b'1', b'2', b'T', b'D', b'D', b'C', b'Z']);
+}
+
+#[tokio::test]
+async fn extended_protocol_binds_parameters_for_a_mutation() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(
+        b"INSERT INTO corium.artist (name, \"release-year\") \
+          VALUES ($1, $2) RETURNING name",
+    );
+    parse.push(0);
+    parse.extend_from_slice(&2i16.to_be_bytes());
+    parse.extend_from_slice(&25i32.to_be_bytes()); // text
+    parse.extend_from_slice(&20i32.to_be_bytes()); // int8
+    client.send(b'P', &parse).await;
+
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes()); // all parameters text format
+    bind.extend_from_slice(&2i16.to_be_bytes());
+    bind.extend_from_slice(&11i32.to_be_bytes());
+    bind.extend_from_slice(b"Jon Hopkins");
+    bind.extend_from_slice(&4i32.to_be_bytes());
+    bind.extend_from_slice(b"2001");
+    bind.extend_from_slice(&0i16.to_be_bytes()); // text results
+    client.send(b'B', &bind).await;
+    client.send(b'D', &[b'P', 0]).await;
+    client.send(b'E', &[0, 0, 0, 0, 0]).await;
+    client.send(b'S', &[]).await;
+
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("returning row")
+                .body
+        ),
+        vec![Some("Jon Hopkins".to_owned())]
+    );
+    assert_eq!(
+        cstrings(
+            &response
+                .iter()
+                .find(|message| message.tag == b'C')
+                .expect("command tag")
+                .body
+        ),
+        vec!["INSERT 0 1".to_owned()]
+    );
 }
 
 #[tokio::test]

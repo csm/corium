@@ -186,6 +186,7 @@ async fn run_vector(kit: &mut Kit, index: usize, vector: &Edn) {
                     db: db_name.clone(),
                     protocol_version: corium_protocol::PROTOCOL_VERSION,
                     tx_data: codec::encode_edn(&Edn::Vector(rewritten)),
+                    expected_basis_t: None,
                 }))
                 .await
                 .unwrap_or_else(|error| panic!("{}: transact failed: {error}", context()))
