@@ -489,8 +489,8 @@ enum Command {
         #[arg(long, requires = "segment_cache_capacity")]
         segment_cache_dir: Option<PathBuf>,
         /// SSD segment-cache capacity (for example `256GiB`).
-        #[arg(long, default_value = "0", value_parser = parse_byte_size, requires = "segment_cache_dir")]
-        segment_cache_capacity: u64,
+        #[arg(long, value_parser = parse_byte_size, requires = "segment_cache_dir")]
+        segment_cache_capacity: Option<u64>,
         /// Bounded memory front tier (defaults to 64MiB when SSD cache is enabled).
         #[arg(long, value_parser = parse_byte_size, requires = "segment_cache_dir")]
         segment_cache_memory: Option<u64>,
@@ -874,7 +874,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let tls = serve.tls()?;
             let cache = segment_cache_dir.map(|directory| SegmentCacheConfig {
                 directory,
-                capacity_bytes: segment_cache_capacity,
+                capacity_bytes: segment_cache_capacity.expect("required with cache directory"),
                 memory_capacity_bytes: segment_cache_memory.unwrap_or(64 * 1024 * 1024),
             });
             if cache.is_some() && !client.peer_bootstrap {

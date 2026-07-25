@@ -5,13 +5,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use fs2::FileExt;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{BlobId, BlobStore, StoreError, digest};
 use async_trait::async_trait;
+
+const ENTRY_METADATA_BYTES: u64 = 96;
 
 /// Minimal cache-neutral interface for immutable segment reads.
 #[async_trait]
@@ -114,6 +116,12 @@ struct Entry {
     generation: u64,
 }
 
+impl Entry {
+    fn accounted_bytes(&self) -> u64 {
+        self.len.saturating_add(ENTRY_METADATA_BYTES)
+    }
+}
+
 #[derive(Default)]
 struct MemoryTier {
     entries: HashMap<BlobId, Arc<[u8]>>,
@@ -127,6 +135,18 @@ struct DiskTier {
     entries: HashMap<BlobId, Entry>,
     generation: u64,
     bytes: u64,
+    readers: HashMap<BlobId, usize>,
+}
+
+#[derive(Clone)]
+enum FlightOutcome {
+    Found(Arc<[u8]>),
+    NotFound,
+}
+
+struct Flight {
+    lock: AsyncMutex<()>,
+    outcome: Mutex<Option<FlightOutcome>>,
 }
 
 /// Bounded read-through cache. Without a disk configuration it remains a
@@ -135,7 +155,7 @@ pub struct SegmentCache {
     memory_capacity: u64,
     memory: Mutex<MemoryTier>,
     disk: Option<Mutex<DiskTier>>,
-    flights: AsyncMutex<HashMap<BlobId, Arc<AsyncMutex<()>>>>,
+    flights: Mutex<HashMap<BlobId, Weak<Flight>>>,
     metrics: Arc<SegmentCacheMetrics>,
 }
 
@@ -153,7 +173,7 @@ impl SegmentCache {
             memory_capacity: capacity_bytes,
             memory: Mutex::default(),
             disk: None,
-            flights: AsyncMutex::default(),
+            flights: Mutex::default(),
             metrics: Arc::default(),
         }
     }
@@ -194,9 +214,10 @@ impl SegmentCache {
             entries: HashMap::new(),
             generation: 0,
             bytes: 0,
+            readers: HashMap::new(),
         };
         tier.reconcile()?;
-        tier.evict_to_capacity(None)?;
+        tier.evict_to_limit(config.capacity_bytes, None)?;
         let metrics = Arc::new(SegmentCacheMetrics::default());
         metrics.disk_bytes.store(tier.bytes, Ordering::Relaxed);
         metrics
@@ -206,7 +227,7 @@ impl SegmentCache {
             memory_capacity: config.memory_capacity_bytes,
             memory: Mutex::default(),
             disk: Some(Mutex::new(tier)),
-            flights: AsyncMutex::default(),
+            flights: Mutex::default(),
             metrics,
         })
     }
@@ -221,6 +242,9 @@ impl SegmentCache {
     ///
     /// # Errors
     /// Returns errors from authoritative storage, including corrupt native bytes.
+    ///
+    /// # Panics
+    /// Panics if an internal cache mutex was poisoned by another panicking thread.
     pub async fn get_or_load(
         &self,
         store: &dyn SegmentReader,
@@ -229,17 +253,21 @@ impl SegmentCache {
         if let Some(bytes) = self.memory_get(id) {
             return Ok(Some(bytes));
         }
-        if let Some(bytes) = self.disk_get(id) {
+        if let Some(bytes) = self.disk_get(id).await {
             self.memory_insert(id.clone(), bytes.clone());
             return Ok(Some(bytes));
         }
         let (flight, joined) = {
-            let mut flights = self.flights.lock().await;
-            if let Some(f) = flights.get(id) {
-                (f.clone(), true)
+            let mut flights = self.flights.lock().expect("cache lock poisoned");
+            flights.retain(|_, flight| flight.strong_count() > 0);
+            if let Some(flight) = flights.get(id).and_then(Weak::upgrade) {
+                (flight, true)
             } else {
-                let f = Arc::new(AsyncMutex::new(()));
-                flights.insert(id.clone(), f.clone());
+                let f = Arc::new(Flight {
+                    lock: AsyncMutex::new(()),
+                    outcome: Mutex::new(None),
+                });
+                flights.insert(id.clone(), Arc::downgrade(&f));
                 (f, false)
             }
         };
@@ -248,12 +276,26 @@ impl SegmentCache {
                 .coalesced_waiters
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let _guard = flight.lock().await;
-        if joined && let Some(bytes) = self.memory_get(id).or_else(|| self.disk_get(id)) {
-            return Ok(Some(bytes));
+        let _guard = flight.lock.lock().await;
+        if joined {
+            match flight.outcome.lock().expect("cache lock poisoned").clone() {
+                Some(FlightOutcome::Found(bytes)) => {
+                    self.metrics
+                        .bytes_native
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    return Ok(Some(bytes));
+                }
+                Some(FlightOutcome::NotFound) => return Ok(None),
+                None => {}
+            }
+            if let Some(bytes) = self.memory_get(id) {
+                return Ok(Some(bytes));
+            }
+            if let Some(bytes) = self.disk_get(id).await {
+                return Ok(Some(bytes));
+            }
         }
         let loaded = store.read_segment(id).await;
-        self.flights.lock().await.remove(id);
         let bytes = match loaded {
             Ok(Some(bytes)) => {
                 self.metrics.native_found.fetch_add(1, Ordering::Relaxed);
@@ -263,6 +305,8 @@ impl SegmentCache {
                 self.metrics
                     .native_not_found
                     .fetch_add(1, Ordering::Relaxed);
+                *flight.outcome.lock().expect("cache lock poisoned") =
+                    Some(FlightOutcome::NotFound);
                 return Ok(None);
             }
             Err(error) => {
@@ -279,6 +323,8 @@ impl SegmentCache {
         let bytes: Arc<[u8]> = bytes.into();
         self.disk_admit(id, &bytes);
         self.memory_insert(id.clone(), bytes.clone());
+        *flight.outcome.lock().expect("cache lock poisoned") =
+            Some(FlightOutcome::Found(bytes.clone()));
         Ok(Some(bytes))
     }
 
@@ -326,29 +372,47 @@ impl SegmentCache {
             .store(memory.entries.len() as u64, Ordering::Relaxed);
     }
 
-    fn disk_get(&self, id: &BlobId) -> Option<Arc<[u8]>> {
+    async fn disk_get(&self, id: &BlobId) -> Option<Arc<[u8]>> {
         let disk = self.disk.as_ref()?;
-        let mut tier = disk.lock().expect("cache lock poisoned");
-        let Some(entry) = tier.entries.get(id).cloned() else {
-            self.metrics.disk_misses.fetch_add(1, Ordering::Relaxed);
-            return None;
+        let (entry, path) = {
+            let mut tier = disk.lock().expect("cache lock poisoned");
+            let Some(entry) = tier.entries.get(id).cloned() else {
+                self.metrics.disk_misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            let path = tier.object_path(id);
+            *tier.readers.entry(id.clone()).or_default() += 1;
+            (entry, path)
         };
-        let path = tier.object_path(id);
-        match fs::read(path) {
-            Ok(bytes) if bytes.len() as u64 == entry.len && digest(&bytes) == *id => {
+        let read = tokio::task::spawn_blocking(move || fs::read(path)).await;
+        let mut tier = disk.lock().expect("cache lock poisoned");
+        if let Some(readers) = tier.readers.get_mut(id) {
+            *readers -= 1;
+            if *readers == 0 {
+                tier.readers.remove(id);
+            }
+        }
+        match read {
+            Ok(Ok(bytes)) if bytes.len() as u64 == entry.len && digest(&bytes) == *id => {
                 tier.generation += 1;
                 let generation = tier.generation;
                 tier.entries.get_mut(id).expect("entry exists").generation = generation;
-                let _ = tier.persist();
                 self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
                 self.metrics
                     .bytes_disk
                     .fetch_add(entry.len, Ordering::Relaxed);
                 Some(bytes.into())
             }
-            _ => {
-                tier.remove_corrupt(id);
+            Ok(Ok(_) | Err(_)) | Err(_) => {
+                if let Err(error) = tier.remove_corrupt(id) {
+                    tracing::warn!(%error, segment_id = %id, "segment cache could not discard corrupt entry");
+                }
+                self.metrics.disk_misses.fetch_add(1, Ordering::Relaxed);
                 self.metrics.corruptions.fetch_add(1, Ordering::Relaxed);
+                self.metrics.disk_bytes.store(tier.bytes, Ordering::Relaxed);
+                self.metrics
+                    .disk_entries
+                    .store(tier.entries.len() as u64, Ordering::Relaxed);
                 None
             }
         }
@@ -359,31 +423,81 @@ impl SegmentCache {
             return;
         };
         let mut tier = disk.lock().expect("cache lock poisoned");
-        if bytes.len() as u64 > tier.config.capacity_bytes {
+        let accounted = (bytes.len() as u64).saturating_add(ENTRY_METADATA_BYTES);
+        if accounted > tier.config.capacity_bytes {
             self.metrics.too_large.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if tier.admit(id, bytes).is_err() {
+        let already_present = tier.entries.contains_key(id);
+        let evicted = if already_present {
+            Vec::new()
+        } else {
+            let limit = tier.config.capacity_bytes - accounted;
+            let before = tier
+                .entries
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.len))
+                .collect::<HashMap<_, _>>();
+            match tier.evict_to_limit(limit, None) {
+                Ok(evicted) => evicted,
+                Err(error) => {
+                    let evicted = before
+                        .into_iter()
+                        .filter(|(id, _)| !tier.entries.contains_key(id))
+                        .collect::<Vec<_>>();
+                    self.record_evictions(&evicted);
+                    self.metrics.disk_bytes.store(tier.bytes, Ordering::Relaxed);
+                    self.metrics
+                        .disk_entries
+                        .store(tier.entries.len() as u64, Ordering::Relaxed);
+                    self.metrics
+                        .admission_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(%error, segment_id = %id, "segment cache could not make admission space");
+                    return;
+                }
+            }
+        };
+        self.record_evictions(&evicted);
+        if let Err(error) = tier.admit(id, bytes) {
             self.metrics
                 .admission_errors
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            tracing::warn!(%error, segment_id = %id, "segment cache admission failed");
+        } else {
+            self.metrics.admissions.fetch_add(1, Ordering::Relaxed);
         }
-        self.metrics.admissions.fetch_add(1, Ordering::Relaxed);
-        let before_bytes = tier.bytes;
-        let before_entries = tier.entries.len();
-        let _ = tier.evict_to_capacity(Some(id));
-        self.metrics
-            .evicted_bytes
-            .fetch_add(before_bytes.saturating_sub(tier.bytes), Ordering::Relaxed);
-        self.metrics.evictions.fetch_add(
-            before_entries.saturating_sub(tier.entries.len()) as u64,
-            Ordering::Relaxed,
-        );
         self.metrics.disk_bytes.store(tier.bytes, Ordering::Relaxed);
         self.metrics
             .disk_entries
             .store(tier.entries.len() as u64, Ordering::Relaxed);
+    }
+
+    fn memory_remove(&self, id: &BlobId) {
+        let mut memory = self.memory.lock().expect("cache lock poisoned");
+        if let Some(value) = memory.entries.remove(id) {
+            memory.bytes -= value.len() as u64;
+            memory.order.retain(|key| key != id);
+            self.metrics
+                .memory_bytes
+                .store(memory.bytes, Ordering::Relaxed);
+            self.metrics
+                .memory_entries
+                .store(memory.entries.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_evictions(&self, evicted: &[(BlobId, u64)]) {
+        for (victim, _) in evicted {
+            self.memory_remove(victim);
+        }
+        self.metrics
+            .evictions
+            .fetch_add(evicted.len() as u64, Ordering::Relaxed);
+        self.metrics.evicted_bytes.fetch_add(
+            evicted.iter().map(|(_, len)| len).sum::<u64>(),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -396,6 +510,31 @@ impl DiskTier {
             .join(&id.as_str()[2..])
     }
     fn reconcile(&mut self) -> io::Result<()> {
+        let index_path = self.config.directory.join("index");
+        let persisted = match self.load_index() {
+            Ok(entries) => entries,
+            Err(error) => {
+                let quarantine = self.config.directory.join(format!(
+                    "index.corrupt-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ));
+                fs::rename(&index_path, quarantine).map_err(|rename_error| {
+                    io::Error::new(
+                        rename_error.kind(),
+                        format!("cannot quarantine corrupt cache index ({error}): {rename_error}"),
+                    )
+                })?;
+                HashMap::new()
+            }
+        };
+        self.generation = persisted
+            .values()
+            .map(|entry| entry.generation)
+            .max()
+            .unwrap_or(0);
         let root = self.config.directory.join("objects");
         for fan in fs::read_dir(root)? {
             let fan = fan?;
@@ -411,21 +550,50 @@ impl DiskTier {
                 let text = format!("{prefix}{}", file.file_name().to_string_lossy());
                 if let Some(id) = BlobId::from_hex(&text) {
                     let len = file.metadata()?.len();
-                    self.generation += 1;
-                    self.bytes += len;
-                    self.entries.insert(
-                        id,
-                        Entry {
-                            len,
-                            generation: self.generation,
+                    let generation = persisted.get(&id).map_or_else(
+                        || {
+                            self.generation += 1;
+                            self.generation
                         },
+                        |entry| entry.generation,
                     );
+                    self.bytes += len.saturating_add(ENTRY_METADATA_BYTES);
+                    self.entries.insert(id, Entry { len, generation });
                 } else {
                     fs::remove_file(file.path())?;
                 }
             }
         }
         self.persist()
+    }
+
+    fn load_index(&self) -> io::Result<HashMap<BlobId, Entry>> {
+        let text = match fs::read_to_string(self.config.directory.join("index")) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => return Err(error),
+        };
+        let mut entries = HashMap::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let id = fields.next().and_then(BlobId::from_hex);
+            let len = fields.next().and_then(|field| field.parse::<u64>().ok());
+            let generation = fields.next().and_then(|field| field.parse::<u64>().ok());
+            if fields.next().is_some() || id.is_none() || len.is_none() || generation.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed segment cache index",
+                ));
+            }
+            entries.insert(
+                id.expect("checked"),
+                Entry {
+                    len: len.expect("checked"),
+                    generation: generation.expect("checked"),
+                },
+            );
+        }
+        Ok(entries)
     }
     fn admit(&mut self, id: &BlobId, bytes: &[u8]) -> io::Result<()> {
         self.generation += 1;
@@ -450,6 +618,7 @@ impl DiskTier {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temp, &target)?;
+        sync_directory(parent)?;
         set_file_owner_only(&target)?;
         let len = bytes.len() as u64;
         self.entries.insert(
@@ -459,33 +628,47 @@ impl DiskTier {
                 generation: self.generation,
             },
         );
-        self.bytes += len;
+        self.bytes += len.saturating_add(ENTRY_METADATA_BYTES);
         self.persist()
     }
-    fn evict_to_capacity(&mut self, protected: Option<&BlobId>) -> io::Result<()> {
-        while self.bytes > self.config.capacity_bytes {
+    fn evict_to_limit(
+        &mut self,
+        limit: u64,
+        protected: Option<&BlobId>,
+    ) -> io::Result<Vec<(BlobId, u64)>> {
+        let mut evicted = Vec::new();
+        while self.bytes > limit {
             let victim = self
                 .entries
                 .iter()
-                .filter(|(id, _)| protected != Some(*id))
+                .filter(|(id, _)| protected != Some(*id) && !self.readers.contains_key(*id))
                 .min_by_key(|(_, entry)| entry.generation)
                 .map(|(id, _)| id.clone());
             let Some(victim) = victim else {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "all cache eviction candidates are being read",
+                ));
             };
             let entry = self.entries.get(&victim).expect("victim exists").clone();
             fs::remove_file(self.object_path(&victim))?;
             self.entries.remove(&victim);
-            self.bytes -= entry.len;
+            self.bytes -= entry.accounted_bytes();
+            evicted.push((victim, entry.len));
+        }
+        self.persist()?;
+        Ok(evicted)
+    }
+    fn remove_corrupt(&mut self, id: &BlobId) -> io::Result<()> {
+        match fs::remove_file(self.object_path(id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(entry) = self.entries.remove(id) {
+            self.bytes -= entry.accounted_bytes();
         }
         self.persist()
-    }
-    fn remove_corrupt(&mut self, id: &BlobId) {
-        if let Some(entry) = self.entries.remove(id) {
-            self.bytes -= entry.len;
-        }
-        let _ = fs::remove_file(self.object_path(id));
-        let _ = self.persist();
     }
     fn persist(&self) -> io::Result<()> {
         let mut sorted = BTreeMap::new();
@@ -498,7 +681,16 @@ impl DiskTier {
             writeln!(file, "{id} {} {}", entry.len, entry.generation)?;
         }
         file.sync_all()?;
-        fs::rename(temp, self.config.directory.join("index"))
+        fs::rename(temp, self.config.directory.join("index"))?;
+        sync_directory(&self.config.directory)
+    }
+}
+
+impl Drop for DiskTier {
+    fn drop(&mut self) {
+        if let Err(error) = self.persist() {
+            tracing::warn!(%error, "segment cache could not flush access generations during shutdown");
+        }
     }
 }
 
@@ -521,10 +713,36 @@ fn set_file_owner_only(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::MemoryStore;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    struct BlockingReader {
+        reads: AtomicUsize,
+        release: Notify,
+        bytes: Option<Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl SegmentReader for BlockingReader {
+        async fn read_segment(&self, _id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.release.notified().await;
+            Ok(self.bytes.clone())
+        }
+    }
 
     fn config(path: &Path, capacity: u64) -> SegmentCacheConfig {
         SegmentCacheConfig {
@@ -562,13 +780,13 @@ mod tests {
         let store = MemoryStore::default();
         let first = store.put(b"one").await.expect("first");
         let second = store.put(b"two").await.expect("second");
-        let cache = SegmentCache::open(&config(directory.path(), 3)).expect("cache");
+        let cache = SegmentCache::open(&config(directory.path(), 99)).expect("cache");
         cache.get_or_load(&store, &first).await.expect("load first");
         cache
             .get_or_load(&store, &second)
             .await
             .expect("load second");
-        assert_eq!(cache.metrics.disk_bytes.load(Ordering::Relaxed), 3);
+        assert_eq!(cache.metrics.disk_bytes.load(Ordering::Relaxed), 99);
         assert_eq!(cache.metrics.disk_entries.load(Ordering::Relaxed), 1);
         assert_eq!(cache.metrics.evictions.load(Ordering::Relaxed), 1);
         assert!(
@@ -583,6 +801,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn persisted_recency_controls_eviction_after_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::default();
+        let first = store.put(b"one").await.expect("first");
+        let second = store.put(b"two").await.expect("second");
+        let third = store.put(b"tri").await.expect("third");
+        {
+            let cache = SegmentCache::open(&config(directory.path(), 198)).expect("cache");
+            cache.get_or_load(&store, &first).await.expect("first read");
+            cache
+                .get_or_load(&store, &second)
+                .await
+                .expect("second read");
+            cache
+                .get_or_load(&store, &first)
+                .await
+                .expect("refresh first");
+        }
+        let cache = SegmentCache::open(&config(directory.path(), 198)).expect("reopen");
+        cache.get_or_load(&store, &third).await.expect("third read");
+        let tier = cache.disk.as_ref().expect("disk").lock().expect("lock");
+        assert!(tier.entries.contains_key(&first));
+        assert!(!tier.entries.contains_key(&second));
+        assert!(tier.entries.contains_key(&third));
+    }
+
+    #[tokio::test]
+    async fn corrupt_disk_entry_self_heals_from_native_storage() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::default();
+        let id = store.put(b"healthy").await.expect("put");
+        let cache = SegmentCache::open(&config(directory.path(), 1024)).expect("cache");
+        cache.get_or_load(&store, &id).await.expect("cold read");
+        let path = cache
+            .disk
+            .as_ref()
+            .expect("disk")
+            .lock()
+            .expect("lock")
+            .object_path(&id);
+        fs::write(path, b"broken").expect("corrupt file");
+        assert_eq!(
+            cache
+                .get_or_load(&store, &id)
+                .await
+                .expect("heal")
+                .as_deref(),
+            Some(b"healthy".as_slice())
+        );
+        assert_eq!(cache.metrics.corruptions.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.metrics.native_found.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_native_misses_are_coalesced_including_not_found() {
+        let reader = Arc::new(BlockingReader {
+            reads: AtomicUsize::new(0),
+            release: Notify::new(),
+            bytes: None,
+        });
+        let cache = Arc::new(SegmentCache::memory_only(0));
+        let id = digest(b"missing");
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let reader = Arc::clone(&reader);
+            let id = id.clone();
+            tasks.push(tokio::spawn(async move {
+                cache.get_or_load(reader.as_ref(), &id).await
+            }));
+        }
+        while cache.metrics.coalesced_waiters.load(Ordering::Relaxed) < 7 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
+        reader.release.notify_waiters();
+        for task in tasks {
+            assert!(task.await.expect("join").expect("read").is_none());
+        }
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.metrics.coalesced_waiters.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn object_larger_than_accounted_capacity_bypasses_disk() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::default();
+        let id = store.put(b"large").await.expect("put");
+        let cache = SegmentCache::open(&config(directory.path(), 100)).expect("cache");
+        assert_eq!(
+            cache
+                .get_or_load(&store, &id)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some(b"large".as_slice())
+        );
+        assert_eq!(cache.metrics.too_large.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.metrics.disk_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.metrics.disk_entries.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn rejects_second_process_and_invalid_capacity() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -592,5 +913,38 @@ mod tests {
         let mut invalid = config(directory.path(), 10);
         invalid.memory_capacity_bytes = 11;
         assert!(SegmentCache::open(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_index_is_quarantined_and_rebuilt() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::default();
+        let id = store.put(b"survivor").await.expect("put");
+        {
+            let cache = SegmentCache::open(&config(directory.path(), 1024)).expect("cache");
+            cache.get_or_load(&store, &id).await.expect("read");
+        }
+        fs::write(directory.path().join("index"), "not an index\n").expect("break index");
+        let cache = SegmentCache::open(&config(directory.path(), 1024)).expect("rebuild");
+        assert!(
+            cache
+                .disk
+                .as_ref()
+                .expect("disk")
+                .lock()
+                .expect("lock")
+                .entries
+                .contains_key(&id)
+        );
+        assert!(
+            fs::read_dir(directory.path())
+                .expect("read directory")
+                .any(|item| {
+                    item.expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("index.corrupt-")
+                })
+        );
     }
 }
