@@ -18,7 +18,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
 use corium_peer::server::PeerServerConfig;
-use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings};
+use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings, SegmentCacheConfig};
 use corium_protocol::auth::{DEFAULT_DEV_TOKEN, client_tls, server_tls};
 use corium_protocol::authz::{
     ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, Principal,
@@ -45,6 +45,31 @@ struct Cli {
 enum LogFormat {
     Human,
     Json,
+}
+
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(split);
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| format!("invalid byte size {value:?}"))?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" => 1_u64 << 10,
+        "mib" => 1_u64 << 20,
+        "gib" => 1_u64 << 30,
+        "tib" => 1_u64 << 40,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        _ => return Err(format!("unknown byte-size suffix in {value:?}")),
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size {value:?} exceeds u64"))
 }
 
 /// Storage-service backend for a transactor's blobs and roots.
@@ -133,6 +158,14 @@ impl ClientFlags {
     }
 
     async fn connect_config(&self, db: impl Into<String>) -> Result<ConnectConfig, String> {
+        self.connect_config_cache(db, None).await
+    }
+
+    async fn connect_config_cache(
+        &self,
+        db: impl Into<String>,
+        cache: Option<SegmentCacheConfig>,
+    ) -> Result<ConnectConfig, String> {
         let db = db.into();
         let mut config = ConnectConfig::with_failover(self.endpoints(), db.clone());
         config.token = self.token();
@@ -158,7 +191,14 @@ impl ClientFlags {
         let store = corium_transactor::NodeStore::open_existing(&spec, &data_dir)
             .await
             .map_err(|error| format!("cannot open peer storage: {error}"))?;
-        Ok(config.with_storage(Arc::new(store)))
+        let storage = Arc::new(store);
+        if let Some(cache) = cache {
+            config
+                .with_storage_cache(storage, &cache)
+                .map_err(|error| format!("cannot open segment cache: {error}"))
+        } else {
+            Ok(config.with_storage(storage))
+        }
     }
 }
 
@@ -445,6 +485,15 @@ enum Command {
         /// Prometheus HTTP listen address (`/metrics`); disabled when omitted.
         #[arg(long)]
         metrics_listen: Option<SocketAddr>,
+        /// Dedicated directory for the optional local SSD segment cache.
+        #[arg(long, requires = "segment_cache_capacity")]
+        segment_cache_dir: Option<PathBuf>,
+        /// SSD segment-cache capacity (for example `256GiB`).
+        #[arg(long, default_value = "0", value_parser = parse_byte_size, requires = "segment_cache_dir")]
+        segment_cache_capacity: u64,
+        /// Bounded memory front tier (defaults to 64MiB when SSD cache is enabled).
+        #[arg(long, value_parser = parse_byte_size, requires = "segment_cache_dir")]
+        segment_cache_memory: Option<u64>,
         #[command(flatten)]
         client: ClientFlags,
         #[command(flatten)]
@@ -816,11 +865,22 @@ async fn run(cli: Cli) -> Result<(), String> {
             listen,
             max_fuel,
             metrics_listen,
+            segment_cache_dir,
+            segment_cache_capacity,
+            segment_cache_memory,
             client,
             serve,
         } => {
             let tls = serve.tls()?;
-            let config = client.connect_config(db).await?;
+            let cache = segment_cache_dir.map(|directory| SegmentCacheConfig {
+                directory,
+                capacity_bytes: segment_cache_capacity,
+                memory_capacity_bytes: segment_cache_memory.unwrap_or(64 * 1024 * 1024),
+            });
+            if cache.is_some() && !client.peer_bootstrap {
+                return Err("segment cache requires --peer-bootstrap".into());
+            }
+            let config = client.connect_config_cache(db, cache).await?;
             let connection = Arc::new(
                 Connection::connect(config)
                     .await

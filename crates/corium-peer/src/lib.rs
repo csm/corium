@@ -31,7 +31,9 @@ use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+pub use crate::segment::CachedPeerStorage;
 use crate::segment::{PeerStorage, SnapshotError, load_current_snapshot};
+pub use corium_store::SegmentCacheConfig;
 
 type Client = TransactorClient<InterceptedService<Channel, TokenInterceptor>>;
 
@@ -141,6 +143,19 @@ impl ConnectConfig {
     pub fn with_storage(mut self, storage: Arc<dyn PeerStorage>) -> Self {
         self.storage = Some(storage);
         self
+    }
+
+    /// Gives this peer direct storage access through a bounded local SSD cache.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid, unwritable, or already-owned cache directory.
+    pub fn with_storage_cache(
+        mut self,
+        storage: Arc<dyn PeerStorage>,
+        cache: &SegmentCacheConfig,
+    ) -> std::io::Result<Self> {
+        self.storage = Some(Arc::new(CachedPeerStorage::open(storage, cache)?));
+        Ok(self)
     }
 
     /// Whether direct peer storage has been configured.
