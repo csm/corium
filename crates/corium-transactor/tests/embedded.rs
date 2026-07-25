@@ -164,7 +164,10 @@ async fn durable_ack_recovers_once_and_publishes_concurrent_snapshot() {
     )
     .expect("crash recovery");
     assert_eq!(recovered.db().basis_t(), 2);
-    assert_eq!(recovered.db().stats().datoms, 2);
+    // Two asserted values plus each transaction's own `:db/txInstant`.
+    assert_eq!(recovered.db().stats().datoms, 4);
+    // Replay reconstructs the transaction-time correspondence from the log.
+    assert!(recovered.db().tx_instant(1) < recovered.db().tx_instant(2));
 }
 
 #[test]
@@ -269,10 +272,14 @@ async fn republication_uploads_only_the_chunks_a_change_touches() {
     let after = blob_ids(&store).await;
     let fresh = after.difference(&before).count();
     assert!(fresh >= 4, "each index publishes a new manifest");
+    // Each index re-uploads its manifest plus the chunks the transaction
+    // dirtied: the appended datom's tail chunk, and the chunk holding the
+    // transaction partition, where the commit's own `:db/txInstant` lands.
+    // Both regions grow at their own tail, so this stays O(1) per commit.
     assert!(
-        fresh <= 12,
+        fresh <= 16,
         "appending one datom re-uploaded {fresh} blobs of {} (expected only \
-         each index's manifest and tail chunk)",
+         each index's manifest and the chunks it appends to)",
         after.len()
     );
 }
@@ -418,6 +425,15 @@ async fn index_root_recovery_matches_full_log_replay() {
         from_log.db().datoms(),
         "index-root recovery must reconstruct the same current value as full replay"
     );
+    // `:db/txInstant` datoms are live facts, so the published snapshot carries
+    // transaction time for the history it covers, not just for the tail.
+    for t in 1..=6 {
+        assert_eq!(
+            from_index.db().tx_instant(t),
+            from_log.db().tx_instant(t),
+            "snapshot recovery lost the instant of transaction {t}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -486,5 +502,118 @@ async fn index_root_recovery_does_not_reuse_ids_retracted_before_the_snapshot() 
         "id {} reused after index-root recovery (retracted id was {})",
         fresh.sequence(),
         doomed.sequence()
+    );
+}
+
+#[test]
+fn every_commit_stamps_a_queryable_transaction_instant() {
+    let (schema, a) = schema();
+    let log: Arc<dyn TransactionLog> = Arc::new(MemoryLog::default());
+    let tx = EmbeddedTransactor::recover(schema, Arc::clone(&log)).expect("recover");
+    for value in 1..=3 {
+        tx.transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp(format!("e{value}")),
+            a,
+            Value::Long(value),
+        ))])
+        .expect("transact");
+    }
+    let db = tx.db();
+
+    // The commit's own datom is in the value, in the report, and in the log.
+    let stamped: Vec<_> = db
+        .datoms_for_attribute(corium_db::bootstrap::TX_INSTANT)
+        .map(|datom| (datom.e, datom.v.clone()))
+        .collect();
+    assert_eq!(stamped.len(), 3);
+    for (t, (entity, value)) in (1..=3).zip(&stamped) {
+        assert_eq!(*entity, EntityId::new(Partition::Tx as u32, t));
+        assert_eq!(*value, Value::Instant(db.tx_instant(t).expect("instant")));
+    }
+    // Monotone, so instants order transactions exactly as `t` does.
+    assert!(db.tx_instant(1) < db.tx_instant(2) && db.tx_instant(2) < db.tx_instant(3));
+    for record in log.replay().expect("replay") {
+        assert_eq!(
+            corium_db::bootstrap::asserted_instant(record.t, &record.datoms),
+            Some(record.tx_instant),
+            "the log record carries the instant as a datom too"
+        );
+    }
+
+    // Wall clock names the same views as the basis does.
+    let second = db.tx_instant(2).expect("instant");
+    assert_eq!(db.as_of_instant(second).datoms(), db.as_of(2).datoms());
+    assert_eq!(db.since_instant(second).datoms(), db.since(2).datoms());
+}
+
+#[test]
+fn transaction_data_can_supply_its_own_instant_but_not_move_time_backwards() {
+    let (schema, a) = schema();
+    let log: Arc<dyn TransactionLog> = Arc::new(MemoryLog::default());
+    let tx = EmbeddedTransactor::recover(schema, log).expect("recover");
+    let backdated = 1_000_000_000_000;
+    let report = tx
+        .transact([
+            TxItem::Op(TxOp::Add(EntityRef::Temp("e".into()), a, Value::Long(1))),
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp(corium_tx::TX_TEMPID.into()),
+                corium_db::bootstrap::TX_INSTANT,
+                Value::Instant(backdated),
+            )),
+        ])
+        .expect("import with a supplied instant");
+    assert_eq!(report.tx_instant, backdated);
+    assert_eq!(tx.db().tx_instant(1), Some(backdated));
+
+    // The next commit's own instant is later than the supplied one, and a
+    // second import may not rewind past it.
+    let rewound = tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp(corium_tx::TX_TEMPID.into()),
+        corium_db::bootstrap::TX_INSTANT,
+        Value::Instant(backdated - 1),
+    ))]);
+    assert!(
+        matches!(
+            rewound,
+            Err(corium_transactor::TransactError::Tx(
+                corium_tx::TxError::TxInstantNotMonotonic { .. }
+            ))
+        ),
+        "expected a monotonicity rejection, got {rewound:?}"
+    );
+    assert_eq!(tx.db().basis_t(), 1, "the rejected commit left no trace");
+}
+
+#[test]
+fn replaying_a_log_written_without_instant_datoms_still_resolves_instants() {
+    // Records appended before Corium recorded `:db/txInstant` as a datom carry
+    // the instant only as a record field; replay must reconstruct the datom so
+    // an old database gains instant-named views without a log rewrite.
+    let (schema, a) = schema();
+    let log: Arc<dyn TransactionLog> = Arc::new(MemoryLog::default());
+    for t in 1..=2 {
+        log.append(&TxRecord {
+            t,
+            tx_instant: i64::try_from(t * 1_000).expect("small instant"),
+            datoms: vec![Datom {
+                e: EntityId::new(Partition::User as u32, corium_db::FIRST_USER_ID + t),
+                a,
+                v: Value::Long(i64::try_from(t).expect("small value")),
+                tx: EntityId::new(Partition::Tx as u32, t),
+                added: true,
+            }],
+        })
+        .expect("append legacy record");
+    }
+    let db = EmbeddedTransactor::recover(schema, log)
+        .expect("recover")
+        .db();
+
+    assert_eq!(db.tx_instant(1), Some(1_000));
+    assert_eq!(db.t_at_instant(1_999), 1);
+    assert_eq!(
+        db.datoms_for_attribute(corium_db::bootstrap::TX_INSTANT)
+            .count(),
+        2
     );
 }

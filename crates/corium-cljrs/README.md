@@ -12,7 +12,10 @@ EDN/Clojure is the language at the API boundary and inside database functions:
   `Value`s (with a `cljrs-reader` text bridge for reading EDN source).
 - **`api`** — the `corium.api` namespace bound to `corium-peer`:
   `connect`/`transact`/`q`/`pull`/`entity`/`datoms`/`as-of`/`since`/`history`/
-  `tx-range`/`tx-report-queue`/`sync`.
+  `tx-range`/`tx-report-queue`/`sync`. `as-of`/`since` take a basis `t` (a
+  long) or an instant value, as Datomic takes a `t` or a `Date`; instants come
+  from the engine (a `:db/txInstant` value, a report's `:tx-instant`), since
+  cljrs's own `#inst` reader is still a passthrough that yields a bare long.
 - **`dbfn` / `sandbox`** — a host that runs `:db/fn` code in a restricted
   interpreter: allowlisted environment, fuel/allocation/call-depth budgets,
   and a watchdog deadline. *No longer the transactor path*: the transactor's

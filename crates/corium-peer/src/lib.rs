@@ -658,7 +658,9 @@ fn apply_item(inner: &Arc<Inner>, item: pb::subscribe_item::Item) -> Result<(), 
                         .clone()
                         .with_naming(state.idents.clone(), state.interner.clone());
                 }
-                state.db = state.db.with_transaction(report.t, &datoms);
+                state.db = state
+                    .db
+                    .with_transaction_at(report.t, report.tx_instant, &datoms);
                 state.instants.insert(report.t, report.tx_instant);
                 PeerReport {
                     t: report.t,

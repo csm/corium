@@ -2,7 +2,7 @@
 
 use corium_core::{Cardinality, EntityId, Partition, Schema, Unique, Value, ValueType};
 use corium_db::{Db, attribute};
-use corium_tx::{EntityRef, TxError, TxItem, TxOp, prepare};
+use corium_tx::{EntityRef, TX_TEMPID, TxError, TxItem, TxOp, prepare};
 use std::sync::Arc;
 
 fn fixture() -> (Db, EntityId, EntityId) {
@@ -213,4 +213,96 @@ fn retract_entity_removes_components_and_incoming_refs() {
     assert_eq!(remaining[0].a, name);
     assert!(db.values(kid, name).is_empty());
     assert!(db.values(other, friend).is_empty());
+}
+
+#[test]
+fn the_reserved_tempid_names_the_transaction_entity() {
+    // Transaction metadata is asserted against the transaction being built,
+    // whose entity id the caller cannot know: the reserved tempid stands in
+    // for it and resolves without allocating a user entity.
+    let (empty, name, _) = fixture();
+    let tx = EntityId::new(Partition::Tx as u32, 1);
+    let prepared = prepare(
+        &empty,
+        [
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp("alice".into()),
+                name,
+                Value::Str(Arc::from("Alice")),
+            )),
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp(TX_TEMPID.into()),
+                name,
+                Value::Str(Arc::from("nightly import")),
+            )),
+        ],
+        tx,
+        1_000,
+    )
+    .expect("prepare with transaction metadata");
+
+    assert_eq!(prepared.tempids[TX_TEMPID], tx);
+    let metadata: Vec<_> = prepared
+        .datoms
+        .iter()
+        .filter(|datom| datom.e == tx)
+        .collect();
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].v, Value::Str(Arc::from("nightly import")));
+    // The metadata datom belongs to the transaction it describes.
+    assert_eq!(metadata[0].tx, tx);
+    // The reserved tempid consumed no user id: `alice` still got the first.
+    assert_eq!(prepared.tempids["alice"].sequence(), 1_000);
+}
+
+#[test]
+fn the_reserved_tempid_does_not_upsert_through_identity_attributes() {
+    // `datomic.tx` is not an ordinary tempid: a unique-identity assertion
+    // unifies an ordinary tempid with the entity already holding that value,
+    // but transaction metadata must stay on the transaction entity — so the
+    // same assertion resolves to the transaction, and a value another entity
+    // already owns is the ordinary uniqueness conflict rather than a silent
+    // retarget.
+    let (empty, _, email) = fixture();
+    let first = prepare(
+        &empty,
+        [TxItem::Op(TxOp::Add(
+            EntityRef::Temp("alice".into()),
+            email,
+            Value::Str(Arc::from("a@example.test")),
+        ))],
+        EntityId::new(Partition::Tx as u32, 1),
+        1_000,
+    )
+    .expect("prepare first transaction");
+    let alice = first.tempids["alice"];
+    let db = empty.with_transaction(1, &first.datoms);
+
+    let tx = EntityId::new(Partition::Tx as u32, 2);
+    let fresh = prepare(
+        &db,
+        [TxItem::Op(TxOp::Add(
+            EntityRef::Temp(TX_TEMPID.into()),
+            email,
+            Value::Str(Arc::from("importer@example.test")),
+        ))],
+        tx,
+        1_001,
+    )
+    .expect("prepare transaction metadata");
+    assert_eq!(fresh.tempids[TX_TEMPID], tx);
+    assert_ne!(fresh.tempids[TX_TEMPID], alice);
+    assert!(fresh.datoms.iter().all(|datom| datom.e == tx));
+
+    let taken = prepare(
+        &db,
+        [TxItem::Op(TxOp::Add(
+            EntityRef::Temp(TX_TEMPID.into()),
+            email,
+            Value::Str(Arc::from("a@example.test")),
+        ))],
+        tx,
+        1_001,
+    );
+    assert_eq!(taken, Err(TxError::UniqueConflict));
 }

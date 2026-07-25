@@ -4,15 +4,22 @@
 //! forms with `:db/id`, and list forms `[:db/add e a v]`, `[:db/retract e a
 //! v]`, `[:db/cas e a old new]`, `[:db/retractEntity e]`. Entity positions
 //! accept tempid strings, raw entity-id longs, `#eid` tags, idents, and
-//! lookup refs. Value positions for `ref` attributes accept the same except
+//! lookup refs; the transaction's own entity is named by the reserved tempid
+//! `"datomic.tx"` or by `:db/current-tx`, which is how transaction metadata is
+//! asserted. Value positions for `ref` attributes accept the same except
 //! tempid strings (same-transaction value tempids are not supported by the
 //! transaction layer; clients resolve them against prior tempid maps).
 
-use corium_core::{EntityId, KeywordInterner, TotalF64, Value, ValueType};
+use corium_core::{EntityId, Keyword, KeywordInterner, TotalF64, Value, ValueType};
 use corium_db::Db;
 use corium_query::edn::Edn;
-use corium_tx::{EntityMap, EntityRef, TxItem, TxOp};
+use corium_tx::{EntityMap, EntityRef, TX_TEMPID, TxItem, TxOp};
 use thiserror::Error;
+
+/// Whether a keyword in entity position names the transaction being built.
+fn is_current_tx(keyword: &Keyword) -> bool {
+    keyword.namespace.as_deref() == Some("db") && keyword.name == "current-tx"
+}
 
 /// Transaction form conversion failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -53,6 +60,12 @@ fn entity_ref(db: &Db, form: &Edn) -> Result<EntityRef, TxFormError> {
         Edn::Long(n) => u64::try_from(*n)
             .map(|raw| EntityRef::Id(EntityId::from_raw(raw)))
             .map_err(|_| TxFormError::BadEntity(form.to_string())),
+        // `:db/current-tx` names the transaction being built, whose entity id
+        // only the transactor knows; the reserved tempid carries that
+        // intention through to `prepare`.
+        Edn::Keyword(keyword) if is_current_tx(keyword) => {
+            Ok(EntityRef::Temp(TX_TEMPID.to_owned()))
+        }
         Edn::Keyword(keyword) => db
             .idents()
             .entid(keyword)

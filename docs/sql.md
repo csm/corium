@@ -81,8 +81,9 @@ corium sql my-database -f report.sql
 Interactive statements end with a semicolon. The shell understands:
 
 ```text
-\as-of t       fix subsequent sessions at t
-\since t       use a since view
+\as-of t       fix subsequent sessions at t (or a UTC timestamp,
+              e.g. \as-of 2026-07-25T09:30:00Z)
+\since t       use a since view (also accepts a timestamp)
 \history on    expose history events
 \history off   return to the current view
 \current       return to the current view

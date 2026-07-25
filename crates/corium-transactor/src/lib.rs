@@ -67,6 +67,38 @@ pub enum TransactError {
     },
 }
 
+/// Settles a transaction's `:db/txInstant` and materializes it as a datom.
+///
+/// Transaction data may assert its own instant against the transaction entity
+/// (`[:db/add "datomic.tx" :db/txInstant …]` — how an import dates backfilled
+/// transactions); otherwise the transactor stamps `max(now, last + 1)`. Either
+/// way the instant ends up in the committed datom set, so the log, the
+/// tx-report, every peer's live index, and the published snapshot all carry
+/// one representation of transaction time.
+///
+/// # Errors
+/// Returns [`TxError::TxInstantNotMonotonic`] when supplied data would move the
+/// transaction clock backwards.
+fn seal_tx_instant(
+    datoms: &mut Vec<corium_core::Datom>,
+    t: u64,
+    now_ms: i64,
+    last_instant: i64,
+) -> Result<i64, TxError> {
+    match corium_db::bootstrap::asserted_instant(t, datoms) {
+        Some(supplied) if supplied <= last_instant => Err(TxError::TxInstantNotMonotonic {
+            supplied,
+            last: last_instant,
+        }),
+        Some(supplied) => Ok(supplied),
+        None => {
+            let instant = now_ms.max(last_instant.saturating_add(1));
+            datoms.push(corium_db::bootstrap::tx_instant_datom(t, instant));
+            Ok(instant)
+        }
+    }
+}
+
 struct State {
     db: Db,
     next_user: u64,
@@ -150,9 +182,11 @@ impl BatchCursor {
         let before = self.db.clone();
         let t = before.basis_t() + 1;
         let tx_id = EntityId::new(Partition::Tx as u32, t);
-        let prepared = prepare(&before, items, tx_id, self.next_user)?;
-        let tx_instant = now_ms.max(self.last_instant.saturating_add(1));
-        let after = before.clone().with_transaction(t, &prepared.datoms);
+        let mut prepared = prepare(&before, items, tx_id, self.next_user)?;
+        let tx_instant = seal_tx_instant(&mut prepared.datoms, t, now_ms, self.last_instant)?;
+        let after = before
+            .clone()
+            .with_transaction_at(t, tx_instant, &prepared.datoms);
         self.next_user = prepared
             .tempids
             .values()
@@ -201,7 +235,7 @@ impl EmbeddedTransactor {
         let mut db = base;
         let mut last_instant = i64::MIN;
         for record in log.replay()? {
-            db = db.with_transaction(record.t, &record.datoms);
+            db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
             last_instant = last_instant.max(record.tx_instant);
         }
         // Allocation must resume past every id that ever appeared in the log,
@@ -240,7 +274,7 @@ impl EmbeddedTransactor {
     ) -> Self {
         let mut last_instant = i64::MIN;
         for record in records {
-            db = db.with_transaction(record.t, &record.datoms);
+            db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
             last_instant = last_instant.max(record.tx_instant);
         }
         let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
@@ -294,7 +328,7 @@ impl EmbeddedTransactor {
         // `next_entity_id`; only the tail can introduce ids past it.
         let mut next_user = next_entity_id.max(FIRST_USER_ID);
         for record in log.tx_range(index_basis + 1, None)? {
-            db = db.with_transaction(record.t, &record.datoms);
+            db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
             last_instant = last_instant.max(record.tx_instant);
             next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
         }
@@ -328,7 +362,7 @@ impl EmbeddedTransactor {
         let mut last_instant = last_tx_instant;
         let mut next_user = next_entity_id.max(FIRST_USER_ID);
         for record in records {
-            db = db.with_transaction(record.t, &record.datoms);
+            db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
             last_instant = last_instant.max(record.tx_instant);
             next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
         }
@@ -393,7 +427,7 @@ impl EmbeddedTransactor {
         let before = state.db.clone();
         let t = before.basis_t() + 1;
         let tx_id = EntityId::new(Partition::Tx as u32, t);
-        let prepared = prepare(&before, items, tx_id, state.next_user)?;
+        let mut prepared = prepare(&before, items, tx_id, state.next_user)?;
         let millis = i64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -401,13 +435,13 @@ impl EmbeddedTransactor {
                 .as_millis(),
         )
         .unwrap_or(i64::MAX);
-        let tx_instant = millis.max(state.last_instant.saturating_add(1));
+        let tx_instant = seal_tx_instant(&mut prepared.datoms, t, millis, state.last_instant)?;
         self.log.append(&TxRecord {
             t,
             tx_instant,
             datoms: prepared.datoms.clone(),
         })?;
-        state.db = before.with_transaction(t, &prepared.datoms);
+        state.db = before.with_transaction_at(t, tx_instant, &prepared.datoms);
         state.last_instant = tx_instant;
         state.next_user = prepared
             .tempids
@@ -453,7 +487,7 @@ impl EmbeddedTransactor {
             let before = state.db.clone();
             let t = before.basis_t() + 1;
             let tx_id = EntityId::new(Partition::Tx as u32, t);
-            let prepared = prepare(&before, items, tx_id, state.next_user)?;
+            let mut prepared = prepare(&before, items, tx_id, state.next_user)?;
             let millis = i64::try_from(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -461,7 +495,7 @@ impl EmbeddedTransactor {
                     .as_millis(),
             )
             .unwrap_or(i64::MAX);
-            let tx_instant = millis.max(state.last_instant.saturating_add(1));
+            let tx_instant = seal_tx_instant(&mut prepared.datoms, t, millis, state.last_instant)?;
             state.async_pending = true;
             (before, prepared, t, tx_instant)
         };
@@ -483,7 +517,10 @@ impl EmbeddedTransactor {
         // Apply to the live value so a naming-only update that ran while the
         // append was pending is preserved; transaction-bearing state cannot
         // change while `async_pending` is set.
-        state.db = state.db.clone().with_transaction(t, &prepared.datoms);
+        state.db = state
+            .db
+            .clone()
+            .with_transaction_at(t, tx_instant, &prepared.datoms);
         state.last_instant = tx_instant;
         state.next_user = prepared
             .tempids

@@ -115,6 +115,8 @@ impl RemoteDbBackend {
             View::AsOf(t) => Some(pb::db_view_spec::View::AsOf(t)),
             View::Since(t) => Some(pb::db_view_spec::View::Since(t)),
             View::History => Some(pb::db_view_spec::View::History(true)),
+            View::AsOfInstant(instant) => Some(pb::db_view_spec::View::AsOfInstant(instant)),
+            View::SinceInstant(instant) => Some(pb::db_view_spec::View::SinceInstant(instant)),
         };
         pb::DbViewSpec {
             db: self.db_name.clone(),

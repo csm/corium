@@ -114,6 +114,8 @@ impl PeerServerSvc {
             Some(pb::db_view_spec::View::AsOf(t)) => base.as_of(*t),
             Some(pb::db_view_spec::View::Since(t)) => base.since(*t),
             Some(pb::db_view_spec::View::History(true)) => base.history(),
+            Some(pb::db_view_spec::View::AsOfInstant(instant)) => base.as_of_instant(*instant),
+            Some(pb::db_view_spec::View::SinceInstant(instant)) => base.since_instant(*instant),
             None | Some(pb::db_view_spec::View::History(false)) => base,
         })
     }

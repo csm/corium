@@ -18,7 +18,8 @@ Ships the `corium` command. Subcommands:
 - **`db create` / `delete` / `fork` / `list` / `stats`** — database
   administration, including restore-as-clone forks.
 - **`db request-index` / `index-policy`** — drive and tune background indexing.
-- **`console`** — interactive query console with as-of/since/history views,
+- **`console`** — interactive query console with as-of/since/history views
+  (named by basis `t` or by UTC timestamp),
   schema/stats/basis inspection, timing, and live tx-report watch.
 - **`tui`** — a full-screen terminal dashboard (query workbench, live store
   metrics, transaction feed, schema browser).

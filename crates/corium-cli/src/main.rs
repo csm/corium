@@ -3,6 +3,7 @@
 
 mod authz;
 mod console;
+mod instant;
 mod metrics_http;
 mod pg_catalog;
 mod sql;

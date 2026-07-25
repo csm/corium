@@ -15,6 +15,7 @@ Given a connection whose latest known basis is `t-now`:
 | `since(db, t)` | only facts added after `t` | filter `tx > t` on current indexes |
 | `history(db)` | all assertions **and** retractions ever | history indexes ∪ current; datoms expose `added` |
 | `sync(t)` / `sync()` | future that completes when the peer's basis ≥ `t` (or ≥ transactor's latest) | tx-report stream bookkeeping |
+| `as-of(db, inst)` / `since(db, inst)` | the same two views named by wall clock | resolve `inst` → the last `t` committed at or before it, then as above |
 
 Rules baked into the index design to make these work:
 
@@ -27,12 +28,36 @@ Rules baked into the index design to make these work:
 - A transactor's indexing job maintains current and history trees in the same
   pass; there is no separate "history build".
 
+## Naming a view by wall clock
+
+Every commit asserts `:db/txInstant` on its transaction entity (see
+[data-model.md](data-model.md)), so the `t ↔ instant` correspondence is part of
+the database value rather than something to go looking for:
+
+- **Resolution.** `instant → t` is the last transaction committed at or before
+  the instant; `t → instant` is the transaction entity's own datom. Both are
+  O(log n) — instants are monotone by construction, so the correspondence is an
+  ordered map maintained across transactions (`Db::instants`), and the datoms
+  behind it are AVET-indexed for direct index seeks as well.
+- **Out-of-range instants.** An instant older than the database resolves to
+  basis 0: `as-of` it is the empty value, `since` it is everything. Datomic
+  interprets out-of-range instants the same way.
+- **View independence.** A derived view (`as-of`, `since`, `history`) keeps the
+  whole correspondence, so naming an instant means the same thing whatever
+  value you start from — otherwise `since(t).as-of(inst)` would silently
+  resolve against a truncated clock.
+- **Surfaces.** `Db::as_of_instant` / `Db::since_instant` in Rust,
+  `d/as-of` / `d/since` with an instant argument in cljrs (a long is a `t`, an
+  instant is wall clock — the distinction Datomic draws between a `t` and a
+  `Date`), `as_of_instant` / `since_instant` in `DbViewSpec` on the wire, and
+  `:as-of <timestamp>` / `\as-of <timestamp>` in the console and SQL shell.
+
 ## Log API
 
 `tx-range(from-t, to-t)` streams `(t, tx-instant, [datom])` straight from the
 log chunk tree — available on any peer without touching the covering indexes.
-`t → tx-instant` resolution and `as-of(instant)` / `since(instant)` variants
-binary-search the log by `:db/txInstant` (monotonic by construction).
+Instant resolution does not need the log: it reads the same `:db/txInstant`
+datoms every view already carries.
 
 ## tx-report queue
 

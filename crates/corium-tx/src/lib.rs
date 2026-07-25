@@ -9,6 +9,14 @@ use thiserror::Error;
 /// A temporary entity identifier scoped to one transaction.
 pub type TempId = String;
 
+/// The reserved tempid naming the transaction's own entity.
+///
+/// Asserting against it attaches metadata to the transaction — the audit
+/// trail's who/why alongside the engine's `:db/txInstant` when. Corium spells
+/// it as Datomic does so ported transaction data works unchanged; the EDN
+/// boundary also accepts `:db/current-tx` in entity position.
+pub const TX_TEMPID: &str = "datomic.tx";
+
 /// An entity position accepted by transaction operations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EntityRef {
@@ -84,6 +92,16 @@ pub enum TxError {
     /// CAS is only valid for cardinality one.
     #[error("compare-and-swap requires cardinality one")]
     CasCardinality,
+    /// Transaction data asserted a `:db/txInstant` that does not advance the
+    /// transaction clock. Instants are monotone by construction, so a
+    /// backdated commit would break the ordering `as-of` an instant relies on.
+    #[error("supplied :db/txInstant {supplied} is not after the last commit's {last}")]
+    TxInstantNotMonotonic {
+        /// Instant asserted by the transaction data.
+        supplied: i64,
+        /// Instant of the previous commit.
+        last: i64,
+    },
 }
 
 /// Expands and validates transaction input against `db`.
@@ -119,6 +137,7 @@ pub fn prepare(
     // Identity assertions unify a tempid with an existing entity before allocation.
     for op in &ops {
         if let TxOp::Add(EntityRef::Temp(temp), a, value) = op
+            && temp != TX_TEMPID
             && db.schema().get(*a).and_then(|x| x.unique) == Some(Unique::Identity)
             && let Some(e) = db.lookup(*a, value)
         {
@@ -133,6 +152,12 @@ pub fn prepare(
             }
         };
         if let EntityRef::Temp(temp) = entity {
+            // The transaction's own entity is already allocated; metadata
+            // assertions resolve to it rather than to a fresh id.
+            if temp == TX_TEMPID {
+                tempids.insert(temp.clone(), tx);
+                continue;
+            }
             tempids.entry(temp.clone()).or_insert_with(|| {
                 let e = EntityId::new(Partition::User as u32, next);
                 next += 1;
