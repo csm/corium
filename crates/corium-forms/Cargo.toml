@@ -5,14 +5,16 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Boundary conversion between EDN schema/transaction forms and engine types"
+description = "Boundary conversion between schema/transaction forms and engine types"
 
 [dependencies]
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-query = { workspace = true }
 corium-tx = { workspace = true }
+serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2"
+toml = "1.1.2"
 
 [dev-dependencies]
 proptest = "1"

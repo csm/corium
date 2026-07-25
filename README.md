@@ -43,7 +43,7 @@ Then, in another terminal, create a database from a schema and open the
 interactive query console:
 
 ```sh
-cargo run -p corium-cli -- db create people --schema schema.edn
+cargo run -p corium-cli -- db create people --schema schema.toml
 cargo run -p corium-cli -- console people
 ```
 

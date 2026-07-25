@@ -22,6 +22,16 @@ use corium_store::{BlobStore, DbRoot, FsStore, RootStore};
 const SCHEMA: &str = r"[{:db/ident :k/v :db/valueType :db.type/long
                           :db/cardinality :db.cardinality/one}]";
 
+const TOML_SCHEMA: &str = r#"
+schema-version = 1
+
+[[entity]]
+name = "k"
+
+[entity.attributes]
+v = "long"
+"#;
+
 fn schema_forms() -> Vec<Edn> {
     match read_one(SCHEMA).expect("schema EDN") {
         Edn::Vector(items) => items,
@@ -576,8 +586,8 @@ async fn cli_admin_commands_round_trip() {
     let port = free_port();
     let proc = TransactorProc::spawn(&data, port, &[]);
     let _admin = proc.wait_ready().await;
-    let schema_path = dir.path().join("schema.edn");
-    std::fs::write(&schema_path, SCHEMA).expect("write schema");
+    let schema_path = dir.path().join("schema.toml");
+    std::fs::write(&schema_path, TOML_SCHEMA).expect("write schema");
 
     let corium = env!("CARGO_BIN_EXE_corium");
     let run = |args: Vec<String>| {

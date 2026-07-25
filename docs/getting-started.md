@@ -34,23 +34,29 @@ cargo run -p corium-cli --features turso -- \
   transactor --store turso --data-dir ./corium-data
 ```
 
-Create a schema file named `schema.edn`:
+Create a schema file named `schema.toml`:
 
-```clojure
-[{:db/ident :person/name
-  :db/valueType :db.type/string
-  :db/cardinality :db.cardinality/one
-  :db/unique :db.unique/identity
-  :db/index true}
- {:db/ident :person/age
-  :db/valueType :db.type/long
-  :db/cardinality :db.cardinality/one}]
+```toml
+schema-version = 1
+
+[[entity]]
+name = "person"
+
+[entity.attributes]
+name = { type = "string", unique = "identity", index = true }
+age = "long"
 ```
+
+The `entity` block is schema-authoring sugar: it supplies the `person` group
+for the `person/name` and `person/age` attributes, but does not install or
+enforce an entity type. Flat `[[attribute]]` declarations and the original
+Datomic-style EDN schema format are also supported. See
+[TOML schemas](schema-toml.md).
 
 Create the database and inspect it:
 
 ```sh
-cargo run -p corium-cli -- db create people --schema schema.edn
+cargo run -p corium-cli -- db create people --schema schema.toml
 cargo run -p corium-cli -- db list
 cargo run -p corium-cli -- db stats people
 cargo run -p corium-cli -- console people

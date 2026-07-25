@@ -1,0 +1,96 @@
+# TOML schemas
+
+Corium accepts hierarchical TOML schema files when `corium db create
+--schema` receives a path ending in `.toml`. The format is a concise authoring
+layer over Corium's flat attribute model; EDN schema files remain supported.
+
+## Grouped attributes
+
+The common form groups attributes under a familiar entity-shaped declaration:
+
+```toml
+schema-version = 1
+
+[[entity]]
+name = "person"
+
+[entity.attributes]
+id      = { type = "uuid", unique = "identity" }
+name    = { type = "string", index = true }
+age     = "long"
+tags    = { type = "keyword", many = true }
+address = { type = "ref", component = true }
+
+[[entity]]
+name = "organization"
+
+[entity.attributes]
+name      = "string"
+employees = { type = "ref", cardinality = "many" }
+```
+
+The first block declares `person/id`, `person/name`, `person/age`,
+`person/tags`, and `person/address`. A string is shorthand for an attribute
+with that type and cardinality one.
+
+An `entity` is only an authoring group. It supplies the keyword namespace but
+does not create a persisted entity type, constrain which attributes may
+coexist, or constrain the targets of reference attributes.
+
+## Flat attributes
+
+Top-level declarations express ungrouped attributes or add attributes to a
+group without an entity block:
+
+```toml
+[[attribute]]
+name = "created-at"
+type = "instant"
+index = true
+
+[[attribute]]
+group = "audit"
+name = "created-by"
+type = "ref"
+```
+
+These declare `created-at` and `audit/created-by`, respectively. Declaring the
+same canonical attribute through grouped and flat syntax is an error.
+
+## Attribute options
+
+Every detailed declaration requires `type`. Supported values are `boolean`,
+`long`, `double`, `instant`, `uuid`, `keyword`, `string`, `bytes`, and `ref`.
+
+The remaining options are:
+
+| Option | Values | Default |
+|---|---|---|
+| `many` | Boolean cardinality shorthand | `false` |
+| `cardinality` | `"one"` or `"many"` | `"one"` |
+| `unique` | `"identity"` or `"value"` | unset |
+| `index` | Boolean | `false` |
+| `component` | Boolean | `false` |
+| `no-history` | Boolean | `false` |
+
+Use only one of `many` and `cardinality` on a declaration. Unique attributes
+receive index coverage whether or not `index = true` is present.
+
+Group and attribute names are preserved exactly. They must be non-empty and
+cannot contain `/`, which is reserved for Corium's canonical group/name
+separator. TOML quoted keys allow names that are not valid bare TOML keys:
+
+```toml
+[entity.attributes]
+"release-group" = "ref"
+```
+
+## Creating a database
+
+```sh
+corium db create people --schema schema.toml
+```
+
+The CLI selects TOML for `.toml` paths. Other extensions retain the existing
+EDN behavior, including a single vector of attribute maps or a sequence of
+bare attribute maps.
