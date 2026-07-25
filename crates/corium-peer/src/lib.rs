@@ -31,7 +31,9 @@ use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+pub use crate::segment::CachedPeerStorage;
 use crate::segment::{PeerStorage, SnapshotError, load_current_snapshot};
+pub use corium_store::{SegmentCacheConfig, SegmentCacheMetrics};
 
 type Client = TransactorClient<InterceptedService<Channel, TokenInterceptor>>;
 
@@ -90,6 +92,14 @@ pub struct ConnectConfig {
     /// Optional direct blob/root storage used to bootstrap from the newest
     /// published index before subscribing to the transaction-log tail.
     storage: Option<Arc<dyn PeerStorage>>,
+    segment_cache_metrics: Option<SegmentCacheMetricsHandle>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SegmentCacheMetricsHandle {
+    pub(crate) metrics: Arc<SegmentCacheMetrics>,
+    pub(crate) disk_capacity: u64,
+    pub(crate) memory_capacity: u64,
 }
 
 impl std::fmt::Debug for ConnectConfig {
@@ -105,6 +115,7 @@ impl std::fmt::Debug for ConnectConfig {
             .field("failover_timeout", &self.failover_timeout)
             .field("heartbeat_timeout", &self.heartbeat_timeout)
             .field("storage", &self.storage.is_some())
+            .field("segment_cache", &self.segment_cache_metrics.is_some())
             .finish()
     }
 }
@@ -129,6 +140,7 @@ impl ConnectConfig {
             failover_timeout: Duration::from_secs(30),
             heartbeat_timeout: None,
             storage: None,
+            segment_cache_metrics: None,
         }
     }
 
@@ -140,7 +152,27 @@ impl ConnectConfig {
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<dyn PeerStorage>) -> Self {
         self.storage = Some(storage);
+        self.segment_cache_metrics = None;
         self
+    }
+
+    /// Gives this peer direct storage access through a bounded local SSD cache.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid, unwritable, or already-owned cache directory.
+    pub fn with_storage_cache(
+        mut self,
+        storage: Arc<dyn PeerStorage>,
+        cache: &SegmentCacheConfig,
+    ) -> std::io::Result<Self> {
+        let cached = CachedPeerStorage::open(storage, cache)?;
+        self.segment_cache_metrics = Some(SegmentCacheMetricsHandle {
+            metrics: cached.metrics(),
+            disk_capacity: cache.capacity_bytes,
+            memory_capacity: cache.memory_capacity_bytes,
+        });
+        self.storage = Some(Arc::new(cached));
+        Ok(self)
     }
 
     /// Whether direct peer storage has been configured.
@@ -240,6 +272,10 @@ fn make_client(channel: Channel, token: Option<String>) -> Client {
 }
 
 impl Connection {
+    pub(crate) fn segment_cache_metrics(&self) -> Option<SegmentCacheMetricsHandle> {
+        self.inner.config.segment_cache_metrics.clone()
+    }
+
     /// Connects and waits until the handshake and required log tail have
     /// been applied locally. With direct storage configured, the peer first
     /// loads the newest published index and subscribes from its basis;

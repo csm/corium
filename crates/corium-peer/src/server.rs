@@ -57,11 +57,12 @@ impl PeerServerSvc {
     /// ([`Guard::disabled`]); add a policy with [`PeerServerSvc::with_guard`].
     #[must_use]
     pub fn new(connection: Arc<Connection>, config: PeerServerConfig) -> Self {
+        let metrics = Arc::new(Metrics::new(connection.segment_cache_metrics()));
         Self {
             connection,
             cache: QueryCache::new(),
             config,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
             guard: Guard::disabled(),
         }
     }
