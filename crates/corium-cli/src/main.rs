@@ -1951,6 +1951,8 @@ mod tests {
         assert!(conflicting.contains("conflict"));
     }
 }
+
+#[cfg(test)]
 mod schema_file_tests {
     use corium_core::{Cardinality, Keyword};
     use corium_protocol::schemaform::schema_from_edn;
