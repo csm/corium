@@ -1949,6 +1949,8 @@ mod tests {
         )
         .expect_err("static and role conflict");
         assert!(conflicting.contains("conflict"));
+    }
+}
 mod schema_file_tests {
     use corium_core::{Cardinality, Keyword};
     use corium_protocol::schemaform::schema_from_edn;
