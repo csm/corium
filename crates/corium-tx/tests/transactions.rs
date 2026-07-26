@@ -1,7 +1,7 @@
 //! Transaction model and validation tests.
 
 use corium_core::{Cardinality, EntityId, Partition, Schema, Unique, Value, ValueType};
-use corium_db::{Db, attribute};
+use corium_db::{Db, attribute, bootstrap};
 use corium_tx::{EntityRef, TX_TEMPID, TxError, TxItem, TxOp, prepare};
 use std::sync::Arc;
 
@@ -305,4 +305,83 @@ fn the_reserved_tempid_does_not_upsert_through_identity_attributes() {
         1_001,
     );
     assert_eq!(taken, Err(TxError::UniqueConflict));
+}
+
+#[test]
+fn transaction_instant_can_only_be_added_once_to_the_current_transaction() {
+    let (empty, _, _) = fixture();
+    let tx = EntityId::new(Partition::Tx as u32, 1);
+    let user = EntityId::new(Partition::User as u32, 1_000);
+
+    let on_user = prepare(
+        &empty,
+        [TxItem::Op(TxOp::Add(
+            EntityRef::Id(user),
+            bootstrap::TX_INSTANT,
+            Value::Instant(1_000),
+        ))],
+        tx,
+        1_000,
+    );
+    assert_eq!(on_user, Err(TxError::InvalidTxInstantOperation));
+
+    let twice = prepare(
+        &empty,
+        [
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp(TX_TEMPID.into()),
+                bootstrap::TX_INSTANT,
+                Value::Instant(2_000),
+            )),
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp(TX_TEMPID.into()),
+                bootstrap::TX_INSTANT,
+                Value::Instant(1_000),
+            )),
+        ],
+        tx,
+        1_000,
+    );
+    assert_eq!(twice, Err(TxError::InvalidTxInstantOperation));
+}
+
+#[test]
+fn transaction_instants_cannot_be_changed_or_retracted() {
+    let (empty, _, _) = fixture();
+    let old_tx = EntityId::new(Partition::Tx as u32, 1);
+    let db = empty.with_transaction_at(1, 1_000, &[]);
+    let tx = EntityId::new(Partition::Tx as u32, 2);
+
+    let retract = prepare(
+        &db,
+        [TxItem::Op(TxOp::Retract(
+            EntityRef::Id(old_tx),
+            bootstrap::TX_INSTANT,
+            Value::Instant(1_000),
+        ))],
+        tx,
+        1_000,
+    );
+    assert_eq!(retract, Err(TxError::InvalidTxInstantOperation));
+
+    let cas = prepare(
+        &db,
+        [TxItem::Op(TxOp::Cas(
+            EntityRef::Id(old_tx),
+            bootstrap::TX_INSTANT,
+            Some(Value::Instant(1_000)),
+            Value::Instant(2_000),
+        ))],
+        tx,
+        1_000,
+    );
+    assert_eq!(cas, Err(TxError::InvalidTxInstantOperation));
+
+    let retract_entity = prepare(
+        &db,
+        [TxItem::Op(TxOp::RetractEntity(EntityRef::Id(old_tx)))],
+        tx,
+        1_000,
+    );
+    assert_eq!(retract_entity, Err(TxError::InvalidTxInstantOperation));
 }

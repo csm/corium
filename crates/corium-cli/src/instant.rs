@@ -42,6 +42,15 @@ pub fn parse_instant(text: &str) -> Option<i64> {
     if date_parts.next().is_some() {
         return None;
     }
+    let days_in_month = match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day > days_in_month {
+        return None;
+    }
 
     let (hour, minute, second, millis) = match time {
         None => (0, 0, 0, 0),
@@ -69,8 +78,8 @@ pub fn parse_instant(text: &str) -> Option<i64> {
     };
 
     let days = days_from_civil(year, month, day);
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    Some(seconds * 1_000 + millis)
+    let seconds = days * 86_400 + i128::from(hour * 3_600 + minute * 60 + second);
+    i64::try_from(seconds * 1_000 + i128::from(millis)).ok()
 }
 
 /// A point in time named on a console or SQL-shell command line.
@@ -107,6 +116,10 @@ fn parse_field(text: &str, low: i64, high: i64) -> Option<i64> {
     (low..=high).contains(&value).then_some(value)
 }
 
+fn is_leap_year(year: i64) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+}
+
 /// Gregorian calendar date for a day count since 1970-01-01 (Howard Hinnant's
 /// `civil_from_days`).
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
@@ -124,10 +137,12 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 /// Day count since 1970-01-01 for a Gregorian date (Howard Hinnant's
 /// `days_from_civil`), the inverse of [`civil_from_days`].
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
+fn days_from_civil(year: i64, month: i64, day: i64) -> i128 {
+    let year = i128::from(year) - i128::from(month <= 2);
     let era = year.div_euclid(400);
     let yoe = year - era * 400;
+    let month = i128::from(month);
+    let day = i128::from(day);
     let mp = if month > 2 { month - 3 } else { month + 9 };
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
@@ -174,6 +189,9 @@ mod tests {
             "1970-01-01T00:00:00+02:00",
             "1970-01-01-01",
             "1970-01",
+            "2026-02-29",
+            "2026-02-31",
+            "2026-04-31",
         ] {
             assert_eq!(parse_instant(text), None, "{text}");
         }

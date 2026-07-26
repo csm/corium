@@ -145,9 +145,13 @@ impl Shell {
         let mut words = line.split_whitespace();
         let command = words.next().unwrap_or_default();
         let argument = words.next();
-        if words.next().is_some() {
+        if !matches!(command, "\\as-of" | "\\since") && words.next().is_some() {
             return Err("too many command arguments".into());
         }
+        let time_argument = || {
+            let trimmed = line[command.len()..].trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        };
         match command {
             "\\q" | "\\quit" => Ok(MetaAction::Quit),
             "\\help" | "\\?" => {
@@ -157,7 +161,7 @@ impl Shell {
                 Ok(MetaAction::Continue)
             }
             "\\as-of" => {
-                self.view = match parse_time_point(argument, "\\as-of")? {
+                self.view = match parse_time_point(time_argument(), "\\as-of")? {
                     TimePoint::T(t) => View::AsOf(t),
                     TimePoint::Instant(instant) => View::AsOfInstant(instant),
                 };
@@ -165,7 +169,7 @@ impl Shell {
                 Ok(MetaAction::Continue)
             }
             "\\since" => {
-                self.view = match parse_time_point(argument, "\\since")? {
+                self.view = match parse_time_point(time_argument(), "\\since")? {
                     TimePoint::T(t) => View::Since(t),
                     TimePoint::Instant(instant) => View::SinceInstant(instant),
                 };
@@ -381,5 +385,21 @@ mod tests {
             vec!["SELECT ';' AS x", "-- ; ignored\nSELECT \"a;b\""]
         );
         assert_eq!(remainder, "SELECT 3");
+    }
+
+    #[tokio::test]
+    async fn time_views_accept_space_separated_timestamps() {
+        let db = Db::new(corium_core::Schema::default());
+        let mut shell = Shell::default();
+        shell
+            .meta(&db, "\\as-of 2026-07-25 09:30:00")
+            .await
+            .expect("as-of timestamp");
+        assert!(matches!(shell.view, View::AsOfInstant(_)));
+        shell
+            .meta(&db, "\\since 2026-07-25 09:30:00")
+            .await
+            .expect("since timestamp");
+        assert!(matches!(shell.view, View::SinceInstant(_)));
     }
 }

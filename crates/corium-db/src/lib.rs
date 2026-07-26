@@ -291,6 +291,7 @@ impl Db {
         let mut instants = TxInstants::default();
         for datom in &datoms {
             if let Datom {
+                e,
                 a,
                 v: Value::Instant(instant),
                 tx,
@@ -298,6 +299,8 @@ impl Db {
                 ..
             } = datom
                 && *a == bootstrap::TX_INSTANT
+                && *e == *tx
+                && tx.partition() == Partition::Tx as u32
             {
                 instants.record(tx.sequence(), *instant);
             }
@@ -563,7 +566,8 @@ impl Db {
     /// field becomes the datom it would carry today.
     #[must_use]
     pub fn with_transaction_at(&self, t: u64, instant: i64, datoms: &[Datom]) -> Self {
-        let mut next = if bootstrap::asserted_instant(t, datoms).is_some() {
+        let asserted = bootstrap::asserted_instant(t, datoms);
+        let mut next = if asserted.is_some() {
             self.apply_transaction(t, datoms)
         } else {
             let mut with_instant = Vec::with_capacity(datoms.len() + 1);
@@ -571,7 +575,7 @@ impl Db {
             with_instant.push(bootstrap::tx_instant_datom(t, instant));
             self.apply_transaction(t, &with_instant)
         };
-        next.instants.record(t, instant);
+        next.instants.record(t, asserted.unwrap_or(instant));
         next
     }
 
@@ -980,7 +984,29 @@ mod tests {
             ],
         );
         assert_eq!(db.values(tx_entity(1), bootstrap::TX_INSTANT).len(), 1);
-        assert_eq!(db.tx_instant(1), Some(5_000));
+        assert_eq!(db.tx_instant(1), Some(1_000));
+    }
+
+    #[test]
+    fn snapshot_ignores_tx_instant_values_on_non_transaction_entities() {
+        let user = entity(1);
+        let db = Db::from_current_snapshot(
+            1,
+            schema(),
+            Idents::default(),
+            KeywordInterner::default(),
+            vec![
+                bootstrap::tx_instant_datom(1, 1_000),
+                Datom {
+                    e: user,
+                    a: bootstrap::TX_INSTANT,
+                    v: Value::Instant(9_000),
+                    tx: tx_entity(1),
+                    added: true,
+                },
+            ],
+        );
+        assert_eq!(db.tx_instant(1), Some(1_000));
     }
 
     #[test]

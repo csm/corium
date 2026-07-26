@@ -617,3 +617,24 @@ fn replaying_a_log_written_without_instant_datoms_still_resolves_instants() {
         2
     );
 }
+
+#[test]
+fn replay_prefers_a_materialized_instant_over_conflicting_log_metadata() {
+    let (schema, _) = schema();
+    let log: Arc<dyn TransactionLog> = Arc::new(MemoryLog::default());
+    log.append(&TxRecord {
+        t: 1,
+        tx_instant: 5_000,
+        datoms: vec![corium_db::bootstrap::tx_instant_datom(1, 1_000)],
+    })
+    .expect("append record");
+    let tx = EmbeddedTransactor::recover(schema, log).expect("recover");
+
+    assert_eq!(tx.db().tx_instant(1), Some(1_000));
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp(corium_tx::TX_TEMPID.into()),
+        corium_db::bootstrap::TX_INSTANT,
+        Value::Instant(2_000),
+    ))])
+    .expect("the materialized datom is the recovered high-water mark");
+}

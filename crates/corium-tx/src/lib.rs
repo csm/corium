@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{Cardinality, Datom, EntityId, Partition, Unique, Value};
-use corium_db::{Db, FIRST_USER_ID};
+use corium_db::{Db, FIRST_USER_ID, bootstrap};
 use thiserror::Error;
 
 /// A temporary entity identifier scoped to one transaction.
@@ -102,6 +102,11 @@ pub enum TxError {
         /// Instant of the previous commit.
         last: i64,
     },
+    /// `:db/txInstant` was retracted, changed, attached to another entity, or
+    /// supplied more than once. It is engine-owned data except for one
+    /// explicit assertion on the transaction currently being prepared.
+    #[error(":db/txInstant may only be added once to the current transaction entity")]
+    InvalidTxInstantOperation,
 }
 
 /// Expands and validates transaction input against `db`.
@@ -180,11 +185,18 @@ pub fn prepare(
     };
     let mut datoms = Vec::new();
     let mut working = db.clone();
+    let mut tx_instant_asserted = false;
     for op in ops {
         let start = datoms.len();
         match op {
             TxOp::Add(entity, a, v) => {
                 let e = resolve(&entity)?;
+                if a == bootstrap::TX_INSTANT {
+                    if e != tx || tx_instant_asserted {
+                        return Err(TxError::InvalidTxInstantOperation);
+                    }
+                    tx_instant_asserted = true;
+                }
                 validate(&working, a, &v)?;
                 if let Some(attr) = working.schema().get(a) {
                     if attr.unique.is_some()
@@ -218,6 +230,9 @@ pub fn prepare(
                 });
             }
             TxOp::Retract(entity, a, v) => {
+                if a == bootstrap::TX_INSTANT {
+                    return Err(TxError::InvalidTxInstantOperation);
+                }
                 validate(&working, a, &v)?;
                 let e = resolve(&entity)?;
                 // Retracting an absent fact is a no-op: no datom recorded.
@@ -232,6 +247,9 @@ pub fn prepare(
                 }
             }
             TxOp::Cas(entity, a, old, new) => {
+                if a == bootstrap::TX_INSTANT {
+                    return Err(TxError::InvalidTxInstantOperation);
+                }
                 validate(&working, a, &new)?;
                 let e = resolve(&entity)?;
                 if working
@@ -270,6 +288,9 @@ pub fn prepare(
                     &mut facts,
                     &mut BTreeSet::new(),
                 );
+                if facts.iter().any(|(_, a, _)| *a == bootstrap::TX_INSTANT) {
+                    return Err(TxError::InvalidTxInstantOperation);
+                }
                 datoms.extend(facts.into_iter().map(|(e, a, v)| Datom {
                     e,
                     a,

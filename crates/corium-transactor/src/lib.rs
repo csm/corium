@@ -99,6 +99,10 @@ fn seal_tx_instant(
     }
 }
 
+fn effective_tx_instant(record: &TxRecord) -> i64 {
+    corium_db::bootstrap::asserted_instant(record.t, &record.datoms).unwrap_or(record.tx_instant)
+}
+
 struct State {
     db: Db,
     next_user: u64,
@@ -235,8 +239,9 @@ impl EmbeddedTransactor {
         let mut db = base;
         let mut last_instant = i64::MIN;
         for record in log.replay()? {
+            let tx_instant = effective_tx_instant(&record);
             db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
-            last_instant = last_instant.max(record.tx_instant);
+            last_instant = last_instant.max(tx_instant);
         }
         // Allocation must resume past every id that ever appeared in the log,
         // not just ids with current datoms; otherwise a fully retracted
@@ -274,8 +279,9 @@ impl EmbeddedTransactor {
     ) -> Self {
         let mut last_instant = i64::MIN;
         for record in records {
+            let tx_instant = effective_tx_instant(&record);
             db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
-            last_instant = last_instant.max(record.tx_instant);
+            last_instant = last_instant.max(tx_instant);
         }
         let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
         Self {
@@ -328,8 +334,9 @@ impl EmbeddedTransactor {
         // `next_entity_id`; only the tail can introduce ids past it.
         let mut next_user = next_entity_id.max(FIRST_USER_ID);
         for record in log.tx_range(index_basis + 1, None)? {
+            let tx_instant = effective_tx_instant(&record);
             db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
-            last_instant = last_instant.max(record.tx_instant);
+            last_instant = last_instant.max(tx_instant);
             next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
         }
         Ok(Self {
@@ -362,8 +369,9 @@ impl EmbeddedTransactor {
         let mut last_instant = last_tx_instant;
         let mut next_user = next_entity_id.max(FIRST_USER_ID);
         for record in records {
+            let tx_instant = effective_tx_instant(&record);
             db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
-            last_instant = last_instant.max(record.tx_instant);
+            last_instant = last_instant.max(tx_instant);
             next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
         }
         Ok(Self {

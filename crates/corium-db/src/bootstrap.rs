@@ -74,16 +74,26 @@ pub fn tx_instant_datom(t: u64, instant: i64) -> Datom {
 #[must_use]
 pub fn asserted_instant(t: u64, datoms: &[Datom]) -> Option<i64> {
     let tx = EntityId::new(Partition::Tx as u32, t);
-    datoms.iter().find_map(|datom| match datom {
-        Datom {
+    let mut asserted = None;
+    for datom in datoms {
+        if let Datom {
             e,
             a,
             v: Value::Instant(instant),
-            added: true,
+            added,
             ..
-        } if *e == tx && *a == TX_INSTANT => Some(*instant),
-        _ => None,
-    })
+        } = datom
+            && *e == tx
+            && *a == TX_INSTANT
+        {
+            if *added {
+                asserted = Some(*instant);
+            } else if asserted == Some(*instant) {
+                asserted = None;
+            }
+        }
+    }
+    asserted
 }
 
 #[cfg(test)]
@@ -106,5 +116,15 @@ mod tests {
         let datoms = vec![tx_instant_datom(7, 1_700_000_000_000)];
         assert_eq!(asserted_instant(7, &datoms), Some(1_700_000_000_000));
         assert_eq!(asserted_instant(8, &datoms), None);
+    }
+
+    #[test]
+    fn asserted_instant_uses_the_final_cardinality_one_value() {
+        let mut datoms = vec![tx_instant_datom(7, 2_000)];
+        let mut retract = tx_instant_datom(7, 2_000);
+        retract.added = false;
+        datoms.push(retract);
+        datoms.push(tx_instant_datom(7, 1_000));
+        assert_eq!(asserted_instant(7, &datoms), Some(1_000));
     }
 }
