@@ -302,6 +302,7 @@ impl StoreSpec {
     ///
     /// # Errors
     /// Returns an error when a local path cannot be represented on the wire.
+    #[cfg_attr(not(feature = "s3"), allow(clippy::unused_async))]
     pub async fn connection_info(
         &self,
         data_dir: &std::path::Path,
