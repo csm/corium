@@ -5,8 +5,9 @@ fact-oriented, with Datalog queries and peer-local query execution — written
 in Rust, paired with [Clojurust](https://github.com/csm/clojurust) for
 EDN/Clojure data handling and database function execution.
 
-The peer also exposes read-only SQL through the `corium-sql` Rust crate and the
-`corium sql` interactive shell; see the [SQL interface](docs/sql.md).
+The peer also exposes SQL through the `corium-sql` Rust crate, a read-only
+`corium sql` shell, and an opt-in PostgreSQL wire server with guarded
+autocommit DML; see the [SQL interface](docs/sql.md).
 `corium tui` opens a full-screen terminal dashboard — query workbench, live
 store metrics, transaction feed, and schema browser; see the
 [operations guide](docs/operations.md#terminal-dashboard-tui).
@@ -76,8 +77,8 @@ processes. Each crate has its own README.
 | [`corium-tx`](crates/corium-tx/README.md) | Transaction expansion, tempid/lookup resolution, schema validation, built-in tx fns |
 | [`corium-db`](crates/corium-db/README.md) | The immutable `Db` value: time views, covering-index access, naming, stats |
 | [`corium-query`](crates/corium-query/README.md) | EDN Datalog compiler/planner/executor, rules, aggregates, Pull, entity API |
-| [`corium-sql`](crates/corium-sql/README.md) | Read-only DataFusion SQL over peer-local `Db` values |
-| [`corium-pgwire`](crates/corium-pgwire/README.md) | PostgreSQL wire-protocol front end for read-only Corium SQL |
+| [`corium-sql`](crates/corium-sql/README.md) | DataFusion SQL and autocommit mutation planning over peer-local `Db` values |
+| [`corium-pgwire`](crates/corium-pgwire/README.md) | PostgreSQL wire-protocol front end for Corium SQL |
 | [`corium-protocol`](crates/corium-protocol/README.md) | protobuf/gRPC definitions, wire value encoding, generated tonic stubs |
 | [`corium-transactor`](crates/corium-transactor/README.md) | Transactor process: pipeline, indexing job, lease/HA, gRPC server, backup |
 | [`corium-peer`](crates/corium-peer/README.md) | Peer library: connection, tx-report handling, segment cache, peer server |

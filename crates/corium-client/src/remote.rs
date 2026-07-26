@@ -81,6 +81,7 @@ impl Peer for RemotePeer {
                 db: self.backend.db_name.clone(),
                 protocol_version: corium_protocol::PROTOCOL_VERSION,
                 tx_data,
+                expected_basis_t: None,
             })
             .await?
             .into_inner();

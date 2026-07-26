@@ -5,7 +5,7 @@ use corium_protocol::codec::encode_edn;
 use corium_query::edn::Edn;
 use corium_query::{QInput, q};
 use corium_transactor::StoreSpec;
-use corium_transactor::node::{NodeConfig, TransactorNode};
+use corium_transactor::node::{NodeConfig, NodeError, TransactorNode};
 
 fn schema() -> Vec<u8> {
     encode_edn(&Edn::Vector(vec![
@@ -69,4 +69,38 @@ async fn mem_backend_runs_the_full_create_transact_read_path() {
     ]);
     let result = q(&query, &[QInput::Db(&db)]).expect("query");
     assert_eq!(result.to_string(), "[[1991]]");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expected_basis_rejects_a_stale_transaction_before_commit() {
+    let mut config = NodeConfig::new(std::path::PathBuf::from("/nonexistent-mem-node"));
+    config.store = StoreSpec::Memory;
+    let node = TransactorNode::open(config).await.expect("open mem node");
+    assert!(node.create_db("mbrainz", &schema()).await.expect("create"));
+
+    let first = node
+        .transact_at("mbrainz", &tx(), Some(0))
+        .await
+        .expect("basis zero is current");
+    assert_eq!(first.basis_t, 1);
+
+    let stale = node
+        .transact_at("mbrainz", &tx(), Some(0))
+        .await
+        .expect_err("stale basis must fail");
+    assert!(matches!(
+        stale,
+        NodeError::BasisMismatch {
+            expected: 0,
+            actual: 1
+        }
+    ));
+    assert_eq!(
+        node.db_state("mbrainz")
+            .await
+            .expect("state")
+            .db()
+            .basis_t(),
+        1
+    );
 }

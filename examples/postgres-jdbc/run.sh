@@ -97,4 +97,19 @@ fi
 POSTGRES_PID=$!
 
 export CORIUM_JDBC_URL="jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${DATABASE}"
-mvn --quiet --file "$EXAMPLE_DIR/pom.xml" compile exec:java
+if command -v mvn >/dev/null 2>&1; then
+  mvn --quiet --file "$EXAMPLE_DIR/pom.xml" compile exec:java
+elif [[ -n "${CORIUM_POSTGRES_JDBC_JAR:-}" ]]; then
+  JAVA_CLASSES="$RUN_DIR/java-classes"
+  mkdir -p "$JAVA_CLASSES"
+  javac \
+    -cp "$CORIUM_POSTGRES_JDBC_JAR" \
+    -d "$JAVA_CLASSES" \
+    "$EXAMPLE_DIR/src/main/java/io/corium/examples/MusicBrainzJdbcExample.java"
+  java \
+    -cp "$JAVA_CLASSES:$CORIUM_POSTGRES_JDBC_JAR" \
+    io.corium.examples.MusicBrainzJdbcExample
+else
+  echo "Maven is unavailable; set CORIUM_POSTGRES_JDBC_JAR to a PgJDBC jar" >&2
+  exit 1
+fi

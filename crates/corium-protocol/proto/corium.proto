@@ -25,6 +25,9 @@ message TransactRequest {
   uint32 protocol_version = 2;
   // Composite-encoded EDN vector of transaction forms (map and list forms).
   bytes tx_data = 3;
+  // When present, commit only if the database is still at this basis.
+  // Peer-local read/modify/write surfaces use this to reject stale plans.
+  optional uint64 expected_basis_t = 4;
 }
 
 message TransactResponse {

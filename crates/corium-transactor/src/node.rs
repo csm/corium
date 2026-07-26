@@ -295,6 +295,14 @@ pub enum NodeError {
     /// Malformed request.
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// A conditional transaction was prepared from a stale database value.
+    #[error("basis changed: expected {expected}, current basis is {actual}")]
+    BasisMismatch {
+        /// Basis supplied by the caller.
+        expected: u64,
+        /// Basis current when the request reached the commit queue.
+        actual: u64,
+    },
     /// A group-commit batch aborted after preparation (durable append,
     /// ownership fence, or metadata publish failed); every batched caller
     /// receives this so it retries. Carries the originating error's text
@@ -313,6 +321,7 @@ struct Naming {
 /// leader that flushes the queue answers `resp`.
 struct CommitRequest {
     forms: Vec<Edn>,
+    expected_basis_t: Option<u64>,
     resp: oneshot::Sender<Result<pb::TransactResponse, NodeError>>,
 }
 
@@ -1330,9 +1339,27 @@ impl TransactorNode {
         name: &str,
         tx_data: &[u8],
     ) -> Result<pb::TransactResponse, NodeError> {
+        self.transact_at(name, tx_data, None).await
+    }
+
+    /// Applies one transaction only if `expected_basis_t` is still current.
+    ///
+    /// An absent expectation preserves the ordinary Corium transaction
+    /// behavior. Conditional callers receive [`NodeError::BasisMismatch`]
+    /// before preparation or durability when another transaction won first.
+    ///
+    /// # Errors
+    /// Returns [`NodeError`] for a stale basis, decode/validation failures,
+    /// lease loss, or storage failures.
+    pub async fn transact_at(
+        &self,
+        name: &str,
+        tx_data: &[u8],
+        expected_basis_t: Option<u64>,
+    ) -> Result<pb::TransactResponse, NodeError> {
         let started = Instant::now();
         let result = self
-            .transact_inner(name, tx_data)
+            .transact_inner(name, tx_data, expected_basis_t)
             .instrument(tracing::info_span!("transact", db = name))
             .await;
         self.metrics.record_tx(started.elapsed(), result.is_ok());
@@ -1346,6 +1373,7 @@ impl TransactorNode {
         &self,
         name: &str,
         tx_data: &[u8],
+        expected_basis_t: Option<u64>,
     ) -> Result<pb::TransactResponse, NodeError> {
         let state = self.db_state(name).await?;
         let decoded = codec::decode_edn(tx_data)?;
@@ -1365,6 +1393,7 @@ impl TransactorNode {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(CommitRequest {
                 forms,
+                expected_basis_t,
                 resp: resp_tx,
             });
         let queued = self.metrics.queue_waiter();
@@ -1442,6 +1471,15 @@ impl TransactorNode {
         let mut measure = Vec::new();
         let mut naming_changed = false;
         while let Some(request) = batch.pop_front() {
+            if let Some(expected) = request.expected_basis_t {
+                let actual = cursor.db().basis_t();
+                if actual != expected {
+                    let _ = request
+                        .resp
+                        .send(Err(NodeError::BasisMismatch { expected, actual }));
+                    continue;
+                }
+            }
             // Expand `:db/fn` against the staging value, so each transaction
             // sees the earlier ones in the batch. The expander blocks up to
             // its budget, so it runs off the async workers.
