@@ -262,10 +262,13 @@ mod tests {
 
     use super::*;
 
+    #[allow(clippy::too_many_lines)]
     fn fixture() -> Db {
         let name = EntityId::from_raw(10);
         let tags = EntityId::from_raw(11);
         let release_year = EntityId::from_raw(12);
+        let status = EntityId::from_raw(13);
+        let uuid = EntityId::from_raw(14);
         let mut schema = Schema::default();
         schema.insert(Attribute {
             id: name,
@@ -294,10 +297,30 @@ mod tests {
             indexed: true,
             no_history: false,
         });
+        schema.insert(Attribute {
+            id: status,
+            value_type: ValueType::Str,
+            cardinality: Cardinality::One,
+            unique: None,
+            is_component: false,
+            indexed: false,
+            no_history: false,
+        });
+        schema.insert(Attribute {
+            id: uuid,
+            value_type: ValueType::Uuid,
+            cardinality: Cardinality::One,
+            unique: None,
+            is_component: false,
+            indexed: false,
+            no_history: false,
+        });
         let mut idents = Idents::default();
         idents.insert(Keyword::parse("artist/name"), name);
         idents.insert(Keyword::parse("artist/tags"), tags);
         idents.insert(Keyword::parse("artist/release-year"), release_year);
+        idents.insert(Keyword::parse("status"), status);
+        idents.insert(Keyword::parse("artist/uuid"), uuid);
         let e = EntityId::from_raw(1_000);
         let second = EntityId::from_raw(1_001);
         let tx = EntityId::from_raw(1);
@@ -420,6 +443,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn untyped_query_parameters_are_coerced_by_expression_context() {
+        let session = SqlSession::new(&fixture()).expect("session");
+        let rows = session
+            .query_params(
+                "SELECT name FROM corium.artist WHERE \"release-year\" = $1",
+                &[SqlValue::Unspecified("2011".into())],
+            )
+            .await
+            .expect("contextual parameter")
+            .collect()
+            .await
+            .expect("rows");
+        assert_eq!(rows, vec![vec![SqlValue::Text("Tycho".into())]]);
+    }
+
+    #[tokio::test]
     async fn wide_table_exposes_lists_with_set_semantics() {
         let session = SqlSession::new(&fixture()).expect("session");
         let query = session
@@ -518,6 +557,112 @@ mod tests {
         let returned = mutation.finish(&after, &tempids).await.expect("returning");
         assert_eq!(returned.rows.len(), 1);
         assert_eq!(returned.rows[0][1], SqlValue::Text("Autechre".into()));
+    }
+
+    #[tokio::test]
+    async fn insert_select_and_global_projection_writes_are_supported() {
+        let db = fixture();
+        let copied = SqlSession::new(&db)
+            .expect("session")
+            .mutation(
+                "INSERT INTO corium.artist (name, \"release-year\") \
+                 SELECT name || ' Copy', \"release-year\" \
+                 FROM corium.artist WHERE name = 'Tycho' RETURNING name",
+            )
+            .await
+            .expect("insert-select plan")
+            .expect("mutation");
+        let (after_copy, tempids) = apply_mutation(&db, &copied);
+        let returned = copied
+            .finish(&after_copy, &tempids)
+            .await
+            .expect("returning");
+        assert_eq!(
+            returned.rows,
+            vec![vec![SqlValue::Text("Tycho Copy".into())]]
+        );
+
+        let global = SqlSession::new(&after_copy)
+            .expect("session")
+            .mutation("INSERT INTO corium._global (status) VALUES ('active') RETURNING status")
+            .await
+            .expect("global plan")
+            .expect("mutation");
+        let (after_global, tempids) = apply_mutation(&after_copy, &global);
+        let returned = global
+            .finish(&after_global, &tempids)
+            .await
+            .expect("global returning");
+        assert_eq!(returned.rows, vec![vec![SqlValue::Text("active".into())]]);
+    }
+
+    #[tokio::test]
+    async fn mutation_identifiers_follow_postgres_case_and_duplicate_rules() {
+        let db = fixture();
+        let mutation = SqlSession::new(&db)
+            .expect("session")
+            .mutation(
+                "UPDATE CORIUM.ARTIST SET NAME = 'BoC' \
+                 WHERE name = 'Boards of Canada'",
+            )
+            .await
+            .expect("unquoted identifiers normalize")
+            .expect("mutation");
+        assert_eq!(mutation.affected(), 1);
+
+        assert!(
+            SqlSession::new(&db)
+                .expect("session")
+                .mutation("UPDATE corium.artist SET name = 'a', name = 'b'")
+                .await
+                .is_err()
+        );
+        assert!(
+            SqlSession::new(&db)
+                .expect("session")
+                .mutation("INSERT INTO corium.artist (name, NAME) VALUES ('a', 'b')")
+                .await
+                .is_err()
+        );
+        assert!(
+            SqlSession::new(&db)
+                .expect("session")
+                .mutation("UPDATE corium.\"Artist\" SET name = 'a'")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn untyped_parameters_coerce_to_targets_and_uuid_is_strict() {
+        let db = fixture();
+        let session = SqlSession::new(&db).expect("session");
+        let mutation = session
+            .mutation_params(
+                "UPDATE corium.artist SET \"release-year\" = $1, uuid = $2 \
+                 WHERE name = 'Tycho'",
+                &[
+                    SqlValue::Unspecified("2024".into()),
+                    SqlValue::Unspecified("123e4567-e89b-12d3-a456-426614174000".into()),
+                ],
+            )
+            .await
+            .expect("untyped coercion")
+            .expect("mutation");
+        assert_eq!(mutation.affected(), 1);
+
+        for malformed in ["1", "+123e4567e89b12d3a456426614174000", "123e4567"] {
+            assert!(
+                session
+                    .mutation_params(
+                        "UPDATE corium.artist SET uuid = $1 WHERE name = 'Tycho'",
+                        &[SqlValue::Unspecified(malformed.into())],
+                    )
+                    .await
+                    .is_err(),
+                "accepted malformed UUID {malformed:?}"
+            );
+        }
     }
 
     #[tokio::test]

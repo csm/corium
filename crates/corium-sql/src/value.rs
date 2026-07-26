@@ -99,6 +99,9 @@ pub enum SqlValue {
     Float(f64),
     /// Milliseconds since the Unix epoch.
     TimestampMillis(i64),
+    /// Untyped `PostgreSQL` text awaiting coercion by the SQL expression or
+    /// mutation target that consumes it.
+    Unspecified(String),
     /// UTF-8 text.
     Text(String),
     /// Arbitrary bytes.
@@ -124,7 +127,9 @@ impl SqlValue {
             Self::TimestampMillis(value) => {
                 ScalarValue::TimestampMillisecond(Some(*value), Some("UTC".into()))
             }
-            Self::Text(value) | Self::Other(value) => ScalarValue::Utf8(Some(value.clone())),
+            Self::Unspecified(value) | Self::Text(value) | Self::Other(value) => {
+                ScalarValue::Utf8(Some(value.clone()))
+            }
             Self::Bytes(value) => ScalarValue::Binary(Some(value.clone())),
             Self::List(values) => {
                 let scalars = values
@@ -211,7 +216,9 @@ impl fmt::Display for SqlValue {
             Self::Integer(value) | Self::TimestampMillis(value) => write!(formatter, "{value}"),
             Self::Unsigned(value) => write!(formatter, "{value}"),
             Self::Float(value) => write!(formatter, "{value}"),
-            Self::Text(value) | Self::Other(value) => formatter.write_str(value),
+            Self::Unspecified(value) | Self::Text(value) | Self::Other(value) => {
+                formatter.write_str(value)
+            }
             Self::Bytes(value) => {
                 for byte in value {
                     write!(formatter, "{byte:02x}")?;

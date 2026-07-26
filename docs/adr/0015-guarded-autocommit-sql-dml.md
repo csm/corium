@@ -25,7 +25,10 @@ them. It does not commit. The transactor protocol accepts an optional expected
 basis and rejects a mismatch before preparing or durably writing the
 transaction. Because an older transactor would ignore the unknown optional
 field and lose that safety property, this change advances Corium's checked
-protocol version from 1 to 2; peers and transactors must be upgraded together.
+protocol version from 1 to 2. New transactors accept both v1 and v2 clients,
+but new clients continue to send v2 and are rejected by old transactors before
+the optional fence can be ignored. Deployments therefore upgrade transactors
+first, followed by peers and clients.
 
 `corium-pgwire` connects that planner to a new, optional `DbCatalog::transact`
 operation. The CLI implementation sends the forms through its cached

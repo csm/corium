@@ -21,7 +21,8 @@ Defines how the transactor, peers, and thin clients talk to each other:
   decisions on surfaces that cannot apply them yet; see
   [`docs/design/auth.md`](../../docs/design/auth.md).
 - `PROTOCOL_VERSION` — the version this crate speaks (currently `2`; version
-  2 adds conditional transaction basis fencing).
+  2 adds conditional transaction basis fencing). Servers also publish a
+  `MIN_SUPPORTED_PROTOCOL_VERSION` and currently accept version 1 clients.
 
 ## Dependencies
 

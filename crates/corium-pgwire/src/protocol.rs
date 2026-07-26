@@ -300,18 +300,23 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
         self.frame(b'Z', |body| body.push(status));
     }
 
-    /// `RowDescription` for a result's columns (always text format).
-    pub(crate) fn row_description(&mut self, fields: &[FieldDescription]) {
+    /// `RowDescription` for a result's columns in the supplied formats.
+    pub(crate) fn row_description_with_formats(
+        &mut self,
+        fields: &[FieldDescription],
+        formats: &[i16],
+    ) {
+        debug_assert_eq!(fields.len(), formats.len());
         self.frame(b'T', |body| {
             put_i16(body, i16::try_from(fields.len()).unwrap_or(i16::MAX));
-            for field in fields {
+            for (field, format) in fields.iter().zip(formats) {
                 put_cstr(body, &field.name);
                 body.extend_from_slice(&0i32.to_be_bytes()); // table OID
                 put_i16(body, 0); // column attribute number
                 body.extend_from_slice(&field.type_oid.to_be_bytes());
                 put_i16(body, field.type_len);
                 body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-                put_i16(body, 0); // text format
+                put_i16(body, *format);
             }
         });
     }

@@ -13,9 +13,9 @@
 //! connections.
 //!
 //! Both simple and extended query sub-protocols are supported, including
-//! typed bound inputs. Results use text format. Mutations are autocommit-only:
-//! explicit transaction blocks allow reads but reject writes until atomic
-//! multi-statement transactions are implemented.
+//! typed bound inputs and text or binary results. Mutations are
+//! autocommit-only: explicit transaction blocks allow reads but reject writes
+//! until atomic multi-statement transactions are implemented.
 
 mod protocol;
 mod types;
@@ -55,6 +55,10 @@ pub enum CatalogError {
     /// The configured Corium principal is not allowed to transact.
     #[error("{0}")]
     Denied(String),
+    /// The remote component does not support the requested write capability
+    /// or protocol version.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Result of a catalog transaction, synchronized through its committed basis.
@@ -166,6 +170,7 @@ struct Portal {
     sql: String,
     database: Option<String>,
     params: Vec<corium_sql::SqlValue>,
+    result_formats: Vec<i16>,
 }
 
 struct PreparedStatement {
@@ -223,6 +228,11 @@ struct ConnectionSession<R, W, C> {
     /// prevents a `BEGIN; INSERT ...; COMMIT` sequence from appearing atomic
     /// while actually committing the insert immediately.
     in_transaction: bool,
+    /// Whether an error has aborted the current explicit transaction.
+    transaction_failed: bool,
+    /// The immutable database value pinned by the first read in the current
+    /// explicit transaction.
+    transaction_db: Option<(String, Db)>,
 }
 
 impl<R, W, C> ConnectionSession<R, W, C>
@@ -247,6 +257,8 @@ where
             portals: HashMap::new(),
             failed: false,
             in_transaction: false,
+            transaction_failed: false,
+            transaction_db: None,
         }
     }
 
@@ -382,23 +394,28 @@ where
     /// Runs one simple-protocol statement. Returns `false` when an error was
     /// reported and the rest of the query string should be abandoned.
     async fn run_simple_statement(&mut self, sql: &str) -> std::io::Result<bool> {
-        match classify(sql) {
+        let statement = classify(sql);
+        if self.transaction_failed && !matches!(&statement, Statement::Rollback) {
+            self.report_transaction_aborted();
+            return Ok(false);
+        }
+        match statement {
             Statement::Control(tag) => {
                 self.writer.command_complete(tag);
                 Ok(true)
             }
             Statement::Begin => {
-                self.in_transaction = true;
+                self.begin_transaction();
                 self.writer.command_complete("BEGIN");
                 Ok(true)
             }
             Statement::Commit => {
-                self.in_transaction = false;
+                self.end_transaction();
                 self.writer.command_complete("COMMIT");
                 Ok(true)
             }
             Statement::Rollback => {
-                self.in_transaction = false;
+                self.end_transaction();
                 self.writer.command_complete("ROLLBACK");
                 Ok(true)
             }
@@ -412,7 +429,7 @@ where
                     Ok(false)
                 }
             },
-            Statement::ShowDatabases => match self.show_databases().await {
+            Statement::ShowDatabases => match self.show_databases(true, &[]).await {
                 Ok(()) => Ok(true),
                 Err(error) => {
                     self.report_dispatch(&error);
@@ -427,7 +444,7 @@ where
                         return Ok(false);
                     }
                 };
-                match self.run_statement(&db, sql, &[], true).await {
+                match self.run_statement(&db, sql, &[], true, &[]).await {
                     Ok(rows) => {
                         self.writer.command_complete(&command_tag(sql, rows));
                         Ok(true)
@@ -454,7 +471,7 @@ where
                         return Ok(false);
                     }
                 };
-                match self.run_mutation(&database, &db, sql, &[], true).await {
+                match self.run_mutation(&database, &db, sql, &[], true, &[]).await {
                     Ok((kind, rows)) => {
                         self.writer
                             .command_complete(&mutation_command_tag(kind, rows));
@@ -500,8 +517,8 @@ where
         if self.failed {
             return;
         }
-        if result_formats.contains(&1) {
-            self.fail_extended("0A000", "binary result format is not supported");
+        if result_formats.iter().any(|format| !matches!(format, 0 | 1)) {
+            self.fail_extended("08P01", "result format code must be zero or one");
             return;
         }
         let Some(prepared) = self.statements.get(statement) else {
@@ -539,6 +556,7 @@ where
                 sql: prepared.sql.clone(),
                 database: self.current_db.clone(),
                 params,
+                result_formats: result_formats.to_vec(),
             },
         );
         self.writer.bind_complete();
@@ -549,7 +567,7 @@ where
             return Ok(());
         }
         // `Describe` of a prepared statement first reports its parameters.
-        let (sql, database, params) = if kind == b'S' {
+        let (sql, database, params, result_formats) = if kind == b'S' {
             let Some((sql, parameter_types)) = self
                 .statements
                 .get(name)
@@ -570,7 +588,7 @@ where
                     return Ok(());
                 }
             };
-            (sql, self.current_db.clone(), params)
+            (sql, self.current_db.clone(), params, Vec::new())
         } else {
             let Some(portal) = self.portals.get(name) else {
                 self.fail_extended("34000", "portal does not exist");
@@ -580,10 +598,13 @@ where
                 portal.sql.clone(),
                 portal.database.clone(),
                 portal.params.clone(),
+                portal.result_formats.clone(),
             )
         };
         match classify(&sql) {
-            Statement::ShowDatabases => self.writer.row_description(&[database_field()]),
+            Statement::ShowDatabases => {
+                self.write_row_description(&[database_field()], &result_formats);
+            }
             Statement::Query if !sql.trim().is_empty() => {
                 let db = match self.snapshot(database.as_deref()).await {
                     Ok(db) => db,
@@ -593,7 +614,9 @@ where
                     }
                 };
                 match self.describe_columns(&db, &sql, &params).await {
-                    Ok(fields) => self.writer.row_description(&fields),
+                    Ok(fields) => {
+                        self.write_row_description(&fields, &result_formats);
+                    }
                     Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
                 }
             }
@@ -608,9 +631,12 @@ where
                 match SqlSession::new(&db) {
                     Ok(session) => match session.mutation_columns(&sql, &params).await {
                         Ok(Some(columns)) if columns.is_empty() => self.writer.no_data(),
-                        Ok(Some(columns)) => self
-                            .writer
-                            .row_description(&columns.iter().map(field_of).collect::<Vec<_>>()),
+                        Ok(Some(columns)) => {
+                            self.write_row_description(
+                                &columns.iter().map(field_of).collect::<Vec<_>>(),
+                                &result_formats,
+                            );
+                        }
                         Ok(None) => self.writer.no_data(),
                         Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
                     },
@@ -626,13 +652,16 @@ where
         if self.failed {
             return Ok(());
         }
-        let Some((sql, database, params)) = self.portals.get(portal).map(|portal| {
-            (
-                portal.sql.clone(),
-                portal.database.clone(),
-                portal.params.clone(),
-            )
-        }) else {
+        let Some((sql, database, params, result_formats)) =
+            self.portals.get(portal).map(|portal| {
+                (
+                    portal.sql.clone(),
+                    portal.database.clone(),
+                    portal.params.clone(),
+                    portal.result_formats.clone(),
+                )
+            })
+        else {
             self.fail_extended("34000", "portal does not exist");
             return Ok(());
         };
@@ -640,18 +669,26 @@ where
             self.writer.empty_query_response();
             return Ok(());
         }
-        match classify(&sql) {
+        let statement = classify(&sql);
+        if self.transaction_failed && !matches!(&statement, Statement::Rollback) {
+            self.fail_extended(
+                "25P02",
+                "current transaction is aborted; commands ignored until end of transaction block",
+            );
+            return Ok(());
+        }
+        match statement {
             Statement::Control(tag) => self.writer.command_complete(tag),
             Statement::Begin => {
-                self.in_transaction = true;
+                self.begin_transaction();
                 self.writer.command_complete("BEGIN");
             }
             Statement::Commit => {
-                self.in_transaction = false;
+                self.end_transaction();
                 self.writer.command_complete("COMMIT");
             }
             Statement::Rollback => {
-                self.in_transaction = false;
+                self.end_transaction();
                 self.writer.command_complete("ROLLBACK");
             }
             Statement::Use(name) => match self.use_database(&name).await {
@@ -659,7 +696,7 @@ where
                 Err(error) => self.fail_dispatch(&error),
             },
             Statement::ShowDatabases => {
-                if let Err(error) = self.show_databases().await {
+                if let Err(error) = self.show_databases(false, &result_formats).await {
                     self.fail_dispatch(&error);
                 }
             }
@@ -671,7 +708,10 @@ where
                         return Ok(());
                     }
                 };
-                match self.run_statement(&db, &sql, &params, false).await {
+                match self
+                    .run_statement(&db, &sql, &params, false, &result_formats)
+                    .await
+                {
                     Ok(rows) => self.writer.command_complete(&command_tag(&sql, rows)),
                     Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
                 }
@@ -693,7 +733,7 @@ where
                     }
                 };
                 match self
-                    .run_mutation(&database, &db, &sql, &params, false)
+                    .run_mutation(&database, &db, &sql, &params, false, &result_formats)
                     .await
                 {
                     Ok((kind, rows)) => self
@@ -715,9 +755,15 @@ where
     }
 
     /// Emits a one-column `database` result listing the catalog.
-    async fn show_databases(&mut self) -> Result<(), Dispatch> {
+    async fn show_databases(
+        &mut self,
+        with_row_description: bool,
+        result_formats: &[i16],
+    ) -> Result<(), Dispatch> {
         let names = self.catalog.list().await.map_err(Dispatch::Catalog)?;
-        self.writer.row_description(&[database_field()]);
+        if with_row_description {
+            self.write_row_description(&[database_field()], result_formats);
+        }
         for name in &names {
             self.writer.data_row(&[Some(name.clone().into_bytes())]);
         }
@@ -727,16 +773,36 @@ where
 
     /// Resolves an immutable snapshot for `database`, falling back to the
     /// connection's active database.
-    async fn snapshot(&self, database: Option<&str>) -> Result<Db, Dispatch> {
+    async fn snapshot(&mut self, database: Option<&str>) -> Result<Db, Dispatch> {
         let name = database
             .map(str::to_owned)
             .or_else(|| self.current_db.clone())
             .ok_or(Dispatch::NoDatabase)?;
-        self.catalog.db(&name).await.map_err(Dispatch::Catalog)
+        if self.in_transaction {
+            if let Some((pinned_name, pinned)) = &self.transaction_db {
+                if pinned_name != &name {
+                    return Err(Dispatch::Sql(SqlError::Mutation(
+                        "cannot switch databases inside an explicit transaction".into(),
+                    )));
+                }
+                return Ok(pinned.clone());
+            }
+            let db = self.catalog.db(&name).await.map_err(Dispatch::Catalog)?;
+            self.transaction_db = Some((name, db.clone()));
+            Ok(db)
+        } else {
+            self.catalog.db(&name).await.map_err(Dispatch::Catalog)
+        }
     }
 
     fn ready_status(&self) -> u8 {
-        if self.in_transaction { b'T' } else { b'I' }
+        if self.transaction_failed {
+            b'E'
+        } else if self.in_transaction {
+            b'T'
+        } else {
+            b'I'
+        }
     }
 
     /// Plans a query and returns its result columns without streaming rows.
@@ -759,16 +825,28 @@ where
         sql: &str,
         params: &[corium_sql::SqlValue],
         with_row_description: bool,
+        result_formats: &[i16],
     ) -> Result<usize, SqlError> {
         let session = SqlSession::new(db)?;
         let mut query = session.query_params(sql, params).await?;
+        let columns = query.columns().to_vec();
+        let formats = expand_result_formats(result_formats, columns.len())
+            .map_err(|message| SqlError::Mutation(message.into()))?;
         if with_row_description {
-            let fields = query.columns().iter().map(field_of).collect::<Vec<_>>();
-            self.writer.row_description(&fields);
+            let fields = columns.iter().map(field_of).collect::<Vec<_>>();
+            self.writer.row_description_with_formats(&fields, &formats);
         }
         let mut count = 0usize;
         while let Some(row) = query.next_row().await? {
-            let values = row.iter().map(types::encode_value).collect::<Vec<_>>();
+            let values = row
+                .iter()
+                .zip(&columns)
+                .zip(&formats)
+                .map(|((value, column), format)| {
+                    types::encode_result(value, &column.data_type, *format)
+                        .map_err(SqlError::Mutation)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             self.writer.data_row(&values);
             count += 1;
             // Bound peak memory on large results by flushing periodically.
@@ -789,6 +867,7 @@ where
         sql: &str,
         params: &[corium_sql::SqlValue],
         with_row_description: bool,
+        result_formats: &[i16],
     ) -> Result<(MutationKind, usize), Dispatch> {
         let session = SqlSession::new(db).map_err(Dispatch::Sql)?;
         let mutation = session
@@ -814,13 +893,25 @@ where
             .finish(&db_after, &tempids)
             .await
             .map_err(Dispatch::Sql)?;
+        let formats = expand_result_formats(result_formats, returned.columns.len())
+            .map_err(|message| Dispatch::Sql(SqlError::Mutation(message.into())))?;
         if with_row_description && !returned.columns.is_empty() {
-            self.writer
-                .row_description(&returned.columns.iter().map(field_of).collect::<Vec<_>>());
+            self.writer.row_description_with_formats(
+                &returned.columns.iter().map(field_of).collect::<Vec<_>>(),
+                &formats,
+            );
         }
         for row in returned.rows {
-            self.writer
-                .data_row(&row.iter().map(types::encode_value).collect::<Vec<_>>());
+            let values = row
+                .iter()
+                .zip(&returned.columns)
+                .zip(&formats)
+                .map(|((value, column), format)| {
+                    types::encode_result(value, &column.data_type, *format)
+                        .map_err(|message| Dispatch::Sql(SqlError::Mutation(message)))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.writer.data_row(&values);
         }
         Ok((mutation.kind(), mutation.affected()))
     }
@@ -832,6 +923,9 @@ where
             code,
             message: &message,
         });
+        if self.in_transaction {
+            self.transaction_failed = true;
+        }
     }
 
     /// Emits an `ErrorResponse` and enters the skip-until-`Sync` state.
@@ -845,6 +939,35 @@ where
     fn fail_extended(&mut self, code: &str, message: &str) {
         self.writer.error_response(&ErrorFields { code, message });
         self.failed = true;
+        if self.in_transaction {
+            self.transaction_failed = true;
+        }
+    }
+
+    fn report_transaction_aborted(&mut self) {
+        self.writer.error_response(&ErrorFields {
+            code: "25P02",
+            message: "current transaction is aborted; commands ignored until end of transaction block",
+        });
+    }
+
+    fn begin_transaction(&mut self) {
+        self.in_transaction = true;
+        self.transaction_failed = false;
+        self.transaction_db = None;
+    }
+
+    fn end_transaction(&mut self) {
+        self.in_transaction = false;
+        self.transaction_failed = false;
+        self.transaction_db = None;
+    }
+
+    fn write_row_description(&mut self, fields: &[FieldDescription], requested: &[i16]) {
+        match expand_result_formats(requested, fields.len()) {
+            Ok(formats) => self.writer.row_description_with_formats(fields, &formats),
+            Err(message) => self.fail_extended("08P01", message),
+        }
     }
 }
 
@@ -881,6 +1004,7 @@ fn dispatch_error_fields(error: &Dispatch) -> (&'static str, String) {
         Dispatch::Catalog(error @ CatalogError::Conflict(_)) => ("40001", error.to_string()),
         Dispatch::Catalog(error @ CatalogError::Rejected(_)) => ("23000", error.to_string()),
         Dispatch::Catalog(error @ CatalogError::Denied(_)) => ("42501", error.to_string()),
+        Dispatch::Catalog(error @ CatalogError::Unsupported(_)) => ("0A000", error.to_string()),
         Dispatch::Sql(error) => (sqlstate_for(error), error.to_string()),
     }
 }
@@ -928,15 +1052,26 @@ fn expand_formats(formats: &[i16], count: usize) -> Result<Vec<i16>, &'static st
     }
 }
 
+fn expand_result_formats(formats: &[i16], count: usize) -> Result<Vec<i16>, &'static str> {
+    match formats {
+        [] => Ok(vec![0; count]),
+        [format] => Ok(vec![*format; count]),
+        formats if formats.len() == count => Ok(formats.to_vec()),
+        _ => Err("result format count must be zero, one, or the result column count"),
+    }
+}
+
 /// Returns the largest `PostgreSQL` positional placeholder (`$1`, `$2`, ...).
-/// Quoted strings and identifiers are skipped so their contents do not affect
-/// the protocol parameter count.
+/// Strings, identifiers, comments, and dollar-quoted bodies are skipped so
+/// their contents do not affect the protocol parameter count.
 fn placeholder_count(sql: &str) -> usize {
     #[derive(Clone, Copy)]
     enum State {
         Normal,
-        Single,
+        Single { backslash_escapes: bool },
         Double,
+        LineComment,
+        BlockComment(usize),
     }
     let bytes = sql.as_bytes();
     let mut state = State::Normal;
@@ -944,7 +1079,24 @@ fn placeholder_count(sql: &str) -> usize {
     let mut index = 0usize;
     while index < bytes.len() {
         match state {
-            State::Normal if bytes[index] == b'\'' => state = State::Single,
+            State::Normal if bytes[index..].starts_with(b"--") => {
+                state = State::LineComment;
+                index += 1;
+            }
+            State::Normal if bytes[index..].starts_with(b"/*") => {
+                state = State::BlockComment(1);
+                index += 1;
+            }
+            State::Normal if bytes[index] == b'\'' => {
+                let backslash_escapes = index > 0
+                    && matches!(bytes[index - 1], b'e' | b'E')
+                    && (index < 2
+                        || !matches!(
+                            bytes[index - 2],
+                            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'
+                        ));
+                state = State::Single { backslash_escapes };
+            }
             State::Normal if bytes[index] == b'"' => state = State::Double,
             State::Normal if bytes[index] == b'$' => {
                 let start = index + 1;
@@ -957,9 +1109,22 @@ fn placeholder_count(sql: &str) -> usize {
                 {
                     count = count.max(number);
                     index = end - 1;
+                } else if let Some(delimiter_end) = dollar_quote_end(bytes, index) {
+                    let delimiter = &bytes[index..delimiter_end];
+                    let body_start = delimiter_end;
+                    if let Some(offset) = find_bytes(&bytes[body_start..], delimiter) {
+                        index = body_start + offset + delimiter.len() - 1;
+                    } else {
+                        index = bytes.len();
+                    }
                 }
             }
-            State::Single if bytes[index] == b'\'' => {
+            State::Single {
+                backslash_escapes: true,
+            } if bytes[index] == b'\\' => {
+                index += usize::from(index + 1 < bytes.len());
+            }
+            State::Single { .. } if bytes[index] == b'\'' => {
                 if bytes.get(index + 1) == Some(&b'\'') {
                     index += 1;
                 } else {
@@ -973,11 +1138,57 @@ fn placeholder_count(sql: &str) -> usize {
                     state = State::Normal;
                 }
             }
-            State::Normal | State::Single | State::Double => {}
+            State::LineComment if matches!(bytes[index], b'\r' | b'\n') => {
+                state = State::Normal;
+            }
+            State::BlockComment(depth) if bytes[index..].starts_with(b"/*") => {
+                state = State::BlockComment(depth + 1);
+                index += 1;
+            }
+            State::BlockComment(depth) if bytes[index..].starts_with(b"*/") => {
+                state = if depth == 1 {
+                    State::Normal
+                } else {
+                    State::BlockComment(depth - 1)
+                };
+                index += 1;
+            }
+            State::Normal
+            | State::Single { .. }
+            | State::Double
+            | State::LineComment
+            | State::BlockComment(_) => {}
         }
         index += 1;
     }
     count
+}
+
+fn dollar_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = start + 1;
+    if bytes.get(end) == Some(&b'$') {
+        return Some(end + 1);
+    }
+    if !bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        return None;
+    }
+    end += 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    (bytes.get(end) == Some(&b'$')).then_some(end + 1)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Classifies a statement so `USE`, `SHOW DATABASES`, and no-op control
@@ -1194,5 +1405,17 @@ mod tests {
     fn command_tag_counts_selects_and_names_explains() {
         assert_eq!(command_tag("SELECT * FROM t", 7), "SELECT 7");
         assert_eq!(command_tag("EXPLAIN SELECT 1", 3), "EXPLAIN");
+    }
+
+    #[test]
+    fn placeholder_count_skips_every_postgres_quoting_form() {
+        let sql = r#"
+            SELECT $2, '$99', E'escaped \' $98', "$97",
+                   $$ body $96 $$, $tag$ body $95 $tag$
+            -- $94
+            /* $93 /* nested $92 */ still comment */
+            WHERE value = $7
+        "#;
+        assert_eq!(placeholder_count(sql), 7);
     }
 }

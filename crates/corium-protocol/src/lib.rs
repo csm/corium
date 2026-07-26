@@ -17,6 +17,12 @@ pub use corium_forms::{schemaform, txforms};
 /// Protocol version spoken by this crate.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Oldest protocol version accepted by this crate's servers.
+///
+/// Version 1 clients cannot request a transaction basis fence, but remain
+/// safe for operations that predate that optional field.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+
 /// Generated protobuf/tonic bindings for `corium.v1`.
 #[allow(
     missing_docs,

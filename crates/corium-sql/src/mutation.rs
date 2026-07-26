@@ -1,6 +1,6 @@
 //! Translation of SQL DML into ordinary Corium transaction forms.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{Attribute, Cardinality, EntityId, Keyword, TotalF64, Value, ValueType};
 use corium_db::{Db, DbView};
@@ -137,18 +137,27 @@ impl SqlMutation {
         };
         let session = SqlSession::new(db_after)?;
         let mut result = SqlMutationResult::default();
-        for selector in &self.entities {
-            let entity = match selector {
-                EntitySelector::Id(entity) => *entity,
-                EntitySelector::Temp(temp) => *tempids.get(temp).ok_or_else(|| {
-                    SqlError::Mutation(format!("transactor did not resolve SQL tempid {temp:?}"))
-                })?,
-            };
-            let sql = format!(
-                "SELECT {returning} FROM {} WHERE e = {}",
-                self.table,
-                entity.raw()
-            );
+        let entities = self
+            .entities
+            .iter()
+            .map(|selector| {
+                Ok(match selector {
+                    EntitySelector::Id(entity) => *entity,
+                    EntitySelector::Temp(temp) => *tempids.get(temp).ok_or_else(|| {
+                        SqlError::Mutation(format!(
+                            "transactor did not resolve SQL tempid {temp:?}"
+                        ))
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, SqlError>>()?;
+        for chunk in entities.chunks(1_024) {
+            let ids = chunk
+                .iter()
+                .map(|entity| entity.raw().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("SELECT {returning} FROM {} WHERE e IN ({ids})", self.table);
             let query = session.query_params(&sql, &self.params).await?;
             if result.columns.is_empty() {
                 result.columns = query.columns().to_vec();
@@ -289,6 +298,7 @@ async fn plan_insert(
         .iter()
         .map(column_name)
         .collect::<Result<Vec<_>, _>>()?;
+    reject_duplicate_columns(&columns, "INSERT")?;
     let mut forms = Vec::with_capacity(values.len());
     let mut entities = Vec::with_capacity(values.len());
     for (row_index, row) in values.into_iter().enumerate() {
@@ -372,11 +382,17 @@ async fn plan_update(
     let table_name = table_factor_name(&update.table.relation)?;
     let target = target(db, table_name)?;
     let mut assignments = Vec::with_capacity(update.assignments.len());
+    let mut assigned = BTreeSet::new();
     for assignment in &update.assignments {
         let AssignmentTarget::ColumnName(name) = &assignment.target else {
             return Err(unsupported("tuple assignment is not supported"));
         };
         let column = column_name(name)?;
+        if !assigned.insert(column.clone()) {
+            return Err(SqlError::Mutation(format!(
+                "column {column:?} is assigned more than once"
+            )));
+        }
         if column == "e" {
             return Err(SqlError::Mutation("entity column e is immutable".into()));
         }
@@ -473,15 +489,12 @@ async fn plan_delete(
         params,
     )
     .await?;
-    let entities = entity_rows
+    let entity_ids = entity_rows
         .iter()
-        .map(|row| entity_id(&row[0]).map(EntitySelector::Id))
+        .map(|row| entity_id(&row[0]))
         .collect::<Result<Vec<_>, _>>()?;
     let mut forms = Vec::new();
-    for selector in &entities {
-        let EntitySelector::Id(entity) = selector else {
-            unreachable!()
-        };
+    for entity in &entity_ids {
         for projected in target.attributes.values() {
             for old in db.values(*entity, projected.id) {
                 forms.push(retract(*entity, projected, value_to_edn(db, &old)?)?);
@@ -500,10 +513,11 @@ async fn plan_delete(
             .await?,
         ),
     };
+    let entities = entity_ids.iter().copied().map(EntitySelector::Id).collect();
     Ok(SqlMutation {
         kind: MutationKind::Delete,
         expected_basis_t: db.basis_t(),
-        affected: entities.len(),
+        affected: entity_ids.len(),
         forms,
         table: target.sql_name,
         entities,
@@ -519,7 +533,7 @@ fn target(db: &Db, name: &ObjectName) -> Result<Target, SqlError> {
         .iter()
         .map(|part| {
             part.as_ident()
-                .map(|ident| ident.value.clone())
+                .map(normalized_ident)
                 .ok_or_else(|| unsupported("dynamic table names are not supported"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -528,7 +542,7 @@ fn target(db: &Db, name: &ObjectName) -> Result<Target, SqlError> {
             "writable tables must be named corium.<namespace>".into(),
         ));
     };
-    if !schema.eq_ignore_ascii_case("corium") {
+    if schema != "corium" {
         return Err(SqlError::Mutation(
             "only corium namespace projections are writable".into(),
         ));
@@ -573,8 +587,28 @@ fn column_name(name: &ObjectName) -> Result<String, SqlError> {
         return Err(unsupported("qualified mutation columns are not supported"));
     };
     part.as_ident()
-        .map(|ident| ident.value.clone())
+        .map(normalized_ident)
         .ok_or_else(|| unsupported("dynamic column names are not supported"))
+}
+
+fn normalized_ident(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_none() {
+        ident.value.to_ascii_lowercase()
+    } else {
+        ident.value.clone()
+    }
+}
+
+fn reject_duplicate_columns(columns: &[String], statement: &str) -> Result<(), SqlError> {
+    let mut seen = BTreeSet::new();
+    for column in columns {
+        if !seen.insert(column) {
+            return Err(SqlError::Mutation(format!(
+                "{statement} column {column:?} is specified more than once"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn desired_values(
@@ -609,6 +643,20 @@ fn desired_values(
 }
 
 fn sql_value(db: &Db, projected: &Projected, value: &SqlValue) -> Result<Value, SqlError> {
+    if let SqlValue::Unspecified(value) = value {
+        return sql_unspecified(db, projected, value);
+    }
+    // DataFusion resolves an unknown placeholder used as a standalone
+    // assignment expression to UTF-8. Apply PostgreSQL-style assignment
+    // coercion for non-text targets after evaluating that expression.
+    if let SqlValue::Text(value) = value
+        && !matches!(
+            projected.attribute.value_type,
+            ValueType::Uuid | ValueType::Keyword | ValueType::Str
+        )
+    {
+        return sql_unspecified(db, projected, value);
+    }
     let out = match (projected.attribute.value_type, value) {
         (ValueType::Bool, SqlValue::Boolean(value)) => Value::Bool(*value),
         (ValueType::Long, SqlValue::Integer(value)) => Value::Long(*value),
@@ -621,15 +669,19 @@ fn sql_value(db: &Db, projected: &Projected, value: &SqlValue) -> Result<Value, 
             let value = *value as f64;
             Value::Double(TotalF64(value))
         }
+        (ValueType::Double, SqlValue::Unsigned(value)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let value = *value as f64;
+            Value::Double(TotalF64(value))
+        }
         (ValueType::Instant, SqlValue::TimestampMillis(value) | SqlValue::Integer(value)) => {
             Value::Instant(*value)
         }
+        (ValueType::Instant, SqlValue::Unsigned(value)) => {
+            Value::Instant(i64::try_from(*value).map_err(|_| type_error(projected, "a TIMESTAMP"))?)
+        }
         (ValueType::Uuid, SqlValue::Text(value)) => {
-            let compact = value.replace('-', "");
-            Value::Uuid(
-                u128::from_str_radix(&compact, 16)
-                    .map_err(|_| type_error(projected, "a UUID string"))?,
-            )
+            Value::Uuid(parse_uuid(value).ok_or_else(|| type_error(projected, "a UUID string"))?)
         }
         (ValueType::Keyword, SqlValue::Text(value)) => {
             let keyword = Keyword::parse(value.strip_prefix(':').unwrap_or(value));
@@ -654,6 +706,72 @@ fn sql_value(db: &Db, projected: &Projected, value: &SqlValue) -> Result<Value, 
         }
     };
     Ok(out)
+}
+
+fn sql_unspecified(db: &Db, projected: &Projected, value: &str) -> Result<Value, SqlError> {
+    let parsed = match projected.attribute.value_type {
+        ValueType::Bool => match value.to_ascii_lowercase().as_str() {
+            "t" | "true" | "1" => SqlValue::Boolean(true),
+            "f" | "false" | "0" => SqlValue::Boolean(false),
+            _ => return Err(type_error(projected, "a BOOLEAN")),
+        },
+        ValueType::Long => SqlValue::Integer(
+            value
+                .parse()
+                .map_err(|_| type_error(projected, "a BIGINT"))?,
+        ),
+        ValueType::Double => SqlValue::Float(
+            value
+                .parse()
+                .map_err(|_| type_error(projected, "a DOUBLE"))?,
+        ),
+        ValueType::Instant => SqlValue::TimestampMillis(
+            value
+                .parse()
+                .map_err(|_| type_error(projected, "epoch milliseconds"))?,
+        ),
+        ValueType::Uuid | ValueType::Keyword | ValueType::Str => SqlValue::Text(value.into()),
+        ValueType::Bytes => {
+            let hex = value
+                .strip_prefix("\\x")
+                .ok_or_else(|| type_error(projected, "hex BYTEA text"))?;
+            if !hex.len().is_multiple_of(2) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(type_error(projected, "hex BYTEA text"));
+            }
+            let bytes = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex checked"), 16)
+                        .expect("hex digits checked")
+                })
+                .collect();
+            SqlValue::Bytes(bytes)
+        }
+        ValueType::Ref => SqlValue::Unsigned(
+            value
+                .parse()
+                .map_err(|_| type_error(projected, "an entity id"))?,
+        ),
+    };
+    sql_value(db, projected, &parsed)
+}
+
+fn parse_uuid(value: &str) -> Option<u128> {
+    let bytes = value.as_bytes();
+    let valid_shape = (bytes.len() == 32 && bytes.iter().all(u8::is_ascii_hexdigit))
+        || (bytes.len() == 36
+            && bytes.iter().enumerate().all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => *byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            }));
+    if !valid_shape {
+        return None;
+    }
+    let compact = value.replace('-', "");
+    (compact.len() == 32 && compact.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| u128::from_str_radix(&compact, 16).ok())
+        .flatten()
 }
 
 fn value_to_edn(db: &Db, value: &Value) -> Result<Edn, SqlError> {

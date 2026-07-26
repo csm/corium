@@ -158,6 +158,52 @@ async fn start_server(config: PgWireConfig) -> std::net::SocketAddr {
     address
 }
 
+struct ConflictCatalog {
+    db: Db,
+}
+
+#[async_trait::async_trait]
+impl DbCatalog for ConflictCatalog {
+    async fn list(&self) -> Result<Vec<String>, CatalogError> {
+        Ok(vec!["corium".into()])
+    }
+
+    async fn db(&self, name: &str) -> Result<Db, CatalogError> {
+        if name == "corium" {
+            Ok(self.db.clone())
+        } else {
+            Err(CatalogError::NotFound(name.into()))
+        }
+    }
+
+    async fn transact(
+        &self,
+        _name: &str,
+        expected_basis_t: u64,
+        _forms: Vec<Edn>,
+    ) -> Result<CatalogTxResult, CatalogError> {
+        Err(CatalogError::Conflict(format!(
+            "expected basis {expected_basis_t}; current basis advanced"
+        )))
+    }
+}
+
+async fn start_conflict_server() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let catalog = Arc::new(ConflictCatalog { db: fixture() });
+    tokio::spawn(async move {
+        let _ = serve(
+            listener,
+            catalog,
+            PgWireConfig::default(),
+            std::future::pending::<()>(),
+        )
+        .await;
+    });
+    address
+}
+
 /// A decoded backend message: tag byte and raw body.
 struct Message {
     tag: u8,
@@ -267,6 +313,44 @@ fn row_description_names(body: &[u8]) -> Vec<String> {
         offset = end + 1 + 18;
     }
     names
+}
+
+/// Extracts result format codes from a `RowDescription` message body.
+fn row_description_formats(body: &[u8]) -> Vec<i16> {
+    let count = i16::from_be_bytes([body[0], body[1]]);
+    let mut offset = 2;
+    let mut formats = Vec::new();
+    for _ in 0..count {
+        let end = body[offset..].iter().position(|byte| *byte == 0).unwrap() + offset;
+        let format_at = end + 1 + 16;
+        formats.push(i16::from_be_bytes([body[format_at], body[format_at + 1]]));
+        offset = end + 1 + 18;
+    }
+    formats
+}
+
+/// Extracts raw values from a `DataRow` message body.
+fn data_row_bytes(body: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let count = i16::from_be_bytes([body[0], body[1]]);
+    let mut offset = 2;
+    let mut values = Vec::new();
+    for _ in 0..count {
+        let length = i32::from_be_bytes([
+            body[offset],
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+        ]);
+        offset += 4;
+        if length < 0 {
+            values.push(None);
+        } else {
+            let end = offset + usize::try_from(length).unwrap();
+            values.push(Some(body[offset..end].to_vec()));
+            offset = end;
+        }
+    }
+    values
 }
 
 /// Extracts the text values of a `DataRow` message body.
@@ -453,6 +537,31 @@ async fn autocommit_insert_update_delete_and_returning_use_the_write_catalog() {
 }
 
 #[tokio::test]
+async fn serialization_conflict_is_reported_as_sqlstate_40001() {
+    let address = start_conflict_server().await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query("INSERT INTO corium.artist (name) VALUES ('Racing Writer')")
+        .await;
+    let response = client.read_until_ready().await;
+    let error = response
+        .iter()
+        .find(|message| message.tag == b'E')
+        .expect("serialization error");
+    assert!(
+        cstrings(&error.body)
+            .iter()
+            .any(|field| field.contains("40001"))
+    );
+    assert_eq!(response.last().unwrap().body, vec![b'I']);
+}
+
+#[tokio::test]
 async fn zero_row_update_returning_still_describes_its_result() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
@@ -503,6 +612,73 @@ async fn explicit_transaction_control_updates_wire_status() {
 }
 
 #[tokio::test]
+async fn explicit_transaction_reads_keep_their_first_snapshot() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut first = Client::connect(address).await;
+    first
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    first.read_until_ready().await;
+    let mut second = Client::connect(address).await;
+    second
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    second.read_until_ready().await;
+
+    first
+        .query(
+            "BEGIN; SELECT \"release-year\" FROM corium.artist \
+             WHERE name = 'Boards of Canada'",
+        )
+        .await;
+    let initial = first.read_until_ready().await;
+    assert!(
+        initial
+            .iter()
+            .filter(|message| message.tag == b'D')
+            .any(|row| data_row_values(&row.body) == vec![Some("1998".into())])
+    );
+
+    second
+        .query(
+            "UPDATE corium.artist SET \"release-year\" = 2000 \
+             WHERE name = 'Boards of Canada'",
+        )
+        .await;
+    second.read_until_ready().await;
+
+    first
+        .query(
+            "SELECT \"release-year\" FROM corium.artist \
+             WHERE name = 'Boards of Canada'",
+        )
+        .await;
+    let pinned = first.read_until_ready().await;
+    assert!(
+        pinned
+            .iter()
+            .filter(|message| message.tag == b'D')
+            .any(|row| data_row_values(&row.body) == vec![Some("1998".into())])
+    );
+
+    first.query("ROLLBACK").await;
+    first.read_until_ready().await;
+    first
+        .query(
+            "SELECT \"release-year\" FROM corium.artist \
+             WHERE name = 'Boards of Canada'",
+        )
+        .await;
+    let current = first.read_until_ready().await;
+    assert!(
+        current
+            .iter()
+            .filter(|message| message.tag == b'D')
+            .any(|row| data_row_values(&row.body) == vec![Some("2000".into())])
+    );
+}
+
+#[tokio::test]
 async fn writes_in_explicit_transaction_blocks_are_rejected_without_committing() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
@@ -516,7 +692,16 @@ async fn writes_in_explicit_transaction_blocks_are_rejected_without_committing()
         .await;
     let response = client.read_until_ready().await;
     assert!(response.iter().any(|message| message.tag == b'E'));
-    assert_eq!(response.last().unwrap().body, vec![b'T']);
+    assert_eq!(response.last().unwrap().body, vec![b'E']);
+
+    client.query("SELECT 1").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(response.first().unwrap().tag, b'E');
+    assert!(
+        cstrings(&response.first().unwrap().body)
+            .iter()
+            .any(|field| field.contains("25P02"))
+    );
 
     client.query("ROLLBACK").await;
     let response = client.read_until_ready().await;
@@ -602,6 +787,54 @@ async fn extended_protocol_runs_a_parameterless_query() {
 }
 
 #[tokio::test]
+async fn extended_protocol_returns_requested_binary_results() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"SELECT \"release-year\" FROM corium.artist WHERE name = $1");
+    parse.push(0);
+    parse.extend_from_slice(&1i16.to_be_bytes());
+    parse.extend_from_slice(&25i32.to_be_bytes());
+    client.send(b'P', &parse).await;
+
+    let mut bind = vec![0u8, 0u8];
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&1i16.to_be_bytes());
+    bind.extend_from_slice(&16i32.to_be_bytes());
+    bind.extend_from_slice(b"Boards of Canada");
+    bind.extend_from_slice(&1i16.to_be_bytes());
+    bind.extend_from_slice(&1i16.to_be_bytes());
+    client.send(b'B', &bind).await;
+    client.send(b'D', &[b'P', 0]).await;
+    client.send(b'E', &[0, 0, 0, 0, 0]).await;
+    client.send(b'S', &[]).await;
+
+    let response = client.read_until_ready().await;
+    let description = response
+        .iter()
+        .find(|message| message.tag == b'T')
+        .expect("row description");
+    assert_eq!(row_description_formats(&description.body), vec![1]);
+    let row = response
+        .iter()
+        .find(|message| message.tag == b'D')
+        .expect("binary data row");
+    let values = data_row_bytes(&row.body);
+    let [Some(bytes)] = values.as_slice() else {
+        panic!("one non-null binary value");
+    };
+    assert_eq!(
+        i64::from_be_bytes(bytes.as_slice().try_into().expect("int8")),
+        1998
+    );
+}
+
+#[tokio::test]
 async fn extended_protocol_describes_parameterized_statements_before_bind() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
@@ -684,8 +917,8 @@ async fn extended_protocol_binds_parameters_for_a_mutation() {
     );
     parse.push(0);
     parse.extend_from_slice(&2i16.to_be_bytes());
-    parse.extend_from_slice(&25i32.to_be_bytes()); // text
-    parse.extend_from_slice(&20i32.to_be_bytes()); // int8
+    parse.extend_from_slice(&0i32.to_be_bytes()); // contextually inferred text
+    parse.extend_from_slice(&0i32.to_be_bytes()); // contextually inferred bigint
     client.send(b'P', &parse).await;
 
     let mut bind = vec![0u8, 0u8];

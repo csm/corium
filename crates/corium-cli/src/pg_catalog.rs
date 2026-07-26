@@ -128,10 +128,28 @@ fn map_write_error(error: &PeerError) -> CatalogError {
         PeerError::Rpc(status)
             if matches!(
                 status.code(),
-                Code::PermissionDenied | Code::Unauthenticated | Code::Unimplemented
+                Code::PermissionDenied | Code::Unauthenticated
             ) =>
         {
             CatalogError::Denied(status.message().to_owned())
+        }
+        PeerError::Rpc(status)
+            if status.code() == Code::Unimplemented
+                && status.message().contains("view filtering") =>
+        {
+            CatalogError::Denied(status.message().to_owned())
+        }
+        PeerError::Rpc(status) if status.code() == Code::Unimplemented => {
+            CatalogError::Unsupported(format!(
+                "the connected peer/transactor does not support SQL writes: {}",
+                status.message()
+            ))
+        }
+        PeerError::Rpc(status)
+            if status.code() == Code::FailedPrecondition
+                && status.message().contains("protocol version") =>
+        {
+            CatalogError::Unsupported(status.message().to_owned())
         }
         PeerError::Rpc(status) if status.code() == Code::InvalidArgument => {
             CatalogError::Rejected(status.message().to_owned())
@@ -161,5 +179,30 @@ mod tests {
             panic!("writes default to disabled");
         };
         assert!(matches!(error, CatalogError::ReadOnly(name) if name == "corium"));
+    }
+
+    #[test]
+    fn write_error_mapping_separates_authz_from_missing_capabilities() {
+        let filtered = PeerError::Rpc(tonic::Status::unimplemented(
+            "view filtering is not enforced on this surface yet",
+        ));
+        assert!(matches!(
+            map_write_error(&filtered),
+            CatalogError::Denied(_)
+        ));
+
+        let old_peer = PeerError::Rpc(tonic::Status::unimplemented("unknown RPC method Transact"));
+        assert!(matches!(
+            map_write_error(&old_peer),
+            CatalogError::Unsupported(_)
+        ));
+
+        let old_server = PeerError::Rpc(tonic::Status::failed_precondition(
+            "protocol version 2 is not supported",
+        ));
+        assert!(matches!(
+            map_write_error(&old_server),
+            CatalogError::Unsupported(_)
+        ));
     }
 }

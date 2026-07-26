@@ -50,6 +50,11 @@ service Transactor {
 - Protocol v2 adds `TransactRequest.expected_basis_t`. When present, the
   transactor rejects a stale request before transaction preparation or durable
   append; peer-local read/modify/write adapters use this fence.
+- Version checks use a supported range to permit server-first rolling
+  upgrades. A v2 server accepts v1 clients (which cannot request the new
+  fence); a v2 client still sends version 2 and is rejected by a v1 server
+  before that older server can ignore the fence. Upgrade transactors first,
+  then peers and clients.
 
 #### Future fleet routing
 

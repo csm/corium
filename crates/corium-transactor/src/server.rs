@@ -246,11 +246,14 @@ impl Transactor for TransactorSvc {
 }
 
 fn check_version(version: u32) -> Result<(), Status> {
-    if version == corium_protocol::PROTOCOL_VERSION {
+    if (corium_protocol::MIN_SUPPORTED_PROTOCOL_VERSION..=corium_protocol::PROTOCOL_VERSION)
+        .contains(&version)
+    {
         Ok(())
     } else {
         Err(Status::failed_precondition(format!(
-            "protocol version {version} is not supported; upgrade to {}",
+            "protocol version {version} is not supported; supported range is {}..={}",
+            corium_protocol::MIN_SUPPORTED_PROTOCOL_VERSION,
             corium_protocol::PROTOCOL_VERSION
         )))
     }
@@ -487,6 +490,18 @@ mod tests {
         assert_eq!(
             requested_gc_retention(subsecond),
             Some(std::time::Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn protocol_versions_allow_server_first_rolling_upgrades() {
+        assert!(check_version(corium_protocol::MIN_SUPPORTED_PROTOCOL_VERSION).is_ok());
+        assert!(check_version(corium_protocol::PROTOCOL_VERSION).is_ok());
+        assert_eq!(
+            check_version(corium_protocol::PROTOCOL_VERSION + 1)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
         );
     }
 }

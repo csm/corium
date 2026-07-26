@@ -1,8 +1,8 @@
 //! Mapping between Corium's SQL row model and `PostgreSQL` wire types.
 //!
-//! Results use the text wire format, so a value becomes a `RowDescription`
-//! type OID plus a UTF-8 rendering placed in a `DataRow`. Bound inputs accept
-//! the supported `PostgreSQL` text and binary parameter encodings.
+//! A value becomes a `RowDescription` type OID plus either `PostgreSQL` text or
+//! binary data in a `DataRow`. Bound inputs likewise accept supported text and
+//! binary parameter encodings.
 
 use std::fmt::Write as _;
 
@@ -103,10 +103,160 @@ pub(crate) fn encode_value(value: &SqlValue) -> Option<Vec<u8>> {
         SqlValue::Unsigned(value) => Some(value.to_string().into_bytes()),
         SqlValue::Float(value) => Some(format_float(*value).into_bytes()),
         SqlValue::TimestampMillis(millis) => Some(format_timestamp(*millis).into_bytes()),
-        SqlValue::Text(text) | SqlValue::Other(text) => Some(text.clone().into_bytes()),
+        SqlValue::Unspecified(text) | SqlValue::Text(text) | SqlValue::Other(text) => {
+            Some(text.clone().into_bytes())
+        }
         SqlValue::Bytes(bytes) => Some(format_bytea(bytes).into_bytes()),
         SqlValue::List(values) => Some(format_array(values).into_bytes()),
     }
+}
+
+/// Encodes one value in the requested `PostgreSQL` result format.
+pub(crate) fn encode_result(
+    value: &SqlValue,
+    sql_type: &SqlType,
+    format: i16,
+) -> Result<Option<Vec<u8>>, String> {
+    match format {
+        0 => Ok(encode_value(value)),
+        1 => encode_binary_result(value, sql_type),
+        other => Err(format!("unknown result format code {other}")),
+    }
+}
+
+fn encode_binary_result(value: &SqlValue, sql_type: &SqlType) -> Result<Option<Vec<u8>>, String> {
+    if matches!(value, SqlValue::Null) {
+        return Ok(None);
+    }
+    let oid = type_oid(sql_type);
+    let bytes = match (oid, value) {
+        (OID_BOOL, SqlValue::Boolean(value)) => vec![u8::from(*value)],
+        (OID_INT2, SqlValue::Integer(value)) => i16::try_from(*value)
+            .map_err(|_| "value does not fit PostgreSQL int2")?
+            .to_be_bytes()
+            .to_vec(),
+        (OID_INT4, SqlValue::Integer(value)) => i32::try_from(*value)
+            .map_err(|_| "value does not fit PostgreSQL int4")?
+            .to_be_bytes()
+            .to_vec(),
+        (OID_INT4, SqlValue::Unsigned(value)) => i32::try_from(*value)
+            .map_err(|_| "value does not fit PostgreSQL int4")?
+            .to_be_bytes()
+            .to_vec(),
+        (OID_INT8, SqlValue::Integer(value)) => value.to_be_bytes().to_vec(),
+        (OID_INT8, SqlValue::Unsigned(value)) => i64::try_from(*value)
+            .map_err(|_| "value does not fit PostgreSQL int8")?
+            .to_be_bytes()
+            .to_vec(),
+        (OID_FLOAT4, SqlValue::Float(value)) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let value = *value as f32;
+            value.to_be_bytes().to_vec()
+        }
+        (OID_FLOAT8, SqlValue::Float(value)) => value.to_be_bytes().to_vec(),
+        (OID_TIMESTAMPTZ, SqlValue::TimestampMillis(value)) => value
+            .checked_sub(946_684_800_000)
+            .and_then(|value| value.checked_mul(1_000))
+            .ok_or("timestamp is outside PostgreSQL binary range")?
+            .to_be_bytes()
+            .to_vec(),
+        (OID_NUMERIC, SqlValue::Unsigned(value)) => encode_numeric_u64(*value),
+        (OID_NUMERIC, SqlValue::Integer(value)) => encode_numeric_i64(*value),
+        (OID_BYTEA, SqlValue::Bytes(value)) => value.clone(),
+        (
+            OID_TEXT | OID_VARCHAR,
+            SqlValue::Unspecified(value) | SqlValue::Text(value) | SqlValue::Other(value),
+        ) => value.as_bytes().to_vec(),
+        (_, SqlValue::List(values)) if matches!(sql_type, SqlType::List(_)) => {
+            let SqlType::List(element_type) = sql_type else {
+                unreachable!("guarded")
+            };
+            encode_binary_array(values, element_type)?
+        }
+        _ => {
+            return Err(format!(
+                "cannot encode {value:?} as binary PostgreSQL type OID {oid}"
+            ));
+        }
+    };
+    Ok(Some(bytes))
+}
+
+fn encode_numeric_i64(value: i64) -> Vec<u8> {
+    let negative = value.is_negative();
+    let magnitude = value.unsigned_abs();
+    encode_numeric(magnitude, negative)
+}
+
+fn encode_numeric_u64(value: u64) -> Vec<u8> {
+    encode_numeric(value, false)
+}
+
+fn encode_numeric(mut magnitude: u64, negative: bool) -> Vec<u8> {
+    if magnitude == 0 {
+        return vec![0; 8];
+    }
+    let mut digits = Vec::new();
+    while magnitude != 0 {
+        digits.push(u16::try_from(magnitude % 10_000).expect("base-10000 digit"));
+        magnitude /= 10_000;
+    }
+    digits.reverse();
+    let mut out = Vec::with_capacity(8 + digits.len() * 2);
+    out.extend_from_slice(
+        &i16::try_from(digits.len())
+            .unwrap_or(i16::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(
+        &i16::try_from(digits.len() - 1)
+            .unwrap_or(i16::MAX)
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(&(if negative { 0x4000u16 } else { 0 }).to_be_bytes());
+    out.extend_from_slice(&0i16.to_be_bytes());
+    for digit in digits {
+        out.extend_from_slice(&digit.to_be_bytes());
+    }
+    out
+}
+
+fn encode_binary_array(values: &[SqlValue], element_type: &SqlType) -> Result<Vec<u8>, String> {
+    if values
+        .iter()
+        .any(|value| matches!(value, SqlValue::List(_)))
+    {
+        return Err("nested binary arrays are not supported".into());
+    }
+    let mut out = Vec::new();
+    let dimensions = i32::from(!values.is_empty());
+    out.extend_from_slice(&dimensions.to_be_bytes());
+    out.extend_from_slice(
+        &i32::from(values.iter().any(|value| matches!(value, SqlValue::Null))).to_be_bytes(),
+    );
+    out.extend_from_slice(&type_oid(element_type).to_be_bytes());
+    if !values.is_empty() {
+        out.extend_from_slice(
+            &i32::try_from(values.len())
+                .map_err(|_| "array has too many elements")?
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&1i32.to_be_bytes());
+        for value in values {
+            match encode_binary_result(value, element_type)? {
+                Some(bytes) => {
+                    out.extend_from_slice(
+                        &i32::try_from(bytes.len())
+                            .map_err(|_| "array element is too large")?
+                            .to_be_bytes(),
+                    );
+                    out.extend_from_slice(&bytes);
+                }
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Decodes one bound `PostgreSQL` parameter.
@@ -129,7 +279,8 @@ pub(crate) fn decode_parameter(
 /// before a portal has supplied real parameter values.
 pub(crate) fn describe_parameter(oid: i32) -> Result<SqlValue, String> {
     match oid {
-        0 | OID_TEXT | OID_VARCHAR | OID_UUID => Ok(SqlValue::Text(String::new())),
+        0 => Ok(SqlValue::Unspecified(String::new())),
+        OID_TEXT | OID_VARCHAR | OID_UUID => Ok(SqlValue::Text(String::new())),
         OID_BOOL => Ok(SqlValue::Boolean(false)),
         OID_INT2 | OID_INT4 | OID_INT8 | OID_NUMERIC => Ok(SqlValue::Integer(0)),
         OID_FLOAT4 | OID_FLOAT8 => Ok(SqlValue::Float(0.0)),
@@ -145,7 +296,8 @@ pub(crate) fn describe_parameter(oid: i32) -> Result<SqlValue, String> {
 fn decode_text_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "parameter is not valid UTF-8")?;
     match oid {
-        0 | OID_TEXT | OID_VARCHAR | OID_UUID => Ok(SqlValue::Text(text.to_owned())),
+        0 => Ok(SqlValue::Unspecified(text.to_owned())),
+        OID_TEXT | OID_VARCHAR | OID_UUID => Ok(SqlValue::Text(text.to_owned())),
         OID_BOOL => match text {
             "t" | "true" | "TRUE" | "1" => Ok(SqlValue::Boolean(true)),
             "f" | "false" | "FALSE" | "0" => Ok(SqlValue::Boolean(false)),
@@ -156,9 +308,9 @@ fn decode_text_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
             .map(SqlValue::Integer)
             .map_err(|error| format!("invalid integer parameter: {error}")),
         OID_NUMERIC => text
-            .parse::<u64>()
-            .map(SqlValue::Unsigned)
-            .or_else(|_| text.parse::<i64>().map(SqlValue::Integer))
+            .parse::<i64>()
+            .map(SqlValue::Integer)
+            .or_else(|_| text.parse::<u64>().map(SqlValue::Unsigned))
             .or_else(|_| text.parse::<f64>().map(SqlValue::Float))
             .map_err(|error| format!("invalid numeric parameter: {error}")),
         OID_FLOAT4 | OID_FLOAT8 => text
@@ -186,7 +338,11 @@ fn decode_binary_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
     match oid {
         OID_BOOL => {
             exact(1)?;
-            Ok(SqlValue::Boolean(bytes[0] != 0))
+            match bytes[0] {
+                0 => Ok(SqlValue::Boolean(false)),
+                1 => Ok(SqlValue::Boolean(true)),
+                _ => Err("binary boolean parameter must be zero or one".into()),
+            }
         }
         OID_INT2 => {
             exact(2)?;
@@ -218,10 +374,26 @@ fn decode_binary_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
                 bytes.try_into().expect("length checked"),
             ))))
         }
-        OID_TEXT | OID_VARCHAR => std::str::from_utf8(bytes)
-            .map(|text| SqlValue::Text(text.to_owned()))
+        OID_NUMERIC => decode_binary_numeric(bytes),
+        0 | OID_TEXT | OID_VARCHAR => std::str::from_utf8(bytes)
+            .map(|text| {
+                if oid == 0 {
+                    SqlValue::Unspecified(text.to_owned())
+                } else {
+                    SqlValue::Text(text.to_owned())
+                }
+            })
             .map_err(|_| "binary text parameter is not valid UTF-8".into()),
         OID_BYTEA => Ok(SqlValue::Bytes(bytes.to_vec())),
+        OID_TIMESTAMPTZ => {
+            exact(8)?;
+            let micros = i64::from_be_bytes(bytes.try_into().expect("length checked"));
+            let millis = micros
+                .div_euclid(1_000)
+                .checked_add(946_684_800_000)
+                .ok_or("binary timestamptz parameter is outside the supported range")?;
+            Ok(SqlValue::TimestampMillis(millis))
+        }
         OID_UUID => {
             exact(16)?;
             let text = bytes
@@ -236,6 +408,78 @@ fn decode_binary_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
             "binary parameter type OID {other} is not supported"
         )),
     }
+}
+
+fn decode_binary_numeric(bytes: &[u8]) -> Result<SqlValue, String> {
+    if bytes.len() < 8 || !(bytes.len() - 8).is_multiple_of(2) {
+        return Err("binary numeric parameter has an invalid length".into());
+    }
+    let ndigits = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+    if bytes.len() != 8 + ndigits * 2 {
+        return Err("binary numeric digit count does not match its length".into());
+    }
+    let weight = i16::from_be_bytes([bytes[2], bytes[3]]);
+    let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let dscale = u16::from_be_bytes([bytes[6], bytes[7]]);
+    let digits = bytes[8..]
+        .chunks_exact(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    if digits.iter().any(|digit| *digit >= 10_000) {
+        return Err("binary numeric contains an invalid base-10000 digit".into());
+    }
+    match sign {
+        0xc000 => return Ok(SqlValue::Float(f64::NAN)),
+        0xd000 => return Ok(SqlValue::Float(f64::INFINITY)),
+        0xf000 => return Ok(SqlValue::Float(f64::NEG_INFINITY)),
+        0x0000 | 0x4000 => {}
+        _ => return Err("binary numeric contains an invalid sign".into()),
+    }
+
+    if dscale == 0 && weight >= 0 {
+        let groups = usize::try_from(weight).unwrap_or(usize::MAX) + 1;
+        if digits.iter().skip(groups).any(|digit| *digit != 0) {
+            return Err("scale-zero binary numeric contains fractional digits".into());
+        }
+        let mut magnitude = 0u128;
+        for index in 0..groups {
+            magnitude = magnitude
+                .checked_mul(10_000)
+                .and_then(|value| {
+                    value.checked_add(u128::from(digits.get(index).copied().unwrap_or(0)))
+                })
+                .ok_or("binary numeric is outside the supported integer range")?;
+        }
+        if sign == 0x4000 {
+            let limit = u128::from(i64::MAX.unsigned_abs()) + 1;
+            if magnitude > limit {
+                return Err("binary numeric is outside the supported signed range".into());
+            }
+            let value = if magnitude == limit {
+                i64::MIN
+            } else {
+                -i64::try_from(magnitude).expect("range checked")
+            };
+            return Ok(SqlValue::Integer(value));
+        }
+        if let Ok(value) = i64::try_from(magnitude) {
+            return Ok(SqlValue::Integer(value));
+        }
+        return u64::try_from(magnitude)
+            .map(SqlValue::Unsigned)
+            .map_err(|_| "binary numeric is outside the supported unsigned range".into());
+    }
+
+    let mut value = 0.0;
+    for (index, digit) in digits.iter().enumerate() {
+        let exponent = i32::from(weight)
+            - i32::try_from(index).map_err(|_| "binary numeric has too many digits")?;
+        value += f64::from(*digit) * 10_000f64.powi(exponent);
+    }
+    if sign == 0x4000 {
+        value = -value;
+    }
+    Ok(SqlValue::Float(value))
 }
 
 fn decode_bytea(text: &str) -> Result<Vec<u8>, String> {
@@ -326,6 +570,7 @@ fn push_array_element(out: &mut String, value: &SqlValue) {
             }
         }
         SqlValue::TimestampMillis(_)
+        | SqlValue::Unspecified(_)
         | SqlValue::Text(_)
         | SqlValue::Bytes(_)
         | SqlValue::Other(_) => {
@@ -422,6 +667,100 @@ mod tests {
             SqlValue::Integer(2001)
         );
         assert_eq!(decode_parameter(OID_TEXT, 0, None).unwrap(), SqlValue::Null);
+        assert_eq!(
+            decode_parameter(0, 0, Some(b"2001")).unwrap(),
+            SqlValue::Unspecified("2001".into())
+        );
+    }
+
+    #[test]
+    fn numeric_text_prefers_signed_integer_before_unsigned() {
+        assert_eq!(
+            decode_parameter(OID_NUMERIC, 0, Some(b"42")).unwrap(),
+            SqlValue::Integer(42)
+        );
+        assert_eq!(
+            decode_parameter(OID_NUMERIC, 0, Some(b"18446744073709551615")).unwrap(),
+            SqlValue::Unsigned(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn binary_parameter_decoders_cover_supported_scalar_types() {
+        assert_eq!(
+            decode_parameter(OID_BOOL, 1, Some(&[1])).unwrap(),
+            SqlValue::Boolean(true)
+        );
+        assert_eq!(
+            decode_parameter(OID_INT2, 1, Some(&(-7i16).to_be_bytes())).unwrap(),
+            SqlValue::Integer(-7)
+        );
+        assert_eq!(
+            decode_parameter(OID_INT4, 1, Some(&42i32.to_be_bytes())).unwrap(),
+            SqlValue::Integer(42)
+        );
+        assert_eq!(
+            decode_parameter(OID_FLOAT4, 1, Some(&1.5f32.to_be_bytes())).unwrap(),
+            SqlValue::Float(1.5)
+        );
+        assert_eq!(
+            decode_parameter(OID_FLOAT8, 1, Some(&2.5f64.to_be_bytes())).unwrap(),
+            SqlValue::Float(2.5)
+        );
+        assert_eq!(
+            decode_parameter(OID_TEXT, 1, Some(b"hello")).unwrap(),
+            SqlValue::Text("hello".into())
+        );
+        assert_eq!(
+            decode_parameter(OID_BYTEA, 1, Some(&[0, 255])).unwrap(),
+            SqlValue::Bytes(vec![0, 255])
+        );
+        assert_eq!(
+            decode_parameter(OID_TIMESTAMPTZ, 1, Some(&0i64.to_be_bytes())).unwrap(),
+            SqlValue::TimestampMillis(946_684_800_000)
+        );
+        assert!(matches!(
+            decode_parameter(OID_UUID, 1, Some(&[0x12; 16])).unwrap(),
+            SqlValue::Text(value) if value == "12121212121212121212121212121212"
+        ));
+        assert!(decode_parameter(OID_INT8, 1, Some(&[0; 7])).is_err());
+        assert!(decode_parameter(OID_BOOL, 1, Some(&[2])).is_err());
+    }
+
+    #[test]
+    fn binary_results_encode_numeric_timestamp_and_arrays() {
+        let numeric = encode_result(
+            &SqlValue::Unsigned(18_446_744_073_709_551_615),
+            &SqlType::UnsignedInteger(64),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(i16::from_be_bytes([numeric[0], numeric[1]]), 5);
+        assert_eq!(i16::from_be_bytes([numeric[2], numeric[3]]), 4);
+        assert_eq!(
+            decode_parameter(OID_NUMERIC, 1, Some(&numeric)).unwrap(),
+            SqlValue::Unsigned(u64::MAX)
+        );
+
+        let timestamp = encode_result(
+            &SqlValue::TimestampMillis(946_684_800_001),
+            &SqlType::TimestampMillis(Some("UTC".into())),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(i64::from_be_bytes(timestamp.try_into().unwrap()), 1_000);
+
+        let array = encode_result(
+            &SqlValue::List(vec![SqlValue::Integer(1), SqlValue::Integer(2)]),
+            &SqlType::List(Box::new(SqlType::SignedInteger(64))),
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(i32::from_be_bytes(array[0..4].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(array[12..16].try_into().unwrap()), 2);
     }
 
     #[test]
