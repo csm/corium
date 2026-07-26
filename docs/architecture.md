@@ -115,7 +115,8 @@ deterministic simulator.
 
 - **Rust** stable toolchain, edition 2024.
 - **tokio + tonic/prost** for the transactor, peer connection, and peer server.
-- **DataFusion + Arrow** for peer-local, read-only SQL execution.
+- **DataFusion + Arrow** for peer-local SQL reads and mutation expression
+  evaluation; writes remain native Corium transactions.
 - **cljrs** (`cljrs-value`, `cljrs-reader`, `cljrs-interp`, `cljrs-interop`)
   for EDN at the boundary and database function execution.
 - **proptest** for property tests; the `corium-sim` harness for whole-system

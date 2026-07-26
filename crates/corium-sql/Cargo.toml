@@ -5,13 +5,14 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Read-only SQL queries over immutable Corium database values"
+description = "SQL queries and autocommit mutation planning over Corium database values"
 
 [dependencies]
 arrow = { version = "58.3.0", default-features = false }
 async-trait = "0.1"
 corium-core = { workspace = true }
 corium-db = { workspace = true }
+corium-query = { workspace = true }
 datafusion = { version = "54.0.0", default-features = false, features = [
     "datetime_expressions",
     "nested_expressions",
@@ -20,9 +21,12 @@ datafusion = { version = "54.0.0", default-features = false, features = [
     "unicode_expressions",
 ] }
 futures = "0.3"
+sqlparser = { version = "0.62", default-features = false, features = ["std"] }
 thiserror = "2"
 
 [dev-dependencies]
+corium-forms = { workspace = true }
+corium-tx = { workspace = true }
 tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread"] }
 
 [lints]
