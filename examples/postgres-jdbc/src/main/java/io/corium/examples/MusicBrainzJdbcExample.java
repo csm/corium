@@ -2,6 +2,7 @@ package io.corium.examples;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -13,8 +14,9 @@ import java.util.Map;
 
 /**
  * Runs a few self-checking MusicBrainz queries through the PostgreSQL JDBC
- * driver. The queries use {@link Statement} because Corium's PostgreSQL wire
- * endpoint does not yet support bound parameters.
+ * driver. The release-count check deliberately executes one
+ * {@link PreparedStatement} more than PgJDBC's default prepare threshold so
+ * the test covers server-prepared execution and binary result negotiation.
  */
 public final class MusicBrainzJdbcExample {
     private static final String DEFAULT_URL =
@@ -62,15 +64,24 @@ public final class MusicBrainzJdbcExample {
     private static void checkReleaseCount(Connection connection)
             throws SQLException {
         String sql = "SELECT COUNT(*) AS release_count "
-                + "FROM corium.release WHERE year = 1997";
+                + "FROM corium.release WHERE year = ?";
 
-        try (Statement statement = connection.createStatement();
-             ResultSet rows = statement.executeQuery(sql)) {
-            require(rows.next(), "release count query returned no row");
-            long count = rows.getLong("release_count");
-            require(count == 20, "expected 20 releases, got " + count);
-            require(!rows.next(), "release count query returned multiple rows");
-            System.out.printf("1997 releases: %d%n", count);
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            for (int execution = 0; execution < 6; execution++) {
+                statement.setInt(1, 1997);
+                try (ResultSet rows = statement.executeQuery()) {
+                    require(rows.next(), "release count query returned no row");
+                    long count = rows.getLong("release_count");
+                    require(count == 20, "expected 20 releases, got " + count);
+                    require(!rows.next(),
+                            "release count query returned multiple rows");
+                    if (execution == 5) {
+                        System.out.printf(
+                                "1997 releases after server prepare: %d%n",
+                                count);
+                    }
+                }
+            }
         }
     }
 

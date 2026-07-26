@@ -68,10 +68,13 @@ These were settled at project initialization and are recorded as ADRs:
 10. **Single transactor now, lease-based HA designed in** — the root store,
     log, and reconnect protocol are shaped for active/standby failover, which
     lands as its own milestone. ([ADR-0010](docs/adr/0010-ha-later.md))
-11. **Peer-local, read-only SQL** — DataFusion executes over immutable database
-    views, with namespace-derived wide tables, list-valued cardinality-many
-    attributes, normalized event relations, and a Corium-owned row API.
-    ([ADR-0011](docs/adr/0011-sql-interface.md))
+11. **Peer-local SQL projection** — DataFusion executes reads over immutable
+    database views, with namespace-derived wide tables, list-valued
+    cardinality-many attributes, normalized event relations, and a
+    Corium-owned row API. A bounded autocommit DML planner emits guarded native
+    transaction forms for write-capable adapters.
+    ([ADR-0011](docs/adr/0011-sql-interface.md),
+    [ADR-0015](docs/adr/0015-guarded-autocommit-sql-dml.md))
 
 ## Current status
 

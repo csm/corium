@@ -10,7 +10,7 @@ mod sql;
 mod tui;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -500,9 +500,9 @@ enum Command {
         #[command(flatten)]
         serve: ServeFlags,
     },
-    /// Serve the database catalog over the `PostgreSQL` wire protocol
-    /// (read-only). Clients pick a database with the startup `database`
-    /// parameter or `USE <db>`, and list them with `SHOW DATABASES`.
+    /// Serve the database catalog over the `PostgreSQL` wire protocol.
+    /// Clients pick a database with the startup `database` parameter or
+    /// `USE <db>`, and list them with `SHOW DATABASES`.
     PostgresServer {
         /// Restrict the databases clients may reach (repeatable). When
         /// omitted, every database in the transactor's catalog is exposed.
@@ -514,6 +514,10 @@ enum Command {
         /// Require this cleartext password from clients (trust when omitted).
         #[arg(long)]
         password: Option<String>,
+        /// Enable guarded autocommit INSERT, UPDATE, and DELETE. Without this
+        /// flag the server remains read-only.
+        #[arg(long)]
+        allow_writes: bool,
         #[command(flatten)]
         client: ClientFlags,
     },
@@ -627,11 +631,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DbCommand {
-    /// Create a database (optionally with an EDN schema file).
+    /// Create a database (optionally with an EDN or TOML schema file).
     Create {
         /// Database name.
         name: String,
-        /// EDN file containing a vector of attribute maps.
+        /// Schema file: `.toml` for hierarchical TOML, otherwise EDN.
         #[arg(long)]
         schema: Option<PathBuf>,
         #[command(flatten)]
@@ -944,18 +948,30 @@ async fn run(cli: Cli) -> Result<(), String> {
             databases,
             listen,
             password,
+            allow_writes,
             client,
         } => {
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|error| format!("cannot bind {listen}: {error}"))?;
-            let catalog = Arc::new(pg_catalog::PeerCatalog::new(client, databases));
+            let catalog = Arc::new(pg_catalog::PeerCatalog::new(
+                client,
+                databases,
+                allow_writes,
+            ));
             let pg_config = corium_pgwire::PgWireConfig {
                 password,
                 ..corium_pgwire::PgWireConfig::default()
             };
-            tracing::info!(%listen, "postgres server serving");
-            eprintln!("corium postgres-server: serving the database catalog on {listen}");
+            tracing::info!(%listen, allow_writes, "postgres server serving");
+            let access = if allow_writes {
+                "guarded autocommit writes enabled"
+            } else {
+                "read-only"
+            };
+            eprintln!(
+                "corium postgres-server: serving the database catalog on {listen} ({access})"
+            );
             corium_pgwire::serve(listener, catalog, pg_config, async {
                 let _ = tokio::signal::ctrl_c().await;
             })
@@ -1303,21 +1319,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             client,
         } => {
             let forms = match schema {
-                Some(path) => {
-                    let text = std::fs::read_to_string(&path)
-                        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-                    let mut forms =
-                        read_all(&text).map_err(|error| format!("bad schema EDN: {error}"))?;
-                    // Accept either one vector of maps or bare maps.
-                    if forms.len() == 1 && matches!(forms[0], Edn::Vector(_)) {
-                        let Edn::Vector(items) = forms.remove(0) else {
-                            unreachable!()
-                        };
-                        items
-                    } else {
-                        forms
-                    }
-                }
+                Some(path) => read_schema_file(&path)?,
                 None => Vec::new(),
             };
             let mut admin = admin_client(&client).await?;
@@ -1393,6 +1395,30 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             };
             run_db_index_policy(&name, update, &client).await
         }
+    }
+}
+
+fn read_schema_file(path: &Path) -> Result<Vec<Edn>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+    {
+        return corium_forms::toml_schema::parse_edn(&text)
+            .map_err(|error| format!("bad schema TOML: {error}"));
+    }
+
+    let mut forms = read_all(&text).map_err(|error| format!("bad schema EDN: {error}"))?;
+    // Accept either one vector of maps or bare maps.
+    if forms.len() == 1 && matches!(forms[0], Edn::Vector(_)) {
+        let Edn::Vector(items) = forms.remove(0) else {
+            unreachable!()
+        };
+        Ok(items)
+    } else {
+        Ok(forms)
     }
 }
 
@@ -1504,5 +1530,60 @@ fn format_value(value: &corium_core::Value, interner: &KeywordInterner) -> Strin
         Value::Str(v) => format!("{v:?}"),
         Value::Bytes(bytes) => format!("#bytes[{}]", bytes.len()),
         Value::Ref(e) => format!("#eid {}", e.raw()),
+    }
+}
+
+#[cfg(test)]
+mod schema_file_tests {
+    use corium_core::{Cardinality, Keyword};
+    use corium_protocol::schemaform::schema_from_edn;
+
+    use super::read_schema_file;
+
+    #[test]
+    fn reads_toml_schema_by_extension() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("schema.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[entity]]
+name = "person"
+
+[entity.attributes]
+name = { type = "string", unique = "identity" }
+tags = { type = "keyword", many = true }
+"#,
+        )
+        .expect("write schema");
+
+        let forms = read_schema_file(&path).expect("read TOML schema");
+        let (schema, idents) = schema_from_edn(&forms).expect("install schema");
+        let tags = idents
+            .entid(&Keyword::new(Some("person"), "tags"))
+            .expect("tags ident");
+        assert_eq!(
+            schema.get(tags).expect("tags attribute").cardinality,
+            Cardinality::Many
+        );
+    }
+
+    #[test]
+    fn continues_to_read_edn_schema() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("schema.edn");
+        std::fs::write(
+            &path,
+            "[{:db/ident :person/name :db/valueType :db.type/string}]",
+        )
+        .expect("write schema");
+
+        let forms = read_schema_file(&path).expect("read EDN schema");
+        let (_, idents) = schema_from_edn(&forms).expect("install schema");
+        assert!(
+            idents
+                .entid(&Keyword::new(Some("person"), "name"))
+                .is_some()
+        );
     }
 }

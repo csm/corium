@@ -1,10 +1,10 @@
 //! `PostgreSQL` v3 frontend/backend message framing.
 //!
 //! This module is deliberately small: it reads the frontend messages the
-//! read-only server understands and writes the backend messages it needs to
-//! answer them. Wire integers are big-endian; strings are NUL-terminated
-//! UTF-8. See the `PostgreSQL` "Frontend/Backend Protocol" chapter for the
-//! canonical layout.
+//! server understands and writes the backend messages it needs to answer
+//! them. Wire integers are big-endian; strings are NUL-terminated UTF-8. See
+//! the `PostgreSQL` "Frontend/Backend Protocol" chapter for the canonical
+//! layout.
 
 use std::io;
 
@@ -17,7 +17,7 @@ const SSL_REQUEST_CODE: i32 = 80_877_103;
 /// Magic version selecting GSSAPI encryption negotiation.
 const GSS_ENC_REQUEST_CODE: i32 = 80_877_104;
 /// Largest message body we will buffer, guarding against hostile length
-/// prefixes. Read-only query text and parameters stay well under this.
+/// prefixes. Query text and parameters stay well under this.
 const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 
 /// A parsed startup handshake, after any TLS/GSS negotiation was declined.
@@ -49,8 +49,8 @@ pub(crate) enum Frontend {
         name: String,
         /// SQL text.
         query: String,
-        /// Number of parameter type OIDs the client declared.
-        parameter_count: usize,
+        /// Parameter type OIDs (`0` asks the server to infer a type).
+        parameter_types: Vec<i32>,
     },
     /// Extended protocol: bind a portal to a prepared statement.
     Bind {
@@ -58,8 +58,10 @@ pub(crate) enum Frontend {
         portal: String,
         /// Source prepared-statement name.
         statement: String,
-        /// Number of bound parameter values.
-        parameter_count: usize,
+        /// Parameter format codes (0 = text, 1 = binary).
+        parameter_formats: Vec<i16>,
+        /// Bound values; `None` is SQL NULL.
+        parameters: Vec<Option<Vec<u8>>>,
         /// Requested result column format codes (0 = text, 1 = binary).
         result_formats: Vec<i16>,
     },
@@ -156,25 +158,34 @@ impl<R: AsyncRead + Unpin> FrontendReader<R> {
                 let name = cursor.read_cstr()?;
                 let query = cursor.read_cstr()?;
                 let parameter_count = usize::from(cursor.read_i16()?.max(0).unsigned_abs());
+                let mut parameter_types = Vec::with_capacity(parameter_count);
+                for _ in 0..parameter_count {
+                    parameter_types.push(cursor.read_i32()?);
+                }
                 Frontend::Parse {
                     name,
                     query,
-                    parameter_count,
+                    parameter_types,
                 }
             }
             b'B' => {
                 let portal = cursor.read_cstr()?;
                 let statement = cursor.read_cstr()?;
-                let format_count = cursor.read_i16()?;
+                let format_count = cursor.read_i16()?.max(0);
+                let mut parameter_formats =
+                    Vec::with_capacity(usize::from(format_count.unsigned_abs()));
                 for _ in 0..format_count {
-                    let _ = cursor.read_i16()?;
+                    parameter_formats.push(cursor.read_i16()?);
                 }
                 let parameter_count = usize::from(cursor.read_i16()?.max(0).unsigned_abs());
+                let mut parameters = Vec::with_capacity(parameter_count);
                 for _ in 0..parameter_count {
                     let len = cursor.read_i32()?;
-                    if len > 0 {
-                        cursor.skip(usize::try_from(len).unwrap_or(0))?;
-                    }
+                    parameters.push(if len < 0 {
+                        None
+                    } else {
+                        Some(cursor.read_bytes(usize::try_from(len).unwrap_or(0))?)
+                    });
                 }
                 let result_format_count = cursor.read_i16()?.max(0);
                 let mut result_formats =
@@ -185,7 +196,8 @@ impl<R: AsyncRead + Unpin> FrontendReader<R> {
                 Frontend::Bind {
                     portal,
                     statement,
-                    parameter_count,
+                    parameter_formats,
+                    parameters,
                     result_formats,
                 }
             }
@@ -288,18 +300,23 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
         self.frame(b'Z', |body| body.push(status));
     }
 
-    /// `RowDescription` for a result's columns (always text format).
-    pub(crate) fn row_description(&mut self, fields: &[FieldDescription]) {
+    /// `RowDescription` for a result's columns in the supplied formats.
+    pub(crate) fn row_description_with_formats(
+        &mut self,
+        fields: &[FieldDescription],
+        formats: &[i16],
+    ) {
+        debug_assert_eq!(fields.len(), formats.len());
         self.frame(b'T', |body| {
             put_i16(body, i16::try_from(fields.len()).unwrap_or(i16::MAX));
-            for field in fields {
+            for (field, format) in fields.iter().zip(formats) {
                 put_cstr(body, &field.name);
                 body.extend_from_slice(&0i32.to_be_bytes()); // table OID
                 put_i16(body, 0); // column attribute number
                 body.extend_from_slice(&field.type_oid.to_be_bytes());
                 put_i16(body, field.type_len);
                 body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-                put_i16(body, 0); // text format
+                put_i16(body, *format);
             }
         });
     }
@@ -309,9 +326,14 @@ impl<W: AsyncWrite + Unpin> BackendWriter<W> {
         self.frame(b'n', |_| {});
     }
 
-    /// `ParameterDescription` (this server only supports zero parameters).
-    pub(crate) fn parameter_description_empty(&mut self) {
-        self.frame(b't', |body| put_i16(body, 0));
+    /// `ParameterDescription`.
+    pub(crate) fn parameter_description(&mut self, type_oids: &[i32]) {
+        self.frame(b't', |body| {
+            put_i16(body, i16::try_from(type_oids.len()).unwrap_or(i16::MAX));
+            for oid in type_oids {
+                body.extend_from_slice(&oid.to_be_bytes());
+            }
+        });
     }
 
     /// One `DataRow`. Each value is already encoded as its text form, or
@@ -452,13 +474,15 @@ impl<'a> Cursor<'a> {
         Ok(i32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
     }
 
-    fn skip(&mut self, count: usize) -> io::Result<()> {
+    fn read_bytes(&mut self, count: usize) -> io::Result<Vec<u8>> {
         let end = self.position.checked_add(count).ok_or_else(truncated)?;
-        if end > self.bytes.len() {
-            return Err(truncated());
-        }
+        let bytes = self
+            .bytes
+            .get(self.position..end)
+            .ok_or_else(truncated)?
+            .to_vec();
         self.position = end;
-        Ok(())
+        Ok(bytes)
     }
 
     fn read_cstr(&mut self) -> io::Result<String> {
