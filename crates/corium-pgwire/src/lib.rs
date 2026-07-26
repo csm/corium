@@ -550,13 +550,27 @@ where
         }
         // `Describe` of a prepared statement first reports its parameters.
         let (sql, database, params) = if kind == b'S' {
-            let Some(statement) = self.statements.get(name) else {
+            let Some((sql, parameter_types)) = self
+                .statements
+                .get(name)
+                .map(|statement| (statement.sql.clone(), statement.parameter_types.clone()))
+            else {
                 self.fail_extended("26000", "prepared statement does not exist");
                 return Ok(());
             };
-            self.writer
-                .parameter_description(&statement.parameter_types);
-            (statement.sql.clone(), self.current_db.clone(), Vec::new())
+            self.writer.parameter_description(&parameter_types);
+            let params = parameter_types
+                .into_iter()
+                .map(types::describe_parameter)
+                .collect::<Result<Vec<_>, _>>();
+            let params = match params {
+                Ok(params) => params,
+                Err(message) => {
+                    self.fail_extended("0A000", &message);
+                    return Ok(());
+                }
+            };
+            (sql, self.current_db.clone(), params)
         } else {
             let Some(portal) = self.portals.get(name) else {
                 self.fail_extended("34000", "portal does not exist");
@@ -592,14 +606,11 @@ where
                     }
                 };
                 match SqlSession::new(&db) {
-                    Ok(session) => match session.mutation_params(&sql, &params).await {
-                        Ok(Some(mutation)) => match mutation.returning_columns(&db).await {
-                            Ok(columns) if columns.is_empty() => self.writer.no_data(),
-                            Ok(columns) => self
-                                .writer
-                                .row_description(&columns.iter().map(field_of).collect::<Vec<_>>()),
-                            Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
-                        },
+                    Ok(session) => match session.mutation_columns(&sql, &params).await {
+                        Ok(Some(columns)) if columns.is_empty() => self.writer.no_data(),
+                        Ok(Some(columns)) => self
+                            .writer
+                            .row_description(&columns.iter().map(field_of).collect::<Vec<_>>()),
                         Ok(None) => self.writer.no_data(),
                         Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
                     },

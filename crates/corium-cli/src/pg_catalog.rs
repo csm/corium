@@ -23,13 +23,15 @@ pub struct PeerCatalog {
     client: ClientFlags,
     /// When present, only these database names are exposed.
     whitelist: Option<HashSet<String>>,
+    allow_writes: bool,
     connections: Mutex<HashMap<String, Arc<Connection>>>,
 }
 
 impl PeerCatalog {
     /// Builds a catalog. An empty `databases` list exposes the whole catalog;
-    /// otherwise only the listed databases are reachable.
-    pub fn new(client: ClientFlags, databases: Vec<String>) -> Self {
+    /// otherwise only the listed databases are reachable. Writes are rejected
+    /// unless `allow_writes` was explicitly enabled by the operator.
+    pub fn new(client: ClientFlags, databases: Vec<String>, allow_writes: bool) -> Self {
         let whitelist = if databases.is_empty() {
             None
         } else {
@@ -38,6 +40,7 @@ impl PeerCatalog {
         Self {
             client,
             whitelist,
+            allow_writes,
             connections: Mutex::new(HashMap::new()),
         }
     }
@@ -102,6 +105,9 @@ impl DbCatalog for PeerCatalog {
         expected_basis_t: u64,
         forms: Vec<Edn>,
     ) -> Result<CatalogTxResult, CatalogError> {
+        if !self.allow_writes {
+            return Err(CatalogError::ReadOnly(name.to_owned()));
+        }
         let connection = self.connection(name).await?;
         let result = connection
             .transact_at(forms, Some(expected_basis_t))
@@ -131,5 +137,29 @@ fn map_write_error(error: &PeerError) -> CatalogError {
             CatalogError::Rejected(status.message().to_owned())
         }
         _ => CatalogError::Unavailable(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catalog_rejects_writes_unless_the_operator_opts_in() {
+        let catalog = PeerCatalog::new(
+            ClientFlags {
+                transactor: "http://127.0.0.1:1".to_owned(),
+                token: None,
+                ca: None,
+                tls_domain: None,
+                peer_bootstrap: false,
+            },
+            Vec::new(),
+            false,
+        );
+        let Err(error) = catalog.transact("corium", 0, Vec::new()).await else {
+            panic!("writes default to disabled");
+        };
+        assert!(matches!(error, CatalogError::ReadOnly(name) if name == "corium"));
     }
 }

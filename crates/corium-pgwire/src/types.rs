@@ -125,6 +125,23 @@ pub(crate) fn decode_parameter(
     }
 }
 
+/// Representative typed value used to plan a statement-level `Describe`
+/// before a portal has supplied real parameter values.
+pub(crate) fn describe_parameter(oid: i32) -> Result<SqlValue, String> {
+    match oid {
+        0 | OID_TEXT | OID_VARCHAR | OID_UUID => Ok(SqlValue::Text(String::new())),
+        OID_BOOL => Ok(SqlValue::Boolean(false)),
+        OID_INT2 | OID_INT4 | OID_INT8 | OID_NUMERIC => Ok(SqlValue::Integer(0)),
+        OID_FLOAT4 | OID_FLOAT8 => Ok(SqlValue::Float(0.0)),
+        OID_TIMESTAMPTZ => Ok(SqlValue::TimestampMillis(0)),
+        OID_BYTEA => Ok(SqlValue::Bytes(Vec::new())),
+        oid if is_array_oid(oid) => {
+            Err("array parameters are not supported yet; use an ARRAY expression".into())
+        }
+        other => Err(format!("parameter type OID {other} is not supported")),
+    }
+}
+
 fn decode_text_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "parameter is not valid UTF-8")?;
     match oid {
@@ -225,14 +242,16 @@ fn decode_bytea(text: &str) -> Result<Vec<u8>, String> {
     let Some(hex) = text.strip_prefix("\\x") else {
         return Err("only hexadecimal bytea input is supported".into());
     };
+    let hex = hex.as_bytes();
     if !hex.len().is_multiple_of(2) {
         return Err("bytea hex input has odd length".into());
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&hex[index..index + 2], 16)
-                .map_err(|error| format!("invalid bytea hex: {error}"))
+    hex.chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+                .ok_or_else(|| "invalid bytea hex".to_owned())
         })
         .collect()
 }
@@ -409,6 +428,14 @@ mod tests {
     fn bytea_uses_hex_output() {
         let value = SqlValue::Bytes(vec![0x00, 0xff, 0x42]);
         assert_eq!(encode_value(&value), Some(b"\\x00ff42".to_vec()));
+    }
+
+    #[test]
+    fn bytea_rejects_non_ascii_hex_without_panicking() {
+        assert_eq!(
+            decode_parameter(OID_BYTEA, 0, Some("\\x€0".as_bytes())),
+            Err("invalid bytea hex".to_owned())
+        );
     }
 
     #[test]

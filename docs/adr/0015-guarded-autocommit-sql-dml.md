@@ -31,7 +31,9 @@ protocol version from 1 to 2; peers and transactors must be upgraded together.
 operation. The CLI implementation sends the forms through its cached
 `corium-peer` connection, preserving the configured Corium principal,
 authorization gate, transaction validation, durability, and publication path.
-Catalogs that do not implement the operation remain read-only.
+Catalogs that do not implement the operation remain read-only. The CLI
+PostgreSQL server also remains read-only by default; operators must pass
+`--allow-writes` to opt into the shared service principal's write authority.
 
 The first mutation contract is:
 

@@ -44,5 +44,6 @@ set the latter to that password.
 
 The example client still uses plain `Statement` queries, but Corium also
 supports typed bound inputs through JDBC's extended query protocol and guarded
-autocommit `INSERT`/`UPDATE`/`DELETE`. Results are text-only; binary result
-formats are not yet implemented.
+autocommit `INSERT`/`UPDATE`/`DELETE` when the server is started with
+`--allow-writes`. Results are text-only; binary result formats are not yet
+implemented.

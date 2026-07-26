@@ -161,17 +161,25 @@ inside them are rejected instead of silently autocommitting. Use one
 autocommit DML statement per transaction until multi-statement transaction
 support lands. `SET`, `RESET`, and `DISCARD` remain compatibility no-ops.
 
+`corium postgres-server` is read-only by default. Pass `--allow-writes` to
+enable the mutation path explicitly:
+
+```console
+corium postgres-server --listen 127.0.0.1:5432 --allow-writes
+```
+
 Pass `--password` to require a cleartext password; TLS is not terminated by the
 server, so front it with a proxy when transport security is needed. The SQL
 dialect is DataFusion's, not PostgreSQL's — wire compatibility does not imply
 `pg_catalog` or dialect compatibility. See
 [ADR-0013](adr/0013-postgres-wire-interface.md).
 
-The CLI server's catalog uses its cached `corium-peer` connection for writes,
-so its configured Corium bearer principal and the transactor's authorization
-gate apply. The PostgreSQL login is currently only a wire-server credential;
-it is not mapped to a distinct Corium principal. Per-user authn/authz parity,
-TLS termination, and PostgreSQL role/catalog semantics remain separate work.
+When writes are enabled, the CLI server's catalog uses its cached
+`corium-peer` connection, so its configured Corium bearer principal and the
+transactor's authorization gate apply. The PostgreSQL login is currently only
+a wire-server credential; it is not mapped to a distinct Corium principal.
+Per-user authn/authz parity, TLS termination, and PostgreSQL role/catalog
+semantics remain separate work.
 
 ## Engine choice and tradeoffs
 

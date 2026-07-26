@@ -77,8 +77,9 @@ This is the crate behind the `corium postgres-server` command. See
 [ADR-0013](../../docs/adr/0013-postgres-wire-interface.md), and
 [ADR-0015](../../docs/adr/0015-guarded-autocommit-sql-dml.md).
 
-The CLI catalog commits writes through its cached `corium-peer` connection, so
-the configured Corium service principal and transactor authorization gate
+The CLI server remains read-only unless its operator passes `--allow-writes`.
+When enabled, the catalog commits through its cached `corium-peer` connection,
+so the configured Corium service principal and transactor authorization gate
 remain authoritative. PostgreSQL usernames/passwords are not yet mapped to
 Corium principals; per-user authentication and authorization parity is still
 future work.

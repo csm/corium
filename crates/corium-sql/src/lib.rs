@@ -172,6 +172,23 @@ impl SqlSession {
     ) -> Result<Option<SqlMutation>, SqlError> {
         mutation::plan(&self.db, sql, params).await
     }
+
+    /// Describes the columns produced by a mutation's `RETURNING` clause
+    /// without evaluating its rows or planning transaction forms.
+    ///
+    /// Returns `None` for a non-mutation and an empty vector for a mutation
+    /// without `RETURNING`.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] for malformed mutation syntax or an invalid
+    /// returning projection.
+    pub async fn mutation_columns(
+        &self,
+        sql: &str,
+        params: &[SqlValue],
+    ) -> Result<Option<Vec<SqlColumn>>, SqlError> {
+        mutation::describe(&self.db, sql, params).await
+    }
 }
 
 /// Streaming result of one SQL statement.
@@ -529,6 +546,30 @@ mod tests {
                 SqlValue::List(vec![SqlValue::Text("ambient".into())]),
             ]]
         );
+    }
+
+    #[tokio::test]
+    async fn zero_row_update_returning_preserves_result_columns() {
+        let db = fixture();
+        let mutation = SqlSession::new(&db)
+            .expect("session")
+            .mutation(
+                "UPDATE corium.artist SET name = 'Nobody' \
+                 WHERE name = 'Missing' RETURNING name",
+            )
+            .await
+            .expect("plan")
+            .expect("mutation");
+        assert_eq!(mutation.affected(), 0);
+        assert!(mutation.is_empty());
+
+        let returned = mutation
+            .finish(&db, &std::collections::BTreeMap::new())
+            .await
+            .expect("returning");
+        assert_eq!(returned.columns.len(), 1);
+        assert_eq!(returned.columns[0].name, "name");
+        assert!(returned.rows.is_empty());
     }
 
     #[tokio::test]

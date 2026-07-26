@@ -12,9 +12,10 @@ Ships the `corium` command. Subcommands:
   indexing options.
 - **`peer-server`** — host a peer as a gRPC endpoint for thin clients.
 - **`postgres-server`** — serve the database catalog over the PostgreSQL wire
-  protocol for standard PostgreSQL clients and drivers, including guarded
-  autocommit DML; clients pick a database with `USE`/the startup parameter and
-  list them with `SHOW DATABASES`.
+  protocol for standard PostgreSQL clients and drivers. It is read-only by
+  default; `--allow-writes` enables guarded autocommit DML. Clients pick a
+  database with `USE`/the startup parameter and list them with
+  `SHOW DATABASES`.
 - **`db create` / `delete` / `fork` / `list` / `stats`** — database
   administration, including restore-as-clone forks.
 - **`db request-index` / `index-policy`** — drive and tune background indexing.

@@ -6,8 +6,8 @@ in Rust, paired with [Clojurust](https://github.com/csm/clojurust) for
 EDN/Clojure data handling and database function execution.
 
 The peer also exposes SQL through the `corium-sql` Rust crate, a read-only
-`corium sql` shell, and a PostgreSQL wire server with guarded autocommit DML;
-see the [SQL interface](docs/sql.md).
+`corium sql` shell, and an opt-in PostgreSQL wire server with guarded
+autocommit DML; see the [SQL interface](docs/sql.md).
 `corium tui` opens a full-screen terminal dashboard — query workbench, live
 store metrics, transaction feed, and schema browser; see the
 [operations guide](docs/operations.md#terminal-dashboard-tui).

@@ -453,6 +453,39 @@ async fn autocommit_insert_update_delete_and_returning_use_the_write_catalog() {
 }
 
 #[tokio::test]
+async fn zero_row_update_returning_still_describes_its_result() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query(
+            "UPDATE corium.artist SET name = 'Nobody' \
+             WHERE name = 'Missing' RETURNING name",
+        )
+        .await;
+    let response = client.read_until_ready().await;
+    let tags = response
+        .iter()
+        .map(|message| message.tag)
+        .collect::<Vec<_>>();
+    assert_eq!(tags, vec![b'T', b'C', b'Z']);
+    assert_eq!(
+        row_description_names(
+            &response
+                .iter()
+                .find(|message| message.tag == b'T')
+                .expect("row description")
+                .body
+        ),
+        vec!["name".to_owned()]
+    );
+}
+
+#[tokio::test]
 async fn explicit_transaction_control_updates_wire_status() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
@@ -566,6 +599,73 @@ async fn extended_protocol_runs_a_parameterless_query() {
     // ParseComplete, BindComplete, RowDescription, 2x DataRow,
     // CommandComplete, ReadyForQuery.
     assert_eq!(tags, vec![b'1', b'2', b'T', b'D', b'D', b'C', b'Z']);
+}
+
+#[tokio::test]
+async fn extended_protocol_describes_parameterized_statements_before_bind() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"SELECT name FROM corium.artist WHERE name = $1");
+    parse.push(0);
+    parse.extend_from_slice(&1i16.to_be_bytes());
+    parse.extend_from_slice(&25i32.to_be_bytes());
+    client.send(b'P', &parse).await;
+    client.send(b'D', &[b'S', 0]).await;
+    client.send(b'S', &[]).await;
+
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        response
+            .iter()
+            .map(|message| message.tag)
+            .collect::<Vec<_>>(),
+        vec![b'1', b't', b'T', b'Z']
+    );
+    assert_eq!(
+        row_description_names(
+            &response
+                .iter()
+                .find(|message| message.tag == b'T')
+                .expect("query row description")
+                .body
+        ),
+        vec!["name".to_owned()]
+    );
+
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"UPDATE corium.artist SET name = $1 WHERE name = $2 RETURNING name");
+    parse.push(0);
+    parse.extend_from_slice(&2i16.to_be_bytes());
+    parse.extend_from_slice(&25i32.to_be_bytes());
+    parse.extend_from_slice(&25i32.to_be_bytes());
+    client.send(b'P', &parse).await;
+    client.send(b'D', &[b'S', 0]).await;
+    client.send(b'S', &[]).await;
+
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        response
+            .iter()
+            .map(|message| message.tag)
+            .collect::<Vec<_>>(),
+        vec![b'1', b't', b'T', b'Z']
+    );
+    assert_eq!(
+        row_description_names(
+            &response
+                .iter()
+                .find(|message| message.tag == b'T')
+                .expect("mutation row description")
+                .body
+        ),
+        vec!["name".to_owned()]
+    );
 }
 
 #[tokio::test]

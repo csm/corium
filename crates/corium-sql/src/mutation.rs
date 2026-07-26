@@ -155,6 +155,9 @@ impl SqlMutation {
             }
             result.rows.extend(query.collect().await?);
         }
+        if result.columns.is_empty() {
+            result.columns = self.returning_columns(db_after).await?;
+        }
         Ok(result)
     }
 }
@@ -193,6 +196,60 @@ pub(crate) async fn plan(
         Statement::Delete(delete) => plan_delete(db, delete, params).await.map(Some),
         _ => Ok(None),
     }
+}
+
+pub(crate) async fn describe(
+    db: &Db,
+    sql: &str,
+    params: &[SqlValue],
+) -> Result<Option<Vec<SqlColumn>>, SqlError> {
+    if db.view() != DbView::Current {
+        return Err(SqlError::Mutation(
+            "writes require a current database view".into(),
+        ));
+    }
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
+    let [statement] = statements.as_slice() else {
+        return Err(SqlError::Mutation(
+            "one mutation statement is required".into(),
+        ));
+    };
+    let (table_name, returning) = match statement {
+        Statement::Insert(insert) => {
+            let sqlparser::ast::TableObject::TableName(table_name) = &insert.table else {
+                return Err(unsupported("INSERT target must be a table"));
+            };
+            (table_name, insert.returning.as_deref())
+        }
+        Statement::Update(update) => (
+            table_factor_name(&update.table.relation)?,
+            update.returning.as_deref(),
+        ),
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+            };
+            let [table] = tables.as_slice() else {
+                return Err(unsupported("DELETE requires exactly one table"));
+            };
+            (
+                table_factor_name(&table.relation)?,
+                delete.returning.as_deref(),
+            )
+        }
+        _ => return Ok(None),
+    };
+    let target = target(db, table_name)?;
+    let Some(returning) = returning_sql(returning) else {
+        return Ok(Some(Vec::new()));
+    };
+    let query = SqlSession::new(db)?
+        .query_params(
+            &format!("SELECT {returning} FROM {} WHERE FALSE", target.sql_name),
+            params,
+        )
+        .await?;
+    Ok(Some(query.columns().to_vec()))
 }
 
 async fn plan_insert(

@@ -499,9 +499,9 @@ enum Command {
         #[command(flatten)]
         serve: ServeFlags,
     },
-    /// Serve the database catalog over the `PostgreSQL` wire protocol
-    /// (read-only). Clients pick a database with the startup `database`
-    /// parameter or `USE <db>`, and list them with `SHOW DATABASES`.
+    /// Serve the database catalog over the `PostgreSQL` wire protocol.
+    /// Clients pick a database with the startup `database` parameter or
+    /// `USE <db>`, and list them with `SHOW DATABASES`.
     PostgresServer {
         /// Restrict the databases clients may reach (repeatable). When
         /// omitted, every database in the transactor's catalog is exposed.
@@ -513,6 +513,10 @@ enum Command {
         /// Require this cleartext password from clients (trust when omitted).
         #[arg(long)]
         password: Option<String>,
+        /// Enable guarded autocommit INSERT, UPDATE, and DELETE. Without this
+        /// flag the server remains read-only.
+        #[arg(long)]
+        allow_writes: bool,
         #[command(flatten)]
         client: ClientFlags,
     },
@@ -943,18 +947,30 @@ async fn run(cli: Cli) -> Result<(), String> {
             databases,
             listen,
             password,
+            allow_writes,
             client,
         } => {
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|error| format!("cannot bind {listen}: {error}"))?;
-            let catalog = Arc::new(pg_catalog::PeerCatalog::new(client, databases));
+            let catalog = Arc::new(pg_catalog::PeerCatalog::new(
+                client,
+                databases,
+                allow_writes,
+            ));
             let pg_config = corium_pgwire::PgWireConfig {
                 password,
                 ..corium_pgwire::PgWireConfig::default()
             };
-            tracing::info!(%listen, "postgres server serving");
-            eprintln!("corium postgres-server: serving the database catalog on {listen}");
+            tracing::info!(%listen, allow_writes, "postgres server serving");
+            let access = if allow_writes {
+                "guarded autocommit writes enabled"
+            } else {
+                "read-only"
+            };
+            eprintln!(
+                "corium postgres-server: serving the database catalog on {listen} ({access})"
+            );
             corium_pgwire::serve(listener, catalog, pg_config, async {
                 let _ = tokio::signal::ctrl_c().await;
             })
