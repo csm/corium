@@ -586,8 +586,10 @@ async fn cli_admin_commands_round_trip() {
     let port = free_port();
     let proc = TransactorProc::spawn(&data, port, &[]);
     let _admin = proc.wait_ready().await;
-    let schema_path = dir.path().join("schema.toml");
-    std::fs::write(&schema_path, TOML_SCHEMA).expect("write schema");
+    let toml_schema_path = dir.path().join("schema.toml");
+    std::fs::write(&toml_schema_path, TOML_SCHEMA).expect("write TOML schema");
+    let edn_schema_path = dir.path().join("schema.edn");
+    std::fs::write(&edn_schema_path, SCHEMA).expect("write EDN schema");
 
     let corium = env!("CARGO_BIN_EXE_corium");
     let run = |args: Vec<String>| {
@@ -603,16 +605,21 @@ async fn cli_admin_commands_round_trip() {
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
     let endpoint = proc.endpoint();
-    let created = run(vec![
-        "db".into(),
-        "create".into(),
-        "clidb".into(),
-        "--schema".into(),
-        schema_path.display().to_string(),
-        "--transactor".into(),
-        endpoint.clone(),
-    ]);
-    assert!(created.contains(":created true"), "{created}");
+    for (db, schema_path) in [
+        ("clidb", toml_schema_path.as_path()),
+        ("edndb", edn_schema_path.as_path()),
+    ] {
+        let created = run(vec![
+            "db".into(),
+            "create".into(),
+            db.into(),
+            "--schema".into(),
+            schema_path.display().to_string(),
+            "--transactor".into(),
+            endpoint.clone(),
+        ]);
+        assert!(created.contains(":created true"), "{created}");
+    }
     let listed = run(vec![
         "db".into(),
         "list".into(),
@@ -620,6 +627,7 @@ async fn cli_admin_commands_round_trip() {
         endpoint.clone(),
     ]);
     assert!(listed.contains("clidb"), "{listed}");
+    assert!(listed.contains("edndb"), "{listed}");
 
     let peer = Connection::connect(ConnectConfig::new(endpoint.clone(), "clidb"))
         .await

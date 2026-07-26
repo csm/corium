@@ -5,10 +5,13 @@
 //! declarations expose the same model without an entity block.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use corium_core::{Cardinality, Keyword, Unique, ValueType};
 use corium_query::edn::Edn;
-use serde::Deserialize;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 /// One normalized attribute declaration, independent of its source syntax.
@@ -88,8 +91,11 @@ pub enum TomlSchemaError {
     /// The document declares an unsupported format version.
     #[error("unsupported schema-version {0}; expected 1")]
     UnsupportedVersion(u32),
-    /// A group or attribute name is empty or uses the reserved `/` separator.
-    #[error("invalid {kind} name {name:?}: names must be non-empty and may not contain '/'")]
+    /// A group or attribute name is not a valid EDN keyword component.
+    #[error(
+        "invalid {kind} name {name:?}: expected a non-empty EDN keyword component \
+         without reserved punctuation, whitespace, or a leading digit"
+    )]
     InvalidName {
         /// Kind of declaration containing the name.
         kind: &'static str,
@@ -129,6 +135,9 @@ pub enum TomlSchemaError {
     /// Grouped and/or flat syntax declared the same canonical attribute twice.
     #[error("duplicate attribute {0}")]
     DuplicateAttribute(String),
+    /// Two entity authoring blocks use the same group name.
+    #[error("duplicate entity group {0:?}")]
+    DuplicateEntity(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,14 +159,57 @@ const fn default_schema_version() -> u32 {
 #[serde(deny_unknown_fields)]
 struct EntityDeclaration {
     name: String,
+    // TOML tables are unordered. Sorting local names makes initial attribute-id
+    // allocation deterministic rather than dependent on parser insertion order.
+    #[serde(default)]
     attributes: BTreeMap<String, RawAttribute>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 enum RawAttribute {
     Shorthand(String),
     Detailed(AttributeOptions),
+}
+
+impl<'de> Deserialize<'de> for RawAttribute {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawAttributeVisitor;
+
+        impl<'de> Visitor<'de> for RawAttributeVisitor {
+            type Value = RawAttribute;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a value type string or an attribute options table")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RawAttribute::Shorthand(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RawAttribute::Shorthand(value))
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                AttributeOptions::deserialize(MapAccessDeserializer::new(map))
+                    .map(RawAttribute::Detailed)
+            }
+        }
+
+        deserializer.deserialize_any(RawAttributeVisitor)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,8 +274,12 @@ pub fn parse(input: &str) -> Result<Vec<AttributeDefinition>, TomlSchemaError> {
     }
 
     let mut definitions = Vec::new();
+    let mut seen_entities = BTreeSet::new();
     for entity in document.entities {
         validate_name("entity", &entity.name)?;
+        if !seen_entities.insert(entity.name.clone()) {
+            return Err(TomlSchemaError::DuplicateEntity(entity.name));
+        }
         for (name, raw) in entity.attributes {
             definitions.push(normalize(
                 Some(entity.name.clone()),
@@ -257,8 +313,8 @@ pub fn parse(input: &str) -> Result<Vec<AttributeDefinition>, TomlSchemaError> {
 pub fn parse_edn(input: &str) -> Result<Vec<Edn>, TomlSchemaError> {
     parse(input).map(|definitions| {
         definitions
-            .iter()
-            .map(AttributeDefinition::to_edn)
+            .into_iter()
+            .map(|definition| definition.to_edn())
             .collect()
     })
 }
@@ -300,6 +356,7 @@ fn normalize(
             })
         })
         .transpose()?;
+    let indexed = options.index || unique.is_some();
 
     Ok(AttributeDefinition {
         group,
@@ -307,21 +364,52 @@ fn normalize(
         value_type,
         cardinality,
         unique,
-        indexed: options.index,
+        indexed,
         component: options.component,
         no_history: options.no_history,
     })
 }
 
 fn validate_name(kind: &'static str, name: &str) -> Result<(), TomlSchemaError> {
-    if name.is_empty() || name.contains('/') {
+    if is_valid_edn_keyword_component(name) {
+        Ok(())
+    } else {
         Err(TomlSchemaError::InvalidName {
             kind,
             name: name.to_owned(),
         })
-    } else {
-        Ok(())
     }
+}
+
+fn is_valid_edn_keyword_component(name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return false;
+    }
+    !name.chars().any(|character| {
+        character.is_whitespace()
+            || character.is_control()
+            || matches!(
+                character,
+                '/' | ':'
+                    | ';'
+                    | '"'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | '`'
+                    | '~'
+                    | '@'
+                    | '^'
+                    | '\\'
+            )
+    })
 }
 
 fn display_ident(group: Option<&str>, name: &str) -> String {
@@ -381,6 +469,7 @@ fn kw(text: &str) -> Edn {
 mod tests {
     use super::*;
     use crate::schemaform::schema_from_edn;
+    use corium_query::edn::read_one;
 
     const SCHEMA: &str = r#"
 schema-version = 1
@@ -427,6 +516,7 @@ type = "ref"
         assert_eq!(definitions[7].ident().to_string(), ":created-at");
         assert_eq!(definitions[8].ident().to_string(), ":audit/created-by");
         assert_eq!(definitions[2].unique, Some(Unique::Identity));
+        assert!(definitions[2].indexed);
         assert_eq!(definitions[4].cardinality, Cardinality::Many);
         assert!(definitions[5].no_history);
     }
@@ -449,6 +539,19 @@ type = "ref"
         let id_meta = schema.get(id).expect("id attribute");
         assert_eq!(id_meta.unique, Some(Unique::Identity));
         assert!(id_meta.indexed);
+        let address = idents
+            .entid(&Keyword::new(Some("person"), "address"))
+            .expect("address ident");
+        assert!(schema.get(address).expect("address attribute").is_component);
+        let employees = idents
+            .entid(&Keyword::new(Some("organization"), "employees"))
+            .expect("employees ident");
+        assert!(
+            schema
+                .get(employees)
+                .expect("employees attribute")
+                .no_history
+        );
     }
 
     #[test]
@@ -484,7 +587,7 @@ name = { type = "string", required = true }
         assert!(
             unknown_field
                 .to_string()
-                .contains("did not match any variant"),
+                .contains("unknown field `required`"),
             "{unknown_field}"
         );
 
@@ -503,21 +606,61 @@ type = "integer"
     }
 
     #[test]
-    fn rejects_names_that_embed_the_edn_separator() {
-        let error = parse(
+    fn rejects_names_that_cannot_round_trip_through_edn() {
+        for name in [
+            "",
+            "123name",
+            "my attr",
+            "a:b[c]",
+            "semi;colon",
+            "quoted\"name",
+            "person/legacy",
+        ] {
+            let input = format!(
+                r#"
+[[attribute]]
+name = {name:?}
+type = "string"
+"#
+            );
+            let error = parse(&input).expect_err("invalid name must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("expected a non-empty EDN keyword component"),
+                "{error}"
+            );
+        }
+
+        let group_error = parse(
             r#"
-[[entity]]
-name = "person/legacy"
-[entity.attributes]
-name = "string"
+[[attribute]]
+group = "group name"
+name = "value"
+type = "string"
 "#,
         )
-        .expect_err("slash must fail");
+        .expect_err("invalid group must fail");
         assert!(
-            error
+            group_error
                 .to_string()
-                .contains("names must be non-empty and may not contain '/'")
+                .contains("invalid group name \"group name\"")
         );
+    }
+
+    #[test]
+    fn quoted_toml_keys_still_round_trip_as_edn_keywords() {
+        let forms = parse_edn(
+            r#"
+[[entity]]
+name = "person"
+[entity.attributes]
+"active?" = "boolean"
+"#,
+        )
+        .expect("valid quoted key");
+        let printed = forms[0].to_string();
+        assert_eq!(read_one(&printed).expect("printed EDN parses"), forms[0]);
     }
 
     #[test]
@@ -536,5 +679,57 @@ many = true
             error.to_string(),
             ":tags specifies both `cardinality` and `many`; use only one"
         );
+    }
+
+    #[test]
+    fn rejects_unsupported_version_and_unknown_unique_mode() {
+        let version = parse("schema-version = 2").expect_err("version must fail");
+        assert_eq!(
+            version.to_string(),
+            "unsupported schema-version 2; expected 1"
+        );
+
+        let unique = parse(
+            r#"
+[[attribute]]
+name = "id"
+type = "uuid"
+unique = "primary"
+"#,
+        )
+        .expect_err("unique mode must fail");
+        assert_eq!(
+            unique.to_string(),
+            "unknown unique mode \"primary\" for :id"
+        );
+    }
+
+    #[test]
+    fn allows_empty_entity_groups_but_rejects_duplicate_groups() {
+        let definitions = parse(
+            r#"
+[[entity]]
+name = "person"
+
+[[attribute]]
+group = "person"
+name = "name"
+type = "string"
+"#,
+        )
+        .expect("empty group is authoring-only");
+        assert_eq!(definitions.len(), 1);
+
+        let duplicate = parse(
+            r#"
+[[entity]]
+name = "person"
+
+[[entity]]
+name = "person"
+"#,
+        )
+        .expect_err("duplicate entity group must fail");
+        assert_eq!(duplicate.to_string(), "duplicate entity group \"person\"");
     }
 }
