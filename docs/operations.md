@@ -20,6 +20,14 @@ store versioned logs natively in the same backend as their blobs and roots.
 Online backup reads every durable backend; restore and offline GC write a
 filesystem data directory.
 
+`GetStorageInfo` never returns a service backend's primary write credential.
+For PostgreSQL, configure a separate database role that has `SELECT` on
+`corium_blobs` and `corium_roots`, then pass its URL with
+`--postgres-read-only-url` (or `CORIUM_POSTGRES_READ_ONLY_URL`). If it is
+missing, storage-aware peer bootstrap and online backup fail explicitly
+instead of falling back to `--postgres-url`. Local filesystem and Turso
+stores need no separate credential configuration.
+
 The PostgreSQL backend creates `corium_blobs` and `corium_roots` in the
 connection's current schema and stores transaction-log objects as fenced
 root records with `log:` names. It uses the platform certificate store for TLS.
@@ -29,6 +37,8 @@ For example:
 cargo run -p corium-cli --features postgres -- \
   transactor --store postgres \
   --postgres-url 'postgresql://corium@db.example/corium?sslmode=require' \
+  --postgres-read-only-url \
+    'postgresql://corium_reader@db.example/corium?sslmode=require' \
   --data-dir /srv/corium
 ```
 
@@ -39,18 +49,56 @@ in the target bucket, and fences root publication with S3 conditional writes
 must support them. The bucket itself is not created automatically — provision
 it beforehand, since bucket creation
 involves region and ownership choices `corium` should not make for you.
-Credentials, region, and any custom endpoint (for MinIO/LocalStack) come
-from the standard AWS environment (`AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_PROFILE`,
-etc.), not `corium` flags. For example:
+The transactor's primary credentials still come from the standard AWS
+configuration chain (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_PROFILE`, instance/task roles, etc.). Region and endpoint may come from
+that chain or `--s3-region`/`--s3-endpoint-url`. Storage discovery uses
+separate read-only credentials in one of two forms:
+
+- Static keys supplied with `--s3-read-only-access-key-id` and
+  `--s3-read-only-secret-access-key` (plus an optional session token). The
+  operator must restrict these keys to reads of the Corium prefix.
+- Short-lived AWS STS credentials generated on every `GetStorageInfo` call
+  with `--s3-read-only-role-arn`. Corium attaches a session policy limited to
+  `s3:GetObject` and prefix-scoped `s3:ListBucket`, so the generated token
+  cannot write even if the role has broader permissions. The transactor's AWS
+  identity must be allowed to assume the role.
+
+`--s3-region` and `--s3-endpoint-url` are advertised with either form. A custom
+endpoint implies path-style S3 addressing. For example:
 
 ```sh
 AWS_REGION=us-east-1 \
 cargo run -p corium-cli --features s3 -- \
   transactor --store s3 \
   --s3-bucket corium-prod --s3-prefix corium/ \
+  --s3-region us-east-1 \
+  --s3-read-only-role-arn arn:aws:iam::123456789012:role/corium-reader \
   --data-dir /srv/corium
 ```
+
+Storage selection and discovery credentials can instead live in one EDN file;
+explicit flags override file values:
+
+```clojure
+{:store :s3
+ :data-dir "/srv/corium"
+ :s3-bucket "corium-prod"
+ :s3-prefix "corium/"
+ :s3-region "us-east-1"
+ :s3-read-only-role-arn "arn:aws:iam::123456789012:role/corium-reader"
+ :s3-read-only-role-duration-seconds 900}
+```
+
+```sh
+corium transactor --config /etc/corium/transactor.edn
+```
+
+Static secret fields are also available through
+`CORIUM_S3_READ_ONLY_ACCESS_KEY_ID`,
+`CORIUM_S3_READ_ONLY_SECRET_ACCESS_KEY`, and
+`CORIUM_S3_READ_ONLY_SESSION_TOKEN`; prefer those or a protected config file
+over putting secrets directly in a process argument.
 
 Tracing is human-readable by default. Use `--log-format json` for structured
 logs and `RUST_LOG` for filtering:

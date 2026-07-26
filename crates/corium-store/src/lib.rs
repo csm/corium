@@ -36,7 +36,7 @@ pub use turso_store::TursoBlobStore;
 #[cfg(feature = "s3")]
 mod s3_store;
 #[cfg(feature = "s3")]
-pub use s3_store::S3BlobStore;
+pub use s3_store::{S3BlobStore, S3ClientConfig};
 
 /// A content identifier for immutable blobs.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]

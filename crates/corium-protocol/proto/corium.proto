@@ -213,10 +213,9 @@ message SetIndexPolicyResponse {
   uint64 tail_deadline_ms = 4;
 }
 
-// Connection details returned once to a storage-aware administrative client.
-// PostgreSQL and S3 currently carry the transactor's read/write connection
-// configuration; these fields can become read-only credentials/configuration
-// without changing the backup protocol.
+// Connection details returned to a storage-aware administrative client.
+// Service backends carry separately configured read-only credentials; local
+// backends need no credential split.
 message StorageConnection {
   oneof backend {
     MemoryStorage memory = 1;
@@ -235,6 +234,7 @@ message FilesystemStorage {
 }
 
 message PostgreSqlStorage {
+  // Separately provisioned read-only connection string.
   string connection_string = 1;
 }
 
@@ -246,6 +246,17 @@ message TursoStorage {
 message S3Storage {
   string bucket = 1;
   string prefix = 2;
+  // Separately provisioned static credentials or temporary AWS STS
+  // credentials. Their policy permits reads only.
+  string access_key_id = 3;
+  string secret_access_key = 4;
+  // Present for temporary STS credentials and optional for static credentials.
+  string session_token = 5;
+  string region = 6;
+  // Optional custom endpoint for S3-compatible storage.
+  string endpoint_url = 7;
+  // Zero for non-expiring static credentials.
+  int64 expires_unix_seconds = 8;
 }
 
 message GetStorageInfoRequest {

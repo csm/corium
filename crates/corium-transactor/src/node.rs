@@ -24,7 +24,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::Instrument;
 
-use crate::backend::{LogBackend, NodeStore, StoreSpec};
+use crate::backend::{LogBackend, NodeStore, StorageInfoConfig, StoreSpec};
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
 use crate::{DbRoot, EmbeddedTransactor, Prepared, TransactError, db_root_name};
@@ -48,6 +48,9 @@ pub trait TxFnExpander: Send + Sync {
 pub struct NodeConfig {
     /// Storage-service backend for blobs and roots (`mem`, `fs`, or Turso).
     pub store: StoreSpec,
+    /// Separately provisioned read-only service credentials advertised by
+    /// `GetStorageInfo`. Local backends do not use this setting.
+    pub storage_info: StorageInfoConfig,
     /// Data directory holding the filesystem blob/root store (for the `fs`
     /// backend) and the transaction logs (for every non-`mem` backend).
     pub data_dir: PathBuf,
@@ -103,6 +106,7 @@ impl std::fmt::Debug for NodeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeConfig")
             .field("store", &self.store)
+            .field("storage_info", &self.storage_info)
             .field("data_dir", &self.data_dir)
             .field("owner", &self.owner)
             .field("lease_ttl_ms", &self.lease_ttl_ms)
@@ -129,6 +133,7 @@ impl NodeConfig {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             store: StoreSpec::Fs,
+            storage_info: StorageInfoConfig::default(),
             data_dir,
             owner: format!(
                 "transactor-{}",
@@ -1697,13 +1702,19 @@ impl TransactorNode {
         // Serialize with the tiny commit critical section so the checkpoint
         // cannot observe a batch after its durable append but before its
         // ownership fence and acknowledgement decision.
-        let _commit = state.commit.lock().await;
-        state.check_lease(self.store.as_ref()).await?;
-        let basis_t = state.db().basis_t();
+        let basis_t = {
+            let _commit = state.commit.lock().await;
+            state.check_lease(self.store.as_ref()).await?;
+            state.db().basis_t()
+        };
+        // Credential generation may call AWS STS. Do that after fixing the
+        // checkpoint and releasing the commit lock so a slow identity service
+        // never stalls transactions.
         let storage = self
             .config
             .store
-            .connection_info(&self.config.data_dir)
+            .connection_info(&self.config.data_dir, &self.config.storage_info)
+            .await
             .map_err(NodeError::BadRequest)?;
         Ok(pb::GetStorageInfoResponse {
             basis_t,

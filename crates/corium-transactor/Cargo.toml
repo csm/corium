@@ -15,7 +15,7 @@ default = ["cljrs"]
 cljrs = ["dep:cljrs-tx", "dep:cljrs-value"]
 postgres = ["corium-store/postgres"]
 turso = ["corium-store/turso"]
-s3 = ["corium-store/s3"]
+s3 = ["corium-store/s3", "dep:aws-config", "dep:aws-sdk-sts", "dep:serde_json"]
 
 [dependencies]
 cljrs-tx = { workspace = true, features = ["no-gc"], optional = true }
@@ -30,7 +30,10 @@ corium-query = { workspace = true }
 corium-store = { workspace = true }
 corium-tx = { workspace = true }
 async-trait = "0.1"
+aws-config = { version = "1", optional = true }
+aws-sdk-sts = { version = "1", optional = true }
 thiserror = "2"
+serde_json = { version = "1", optional = true }
 tracing = "0.1"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = "0.1.18"
