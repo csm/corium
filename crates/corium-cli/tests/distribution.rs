@@ -641,8 +641,9 @@ async fn cli_admin_commands_round_trip() {
         "--transactor".into(),
         endpoint.clone(),
     ]);
+    // Two datoms: the asserted value and the transaction's own `:db/txInstant`.
     assert!(
-        stats.contains(":basis-t 1") && stats.contains(":datoms 1"),
+        stats.contains(":basis-t 1") && stats.contains(":datoms 2"),
         "{stats}"
     );
 

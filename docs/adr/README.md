@@ -20,3 +20,4 @@ reference the old. Format: Context / Decision / Consequences.
 | [0013](0013-postgres-wire-interface.md) | PostgreSQL wire-protocol front end for read-only SQL | Accepted |
 | [0014](0014-self-hosted-rebac-authz.md) | Self-hosted relationship-based authorization in a Corium database | Accepted |
 | [0015](0015-guarded-autocommit-sql-dml.md) | Guarded autocommit SQL DML through the transactor | Accepted |
+| [0016](0016-transaction-time-as-data.md) | Transaction time as data (`:db/txInstant` datoms, instant-named views) | Accepted |

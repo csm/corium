@@ -82,7 +82,9 @@ fn schema_forms() -> Vec<corium_query::edn::Edn> {
 
 /// Loads Alice (39) and Bob (40, friend of Alice) through the fluent tx
 /// builder; returns the basis after the first (Alice-only) transaction.
-async fn load_people(peer: &impl Peer) -> u64 {
+/// Loads the fixture, returning the first transaction's basis and commit
+/// instant so time travel can be exercised by both.
+async fn load_people(peer: &impl Peer) -> (u64, i64) {
     let first = peer
         .transact(
             TxBuilder::new()
@@ -113,7 +115,7 @@ async fn load_people(peer: &impl Peer) -> u64 {
     .await
     .expect("second tx");
 
-    first.basis_t
+    (first.basis_t, first.tx_instant)
 }
 
 /// Runs the shared fluent read workload against a database value and returns
@@ -183,7 +185,7 @@ async fn local_and_remote_backends_agree() {
     let local = LocalPeer::connect(ConnectConfig::new(&endpoint, "people"))
         .await
         .expect("local connect");
-    let first_basis = load_people(&local).await;
+    let (first_basis, first_instant) = load_people(&local).await;
     let local_db = local.sync().await.expect("local sync");
     let local_obs = observe(&local_db).await;
 
@@ -197,6 +199,10 @@ async fn local_and_remote_backends_agree() {
     let early = observe(&as_of_first).await;
     assert_eq!(early.age_datoms, 1, "only Alice existed at the first basis");
     assert!(early.adults.is_empty(), "Alice (39) is not an adult at 40+");
+
+    // The same view named by the commit's wall clock rather than its basis.
+    let early_by_instant = observe(&local_db.as_of_instant(first_instant)).await;
+    assert_eq!(early_by_instant, early);
 
     // --- Remote peer: same surface over the peer-server gRPC. ---
     let hosted = Arc::new(
@@ -241,6 +247,29 @@ async fn local_and_remote_backends_agree() {
 
     // The two backends observe the same database.
     assert_eq!(local_obs, remote_obs, "local and remote backends disagree");
+
+    // Including instant-named views, which the server resolves against
+    // `:db/txInstant` before answering.
+    assert_eq!(
+        observe(&remote_db.as_of_instant(first_instant)).await,
+        early,
+        "remote as-of-instant disagrees with the local view"
+    );
+    // `since` hides the facts `observe` reads, so compare the two backends'
+    // since-instant views by their counts instead.
+    assert_eq!(
+        remote_db
+            .since_instant(first_instant)
+            .stats()
+            .await
+            .expect("remote since-instant stats"),
+        local_db
+            .since_instant(first_instant)
+            .stats()
+            .await
+            .expect("local since-instant stats"),
+        "remote since-instant disagrees with the local view"
+    );
 
     let _ = stop.send(());
     let _ = peer_stop_tx.send(());

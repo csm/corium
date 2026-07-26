@@ -10,13 +10,15 @@ value — cheap to clone, never mutated in place. It provides:
 
 - **Time views** — `Db::as_of`, `Db::since`, and `Db::history` (via `DbView`),
   each wrapping the same recorded datoms with a different fold policy; no facts
-  are copied.
+  are copied. `Db::as_of_instant` / `Db::since_instant` name the same views by
+  wall clock, resolving through the `:db/txInstant` datom every commit asserts.
 - **Covering-index access** — the four indexes for a view, materialized lazily
   on first read and shared by every clone.
 - **Naming** — the `Idents` registry mapping `:db/ident` keywords to entity ids.
 - **Statistics** — per-attribute counts used by the query planner.
-- **Bootstrap** — the reserved-id layout (`FIRST_USER_ID`) and the initial
-  schema every database starts with.
+- **Bootstrap** — the reserved-id layout (`FIRST_USER_ID`) and the attributes
+  the engine installs in every database (`bootstrap`: `:db/txInstant` today),
+  which is what makes transaction time ordinary queryable data.
 
 ## Dependencies
 

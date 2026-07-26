@@ -6,6 +6,12 @@
 //! datoms with a different fold policy — no copying of facts. The four
 //! covering indexes for a view are materialized lazily on first read and
 //! shared by every clone of that value.
+//!
+//! Transaction time is data: every committed transaction asserts
+//! `:db/txInstant` on its transaction entity (see [`bootstrap`]), so views can
+//! also be named by wall clock ([`Db::as_of_instant`], [`Db::since_instant`]).
+
+pub mod bootstrap;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -173,6 +179,64 @@ pub fn key_prefix(
     out
 }
 
+/// The `t` ↔ `:db/txInstant` correspondence for the transactions a value has
+/// seen, in both directions.
+///
+/// Both maps are persistent, so carrying them on every database value costs
+/// one O(log n) insert per transaction and nothing per clone. They are a
+/// property of the recorded transactions rather than of a time view, so a
+/// derived view (`as-of`, `since`, `history`) keeps the whole correspondence:
+/// naming a view by instant means the same thing whatever view you start from.
+///
+/// `:db/txInstant` is monotone by construction (the transactor stamps
+/// `max(now, last + 1)`), so ordering by instant and ordering by `t` agree.
+#[derive(Clone, Debug, Default)]
+pub struct TxInstants {
+    by_t: RedBlackTreeMapSync<u64, i64>,
+    by_instant: RedBlackTreeMapSync<i64, u64>,
+}
+
+impl TxInstants {
+    fn record(&mut self, t: u64, instant: i64) {
+        self.by_t.insert_mut(t, instant);
+        // Equal instants can only come from a log written without the
+        // monotonicity rule; keeping the highest `t` makes resolution pick the
+        // last transaction that shares an instant, matching `as-of`'s
+        // inclusive semantics.
+        if self.by_instant.get(&instant).is_none_or(|held| *held < t) {
+            self.by_instant.insert_mut(instant, t);
+        }
+    }
+
+    /// The commit instant of transaction `t`.
+    #[must_use]
+    pub fn instant(&self, t: u64) -> Option<i64> {
+        self.by_t.get(&t).copied()
+    }
+
+    /// The latest `t` committed at or before `instant`, or zero when no known
+    /// transaction is that old (the basis of an empty database).
+    #[must_use]
+    pub fn t_at(&self, instant: i64) -> u64 {
+        self.by_instant
+            .range(..=instant)
+            .next_back()
+            .map_or(0, |(_, t)| *t)
+    }
+
+    /// Number of transactions with a known instant.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_t.size()
+    }
+
+    /// Whether no transaction instant is known.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_t.is_empty()
+    }
+}
+
 /// An immutable value of a database at one basis transaction and time view.
 #[derive(Clone, Debug, Default)]
 pub struct Db {
@@ -182,14 +246,20 @@ pub struct Db {
     idents: Arc<Idents>,
     interner: Arc<KeywordInterner>,
     view: DbView,
+    instants: TxInstants,
     indexes: Arc<OnceLock<[Index; 4]>>,
     stats: Arc<OnceLock<PlannerStats>>,
 }
 
 impl Db {
     /// Creates an empty database with the supplied schema.
+    ///
+    /// The engine's own attributes ([`bootstrap`]) are installed over
+    /// `schema`, so every database understands `:db/txInstant` whether or not
+    /// the caller's schema mentions it.
     #[must_use]
-    pub fn new(schema: Schema) -> Self {
+    pub fn new(mut schema: Schema) -> Self {
+        bootstrap::install_schema(&mut schema);
         Self {
             schema,
             ..Self::default()
@@ -203,14 +273,38 @@ impl Db {
     /// no longer contribute a live fact are not reconstructed. This makes
     /// the value suitable for current queries and for applying the log tail;
     /// complete historical views still require replaying the full log.
+    ///
+    /// `:db/txInstant` datoms are live facts (nothing retracts them), so a
+    /// snapshot carries the transaction-time correspondence for every
+    /// transaction it covers — unless it was published before the engine
+    /// recorded instants as datoms, in which case instant-named views resolve
+    /// only within the replayed tail.
     #[must_use]
     pub fn from_current_snapshot(
         basis_t: u64,
-        schema: Schema,
-        idents: Idents,
+        mut schema: Schema,
+        mut idents: Idents,
         interner: KeywordInterner,
         datoms: Vec<Datom>,
     ) -> Self {
+        bootstrap::install(&mut schema, &mut idents);
+        let mut instants = TxInstants::default();
+        for datom in &datoms {
+            if let Datom {
+                e,
+                a,
+                v: Value::Instant(instant),
+                tx,
+                added: true,
+                ..
+            } = datom
+                && *a == bootstrap::TX_INSTANT
+                && *e == *tx
+                && tx.partition() == Partition::Tx as u32
+            {
+                instants.record(tx.sequence(), *instant);
+            }
+        }
         Self {
             basis_t,
             schema,
@@ -218,6 +312,7 @@ impl Db {
             idents: Arc::new(idents),
             interner: Arc::new(interner),
             view: DbView::Current,
+            instants,
             indexes: Arc::new(OnceLock::new()),
             stats: Arc::new(OnceLock::new()),
         }
@@ -225,7 +320,8 @@ impl Db {
 
     /// Attaches ident and keyword naming registries, returning the named value.
     #[must_use]
-    pub fn with_naming(mut self, idents: Idents, interner: KeywordInterner) -> Self {
+    pub fn with_naming(mut self, mut idents: Idents, interner: KeywordInterner) -> Self {
+        bootstrap::install(&mut self.schema, &mut idents);
         self.idents = Arc::new(idents);
         self.interner = Arc::new(interner);
         self
@@ -288,6 +384,45 @@ impl Db {
     #[must_use]
     pub fn history(&self) -> Self {
         self.with_view(DbView::History)
+    }
+
+    /// The `t` ↔ `:db/txInstant` correspondence recorded by this value.
+    #[must_use]
+    pub const fn instants(&self) -> &TxInstants {
+        &self.instants
+    }
+
+    /// The commit instant of transaction `t`, when this value has seen it.
+    #[must_use]
+    pub fn tx_instant(&self, t: u64) -> Option<i64> {
+        self.instants.instant(t)
+    }
+
+    /// The latest basis committed at or before `instant` (Unix milliseconds).
+    ///
+    /// Zero when no known transaction is that old, so `as-of` an instant
+    /// before the database existed is the empty value and `since` that instant
+    /// is everything — the same interpretation Datomic gives out-of-range
+    /// instants.
+    #[must_use]
+    pub fn t_at_instant(&self, instant: i64) -> u64 {
+        self.instants.t_at(instant)
+    }
+
+    /// Returns the as-of view at wall-clock `instant` (Unix milliseconds):
+    /// facts as they stood after the last transaction committed at or before
+    /// it.
+    #[must_use]
+    pub fn as_of_instant(&self, instant: i64) -> Self {
+        self.as_of(self.t_at_instant(instant))
+    }
+
+    /// Returns the since view at wall-clock `instant` (Unix milliseconds):
+    /// only live facts added after the last transaction committed at or before
+    /// it.
+    #[must_use]
+    pub fn since_instant(&self, instant: i64) -> Self {
+        self.since(self.t_at_instant(instant))
     }
 
     fn with_view(&self, view: DbView) -> Self {
@@ -411,8 +546,40 @@ impl Db {
     /// Applies a committed record, returning a new database value.
     ///
     /// Only meaningful for the current view; time views are read-only.
+    ///
+    /// A `:db/txInstant` assertion on the transaction entity — which every
+    /// commit path materializes — is picked up as this transaction's place on
+    /// the wall clock.
     #[must_use]
     pub fn with_transaction(&self, t: u64, datoms: &[Datom]) -> Self {
+        match bootstrap::asserted_instant(t, datoms) {
+            Some(instant) => self.with_transaction_at(t, instant, datoms),
+            None => self.apply_transaction(t, datoms),
+        }
+    }
+
+    /// Applies a committed record whose commit instant is known separately,
+    /// materializing the `:db/txInstant` datom when `datoms` lacks one.
+    ///
+    /// Replay paths use this so a log written before Corium recorded instants
+    /// as datoms still yields instant-named views: the record's timestamp
+    /// field becomes the datom it would carry today.
+    #[must_use]
+    pub fn with_transaction_at(&self, t: u64, instant: i64, datoms: &[Datom]) -> Self {
+        let asserted = bootstrap::asserted_instant(t, datoms);
+        let mut next = if asserted.is_some() {
+            self.apply_transaction(t, datoms)
+        } else {
+            let mut with_instant = Vec::with_capacity(datoms.len() + 1);
+            with_instant.extend_from_slice(datoms);
+            with_instant.push(bootstrap::tx_instant_datom(t, instant));
+            self.apply_transaction(t, &with_instant)
+        };
+        next.instants.record(t, asserted.unwrap_or(instant));
+        next
+    }
+
+    fn apply_transaction(&self, t: u64, datoms: &[Datom]) -> Self {
         debug_assert!(
             self.view == DbView::Current,
             "with_transaction applies only to the current view"
@@ -729,6 +896,117 @@ mod tests {
             .map(|d| d.e)
             .collect();
         assert_eq!(hits, vec![entity(2)]);
+    }
+
+    /// The same two transactions as [`sample`], committed at known instants
+    /// the way the transactor commits them.
+    fn timed_sample() -> Db {
+        Db::new(schema())
+            .with_transaction_at(
+                1,
+                1_000,
+                &[datom(1, 1, Value::Str("alice".into()), 1, true)],
+            )
+            .with_transaction_at(
+                2,
+                2_000,
+                &[
+                    datom(1, 1, Value::Str("alice".into()), 2, false),
+                    datom(1, 1, Value::Str("alicia".into()), 2, true),
+                ],
+            )
+    }
+
+    #[test]
+    fn commit_instants_are_recorded_in_both_directions() {
+        let db = timed_sample();
+        assert_eq!(db.tx_instant(1), Some(1_000));
+        assert_eq!(db.tx_instant(2), Some(2_000));
+        assert_eq!(db.tx_instant(3), None);
+        // Exactly on a commit, before the first, between two, and after the last.
+        assert_eq!(db.t_at_instant(1_000), 1);
+        assert_eq!(db.t_at_instant(999), 0);
+        assert_eq!(db.t_at_instant(1_999), 1);
+        assert_eq!(db.t_at_instant(9_999), 2);
+    }
+
+    #[test]
+    fn instant_named_views_match_their_basis_named_equivalents() {
+        let db = timed_sample();
+        assert_eq!(db.as_of_instant(1_500).datoms(), db.as_of(1).datoms());
+        assert_eq!(db.since_instant(1_500).datoms(), db.since(1).datoms());
+        // An instant older than the database is the empty value; `since` that
+        // same instant is therefore everything.
+        assert!(db.as_of_instant(0).datoms().is_empty());
+        assert_eq!(db.since_instant(0).datoms(), db.since(0).datoms());
+    }
+
+    #[test]
+    fn transaction_time_is_queryable_data() {
+        let db = timed_sample();
+        let instants: Vec<_> = db
+            .datoms_for_attribute(bootstrap::TX_INSTANT)
+            .map(|datom| (datom.e, datom.v.clone()))
+            .collect();
+        assert_eq!(
+            instants,
+            vec![
+                (tx_entity(1), Value::Instant(1_000)),
+                (tx_entity(2), Value::Instant(2_000)),
+            ]
+        );
+        // Indexed, so an instant range is an AVET seek rather than a scan.
+        assert!(avet_covered(db.schema(), bootstrap::TX_INSTANT));
+    }
+
+    #[test]
+    fn derived_views_keep_the_whole_transaction_time_correspondence() {
+        // Resolution must not depend on which view names the instant: a
+        // `since` view hides older datoms, but the instants they were
+        // committed at still name the same transactions.
+        let db = timed_sample();
+        for view in [db.as_of(1), db.since(2), db.history()] {
+            assert_eq!(view.tx_instant(1), Some(1_000));
+            assert_eq!(view.t_at_instant(2_500), 2);
+        }
+    }
+
+    #[test]
+    fn an_instant_supplied_with_the_datoms_wins_over_the_replayed_one() {
+        // A log record written by a transactor that already materialized the
+        // datom must not gain a second, contradictory one.
+        let db = Db::new(schema()).with_transaction_at(
+            1,
+            5_000,
+            &[
+                datom(1, 1, Value::Str("alice".into()), 1, true),
+                bootstrap::tx_instant_datom(1, 1_000),
+            ],
+        );
+        assert_eq!(db.values(tx_entity(1), bootstrap::TX_INSTANT).len(), 1);
+        assert_eq!(db.tx_instant(1), Some(1_000));
+    }
+
+    #[test]
+    fn snapshot_ignores_tx_instant_values_on_non_transaction_entities() {
+        let user = entity(1);
+        let db = Db::from_current_snapshot(
+            1,
+            schema(),
+            Idents::default(),
+            KeywordInterner::default(),
+            vec![
+                bootstrap::tx_instant_datom(1, 1_000),
+                Datom {
+                    e: user,
+                    a: bootstrap::TX_INSTANT,
+                    v: Value::Instant(9_000),
+                    tx: tx_entity(1),
+                    added: true,
+                },
+            ],
+        );
+        assert_eq!(db.tx_instant(1), Some(1_000));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use ratatui::crossterm::event::{
 use ratatui::widgets::TableState;
 
 use crate::console;
+pub use crate::instant::format_instant;
 
 /// Points kept per metrics sparkline.
 const HISTORY_CAP: usize = 240;
@@ -774,36 +775,6 @@ pub fn edn_complete(text: &str) -> bool {
     seen && depth <= 0 && !in_string
 }
 
-/// Formats a Unix-millisecond timestamp as UTC `YYYY-MM-DD HH:MM:SS.mmm`.
-pub fn format_instant(unix_ms: i64) -> String {
-    let seconds = unix_ms.div_euclid(1_000);
-    let millis = unix_ms.rem_euclid(1_000);
-    let days = seconds.div_euclid(86_400);
-    let tod = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}.{millis:03}",
-        tod / 3_600,
-        (tod % 3_600) / 60,
-        tod % 60
-    )
-}
-
-/// Gregorian calendar date for a day count since 1970-01-01 (Howard Hinnant's
-/// `civil_from_days`).
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
-
 /// Groups digits with commas: `1234567` → `"1,234,567"`.
 pub fn group_digits(value: u64) -> String {
     let digits = value.to_string();
@@ -831,13 +802,6 @@ mod tests {
         assert!(!edn_complete("   "));
         assert!(edn_complete("[\"bracket in \\\" string ]\"]"));
         assert!(!edn_complete("[:find ?e ; comment ]\n"));
-    }
-
-    #[test]
-    fn instants_format_as_utc() {
-        assert_eq!(format_instant(0), "1970-01-01 00:00:00.000");
-        assert_eq!(format_instant(1_700_000_000_123), "2023-11-14 22:13:20.123");
-        assert_eq!(format_instant(-1), "1969-12-31 23:59:59.999");
     }
 
     #[test]

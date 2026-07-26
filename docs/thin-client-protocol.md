@@ -45,8 +45,11 @@ can validate their codec against
 
 ## Database views and calls
 
-`DbViewSpec` names the database plus at most one of `as_of`, `since`, or
-`history`. No selector means current. Query database views bind positionally
+`DbViewSpec` names the database plus at most one of `as_of`, `since`,
+`history`, `as_of_instant`, or `since_instant`. No selector means current. The
+instant selectors carry Unix milliseconds and are resolved server-side against
+`:db/txInstant` to the last transaction committed at or before them; an instant
+older than the database resolves to basis 0. Query database views bind positionally
 to `$`, `$2`, and so on; `args` is a composite vector for remaining `:in`
 bindings. `fuel = 0` requests the server default, otherwise the server clamps
 it to its configured ceiling.

@@ -11,12 +11,16 @@ package corium.v1;
 // ---------------------------------------------------------------------------
 
 // Names a database view for a request: current, as-of, since, or history.
+// The instant variants name the same views by wall clock (Unix milliseconds),
+// resolved server-side to the last transaction committed at or before them.
 message DbViewSpec {
   string db = 1;
   oneof view {
     uint64 as_of = 2;
     uint64 since = 3;
     bool history = 4;
+    int64 as_of_instant = 5;
+    int64 since_instant = 6;
   }
 }
 

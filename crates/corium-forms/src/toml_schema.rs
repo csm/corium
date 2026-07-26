@@ -525,7 +525,11 @@ type = "ref"
     fn generated_edn_installs_through_existing_schema_path() {
         let forms = parse_edn(SCHEMA).expect("schema parses");
         let (schema, idents) = schema_from_edn(&forms).expect("schema installs");
-        assert_eq!(schema.iter().count(), 9);
+        assert_eq!(schema.iter().count(), forms.len() + 1);
+        assert_eq!(
+            idents.entid(&corium_db::bootstrap::tx_instant_ident()),
+            Some(corium_db::bootstrap::TX_INSTANT)
+        );
         let tags = idents
             .entid(&Keyword::new(Some("person"), "tags"))
             .expect("tags ident");

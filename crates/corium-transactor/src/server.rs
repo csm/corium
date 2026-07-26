@@ -96,7 +96,8 @@ pub(crate) fn subscription_stream(
                 };
                 if !send(pb::subscribe_item::Item::Report(pb::TxReport {
                     t: record.t,
-                    tx_instant: record.tx_instant,
+                    tx_instant: corium_db::bootstrap::asserted_instant(record.t, &record.datoms)
+                        .unwrap_or(record.tx_instant),
                     datoms,
                 }))
                 .await

@@ -17,7 +17,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/indexes-and-storage.md](docs/design/indexes-and-storage.md) | Covering indexes, immutable segments, blob store, roots, GC |
 | [docs/design/log-and-transactor.md](docs/design/log-and-transactor.md) | Transaction log, transaction pipeline, background indexing, HA design |
 | [docs/design/transactor-fleet.md](docs/design/transactor-fleet.md) | Future multi-database placement, single-endpoint routing, forwarding, and fleet HA |
-| [docs/design/time-model.md](docs/design/time-model.md) | as-of, since, history, log API, tx-report queue |
+| [docs/design/time-model.md](docs/design/time-model.md) | as-of, since, history (by basis or instant), log API, tx-report queue |
 | [docs/design/query-engine.md](docs/design/query-engine.md) | Datalog compiler/planner, rules, aggregates, Pull, entity API |
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |
 | [docs/design/auth.md](docs/design/auth.md) | Request-scoped identity, the authorization seam, and the self-hosted ReBAC policy database |
@@ -152,3 +152,11 @@ immutable snapshot keyed by its basis `t` and evaluated with a bounded,
 cycle-safe graph walk in memory. `corium authz init|grant|revoke|check|status`
 operates it; [docs/design/auth.md](docs/design/auth.md) records the model and
 [docs/operations.md](docs/operations.md) the runbook.
+
+Transaction time is now data rather than log metadata
+([ADR-0015](docs/adr/0015-transaction-time-as-data.md)): every commit asserts
+`:db/txInstant` on its transaction entity, so `[?tx :db/txInstant ?inst]` joins
+like any other clause, transaction metadata can be attached through the
+reserved `"datomic.tx"` tempid (or `:db/current-tx`), and `as-of`/`since`
+accept a wall-clock instant as well as a basis `t` — in Rust, cljrs, the wire
+protocol, the console, and the SQL shell.

@@ -135,7 +135,9 @@ Console commands are:
 ```text
 :basis
 :as-of 10
+:as-of 2026-07-25T09:30:00Z
 :since 10
+:since 2026-07-25 09:30:00
 :history on
 :history off
 :current
@@ -146,6 +148,12 @@ Console commands are:
 :watch
 :quit
 ```
+
+`:as-of` and `:since` take either a transaction number or a UTC timestamp
+(`YYYY-MM-DD`, optionally with `HH:MM[:SS[.mmm]]`); a timestamp selects the last
+transaction committed at or before it, resolved through the `:db/txInstant`
+datom every commit asserts. The SQL shell's `\as-of` and `\since` accept the
+same two forms.
 
 `:watch` tails live transaction reports until Ctrl-C. The reproducible M6
 smoke script is [m6-console.txt](demo/m6-console.txt).

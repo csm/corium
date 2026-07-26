@@ -103,8 +103,9 @@ service PeerServer {
 }
 ```
 
-Requests name a db view as `{db-name, as-of?, since?, history?}` so thin
-clients get the full time model. Result streams are chunked with a
+Requests name a db view as
+`{db-name, as-of?, since?, history?, as-of-instant?, since-instant?}` so thin
+clients get the full time model, by basis or by wall clock. Result streams are chunked with a
 server-enforced fuel/deadline per query. This service definition plus the
 codec spec **is** the public thin-client protocol; a conformance doc and test
 vectors ship with it so third parties can write clients.

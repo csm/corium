@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use corium_core::{Datom, EntityId, KeywordInterner, Schema};
-use corium_db::{Db, Idents};
+use corium_db::{Db, Idents, bootstrap};
 use corium_log::TxRecord;
 use corium_protocol::auth::TokenInterceptor;
 use corium_protocol::codec::{self, CodecError};
@@ -718,17 +718,19 @@ fn apply_item(inner: &Arc<Inner>, item: pb::subscribe_item::Item) -> Result<(), 
                 }
                 let before = state.interner.len();
                 let datoms = codec::decode_datoms(&report.datoms, &mut state.interner)?;
+                let tx_instant =
+                    bootstrap::asserted_instant(report.t, &datoms).unwrap_or(report.tx_instant);
                 if state.interner.len() > before {
                     state.db = state
                         .db
                         .clone()
                         .with_naming(state.idents.clone(), state.interner.clone());
                 }
-                state.db = state.db.with_transaction(report.t, &datoms);
-                state.instants.insert(report.t, report.tx_instant);
+                state.db = state.db.with_transaction_at(report.t, tx_instant, &datoms);
+                state.instants.insert(report.t, tx_instant);
                 PeerReport {
                     t: report.t,
-                    tx_instant: report.tx_instant,
+                    tx_instant,
                     datoms,
                     db_after: state.db.clone(),
                 }
