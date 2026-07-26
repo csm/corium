@@ -1,4 +1,4 @@
-# ADR-0015: Transaction time as data
+# ADR-0016: Transaction by time as data
 
 **Status:** Accepted (2026-07-25); implemented in
 [`corium-db::bootstrap`](../../crates/corium-db/src/bootstrap.rs) with the
