@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use corium_core::{Datom, EntityId, KeywordInterner, Schema};
-use corium_db::{Db, Idents};
+use corium_db::{Db, Idents, bootstrap};
 use corium_log::TxRecord;
 use corium_protocol::auth::TokenInterceptor;
 use corium_protocol::codec::{self, CodecError};
@@ -31,7 +31,9 @@ use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+pub use crate::segment::CachedPeerStorage;
 use crate::segment::{PeerStorage, SnapshotError, load_current_snapshot};
+pub use corium_store::{SegmentCacheConfig, SegmentCacheMetrics};
 
 type Client = TransactorClient<InterceptedService<Channel, TokenInterceptor>>;
 
@@ -90,6 +92,14 @@ pub struct ConnectConfig {
     /// Optional direct blob/root storage used to bootstrap from the newest
     /// published index before subscribing to the transaction-log tail.
     storage: Option<Arc<dyn PeerStorage>>,
+    segment_cache_metrics: Option<SegmentCacheMetricsHandle>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SegmentCacheMetricsHandle {
+    pub(crate) metrics: Arc<SegmentCacheMetrics>,
+    pub(crate) disk_capacity: u64,
+    pub(crate) memory_capacity: u64,
 }
 
 impl std::fmt::Debug for ConnectConfig {
@@ -105,6 +115,7 @@ impl std::fmt::Debug for ConnectConfig {
             .field("failover_timeout", &self.failover_timeout)
             .field("heartbeat_timeout", &self.heartbeat_timeout)
             .field("storage", &self.storage.is_some())
+            .field("segment_cache", &self.segment_cache_metrics.is_some())
             .finish()
     }
 }
@@ -129,6 +140,7 @@ impl ConnectConfig {
             failover_timeout: Duration::from_secs(30),
             heartbeat_timeout: None,
             storage: None,
+            segment_cache_metrics: None,
         }
     }
 
@@ -140,7 +152,27 @@ impl ConnectConfig {
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<dyn PeerStorage>) -> Self {
         self.storage = Some(storage);
+        self.segment_cache_metrics = None;
         self
+    }
+
+    /// Gives this peer direct storage access through a bounded local SSD cache.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid, unwritable, or already-owned cache directory.
+    pub fn with_storage_cache(
+        mut self,
+        storage: Arc<dyn PeerStorage>,
+        cache: &SegmentCacheConfig,
+    ) -> std::io::Result<Self> {
+        let cached = CachedPeerStorage::open(storage, cache)?;
+        self.segment_cache_metrics = Some(SegmentCacheMetricsHandle {
+            metrics: cached.metrics(),
+            disk_capacity: cache.capacity_bytes,
+            memory_capacity: cache.memory_capacity_bytes,
+        });
+        self.storage = Some(Arc::new(cached));
+        Ok(self)
     }
 
     /// Whether direct peer storage has been configured.
@@ -240,6 +272,10 @@ fn make_client(channel: Channel, token: Option<String>) -> Client {
 }
 
 impl Connection {
+    pub(crate) fn segment_cache_metrics(&self) -> Option<SegmentCacheMetricsHandle> {
+        self.inner.config.segment_cache_metrics.clone()
+    }
+
     /// Connects and waits until the handshake and required log tail have
     /// been applied locally. With direct storage configured, the peer first
     /// loads the newest published index and subscribes from its basis;
@@ -388,10 +424,26 @@ impl Connection {
     /// # Errors
     /// Returns [`PeerError`] for rejected transactions or transport failure.
     pub async fn transact(&self, forms: Vec<Edn>) -> Result<TxResult, PeerError> {
+        self.transact_at(forms, None).await
+    }
+
+    /// Submits a transaction conditionally against `expected_basis_t`.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for a stale basis, rejected transaction, or
+    /// transport failure.
+    pub async fn transact_at(
+        &self,
+        forms: Vec<Edn>,
+        expected_basis_t: Option<u64>,
+    ) -> Result<TxResult, PeerError> {
         let tx_data = codec::encode_edn(&Edn::Vector(forms));
         let deadline = tokio::time::Instant::now() + self.inner.config.failover_timeout;
         let response = loop {
-            match self.transact_raw(tx_data.clone()).await {
+            match self
+                .transact_raw_at(tx_data.clone(), expected_basis_t)
+                .await
+            {
                 Ok(response) => break response,
                 Err(error) if retry_is_safe(&error) && tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(self.inner.config.reconnect_min).await;
@@ -416,10 +468,24 @@ impl Connection {
     /// # Errors
     /// Returns [`PeerError`] for rejected transactions or transport failure.
     pub async fn transact_raw(&self, tx_data: Vec<u8>) -> Result<pb::TransactResponse, PeerError> {
+        self.transact_raw_at(tx_data, None).await
+    }
+
+    /// Submits already-encoded transaction data with an optional basis fence.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for a stale basis, rejected transaction, or
+    /// transport failure.
+    pub async fn transact_raw_at(
+        &self,
+        tx_data: Vec<u8>,
+        expected_basis_t: Option<u64>,
+    ) -> Result<pb::TransactResponse, PeerError> {
         let request = pb::TransactRequest {
             db: self.inner.config.db.clone(),
             protocol_version: corium_protocol::PROTOCOL_VERSION,
             tx_data,
+            expected_basis_t,
         };
         let mut client = self
             .inner
@@ -652,17 +718,19 @@ fn apply_item(inner: &Arc<Inner>, item: pb::subscribe_item::Item) -> Result<(), 
                 }
                 let before = state.interner.len();
                 let datoms = codec::decode_datoms(&report.datoms, &mut state.interner)?;
+                let tx_instant =
+                    bootstrap::asserted_instant(report.t, &datoms).unwrap_or(report.tx_instant);
                 if state.interner.len() > before {
                     state.db = state
                         .db
                         .clone()
                         .with_naming(state.idents.clone(), state.interner.clone());
                 }
-                state.db = state.db.with_transaction(report.t, &datoms);
-                state.instants.insert(report.t, report.tx_instant);
+                state.db = state.db.with_transaction_at(report.t, tx_instant, &datoms);
+                state.instants.insert(report.t, tx_instant);
                 PeerReport {
                     t: report.t,
-                    tx_instant: report.tx_instant,
+                    tx_instant,
                     datoms,
                     db_after: state.db.clone(),
                 }

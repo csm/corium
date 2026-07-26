@@ -15,11 +15,14 @@ Defines how the transactor, peers, and thin clients talk to each other:
 - **`schemaform` / `txforms`** — encode/decode helpers for schema and
   transaction payloads on the wire.
 - **`auth`** — bearer-token interceptors and TLS config helpers.
-- **`authz`** — *(spike)* request-scoped identity and authorization: pluggable
+- **`authz`** — request-scoped identity and authorization: pluggable
   `IdentityProvider`/`Authorizer`, per-principal `ViewFilter`, and a `Guard` +
-  interceptor. Not yet wired into the servers; see
+  interceptor. Transactor and peer services enforce guards and reject filtered
+  decisions on surfaces that cannot apply them yet; see
   [`docs/design/auth.md`](../../docs/design/auth.md).
-- `PROTOCOL_VERSION` — the version this crate speaks (currently `1`).
+- `PROTOCOL_VERSION` — the version this crate speaks (currently `2`; version
+  2 adds conditional transaction basis fencing). Servers also publish a
+  `MIN_SUPPORTED_PROTOCOL_VERSION` and currently accept version 1 clients.
 
 ## Dependencies
 

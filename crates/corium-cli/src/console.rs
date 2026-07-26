@@ -8,6 +8,8 @@ use corium_peer::Connection;
 use corium_query::ast::{InSpec, parse_query};
 use corium_query::edn::read_one;
 use corium_query::{ExecOptions, QInput};
+
+use crate::instant::{TimePoint, format_instant, parse_time_point};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -18,6 +20,10 @@ enum View {
     AsOf(u64),
     Since(u64),
     History,
+    /// As-of a wall-clock instant (Unix milliseconds).
+    AsOfInstant(i64),
+    /// Since a wall-clock instant (Unix milliseconds).
+    SinceInstant(i64),
 }
 
 impl View {
@@ -27,6 +33,8 @@ impl View {
             Self::AsOf(t) => db.as_of(t),
             Self::Since(t) => db.since(t),
             Self::History => db.history(),
+            Self::AsOfInstant(instant) => db.as_of_instant(instant),
+            Self::SinceInstant(instant) => db.since_instant(instant),
         }
     }
 }
@@ -114,18 +122,28 @@ impl Session {
                 .then_some(())
                 .ok_or_else(|| "too many command arguments".to_owned())
         };
+        // Timestamps may be written with a space between date and time, so
+        // these two commands take the rest of the line rather than one word.
+        let rest = || {
+            let trimmed = line[command.len()..].trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        };
         match command {
             ":as-of" => {
-                let t = parse_t(argument, ":as-of")?;
-                no_more()?;
-                self.view = View::AsOf(t);
-                Ok(Action::Output(format!(";; view is now as-of {t}")))
+                let view = match parse_time_point(rest(), ":as-of")? {
+                    TimePoint::T(t) => View::AsOf(t),
+                    TimePoint::Instant(instant) => View::AsOfInstant(instant),
+                };
+                self.view = view;
+                Ok(Action::Output(format!(";; view is now {}", view_name(view))))
             }
             ":since" => {
-                let t = parse_t(argument, ":since")?;
-                no_more()?;
-                self.view = View::Since(t);
-                Ok(Action::Output(format!(";; view is now since {t}")))
+                let view = match parse_time_point(rest(), ":since")? {
+                    TimePoint::T(t) => View::Since(t),
+                    TimePoint::Instant(instant) => View::SinceInstant(instant),
+                };
+                self.view = view;
+                Ok(Action::Output(format!(";; view is now {}", view_name(view))))
             }
             ":history" => {
                 no_more()?;
@@ -217,7 +235,7 @@ impl Session {
             }
             ":quit" | ":exit" => Ok(Action::Quit),
             ":help" => Ok(Action::Output(
-                ":as-of t | :since t | :history on|off | :current | :basis | :schema [attr] | :stats | :watch | :timing on|off | :quit".into(),
+                ":as-of t|timestamp | :since t|timestamp | :history on|off | :current | :basis | :schema [attr] | :stats | :watch | :timing on|off | :quit".into(),
             )),
             _ => Err(format!("unknown console command {command}; try :help")),
         }
@@ -267,19 +285,14 @@ pub(crate) fn execute_pull(
         .map_err(|error| error.to_string())
 }
 
-fn parse_t(argument: Option<&str>, command: &str) -> Result<u64, String> {
-    argument
-        .ok_or_else(|| format!("usage: {command} t"))?
-        .parse()
-        .map_err(|_| format!("{command} requires a non-negative transaction number"))
-}
-
 fn view_name(view: View) -> String {
     match view {
         View::Current => "current".into(),
         View::AsOf(t) => format!("[:as-of {t}]"),
         View::Since(t) => format!("[:since {t}]"),
         View::History => "history".into(),
+        View::AsOfInstant(instant) => format!("[:as-of #inst \"{}\"]", format_instant(instant)),
+        View::SinceInstant(instant) => format!("[:since #inst \"{}\"]", format_instant(instant)),
     }
 }
 
@@ -366,8 +379,8 @@ mod tests {
             tx: EntityId::from_raw(2),
             ..one.clone()
         };
-        db.with_transaction(1, &[one])
-            .with_transaction(2, &[retract, two])
+        db.with_transaction_at(1, 1_000_000, &[one])
+            .with_transaction_at(2, 2_000_000, &[retract, two])
     }
 
     #[test]
@@ -392,6 +405,32 @@ mod tests {
             session.execute(&db, ":stats"),
             Ok(Action::Output(_))
         ));
+    }
+
+    #[test]
+    fn time_views_can_be_named_by_timestamp() {
+        let db = fixture();
+        let mut session = Session::default();
+        let query = "[:find ?v :where [?e :item/value ?v]]";
+
+        // The first commit is at 1970-01-01 00:16:40 UTC; naming any instant
+        // between the two commits selects the first.
+        assert!(session.execute(&db, ":as-of 1970-01-01T00:20:00Z").is_ok());
+        assert_eq!(
+            session.view_label(),
+            "[:as-of #inst \"1970-01-01 00:20:00.000\"]"
+        );
+        assert!(output(session.execute(&db, query)).contains('1'));
+
+        assert!(session.execute(&db, ":since 1970-01-01 00:20:00").is_ok());
+        assert!(output(session.execute(&db, query)).contains('2'));
+
+        // Before the database existed: as-of is empty, since is everything.
+        assert!(session.execute(&db, ":as-of 1969-12-31").is_ok());
+        assert!(!output(session.execute(&db, query)).contains('1'));
+
+        assert!(session.execute(&db, ":as-of nonsense").is_err());
+        assert!(session.execute(&db, ":as-of").is_err());
     }
 
     fn output(action: Result<Action, String>) -> String {

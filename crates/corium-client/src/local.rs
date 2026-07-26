@@ -93,6 +93,8 @@ impl LocalDbBackend {
             View::AsOf(t) => self.snapshot.as_of(t),
             View::Since(t) => self.snapshot.since(t),
             View::History => self.snapshot.history(),
+            View::AsOfInstant(instant) => self.snapshot.as_of_instant(instant),
+            View::SinceInstant(instant) => self.snapshot.since_instant(instant),
         }
     }
 }

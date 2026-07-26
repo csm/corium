@@ -145,6 +145,30 @@ fn t_of(value: &Value) -> ValueResult<u64> {
     u64::try_from(long_of(value, "t")?).map_err(|_| verr("t must be non-negative"))
 }
 
+/// How a caller named a point in time to `as-of`/`since`.
+enum Basis {
+    /// A transaction basis.
+    T(u64),
+    /// A wall-clock instant in Unix milliseconds, resolved against
+    /// `:db/txInstant`.
+    Instant(i64),
+}
+
+/// Reads a time argument: a long is a basis `t`, an `#inst` is wall clock —
+/// the same distinction Datomic draws between a `t` and a `Date`.
+fn basis_of(value: &Value) -> ValueResult<Basis> {
+    match to_edn(value).map_err(|error| verr(error.to_string()))? {
+        Edn::Long(t) => u64::try_from(t)
+            .map(Basis::T)
+            .map_err(|_| verr("t must be non-negative")),
+        Edn::Tagged(tag, inner) if tag == "inst" => match *inner {
+            Edn::Long(ms) => Ok(Basis::Instant(ms)),
+            _ => Err(verr("#inst must wrap Unix milliseconds")),
+        },
+        _ => Err(verr("time argument must be a basis t or an #inst")),
+    }
+}
+
 /// Resolves an entity position: long, ident keyword, `#eid`, or lookup ref.
 fn eid_of(db: &Db, form: &Edn) -> ValueResult<EntityId> {
     match form {
@@ -321,14 +345,22 @@ pub fn register_read_api(globals: &Arc<GlobalEnv>) {
         globals,
         "as-of",
         NativeFn::with_closure("as-of", Arity::Fixed(2), |args| {
-            Ok(db_value(db_of(&args[0])?.as_of(t_of(&args[1])?)))
+            let db = db_of(&args[0])?;
+            Ok(db_value(match basis_of(&args[1])? {
+                Basis::T(t) => db.as_of(t),
+                Basis::Instant(ms) => db.as_of_instant(ms),
+            }))
         }),
     );
     define(
         globals,
         "since",
         NativeFn::with_closure("since", Arity::Fixed(2), |args| {
-            Ok(db_value(db_of(&args[0])?.since(t_of(&args[1])?)))
+            let db = db_of(&args[0])?;
+            Ok(db_value(match basis_of(&args[1])? {
+                Basis::T(t) => db.since(t),
+                Basis::Instant(ms) => db.since_instant(ms),
+            }))
         }),
     );
     define(

@@ -57,11 +57,12 @@ impl PeerServerSvc {
     /// ([`Guard::disabled`]); add a policy with [`PeerServerSvc::with_guard`].
     #[must_use]
     pub fn new(connection: Arc<Connection>, config: PeerServerConfig) -> Self {
+        let metrics = Arc::new(Metrics::new(connection.segment_cache_metrics()));
         Self {
             connection,
             cache: QueryCache::new(),
             config,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
             guard: Guard::disabled(),
         }
     }
@@ -114,6 +115,8 @@ impl PeerServerSvc {
             Some(pb::db_view_spec::View::AsOf(t)) => base.as_of(*t),
             Some(pb::db_view_spec::View::Since(t)) => base.since(*t),
             Some(pb::db_view_spec::View::History(true)) => base.history(),
+            Some(pb::db_view_spec::View::AsOfInstant(instant)) => base.as_of_instant(*instant),
+            Some(pb::db_view_spec::View::SinceInstant(instant)) => base.since_instant(*instant),
             None | Some(pb::db_view_spec::View::History(false)) => base,
         })
     }
@@ -313,7 +316,7 @@ impl PeerServer for PeerServerSvc {
         }
         let response = self
             .connection
-            .transact_raw(request.tx_data)
+            .transact_raw_at(request.tx_data, request.expected_basis_t)
             .await
             .map_err(|error| match error {
                 crate::PeerError::Rpc(status) => status,

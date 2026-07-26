@@ -11,12 +11,16 @@ package corium.v1;
 // ---------------------------------------------------------------------------
 
 // Names a database view for a request: current, as-of, since, or history.
+// The instant variants name the same views by wall clock (Unix milliseconds),
+// resolved server-side to the last transaction committed at or before them.
 message DbViewSpec {
   string db = 1;
   oneof view {
     uint64 as_of = 2;
     uint64 since = 3;
     bool history = 4;
+    int64 as_of_instant = 5;
+    int64 since_instant = 6;
   }
 }
 
@@ -25,6 +29,9 @@ message TransactRequest {
   uint32 protocol_version = 2;
   // Composite-encoded EDN vector of transaction forms (map and list forms).
   bytes tx_data = 3;
+  // When present, commit only if the database is still at this basis.
+  // Peer-local read/modify/write surfaces use this to reject stale plans.
+  optional uint64 expected_basis_t = 4;
 }
 
 message TransactResponse {

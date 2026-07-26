@@ -41,6 +41,17 @@ fn bad_tx() -> Vec<u8> {
     ])]))
 }
 
+/// Item entities, counted without the transaction entities that every commit
+/// now creates for its own `:db/txInstant`.
+fn item_count(db: &corium_db::Db) -> usize {
+    db.datoms()
+        .iter()
+        .filter(|datom| datom.e.partition() == corium_core::Partition::User as u32)
+        .map(|datom| datom.e)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 async fn mem_node() -> Arc<TransactorNode> {
     mem_node_with_batch(None).await
 }
@@ -86,7 +97,7 @@ async fn concurrent_transactions_all_commit_with_contiguous_basis() {
     // The committed value holds exactly `count` entities.
     let db = node.db_state("items").await.expect("state").db();
     assert_eq!(db.basis_t(), count);
-    assert_eq!(db.stats().entities, usize::try_from(count).expect("fits"));
+    assert_eq!(item_count(&db), usize::try_from(count).expect("fits"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -108,7 +119,7 @@ async fn a_rejected_transaction_does_not_abort_its_batchmates() {
     );
 
     let db = node.db_state("items").await.expect("state").db();
-    assert_eq!(db.stats().entities, 1);
+    assert_eq!(item_count(&db), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -140,5 +151,5 @@ async fn a_batch_cap_of_one_disables_batching_but_stays_correct() {
 
     let db = node.db_state("items").await.expect("state").db();
     assert_eq!(db.basis_t(), count);
-    assert_eq!(db.stats().entities, usize::try_from(count).expect("fits"));
+    assert_eq!(item_count(&db), usize::try_from(count).expect("fits"));
 }

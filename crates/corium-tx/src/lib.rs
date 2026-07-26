@@ -3,11 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{Cardinality, Datom, EntityId, Partition, Unique, Value};
-use corium_db::{Db, FIRST_USER_ID};
+use corium_db::{Db, FIRST_USER_ID, bootstrap};
 use thiserror::Error;
 
 /// A temporary entity identifier scoped to one transaction.
 pub type TempId = String;
+
+/// The reserved tempid naming the transaction's own entity.
+///
+/// Asserting against it attaches metadata to the transaction — the audit
+/// trail's who/why alongside the engine's `:db/txInstant` when. Corium spells
+/// it as Datomic does so ported transaction data works unchanged; the EDN
+/// boundary also accepts `:db/current-tx` in entity position.
+pub const TX_TEMPID: &str = "datomic.tx";
 
 /// An entity position accepted by transaction operations.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +92,21 @@ pub enum TxError {
     /// CAS is only valid for cardinality one.
     #[error("compare-and-swap requires cardinality one")]
     CasCardinality,
+    /// Transaction data asserted a `:db/txInstant` that does not advance the
+    /// transaction clock. Instants are monotone by construction, so a
+    /// backdated commit would break the ordering `as-of` an instant relies on.
+    #[error("supplied :db/txInstant {supplied} is not after the last commit's {last}")]
+    TxInstantNotMonotonic {
+        /// Instant asserted by the transaction data.
+        supplied: i64,
+        /// Instant of the previous commit.
+        last: i64,
+    },
+    /// `:db/txInstant` was retracted, changed, attached to another entity, or
+    /// supplied more than once. It is engine-owned data except for one
+    /// explicit assertion on the transaction currently being prepared.
+    #[error(":db/txInstant may only be added once to the current transaction entity")]
+    InvalidTxInstantOperation,
 }
 
 /// Expands and validates transaction input against `db`.
@@ -119,6 +142,7 @@ pub fn prepare(
     // Identity assertions unify a tempid with an existing entity before allocation.
     for op in &ops {
         if let TxOp::Add(EntityRef::Temp(temp), a, value) = op
+            && temp != TX_TEMPID
             && db.schema().get(*a).and_then(|x| x.unique) == Some(Unique::Identity)
             && let Some(e) = db.lookup(*a, value)
         {
@@ -133,6 +157,12 @@ pub fn prepare(
             }
         };
         if let EntityRef::Temp(temp) = entity {
+            // The transaction's own entity is already allocated; metadata
+            // assertions resolve to it rather than to a fresh id.
+            if temp == TX_TEMPID {
+                tempids.insert(temp.clone(), tx);
+                continue;
+            }
             tempids.entry(temp.clone()).or_insert_with(|| {
                 let e = EntityId::new(Partition::User as u32, next);
                 next += 1;
@@ -155,11 +185,18 @@ pub fn prepare(
     };
     let mut datoms = Vec::new();
     let mut working = db.clone();
+    let mut tx_instant_asserted = false;
     for op in ops {
         let start = datoms.len();
         match op {
             TxOp::Add(entity, a, v) => {
                 let e = resolve(&entity)?;
+                if a == bootstrap::TX_INSTANT {
+                    if e != tx || tx_instant_asserted {
+                        return Err(TxError::InvalidTxInstantOperation);
+                    }
+                    tx_instant_asserted = true;
+                }
                 validate(&working, a, &v)?;
                 if let Some(attr) = working.schema().get(a) {
                     if attr.unique.is_some()
@@ -193,6 +230,9 @@ pub fn prepare(
                 });
             }
             TxOp::Retract(entity, a, v) => {
+                if a == bootstrap::TX_INSTANT {
+                    return Err(TxError::InvalidTxInstantOperation);
+                }
                 validate(&working, a, &v)?;
                 let e = resolve(&entity)?;
                 // Retracting an absent fact is a no-op: no datom recorded.
@@ -207,6 +247,9 @@ pub fn prepare(
                 }
             }
             TxOp::Cas(entity, a, old, new) => {
+                if a == bootstrap::TX_INSTANT {
+                    return Err(TxError::InvalidTxInstantOperation);
+                }
                 validate(&working, a, &new)?;
                 let e = resolve(&entity)?;
                 if working
@@ -245,6 +288,9 @@ pub fn prepare(
                     &mut facts,
                     &mut BTreeSet::new(),
                 );
+                if facts.iter().any(|(_, a, _)| *a == bootstrap::TX_INSTANT) {
+                    return Err(TxError::InvalidTxInstantOperation);
+                }
                 datoms.extend(facts.into_iter().map(|(e, a, v)| Datom {
                     e,
                     a,

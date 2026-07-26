@@ -24,6 +24,7 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::Codec(_)
         | NodeError::TxForm(_)
         | NodeError::SchemaForm(_) => Status::invalid_argument(error.to_string()),
+        NodeError::BasisMismatch { .. } => Status::aborted(error.to_string()),
         NodeError::Deposed(_) | NodeError::Standby { .. } | NodeError::UnsupportedFormat { .. } => {
             Status::failed_precondition(error.to_string())
         }
@@ -95,7 +96,8 @@ pub(crate) fn subscription_stream(
                 };
                 if !send(pb::subscribe_item::Item::Report(pb::TxReport {
                     t: record.t,
-                    tx_instant: record.tx_instant,
+                    tx_instant: corium_db::bootstrap::asserted_instant(record.t, &record.datoms)
+                        .unwrap_or(record.tx_instant),
                     datoms,
                 }))
                 .await
@@ -169,7 +171,7 @@ impl Transactor for TransactorSvc {
         )
         .await?;
         self.0
-            .transact(&request.db, &request.tx_data)
+            .transact_at(&request.db, &request.tx_data, request.expected_basis_t)
             .await
             .map(Response::new)
             .map_err(|error| to_status(&error))
@@ -245,11 +247,14 @@ impl Transactor for TransactorSvc {
 }
 
 fn check_version(version: u32) -> Result<(), Status> {
-    if version == corium_protocol::PROTOCOL_VERSION {
+    if (corium_protocol::MIN_SUPPORTED_PROTOCOL_VERSION..=corium_protocol::PROTOCOL_VERSION)
+        .contains(&version)
+    {
         Ok(())
     } else {
         Err(Status::failed_precondition(format!(
-            "protocol version {version} is not supported; upgrade to {}",
+            "protocol version {version} is not supported; supported range is {}..={}",
+            corium_protocol::MIN_SUPPORTED_PROTOCOL_VERSION,
             corium_protocol::PROTOCOL_VERSION
         )))
     }
@@ -486,6 +491,18 @@ mod tests {
         assert_eq!(
             requested_gc_retention(subsecond),
             Some(std::time::Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn protocol_versions_allow_server_first_rolling_upgrades() {
+        assert!(check_version(corium_protocol::MIN_SUPPORTED_PROTOCOL_VERSION).is_ok());
+        assert!(check_version(corium_protocol::PROTOCOL_VERSION).is_ok());
+        assert_eq!(
+            check_version(corium_protocol::PROTOCOL_VERSION + 1)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
         );
     }
 }
