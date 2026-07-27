@@ -154,8 +154,8 @@ Reads run through the same `SqlSession` as the shell. A write-capable
 transactor connection; a catalog that does not implement `transact` remains
 read-only. The server supports both simple and extended query sub-protocols,
 including PostgreSQL `$1` bound inputs. Common scalar parameters accept text
-and binary input encodings. Results remain text-only; array inputs, text
-`timestamptz` inputs, and binary results are not yet supported.
+and binary input encodings, including ISO 8601 `timestamptz` text. Results
+support both text and binary encodings. Array inputs are not yet supported.
 
 Explicit `BEGIN` blocks track transaction status and permit reads, but writes
 inside them are rejected instead of silently autocommitting. Use one

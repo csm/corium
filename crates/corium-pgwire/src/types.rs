@@ -6,6 +6,7 @@
 
 use std::fmt::Write as _;
 
+use chrono::DateTime;
 use corium_sql::{SqlType, SqlValue};
 
 // PostgreSQL built-in type OIDs (from `pg_type`).
@@ -318,15 +319,19 @@ fn decode_text_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
             .map(SqlValue::Float)
             .map_err(|error| format!("invalid floating-point parameter: {error}")),
         OID_BYTEA => decode_bytea(text).map(SqlValue::Bytes),
-        OID_TIMESTAMPTZ => Err(
-            "text timestamptz parameters are not supported yet; bind an integer epoch expression"
-                .into(),
-        ),
+        OID_TIMESTAMPTZ => decode_text_timestamp(text).map(SqlValue::TimestampMillis),
         oid if is_array_oid(oid) => {
             Err("array parameters are not supported yet; use an ARRAY expression".into())
         }
         other => Err(format!("parameter type OID {other} is not supported")),
     }
+}
+
+fn decode_text_timestamp(text: &str) -> Result<i64, String> {
+    DateTime::parse_from_rfc3339(text)
+        .or_else(|_| DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z"))
+        .map(|timestamp| timestamp.timestamp_millis())
+        .map_err(|error| format!("invalid timestamptz parameter: {error}"))
 }
 
 fn decode_binary_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
@@ -683,6 +688,19 @@ mod tests {
             decode_parameter(OID_NUMERIC, 0, Some(b"18446744073709551615")).unwrap(),
             SqlValue::Unsigned(u64::MAX)
         );
+    }
+
+    #[test]
+    fn text_timestamptz_accepts_iso_8601_and_postgresql_offsets() {
+        assert_eq!(
+            decode_parameter(OID_TIMESTAMPTZ, 0, Some(b"2021-01-01T00:00:00.123Z")).unwrap(),
+            SqlValue::TimestampMillis(1_609_459_200_123)
+        );
+        assert_eq!(
+            decode_parameter(OID_TIMESTAMPTZ, 0, Some(b"2021-01-01 01:30:00+01:30")).unwrap(),
+            SqlValue::TimestampMillis(1_609_459_200_000)
+        );
+        assert!(decode_parameter(OID_TIMESTAMPTZ, 0, Some(b"not-a-timestamp")).is_err());
     }
 
     #[test]

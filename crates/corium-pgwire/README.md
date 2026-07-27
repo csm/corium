@@ -65,6 +65,10 @@ Corium's `SqlType`/`SqlValue` are rendered into PostgreSQL types:
 | `Bytes` | `bytea` (hex output) |
 | `List<T>` | the matching array type, e.g. `_text` |
 
+Scalar parameters accept PostgreSQL text and binary encodings, including ISO
+8601 `timestamptz` text. Query results support both text and binary formats;
+array parameters remain unsupported.
+
 ## Dependencies
 
 - `corium-sql`, `corium-db`, `corium-core` — the database and its SQL

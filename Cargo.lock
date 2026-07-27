@@ -2044,6 +2044,7 @@ name = "corium-pgwire"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "corium-core",
  "corium-db",
  "corium-forms",
