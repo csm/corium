@@ -14,6 +14,9 @@ use std::{
 };
 use thiserror::Error;
 
+const CHECKSUMMED_FRAME: u64 = 1 << 63;
+const FRAME_CHECKSUM_LEN: usize = size_of::<u32>();
+
 /// One committed transaction record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TxRecord {
@@ -169,14 +172,10 @@ impl TransactionLog for FileLog {
         if *next_t != record.t {
             return Err(LogError::Corrupt);
         }
-        let payload = encode_record(record);
+        let mut frame = Vec::new();
+        append_framed_record(&mut frame, record)?;
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
-        file.write_all(
-            &u64::try_from(payload.len())
-                .map_err(|_| LogError::Corrupt)?
-                .to_be_bytes(),
-        )?;
-        file.write_all(&payload)?;
+        file.write_all(&frame)?;
         file.sync_all()?;
         *next_t += 1;
         Ok(())
@@ -283,14 +282,10 @@ impl TransactionLog for VersionedLog {
         if *next_t != record.t {
             return Err(LogError::Corrupt);
         }
-        let payload = encode_record(record);
+        let mut frame = Vec::new();
+        append_framed_record(&mut frame, record)?;
         let mut file = OpenOptions::new().append(true).open(&self.write_path)?;
-        file.write_all(
-            &u64::try_from(payload.len())
-                .map_err(|_| LogError::Corrupt)?
-                .to_be_bytes(),
-        )?;
-        file.write_all(&payload)?;
+        file.write_all(&frame)?;
         file.sync_all()?;
         *next_t += 1;
         Ok(())
@@ -828,13 +823,39 @@ fn decode_record(mut bytes: &[u8]) -> Result<TxRecord, LogError> {
         datoms,
     })
 }
+
+fn frame_header(payload_len: usize) -> Result<[u8; 8], LogError> {
+    let payload_len = u64::try_from(payload_len).map_err(|_| LogError::Corrupt)?;
+    if payload_len & CHECKSUMMED_FRAME != 0 {
+        return Err(LogError::Corrupt);
+    }
+    Ok((payload_len | CHECKSUMMED_FRAME).to_be_bytes())
+}
+
+fn frame_payload_len(header: [u8; 8]) -> Result<(usize, bool), LogError> {
+    let encoded = u64::from_be_bytes(header);
+    let checksummed = encoded & CHECKSUMMED_FRAME != 0;
+    let payload_len = encoded & !CHECKSUMMED_FRAME;
+    Ok((
+        usize::try_from(payload_len).map_err(|_| LogError::Corrupt)?,
+        checksummed,
+    ))
+}
+
+fn frame_checksum(header: [u8; 8], payload: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc32c::crc32c(&header), payload)
+}
+
 /// Reads fully written records plus the byte length of that durable prefix.
 ///
 /// A record cut short by a crash mid-append (truncated length prefix or
-/// payload) ends the scan; a fully present record that fails to decode is
-/// genuine corruption and errors.
+/// payload/checksum) ends the scan; a fully present record with a checksum
+/// mismatch or invalid payload is genuine corruption and errors. Legacy
+/// length-only records remain readable, while newly written records set the
+/// high bit of the length word and carry a trailing CRC32C.
 fn read_records(path: &Path) -> Result<(Vec<TxRecord>, u64), LogError> {
     let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
     let mut records = Vec::new();
     let mut durable_len = 0_u64;
     loop {
@@ -844,56 +865,98 @@ fn read_records(path: &Path) -> Result<(Vec<TxRecord>, u64), LogError> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
-        let len = usize::try_from(u64::from_be_bytes(len)).map_err(|_| LogError::Corrupt)?;
-        let mut payload = vec![0; len];
+        let (payload_len, checksummed) = frame_payload_len(len)?;
+        let frame_len = 8_u64
+            .checked_add(u64::try_from(payload_len).map_err(|_| LogError::Corrupt)?)
+            .and_then(|len| {
+                len.checked_add(if checksummed {
+                    u64::try_from(FRAME_CHECKSUM_LEN).expect("checksum length fits u64")
+                } else {
+                    0
+                })
+            })
+            .ok_or(LogError::Corrupt)?;
+        // Check the bytes remaining before allocating from an untrusted length
+        // word. A short final frame is the recoverable crash-tail case.
+        if file_len.saturating_sub(durable_len) < frame_len {
+            break;
+        }
+        let mut payload = vec![0; payload_len];
         match file.read_exact(&mut payload) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
+        if checksummed {
+            let mut stored_checksum = [0; FRAME_CHECKSUM_LEN];
+            match file.read_exact(&mut stored_checksum) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            if u32::from_be_bytes(stored_checksum) != frame_checksum(len, &payload) {
+                return Err(LogError::Corrupt);
+            }
+        }
         records.push(decode_record(&payload)?);
-        durable_len += 8 + len as u64;
+        durable_len = durable_len
+            .checked_add(frame_len)
+            .ok_or(LogError::Corrupt)?;
     }
     Ok((records, durable_len))
 }
 
-/// Appends one length-prefixed encoded record to `out`.
+/// Appends one checksummed, length-prefixed encoded record to `out`.
+///
+/// The high bit of the length word identifies the checksummed frame format;
+/// the remaining 63 bits are the payload length. A big-endian CRC32C over the
+/// encoded length word and payload follows the payload.
 ///
 /// # Errors
 /// Returns an error if the record payload length is not representable.
 pub fn append_framed_record(out: &mut Vec<u8>, record: &TxRecord) -> Result<(), LogError> {
     let payload = encode_record(record);
-    out.extend_from_slice(
-        &u64::try_from(payload.len())
-            .map_err(|_| LogError::Corrupt)?
-            .to_be_bytes(),
-    );
+    let header = frame_header(payload.len())?;
+    out.extend_from_slice(&header);
     out.extend_from_slice(&payload);
+    out.extend_from_slice(&frame_checksum(header, &payload).to_be_bytes());
     Ok(())
 }
 
-/// Decodes all records from a length-prefixed byte slice.
+/// Decodes all records from a framed byte slice.
 ///
 /// Unlike filesystem crash recovery, native stores publish whole values
 /// atomically, so any trailing partial frame is treated as corruption.
+/// Both legacy length-only frames and checksummed frames are accepted.
 ///
 /// # Errors
 /// Returns an error when any frame is truncated, has an invalid length, or
-/// contains a corrupt encoded transaction record.
+/// checksum, or contains a corrupt encoded transaction record.
 pub fn decode_framed_records(mut bytes: &[u8]) -> Result<Vec<TxRecord>, LogError> {
     let mut records = Vec::new();
     while !bytes.is_empty() {
         if bytes.len() < 8 {
             return Err(LogError::Corrupt);
         }
-        let len = usize::try_from(u64::from_be_bytes(
-            bytes[..8].try_into().map_err(|_| LogError::Corrupt)?,
-        ))
-        .map_err(|_| LogError::Corrupt)?;
+        let header: [u8; 8] = bytes[..8].try_into().map_err(|_| LogError::Corrupt)?;
+        let (payload_len, checksummed) = frame_payload_len(header)?;
         bytes = &bytes[8..];
-        let payload = bytes.get(..len).ok_or(LogError::Corrupt)?;
+        let payload = bytes.get(..payload_len).ok_or(LogError::Corrupt)?;
+        bytes = &bytes[payload_len..];
+        if checksummed {
+            let stored_checksum = u32::from_be_bytes(
+                bytes
+                    .get(..FRAME_CHECKSUM_LEN)
+                    .ok_or(LogError::Corrupt)?
+                    .try_into()
+                    .map_err(|_| LogError::Corrupt)?,
+            );
+            if stored_checksum != frame_checksum(header, payload) {
+                return Err(LogError::Corrupt);
+            }
+            bytes = &bytes[FRAME_CHECKSUM_LEN..];
+        }
         records.push(decode_record(payload)?);
-        bytes = &bytes[len..];
     }
     Ok(records)
 }
