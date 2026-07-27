@@ -870,7 +870,8 @@ impl RootIndexState {
 /// With a usable previous publication this folds only the tail since its basis
 /// into each segment; without one it rebuilds each segment from the database's
 /// own covering index, which is already in key order — so even the fallback
-/// path never sorts.
+/// path never sorts. Either way the datoms are read in place and kept only as
+/// the key they encode to, so a pass never copies the facts it indexes.
 fn plan_indexes(
     snapshot: &Db,
     previous: Option<&PublishedIndexes>,
@@ -879,14 +880,13 @@ fn plan_indexes(
     let mut planned: Vec<Vec<ChunkPlan>> = Vec::with_capacity(ORDERS.len());
     for (slot, order) in ORDERS.into_iter().enumerate() {
         let segment = match previous {
-            Some(previous) => previous.segments[slot].apply(
+            Some(previous) => previous.segments[slot].apply_ref(
                 order,
                 snapshot
                     .recorded_since(previous.basis_t)
-                    .filter(|datom| corium_db::covered(snapshot.schema(), order, datom))
-                    .cloned(),
+                    .filter(|datom| corium_db::covered(snapshot.schema(), order, datom)),
             ),
-            None => Segment::from_sorted(order, snapshot.datoms_at(order).cloned()),
+            None => Segment::from_sorted_ref(order, snapshot.datoms_at(order)),
         };
         let stored = previous.map(|previous| &previous.chunks[slot]);
         planned.push(

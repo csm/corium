@@ -12,7 +12,9 @@ transaction tail into it without rebuilding it:
   whole datom, so a segment is just its key stream.
 - **`Segment::apply`** — the current-value fold (assert replaces the fact,
   retract removes it) of a transaction tail into a segment, rebuilding only
-  the leaves the tail touches.
+  the leaves the tail touches. A fold keeps only the key each datom encodes
+  to, so `apply_ref`/`from_sorted_ref` take a tail — or a whole covering
+  index — the caller keeps, and publication indexes it without copying it.
 - **`Leaf`** — one content-defined run of keys. Leaves are `Arc`-shared, and
   `Leaf::id` reports which ones a fold carried across untouched.
 
