@@ -137,6 +137,26 @@ Scaling and durability (see
   [indexes-and-storage.md](design/indexes-and-storage.md)) — published v1
   segments carry current facts only, so those views still require full-log
   replay.
+- **Lazy segment descent on the read side (peer resident set).** Today a
+  peer is an in-memory database that storage reconstructs rather than
+  bounds. Its `Db` value keeps every datom it has seen — the full history,
+  retractions included — and folds four covering indexes over that log per
+  time view. Datoms are allocated once and shared by handle across the log
+  and every index of every view, so the indexes cost encoded keys and
+  pointers rather than duplicate facts, and `since` narrows the live set
+  before projecting the four orders instead of rebuilding finished indexes;
+  views that select exactly the datoms of an already-folded one share its
+  fold. What none of that fixes: nothing is evicted, so the resident set
+  tracks total history rather than the live database, and the first read of
+  a genuinely distinct `as-of`/`since`/`history` view costs a fold of the
+  whole history rather than of the view. The fix is the segment-tree read
+  path — inner tree levels in the published format so a reader can seek
+  without materializing an index, then descent through `corium-store`'s
+  bounded segment cache, so a peer's memory tracks its working set and view
+  latency tracks the answer. Depends on published history roots for the
+  historical views, exactly as the item above. See
+  [indexes-and-storage.md](design/indexes-and-storage.md) and
+  [time-model.md](design/time-model.md).
 - **Transactor fleet placement and routing.** Pursue the
   [fleet design](design/transactor-fleet.md): assign each database a small
   candidate set so nodes are active for some databases and standby for

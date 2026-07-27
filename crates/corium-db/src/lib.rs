@@ -7,6 +7,11 @@
 //! covering indexes for a view are materialized lazily on first read and
 //! shared by every clone of that value.
 //!
+//! Cheap to clone is not the same as cheap to hold or cheap to open: see
+//! [`Db`'s memory and cost notes](Db#memory), which say plainly what a
+//! holder of this value pays today and where that departs from the segment
+//! design in `docs/design/indexes-and-storage.md`.
+//!
 //! Transaction time is data: every committed transaction asserts
 //! `:db/txInstant` on its transaction entity (see [`bootstrap`]), so views can
 //! also be named by wall clock ([`Db::as_of_instant`], [`Db::since_instant`]).
@@ -119,7 +124,15 @@ impl PlannerStats {
 /// the touched paths instead of the whole tree. This is what keeps
 /// `with_transaction` — and the per-operation folding inside `corium-tx` —
 /// from re-cloning the entire index on every write.
-type Index = RedBlackTreeMapSync<Vec<u8>, Datom>;
+///
+/// Entries hold the datom [by handle](Db#memory): a datom is allocated once,
+/// when it is recorded, and the log and every covering index of every
+/// materialized view point at that one allocation. Only the encoded key is
+/// per-index, so a second order costs a key and a pointer rather than a
+/// duplicate of the fact — which matters most for the values that are
+/// themselves heap-allocated (strings, byte arrays), since those would
+/// otherwise be copied once per order per view.
+type Index = RedBlackTreeMapSync<Vec<u8>, Arc<Datom>>;
 
 const ORDERS: [IndexOrder; 4] = [
     IndexOrder::Eavt,
@@ -238,11 +251,56 @@ impl TxInstants {
 }
 
 /// An immutable value of a database at one basis transaction and time view.
+///
+/// # Memory
+///
+/// This value is fully resident. `recorded` holds **every datom the value has
+/// seen** — assertions and retractions alike, the whole history, not just the
+/// live facts — and a materialized view adds four covering indexes over it.
+/// A holder therefore pays, per datom:
+///
+/// - one heap allocation for the datom itself, shared by handle with every
+///   index entry that refers to it, in every materialized view; plus
+/// - one encoded key per covering order the datom is in (always EAVT and
+///   AEVT, plus AVET for an indexed or unique attribute and VAET for a
+///   reference value), plus a pointer per entry.
+///
+/// So a fact is stored once however many orders and views index it. The keys
+/// are not free — a key embeds the encoded value, so a long string still
+/// appears once per covering order — but they are the ordering itself rather
+/// than a duplicate of the datom.
+///
+/// What is *not* bounded is history: nothing here is ever evicted, and a
+/// peer's resident set grows with everything ever transacted rather than
+/// with the live database. A database whose history greatly exceeds its live
+/// set will be dominated by datoms no current query can reach.
+///
+/// # Cost of a time view
+///
+/// Materializing a view is O(recorded history), not O(the view's size).
+/// [`Db::as_of`] folds the log up to its basis, [`Db::history`] folds all of
+/// it, and [`Db::since`] folds all of it and then filters. The result is
+/// cached in this value and shared by its clones — and views that select
+/// exactly the same datoms as an already-folded one share that fold rather
+/// than repeating it — but a *distinct* time view is a fresh fold over the
+/// whole history the first time it is read. Deriving many different `as-of`
+/// values, or re-deriving one from a fresh [`Db`] each time, pays that fold
+/// each time.
+///
+/// # How this differs from the design
+///
+/// `docs/design/indexes-and-storage.md` describes readers descending
+/// persistent segment trees and pulling only the segments a query touches,
+/// through a bounded cache. That is what the published format is being built
+/// toward; the inner tree levels that would let a reader seek without
+/// downloading an index are still future work. Until they land, a peer holds
+/// the whole database — and its whole history — in memory, and durable
+/// storage serves to reconstruct that state rather than to bound it.
 #[derive(Clone, Debug, Default)]
 pub struct Db {
     basis_t: u64,
     schema: Schema,
-    recorded: VectorSync<Datom>,
+    recorded: VectorSync<Arc<Datom>>,
     idents: Arc<Idents>,
     interner: Arc<KeywordInterner>,
     view: DbView,
@@ -308,7 +366,7 @@ impl Db {
         Self {
             basis_t,
             schema,
-            recorded: datoms.into_iter().collect(),
+            recorded: datoms.into_iter().map(Arc::new).collect(),
             idents: Arc::new(idents),
             interner: Arc::new(interner),
             view: DbView::Current,
@@ -359,7 +417,7 @@ impl Db {
 
     /// Every recorded assertion and retraction, in transaction order.
     pub fn recorded_datoms(&self) -> impl Iterator<Item = &Datom> {
-        self.recorded.iter()
+        self.recorded.iter().map(AsRef::as_ref)
     }
 
     /// Number of recorded assertions and retractions.
@@ -395,7 +453,9 @@ impl Db {
         // Indexed access rather than `iter().skip(start)`: the persistent
         // vector's iterator would have to walk the whole prefix to reach the
         // tail, which is the cost this method exists to avoid.
-        (start..self.recorded.len()).filter_map(|index| self.recorded.get(index))
+        (start..self.recorded.len())
+            .filter_map(|index| self.recorded.get(index))
+            .map(AsRef::as_ref)
     }
 
     /// Returns the as-of view at basis `t`: facts as they stood then.
@@ -459,11 +519,40 @@ impl Db {
         if view == self.view {
             return self.clone();
         }
+        // Two views that select the same datoms share one fold, so a view
+        // that merely names the current value does not pay to rebuild it.
+        // The declared view is kept as asked for: callers distinguish a time
+        // view from the current value regardless of what it holds (writes,
+        // for instance, are refused on any time view).
+        let shared = self.fold_class(view) == self.fold_class(self.view);
         Self {
             view,
-            indexes: Arc::new(OnceLock::new()),
-            stats: Arc::new(OnceLock::new()),
+            indexes: if shared {
+                Arc::clone(&self.indexes)
+            } else {
+                Arc::new(OnceLock::new())
+            },
+            stats: if shared {
+                Arc::clone(&self.stats)
+            } else {
+                Arc::new(OnceLock::new())
+            },
             ..self.clone()
+        }
+    }
+
+    /// Canonicalizes a view to the fold that materializes it, so views that
+    /// differ only in name share an index and statistics cache.
+    ///
+    /// Every recorded datom belongs to a transaction at or before the basis,
+    /// so an `as-of` at or after the basis excludes nothing; and transaction
+    /// numbering starts at one, so a `since` at basis zero excludes nothing
+    /// either. Both therefore fold exactly as the current view does.
+    const fn fold_class(&self, view: DbView) -> DbView {
+        match view {
+            DbView::AsOf(t) if t >= self.basis_t => DbView::Current,
+            DbView::Since(0) => DbView::Current,
+            other => other,
         }
     }
 
@@ -474,7 +563,7 @@ impl Db {
         for datom in &self.recorded {
             let t = datom.tx.sequence();
             if t >= start && end.is_none_or(|end| t < end) {
-                by_t.entry(t).or_default().push(datom.clone());
+                by_t.entry(t).or_default().push((**datom).clone());
             }
         }
         by_t.into_iter().collect()
@@ -491,7 +580,7 @@ impl Db {
     /// AVET covers only indexed/unique attributes and VAET only reference
     /// values, mirroring Datomic's covering-index composition.
     pub fn datoms_at(&self, order: IndexOrder) -> impl Iterator<Item = &Datom> {
-        self.indexes()[slot(order)].values()
+        self.indexes()[slot(order)].values().map(AsRef::as_ref)
     }
 
     /// Iterates this view's datoms for one attribute in AEVT order.
@@ -504,7 +593,7 @@ impl Db {
         self.indexes()[slot(IndexOrder::Aevt)]
             .range(prefix.clone()..)
             .take_while(move |(key, _)| key.starts_with(&prefix))
-            .map(|(_, datom)| datom)
+            .map(|(_, datom)| datom.as_ref())
     }
 
     /// Iterates datoms whose key in `order` starts with `prefix`.
@@ -516,7 +605,7 @@ impl Db {
         self.indexes()[slot(order)]
             .range(prefix.to_vec()..)
             .take_while(move |(key, _)| key.starts_with(prefix))
-            .map(|(_, datom)| datom)
+            .map(|(_, datom)| datom.as_ref())
     }
 
     /// Iterates datoms in `order` starting from the first key at or after `start`.
@@ -527,7 +616,7 @@ impl Db {
     ) -> impl Iterator<Item = &'a Datom> {
         self.indexes()[slot(order)]
             .range(start.to_vec()..)
-            .map(|(_, datom)| datom)
+            .map(|(_, datom)| datom.as_ref())
     }
 
     /// Iterates the AVET index for `a` over the value range `[start, end)`.
@@ -544,7 +633,7 @@ impl Db {
         self.indexes()[slot(IndexOrder::Avet)]
             .range(start_key..)
             .take_while(move |(key, _)| key.starts_with(&a_prefix))
-            .map(|(_, datom)| datom)
+            .map(|(_, datom)| datom.as_ref())
             .take_while(move |datom| end.is_none_or(|end| datom.v < *end))
     }
 
@@ -616,12 +705,16 @@ impl Db {
         );
         let mut next = self.clone();
         next.basis_t = t;
+        // Allocate each datom once here: the log entry and every covering
+        // index entry derived from it below are handles on this one
+        // allocation, not copies of the fact.
+        let arrived: Vec<Arc<Datom>> = datoms.iter().cloned().map(Arc::new).collect();
         // `recorded` is a persistent vector: this clone shared its whole spine
         // with the parent, and appending copies only the O(log n) nodes on the
         // tail path — never the entire log, even while `db_before` keeps the
         // parent alive.
-        for datom in datoms {
-            next.recorded.push_back_mut(datom.clone());
+        for datom in &arrived {
+            next.recorded.push_back_mut(Arc::clone(datom));
         }
         next.indexes = Arc::new(OnceLock::new());
         next.stats = Arc::new(OnceLock::new());
@@ -629,7 +722,7 @@ impl Db {
         // transaction pipelines don't refold the whole history per operation.
         if let Some(parent) = self.indexes.get() {
             let mut derived = parent.clone();
-            apply_current(&mut derived, datoms.iter(), &self.schema);
+            apply_current(&mut derived, arrived.iter(), &self.schema);
             let _ = next.indexes.set(derived);
         }
         next
@@ -683,24 +776,58 @@ impl Db {
                     }
                 }
                 DbView::Current | DbView::AsOf(_) | DbView::Since(_) => {
+                    // One fold decides liveness for all four orders. A
+                    // retraction cancels the assertion sharing its
+                    // `(e, a, v)`, and that is the EAVT key, so the live set
+                    // can be folded in EAVT alone and the other three orders
+                    // projected from it. Folding once means a fact that is
+                    // later retracted churns one tree rather than four, and
+                    // nothing that never survives the fold is ever encoded
+                    // into AEVT/AVET/VAET.
                     let cutoff = match self.view {
                         DbView::AsOf(t) => Some(t),
                         _ => None,
                     };
-                    let filtered = self
-                        .recorded
-                        .iter()
-                        .filter(|d| cutoff.is_none_or(|t| d.tx.sequence() <= t));
-                    apply_current(&mut indexes, filtered, &self.schema);
-                    if let DbView::Since(t) = self.view {
-                        for index in &mut indexes {
-                            *index = index
-                                .iter()
-                                .filter(|(_, datom)| datom.tx.sequence() > t)
-                                .map(|(key, datom)| (key.clone(), datom.clone()))
-                                .collect();
+                    let mut live = Index::new_sync();
+                    for datom in &self.recorded {
+                        if cutoff.is_some_and(|t| datom.tx.sequence() > t) {
+                            continue;
+                        }
+                        let key = key_prefix(
+                            IndexOrder::Eavt,
+                            Some(datom.e),
+                            Some(datom.a),
+                            Some(&datom.v),
+                        );
+                        if datom.added {
+                            live.insert_mut(key, Arc::clone(datom));
+                        } else {
+                            live.remove_mut(&key);
                         }
                     }
+                    // `since` keeps only the live facts a later transaction
+                    // added. Narrowing the live set before projecting costs
+                    // one transient tree of keys and handles; filtering the
+                    // four built indexes instead — the shape this replaces —
+                    // held four whole indexes and four filtered copies of
+                    // them alive at once.
+                    if let DbView::Since(t) = self.view {
+                        live = live
+                            .iter()
+                            .filter(|(_, datom)| datom.tx.sequence() > t)
+                            .map(|(key, datom)| (key.clone(), Arc::clone(datom)))
+                            .collect();
+                    }
+                    for datom in live.values() {
+                        for order in [IndexOrder::Aevt, IndexOrder::Avet, IndexOrder::Vaet] {
+                            if covered(&self.schema, order, datom) {
+                                let key =
+                                    key_prefix(order, Some(datom.e), Some(datom.a), Some(&datom.v));
+                                indexes[slot(order)].insert_mut(key, Arc::clone(datom));
+                            }
+                        }
+                    }
+                    indexes[slot(IndexOrder::Eavt)] = live;
                 }
             }
             indexes
@@ -715,7 +842,7 @@ impl Db {
 /// erase the assertion regardless of which transactions produced them.
 fn apply_current<'a>(
     indexes: &mut [Index; 4],
-    datoms: impl Iterator<Item = &'a Datom>,
+    datoms: impl Iterator<Item = &'a Arc<Datom>>,
     schema: &Schema,
 ) {
     for datom in datoms {
@@ -732,7 +859,7 @@ fn apply_current<'a>(
     }
 }
 
-fn insert_datom(indexes: &mut [Index; 4], datom: &Datom, schema: &Schema, with_tx: bool) {
+fn insert_datom(indexes: &mut [Index; 4], datom: &Arc<Datom>, schema: &Schema, with_tx: bool) {
     for order in ORDERS {
         if covered(schema, order, datom) {
             let key = if with_tx {
@@ -740,7 +867,7 @@ fn insert_datom(indexes: &mut [Index; 4], datom: &Datom, schema: &Schema, with_t
             } else {
                 key_prefix(order, Some(datom.e), Some(datom.a), Some(&datom.v))
             };
-            indexes[slot(order)].insert_mut(key, datom.clone());
+            indexes[slot(order)].insert_mut(key, Arc::clone(datom));
         }
     }
 }
@@ -934,6 +1061,78 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 3);
         assert!(names.contains(&(Value::Str("alice".into()), false)));
+    }
+
+    #[test]
+    fn since_filters_the_live_set_in_every_order() {
+        // The four orders are projections of one filtered live set, so the
+        // floor has to hold in all of them and not just the one folded first.
+        let db = sample().since(1);
+        assert_eq!(db.datoms_at(IndexOrder::Eavt).count(), 2);
+        assert_eq!(db.datoms_at(IndexOrder::Aevt).count(), 2);
+        // The sole AVET-covered attribute's live datom was asserted at t=1.
+        assert_eq!(db.datoms_at(IndexOrder::Avet).count(), 0);
+        assert_eq!(db.datoms_at(IndexOrder::Vaet).count(), 1);
+        for order in ORDERS {
+            assert!(db.datoms_at(order).all(|datom| datom.tx.sequence() > 1));
+        }
+    }
+
+    #[test]
+    fn a_datom_is_allocated_once_and_shared_by_the_log_and_every_index() {
+        let db = sample();
+        let indexes = db.indexes();
+        for (_, eavt) in &indexes[slot(IndexOrder::Eavt)] {
+            // AEVT covers every datom, and holds this one by handle rather
+            // than as a second copy of the fact.
+            let aevt = indexes[slot(IndexOrder::Aevt)]
+                .get(&key_prefix(
+                    IndexOrder::Aevt,
+                    Some(eavt.e),
+                    Some(eavt.a),
+                    Some(&eavt.v),
+                ))
+                .expect("AEVT covers every datom");
+            assert!(Arc::ptr_eq(eavt, aevt), "AEVT copied the datom");
+            assert!(
+                db.recorded.iter().any(|entry| Arc::ptr_eq(entry, eavt)),
+                "the index copied the datom instead of sharing the log's"
+            );
+        }
+    }
+
+    #[test]
+    fn views_that_name_the_current_value_share_its_fold() {
+        let db = sample();
+        let _ = db.datoms();
+        for view in [
+            db.as_of(db.basis_t()),
+            db.as_of(db.basis_t() + 10),
+            db.since(0),
+        ] {
+            assert!(
+                Arc::ptr_eq(&db.indexes, &view.indexes),
+                "{:?} refolded the whole history to reach the current value",
+                view.view()
+            );
+            assert!(Arc::ptr_eq(&db.stats, &view.stats));
+            assert_eq!(view.datoms(), db.datoms());
+        }
+        // A view that genuinely selects a different set folds its own.
+        for view in [db.as_of(1), db.since(1), db.history()] {
+            assert!(!Arc::ptr_eq(&db.indexes, &view.indexes));
+        }
+    }
+
+    #[test]
+    fn a_view_reports_the_time_view_it_was_asked_for() {
+        // Sharing a fold must not restate an as-of view as the current value:
+        // callers key behaviour off the declared view (writes are refused on
+        // any time view) whatever facts it happens to hold.
+        let db = sample();
+        assert_eq!(db.view(), DbView::Current);
+        assert_eq!(db.as_of(db.basis_t()).view(), DbView::AsOf(db.basis_t()));
+        assert_eq!(db.since(0).view(), DbView::Since(0));
     }
 
     #[test]
