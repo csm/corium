@@ -12,6 +12,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
+#[cfg(feature = "s3")]
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use corium_log::{LogError, MemLogRegistry, TransactionLog, TxRecord, VersionedLog};
@@ -21,10 +23,10 @@ use corium_store::{BlobId, BlobIdStream, BlobStore, FsStore, MemoryStore, RootSt
 
 #[cfg(feature = "postgres")]
 use corium_store::PostgresBlobStore;
-#[cfg(feature = "s3")]
-use corium_store::S3BlobStore;
 #[cfg(feature = "turso")]
 use corium_store::TursoBlobStore;
+#[cfg(feature = "s3")]
+use corium_store::{S3BlobStore, S3ClientConfig, normalize_s3_prefix};
 
 /// Selects the transactor's storage-service backend (blobs + roots).
 #[derive(Clone, Default)]
@@ -56,6 +58,9 @@ pub enum StoreSpec {
         bucket: String,
         /// Key prefix namespacing every object this store touches.
         prefix: String,
+        /// Explicit primary-client overrides. Empty values use the standard
+        /// AWS configuration chain.
+        client: S3ClientConfig,
     },
 }
 
@@ -72,12 +77,148 @@ impl fmt::Debug for StoreSpec {
             #[cfg(feature = "turso")]
             Self::Turso { path } => formatter.debug_struct("Turso").field("path", path).finish(),
             #[cfg(feature = "s3")]
-            Self::S3 { bucket, prefix } => formatter
+            Self::S3 {
+                bucket,
+                prefix,
+                client,
+            } => formatter
                 .debug_struct("S3")
                 .field("bucket", bucket)
                 .field("prefix", prefix)
+                .field("client", client)
                 .finish(),
         }
+    }
+}
+
+/// Credentials advertised by `GetStorageInfo` for S3 read-only clients.
+#[cfg(feature = "s3")]
+#[derive(Clone)]
+pub enum S3ReadOnlyCredentials {
+    /// Operator-provisioned credentials whose IAM/bucket policy permits only
+    /// reads of the configured Corium prefix.
+    Static {
+        /// Access-key id.
+        access_key_id: String,
+        /// Secret access key.
+        secret_access_key: String,
+        /// Optional session token.
+        session_token: Option<String>,
+    },
+    /// Temporary credentials obtained from AWS STS for this request.
+    ///
+    /// Corium attaches a restrictive session policy allowing only
+    /// `GetObject` and prefix-scoped `ListBucket`, so the issued credential
+    /// cannot write even if the role itself has broader permissions.
+    AssumeRole {
+        /// IAM role to assume.
+        role_arn: String,
+        /// STS role-session name.
+        session_name: String,
+        /// Requested token lifetime in seconds.
+        duration_seconds: i32,
+        /// Optional trust-policy external id.
+        external_id: Option<String>,
+    },
+}
+
+#[cfg(feature = "s3")]
+impl fmt::Debug for S3ReadOnlyCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static { .. } => formatter.write_str("Static([REDACTED])"),
+            Self::AssumeRole {
+                role_arn,
+                session_name,
+                duration_seconds,
+                external_id,
+            } => formatter
+                .debug_struct("AssumeRole")
+                .field("role_arn", role_arn)
+                .field("session_name", session_name)
+                .field("duration_seconds", duration_seconds)
+                .field("external_id", &external_id.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+        }
+    }
+}
+
+/// S3 endpoint metadata and read-only credential source advertised to peers.
+#[cfg(feature = "s3")]
+#[derive(Clone)]
+pub struct S3ReadOnlyConfig {
+    /// Region clients should use.
+    pub region: Option<String>,
+    /// Optional S3-compatible endpoint.
+    pub endpoint_url: Option<String>,
+    /// Static or STS-generated credentials.
+    pub credentials: S3ReadOnlyCredentials,
+    runtime: Arc<S3ReadOnlyRuntime>,
+}
+
+#[cfg(feature = "s3")]
+impl fmt::Debug for S3ReadOnlyConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S3ReadOnlyConfig")
+            .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("credentials", &self.credentials)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "s3")]
+#[derive(Default)]
+struct S3ReadOnlyRuntime {
+    aws: tokio::sync::OnceCell<ResolvedAwsConfig>,
+    cached_credentials: tokio::sync::Mutex<Option<CachedS3Credentials>>,
+}
+
+#[cfg(feature = "s3")]
+struct ResolvedAwsConfig {
+    sts: aws_sdk_sts::Client,
+    region: Option<String>,
+    endpoint_url: Option<String>,
+}
+
+#[cfg(feature = "s3")]
+#[derive(Clone)]
+struct CachedS3Credentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: String,
+    expires_unix_seconds: i64,
+    refresh_at: SystemTime,
+}
+
+/// Separately provisioned credentials returned by `GetStorageInfo`.
+///
+/// Local storage backends do not consult this value. Service backends fail
+/// storage discovery rather than falling back to the transactor's primary
+/// read/write credentials.
+#[derive(Clone, Default)]
+pub struct StorageInfoConfig {
+    /// Read-only `PostgreSQL` URL.
+    pub postgres_connection_string: Option<String>,
+    /// Read-only S3 access.
+    #[cfg(feature = "s3")]
+    pub s3: Option<S3ReadOnlyConfig>,
+}
+
+impl fmt::Debug for StorageInfoConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("StorageInfoConfig");
+        debug.field(
+            "postgres_connection_string",
+            &self
+                .postgres_connection_string
+                .as_ref()
+                .map(|_| "[REDACTED]"),
+        );
+        #[cfg(feature = "s3")]
+        debug.field("s3", &self.s3);
+        debug.finish()
     }
 }
 
@@ -153,10 +294,30 @@ impl StoreSpec {
             Backend::S3(storage) => {
                 #[cfg(feature = "s3")]
                 {
+                    let access_key_id = nonempty(storage.access_key_id).ok_or_else(|| {
+                        StorageConnectionError::Unsupported(
+                            "S3 storage info did not include read-only credentials".into(),
+                        )
+                    })?;
+                    let secret_access_key =
+                        nonempty(storage.secret_access_key).ok_or_else(|| {
+                            StorageConnectionError::Unsupported(
+                                "S3 storage info did not include read-only credentials".into(),
+                            )
+                        })?;
                     (
                         Self::S3 {
                             bucket: storage.bucket,
                             prefix: storage.prefix,
+                            client: S3ClientConfig {
+                                region: nonempty(storage.region),
+                                endpoint_url: nonempty(storage.endpoint_url),
+                                access_key_id: Some(access_key_id),
+                                secret_access_key: Some(secret_access_key),
+                                session_token: nonempty(storage.session_token),
+                                expires_after: unix_timestamp(storage.expires_unix_seconds),
+                                ..S3ClientConfig::default()
+                            },
                         },
                         PathBuf::new(),
                     )
@@ -182,9 +343,15 @@ impl StoreSpec {
     ///
     /// # Errors
     /// Returns an error when a local path cannot be represented on the wire.
-    pub fn connection_info(
+    #[cfg_attr(not(feature = "s3"), allow(clippy::unused_async))]
+    pub async fn connection_info(
         &self,
         data_dir: &std::path::Path,
+        #[cfg_attr(
+            not(any(feature = "postgres", feature = "s3")),
+            allow(unused_variables)
+        )]
+        read_only: &StorageInfoConfig,
     ) -> Result<corium_protocol::pb::StorageConnection, String> {
         use corium_protocol::pb;
         use pb::storage_connection::Backend;
@@ -208,22 +375,243 @@ impl StoreSpec {
                 data_dir: absolute(data_dir)?,
             }),
             #[cfg(feature = "postgres")]
-            Self::Postgres { connection_string } => Backend::Postgres(pb::PostgreSqlStorage {
-                connection_string: connection_string.clone(),
-            }),
+            Self::Postgres { .. } => {
+                let connection_string =
+                    read_only
+                        .postgres_connection_string
+                        .clone()
+                        .ok_or_else(|| {
+                            "PostgreSQL storage discovery requires a separately configured \
+                         read-only connection string"
+                                .to_owned()
+                        })?;
+                Backend::Postgres(pb::PostgreSqlStorage { connection_string })
+            }
             #[cfg(feature = "turso")]
             Self::Turso { path } => Backend::Turso(pb::TursoStorage {
                 path: absolute(std::path::Path::new(path))?,
             }),
             #[cfg(feature = "s3")]
-            Self::S3 { bucket, prefix } => Backend::S3(pb::S3Storage {
-                bucket: bucket.clone(),
-                prefix: prefix.clone(),
-            }),
+            Self::S3 { bucket, prefix, .. } => {
+                let read_only = read_only.s3.as_ref().ok_or_else(|| {
+                    "S3 storage discovery requires separately configured read-only credentials"
+                        .to_owned()
+                })?;
+                Backend::S3(read_only.s3_storage(bucket, prefix).await?)
+            }
         };
         Ok(pb::StorageConnection {
             backend: Some(backend),
         })
+    }
+}
+
+#[cfg(feature = "s3")]
+fn nonempty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(feature = "s3")]
+fn unix_timestamp(seconds: i64) -> Option<SystemTime> {
+    u64::try_from(seconds)
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+}
+
+#[cfg(feature = "s3")]
+impl S3ReadOnlyConfig {
+    /// Creates read-only S3 discovery configuration with a shared AWS client
+    /// and temporary-credential cache.
+    #[must_use]
+    pub fn new(
+        region: Option<String>,
+        endpoint_url: Option<String>,
+        credentials: S3ReadOnlyCredentials,
+    ) -> Self {
+        Self {
+            region,
+            endpoint_url,
+            credentials,
+            runtime: Arc::new(S3ReadOnlyRuntime::default()),
+        }
+    }
+
+    async fn aws(&self) -> &ResolvedAwsConfig {
+        self.runtime
+            .aws
+            .get_or_init(|| async {
+                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+                if let Some(region) = &self.region {
+                    loader = loader.region(aws_sdk_sts::config::Region::new(region.clone()));
+                }
+                let config = loader.load().await;
+                let region = self
+                    .region
+                    .clone()
+                    .or_else(|| config.region().map(ToString::to_string));
+                let endpoint_url = self.endpoint_url.clone().or_else(ambient_s3_endpoint);
+                ResolvedAwsConfig {
+                    sts: aws_sdk_sts::Client::new(&config),
+                    region,
+                    endpoint_url,
+                }
+            })
+            .await
+    }
+
+    pub(crate) async fn initialize(&self) {
+        self.aws().await;
+    }
+
+    async fn s3_storage(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<corium_protocol::pb::S3Storage, String> {
+        let prefix = normalize_s3_prefix(prefix.to_owned());
+        let aws = self.aws().await;
+        let (access_key_id, secret_access_key, session_token, expires_unix_seconds) =
+            match &self.credentials {
+                S3ReadOnlyCredentials::Static {
+                    access_key_id,
+                    secret_access_key,
+                    session_token,
+                } => (
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    session_token.clone().unwrap_or_default(),
+                    0,
+                ),
+                S3ReadOnlyCredentials::AssumeRole {
+                    role_arn,
+                    session_name,
+                    duration_seconds,
+                    external_id,
+                } => {
+                    let issued = self
+                        .assume_role_credentials(
+                            bucket,
+                            &prefix,
+                            role_arn,
+                            session_name,
+                            *duration_seconds,
+                            external_id.as_deref(),
+                        )
+                        .await?;
+                    (
+                        issued.access_key_id,
+                        issued.secret_access_key,
+                        issued.session_token,
+                        issued.expires_unix_seconds,
+                    )
+                }
+            };
+        Ok(corium_protocol::pb::S3Storage {
+            bucket: bucket.to_owned(),
+            prefix,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region: aws.region.clone().unwrap_or_default(),
+            endpoint_url: aws.endpoint_url.clone().unwrap_or_default(),
+            expires_unix_seconds,
+        })
+    }
+
+    async fn assume_role_credentials(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        role_arn: &str,
+        session_name: &str,
+        duration_seconds: i32,
+        external_id: Option<&str>,
+    ) -> Result<CachedS3Credentials, String> {
+        let mut cached = self.runtime.cached_credentials.lock().await;
+        if let Some(credentials) = cached
+            .as_ref()
+            .filter(|credentials| SystemTime::now() < credentials.refresh_at)
+        {
+            return Ok(credentials.clone());
+        }
+        let partition = role_arn.split(':').nth(1).unwrap_or("aws");
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:GetObject"],
+                    "Resource": [format!("arn:{partition}:s3:::{bucket}/{prefix}*")]
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": ["s3:ListBucket"],
+                    "Resource": [format!("arn:{partition}:s3:::{bucket}")],
+                    "Condition": {
+                        "StringLike": {
+                            "s3:prefix": [format!("{prefix}*")]
+                        }
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let issued_at = SystemTime::now();
+        let output = self
+            .aws()
+            .await
+            .sts
+            .assume_role()
+            .role_arn(role_arn)
+            .role_session_name(session_name)
+            .duration_seconds(duration_seconds)
+            .policy(policy)
+            .set_external_id(external_id.map(str::to_owned))
+            .send()
+            .await
+            .map_err(|error| format!("cannot assume S3 read-only role: {error}"))?;
+        let credentials = output.credentials().ok_or_else(|| {
+            "AWS STS returned no credentials for the S3 read-only role".to_owned()
+        })?;
+        let expires_unix_seconds = credentials.expiration().secs();
+        let expiration = unix_timestamp(expires_unix_seconds).unwrap_or(issued_at);
+        let lifetime = expiration
+            .duration_since(issued_at)
+            .unwrap_or(Duration::ZERO);
+        let issued = CachedS3Credentials {
+            access_key_id: credentials.access_key_id().to_owned(),
+            secret_access_key: credentials.secret_access_key().to_owned(),
+            session_token: credentials.session_token().to_owned(),
+            expires_unix_seconds,
+            refresh_at: issued_at
+                .checked_add(lifetime.mul_f64(0.8))
+                .unwrap_or(issued_at),
+        };
+        *cached = Some(issued.clone());
+        Ok(issued)
+    }
+}
+
+#[cfg(feature = "s3")]
+fn ambient_s3_endpoint() -> Option<String> {
+    std::env::var("AWS_ENDPOINT_URL_S3")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("AWS_ENDPOINT_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+}
+
+impl StorageInfoConfig {
+    #[cfg_attr(not(feature = "s3"), allow(clippy::unused_async))]
+    pub(crate) async fn initialize(&self) {
+        #[cfg(feature = "s3")]
+        if let Some(s3) = &self.s3 {
+            s3.initialize().await;
+        }
     }
 }
 
@@ -266,9 +654,13 @@ impl NodeStore {
             #[cfg(feature = "turso")]
             StoreSpec::Turso { path } => Ok(Self::Turso(TursoBlobStore::open(path).await?)),
             #[cfg(feature = "s3")]
-            StoreSpec::S3 { bucket, prefix } => {
-                Ok(Self::S3(S3BlobStore::connect(bucket, prefix).await?))
-            }
+            StoreSpec::S3 {
+                bucket,
+                prefix,
+                client,
+            } => Ok(Self::S3(
+                S3BlobStore::connect_with_config(bucket, prefix, client).await?,
+            )),
         }
     }
 
@@ -294,9 +686,13 @@ impl NodeStore {
                 Ok(Self::Turso(TursoBlobStore::open_existing(path).await?))
             }
             #[cfg(feature = "s3")]
-            StoreSpec::S3 { bucket, prefix } => {
-                Ok(Self::S3(S3BlobStore::connect(bucket, prefix).await?))
-            }
+            StoreSpec::S3 {
+                bucket,
+                prefix,
+                client,
+            } => Ok(Self::S3(
+                S3BlobStore::connect_existing_with_config(bucket, prefix, client).await?,
+            )),
         }
     }
 }
@@ -816,6 +1212,116 @@ impl NativeLogStorage for NativeRootLogStore {
 mod tests {
     use super::*;
     use corium_core::{Datom, EntityId, Value};
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_storage_info_uses_only_the_read_only_url() {
+        let primary = "postgresql://writer:primary-secret@db/corium";
+        let read_only = "postgresql://reader:read-secret@db/corium";
+        let spec = StoreSpec::Postgres {
+            connection_string: primary.into(),
+        };
+        let missing = spec
+            .connection_info(std::path::Path::new("."), &StorageInfoConfig::default())
+            .await
+            .expect_err("primary URL must not be advertised");
+        assert!(missing.contains("read-only"));
+
+        let info = spec
+            .connection_info(
+                std::path::Path::new("."),
+                &StorageInfoConfig {
+                    postgres_connection_string: Some(read_only.into()),
+                    #[cfg(feature = "s3")]
+                    s3: None,
+                },
+            )
+            .await
+            .expect("read-only info");
+        let Some(corium_protocol::pb::storage_connection::Backend::Postgres(postgres)) =
+            info.backend
+        else {
+            panic!("PostgreSQL storage info");
+        };
+        assert_eq!(postgres.connection_string, read_only);
+        assert!(!postgres.connection_string.contains("primary-secret"));
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn s3_storage_info_carries_static_read_only_credentials() {
+        let missing = StoreSpec::from_connection(corium_protocol::pb::StorageConnection {
+            backend: Some(corium_protocol::pb::storage_connection::Backend::S3(
+                corium_protocol::pb::S3Storage {
+                    bucket: "bucket".into(),
+                    prefix: String::new(),
+                    ..Default::default()
+                },
+            )),
+        })
+        .expect_err("S3 clients must not fall back to ambient credentials");
+        assert!(missing.to_string().contains("read-only credentials"));
+
+        let spec = StoreSpec::S3 {
+            bucket: "bucket".into(),
+            prefix: "tenant/".into(),
+            client: S3ClientConfig {
+                access_key_id: Some("PRIMARY".into()),
+                secret_access_key: Some("primary-secret".into()),
+                ..S3ClientConfig::default()
+            },
+        };
+        let info = spec
+            .connection_info(
+                std::path::Path::new("."),
+                &StorageInfoConfig {
+                    postgres_connection_string: None,
+                    s3: Some(S3ReadOnlyConfig::new(
+                        Some("us-west-2".into()),
+                        Some("https://objects.example".into()),
+                        S3ReadOnlyCredentials::Static {
+                            access_key_id: "READONLY".into(),
+                            secret_access_key: "read-secret".into(),
+                            session_token: Some("session".into()),
+                        },
+                    )),
+                },
+            )
+            .await
+            .expect("read-only info");
+        let Some(corium_protocol::pb::storage_connection::Backend::S3(mut s3)) = info.backend
+        else {
+            panic!("S3 storage info");
+        };
+        assert_eq!(s3.bucket, "bucket");
+        assert_eq!(s3.prefix, "tenant/");
+        assert_eq!(s3.access_key_id, "READONLY");
+        assert_eq!(s3.secret_access_key, "read-secret");
+        assert_eq!(s3.session_token, "session");
+        assert_eq!(s3.region, "us-west-2");
+        assert_eq!(s3.endpoint_url, "https://objects.example");
+        assert_eq!(s3.expires_unix_seconds, 0);
+        assert_ne!(s3.access_key_id, "PRIMARY");
+
+        s3.expires_unix_seconds = 1_900_000_000;
+        let (StoreSpec::S3 { client, .. }, _) =
+            StoreSpec::from_connection(corium_protocol::pb::StorageConnection {
+                backend: Some(corium_protocol::pb::storage_connection::Backend::S3(s3)),
+            })
+            .expect("parse S3 storage info")
+        else {
+            panic!("S3 store spec");
+        };
+        assert_eq!(
+            client
+                .expires_after
+                .expect("temporary credential expiration")
+                .duration_since(UNIX_EPOCH)
+                .expect("timestamp after epoch")
+                .as_secs(),
+            1_900_000_000
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_root_log_writes_one_object_per_record_on_the_runtime() {

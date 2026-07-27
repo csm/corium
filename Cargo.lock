@@ -1878,6 +1878,7 @@ name = "corium-cli"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
  "clap",
  "corium-authz",
  "corium-core",
@@ -2124,6 +2125,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
  "blake3",
  "corium-core",
@@ -2144,6 +2146,8 @@ name = "corium-transactor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-config",
+ "aws-sdk-sts",
  "cljrs-tx",
  "cljrs-value",
  "corium-authz",
@@ -2155,6 +2159,7 @@ dependencies = [
  "corium-query",
  "corium-store",
  "corium-tx",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

@@ -49,7 +49,9 @@ runnable processes and interactive tools but holds little logic of its own. The
 transactor and peer-server subcommands construct and run `corium-transactor` and
 `corium-peer` servers; `postgres-server` serves the `corium-pgwire` protocol
 over a catalog of lazily cached peer connections; the `console`, `tui`, `sql`,
-and `db *` subcommands drive a peer `Connection` and render results. Storage-backend selection and TLS/token
-auth are surfaced as flags and forwarded down to the relevant crate. See
+and `db *` subcommands drive a peer `Connection` and render results.
+Storage-backend selection and separately provisioned read-only discovery
+credentials are surfaced as flags or an EDN `transactor --config` file;
+TLS/token auth remains available as flags. See
 [`docs/getting-started.md`](../../docs/getting-started.md) and
 [`docs/operations.md`](../../docs/operations.md).

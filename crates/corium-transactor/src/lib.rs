@@ -11,7 +11,9 @@ pub mod server;
 #[cfg(feature = "cljrs")]
 pub mod txfn;
 
-pub use backend::{LogBackend, NodeStore, StorageConnectionError, StoreSpec};
+pub use backend::{LogBackend, NodeStore, StorageConnectionError, StorageInfoConfig, StoreSpec};
+#[cfg(feature = "s3")]
+pub use backend::{S3ReadOnlyConfig, S3ReadOnlyCredentials};
 
 use corium_core::{EntityId, IndexOrder, KeywordInterner, Partition, Schema};
 use corium_db::{Db, FIRST_USER_ID, Idents};

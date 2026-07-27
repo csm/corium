@@ -221,7 +221,11 @@ fn build_store_spec(args: &Args) -> Result<StoreSpec, String> {
                     .clone()
                     .ok_or("s3 backend needs --s3-bucket or CORIUM_BENCH_S3_BUCKET")?;
                 let prefix = args.s3_prefix.clone().unwrap_or_default();
-                Ok(StoreSpec::S3 { bucket, prefix })
+                Ok(StoreSpec::S3 {
+                    bucket,
+                    prefix,
+                    client: corium_store::S3ClientConfig::default(),
+                })
             }
             #[cfg(not(feature = "s3"))]
             Err("rebuild with `--features s3` to use the s3 backend".into())
