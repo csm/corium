@@ -83,9 +83,14 @@ processes. Each crate has its own README.
 | [`corium-transactor`](crates/corium-transactor/README.md) | Transactor process: pipeline, indexing job, lease/HA, gRPC server, backup |
 | [`corium-peer`](crates/corium-peer/README.md) | Peer library: connection, tx-report handling, segment cache, peer server |
 | [`corium-client`](crates/corium-client/README.md) | Fluent async Datomic-style API over the peer library and peer-server gRPC; typesafe Datalog/Pull builders |
+| [`corium-ffi`](crates/corium-ffi/README.md) | Owned, runtime-neutral facade for native language bindings |
 | [`corium-cljrs`](crates/corium-cljrs/README.md) | Clojurust bindings: value conversion, `corium.api`, `:db/fn` sandbox host |
 | [`corium-cli`](crates/corium-cli/README.md) | `corium` binary: launchers, admin commands, console, TUI, SQL shell |
 | [`corium-sim`](crates/corium-sim/README.md) | Deterministic simulation harness for fault-injection tests (not published) |
+
+Language clients live under `clients/`; the
+[`clients/python`](clients/python/README.md) package provides the shared
+asynchronous local/remote Python API.
 
 ## Examples
 
