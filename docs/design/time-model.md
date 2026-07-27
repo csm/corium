@@ -1,8 +1,15 @@
 # Time Model
 
 Every datom carries its transaction; nothing is overwritten. The database
-value handed to queries is a *view* defined by a basis filter, and all views
-are cheap (they wrap the same trees with a filter/merge policy — no copying).
+value handed to queries is a *view* defined by a basis filter: views wrap the
+same datoms with a different fold policy and never copy a fact.
+
+Cheap to *name*, though, is not yet cheap to *open*. In the implementation a
+view's covering indexes are folded in memory from the peer's recorded log, so
+the first read of a distinct time view costs O(total history) rather than
+O(the view's size), and the fold is what the design's segment descent is meant
+to replace. [Cost of a view today](#cost-of-a-view-today) states what a peer
+actually pays; the table below describes each view's meaning.
 
 ## Database views
 
@@ -27,6 +34,39 @@ Rules baked into the index design to make these work:
   planning (uniqueness holds only for the current view).
 - A transactor's indexing job maintains current and history trees in the same
   pass; there is no separate "history build".
+
+## Cost of a view today
+
+The table above is the design. What a peer runs today is an in-memory fold,
+and the difference is worth stating plainly because it shows up as latency and
+as resident memory rather than as a wrong answer:
+
+- **A peer holds the whole history.** Its database value keeps every datom it
+  has seen — assertions *and* retractions, not just live facts — and each
+  materialized view adds four covering indexes over that log. Datoms are
+  allocated once and shared by handle across the log and every index of every
+  view, so the indexes cost encoded keys and pointers rather than duplicate
+  facts; but nothing is evicted, so a peer's footprint tracks everything ever
+  transacted, not the size of the live database.
+- **A cold view costs the whole history, not the view.** `as-of` folds the log
+  up to its basis, `history` folds all of it, `since` folds all of it and then
+  filters. The result is cached in the database value and shared by its clones,
+  and a view that selects exactly the datoms of an already-folded one (`as-of`
+  at or after the basis, `since` 0) reuses that fold instead of repeating it.
+  A genuinely distinct view still pays a full fold on first read.
+- **`since` narrows before it projects.** The live set is folded once in EAVT
+  and the other three orders are projected from it, so the floor is applied
+  while building rather than by rebuilding four finished indexes into four
+  filtered ones.
+
+The design's answer to the first two is the segment tree: readers descend
+persistent index segments and fetch only what a query touches, through the
+bounded cache `corium-store` already implements. The published format is being
+built toward that — see the format-3 note in
+[indexes-and-storage.md](indexes-and-storage.md) — but the inner tree levels
+that let a reader seek without materializing an index are still future work.
+Until they land, treat a peer as an in-memory database that storage
+reconstructs rather than bounds, and size it against total history.
 
 ## Naming a view by wall clock
 

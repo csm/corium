@@ -76,6 +76,20 @@ so consecutive roots share every untouched chunk. Inner tree levels (and
 with them seek-without-full-download) are still future work; readers
 concatenate a manifest's chunks and accept pre-format-3 flat snapshots.
 
+The consequence on the read side is worth being explicit about: because a
+reader cannot yet seek into a published index, **a peer materializes the whole
+thing in memory**. Its database value keeps every datom it has seen — the full
+history, retractions included — and folds four covering indexes over that log
+per time view, lazily and cached. Facts are allocated once and shared by handle
+across the log and every index, so the indexes cost keys and pointers rather
+than copies, but nothing is evicted and a cold time view costs a fold of the
+entire history rather than of the view. So a peer today is an in-memory
+database whose durable storage reconstructs its state rather than bounds it:
+size peers against total history, and expect first-touch latency on a distinct
+`as-of`/`since`/`history` view to scale with history rather than with the
+answer. Lazy descent through the segment cache is what closes this, and
+`docs/design/time-model.md` records the current costs per view.
+
 One rule (`corium-core`'s `chunk` module) decides where a sorted key stream
 is cut, and both the published format and the in-memory segment
 (`corium-index`) obey it — so **a segment's leaf is exactly one published
