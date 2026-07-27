@@ -18,6 +18,8 @@
 //! transaction made it.
 
 use std::{
+    borrow::Borrow,
+    cmp::Ordering,
     collections::{BTreeMap, HashSet},
     sync::Arc,
 };
@@ -88,15 +90,20 @@ impl Segment {
     ///
     /// A current-value index map (`corium_db`'s covering indexes) iterates in
     /// exactly this order, so publication never re-sorts what the transaction
-    /// pipeline already sorted.
+    /// pipeline already sorted. Datoms are taken by reference — only the key
+    /// each one encodes to is kept — so a rebuild reads the database's index
+    /// in place instead of copying it.
     ///
     /// # Panics
     /// Debug builds assert the input really is strictly increasing by key.
     #[must_use]
-    pub fn from_sorted(order: IndexOrder, datoms: impl IntoIterator<Item = Datom>) -> Self {
+    pub fn from_sorted(
+        order: IndexOrder,
+        datoms: impl IntoIterator<Item = impl Borrow<Datom>>,
+    ) -> Self {
         let mut builder = LeafBuilder::default();
         for datom in datoms {
-            builder.push(datom.key(order));
+            builder.push(datom.borrow().key(order));
         }
         Self {
             leaves: builder.finish().into(),
@@ -105,11 +112,14 @@ impl Segment {
 
     /// Builds a segment from datoms in any order, keeping the last datom
     /// stated for each fact.
+    ///
+    /// Unsorted input has to be ordered somewhere; [`Segment::from_sorted`]
+    /// is the path publication takes.
     #[must_use]
-    pub fn build(order: IndexOrder, datoms: impl IntoIterator<Item = Datom>) -> Self {
+    pub fn build(order: IndexOrder, datoms: impl IntoIterator<Item = impl Borrow<Datom>>) -> Self {
         let mut by_fact: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for datom in datoms {
-            let key = datom.key(order);
+            let key = datom.borrow().key(order);
             by_fact.insert(key_components(&key).to_vec(), key);
         }
         Self::from_keys(by_fact.into_values())
@@ -183,12 +193,20 @@ impl Segment {
     /// indexes. Only leaves whose key span the tail touches are rebuilt;
     /// every other leaf is carried over by handle, so the result shares its
     /// allocations — and therefore its published chunks — with `self`.
+    ///
+    /// The tail is taken by reference and collapsed to its net key per fact,
+    /// so folding costs the tail rather than a copy of it.
     #[must_use]
-    pub fn apply(&self, order: IndexOrder, changes: impl IntoIterator<Item = Datom>) -> Self {
+    pub fn apply(
+        &self,
+        order: IndexOrder,
+        changes: impl IntoIterator<Item = impl Borrow<Datom>>,
+    ) -> Self {
         // Collapse the tail to one net change per fact first, so a fact
         // churned repeatedly across the tail rewrites its leaf once.
         let mut folded: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         for datom in changes {
+            let datom = datom.borrow();
             let key = datom.key(order);
             let fact = key_components(&key).to_vec();
             folded.insert(fact, datom.added.then_some(key));
@@ -196,7 +214,9 @@ impl Segment {
         if folded.is_empty() {
             return self.clone();
         }
-        let pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = folded.into_iter().collect();
+        // Each entry is consumed exactly once, in order, by the walk below,
+        // so its replacement key is moved into the leaf it lands in.
+        let mut pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = folded.into_iter().collect();
         // Retractions add nothing behind the leaf they land in, so only a
         // pending assertion can force an open trailing leaf to be re-cut.
         let last_assertion = pending.iter().rposition(|(_, key)| key.is_some());
@@ -210,10 +230,11 @@ impl Segment {
             };
             // Changes sorting before this leaf are insertions into the gap
             // ahead of it; a retraction of an absent fact is a no-op.
-            while let Some((fact, replacement)) = pending.get(cursor)
-                && fact.as_slice() < key_components(first)
+            while pending
+                .get(cursor)
+                .is_some_and(|(fact, _)| fact.as_slice() < key_components(first))
             {
-                builder.push_change(replacement.clone());
+                builder.push_change(pending[cursor].1.take());
                 cursor += 1;
             }
             let touched = pending
@@ -228,23 +249,26 @@ impl Segment {
             builder.begin_dirty();
             for key in keys {
                 let fact = key_components(key);
-                while let Some((pending_fact, replacement)) = pending.get(cursor)
-                    && pending_fact.as_slice() < fact
+                while pending
+                    .get(cursor)
+                    .is_some_and(|(pending_fact, _)| pending_fact.as_slice() < fact)
                 {
-                    builder.push_change(replacement.clone());
+                    builder.push_change(pending[cursor].1.take());
                     cursor += 1;
                 }
-                match pending.get(cursor) {
-                    Some((pending_fact, replacement)) if pending_fact.as_slice() == fact => {
-                        builder.push_change(replacement.clone());
-                        cursor += 1;
-                    }
-                    _ => builder.push(key.clone()),
+                if pending
+                    .get(cursor)
+                    .is_some_and(|(pending_fact, _)| pending_fact.as_slice() == fact)
+                {
+                    builder.push_change(pending[cursor].1.take());
+                    cursor += 1;
+                } else {
+                    builder.push(key.clone());
                 }
             }
         }
-        for (_, replacement) in &pending[cursor..] {
-            builder.push_change(replacement.clone());
+        for (_, replacement) in &mut pending[cursor..] {
+            builder.push_change(replacement.take());
         }
         Self {
             leaves: builder.finish().into(),
@@ -252,10 +276,30 @@ impl Segment {
     }
 
     /// Counts keys shared exactly with `older`.
+    ///
+    /// Both segments are sorted, so this is one linear pass over the two key
+    /// streams rather than an index built over either of them.
     #[must_use]
     pub fn shared_key_count(&self, older: &Self) -> usize {
-        let old: HashSet<&Vec<u8>> = older.keys().collect();
-        self.keys().filter(|key| old.contains(key)).count()
+        let mut mine = self.keys().peekable();
+        let mut theirs = older.keys().peekable();
+        let mut shared = 0;
+        while let (Some(left), Some(right)) = (mine.peek(), theirs.peek()) {
+            match left.cmp(right) {
+                Ordering::Less => {
+                    mine.next();
+                }
+                Ordering::Greater => {
+                    theirs.next();
+                }
+                Ordering::Equal => {
+                    shared += 1;
+                    mine.next();
+                    theirs.next();
+                }
+            }
+        }
+        shared
     }
 
     /// Counts leaves carried over from `older` by handle — the chunks a
@@ -440,7 +484,7 @@ mod tests {
     #[test]
     fn an_empty_tail_reuses_every_leaf() {
         let segment = Segment::from_sorted(IndexOrder::Eavt, many(5_000));
-        let after = segment.apply(IndexOrder::Eavt, []);
+        let after = segment.apply(IndexOrder::Eavt, std::iter::empty::<&Datom>());
         assert_eq!(after.shared_leaf_count(&segment), segment.leaves().len());
     }
 
@@ -511,6 +555,55 @@ mod tests {
             .filter(|leaf| !carried.contains(&leaf.id()))
             .count();
         assert_eq!(rebuilt, 1, "only the appended-to leaf should be rebuilt");
+    }
+
+    /// Publication indexes the database's own covering index and the log tail
+    /// in place, so both builders have to take datoms by reference — a `Vec`
+    /// of them is never copied just to be indexed.
+    #[test]
+    fn segments_build_from_borrowed_datoms() {
+        let datoms = many(2_000);
+        let tail = [datom(2_000, 1, 2_000), retraction(0, 1, 0)];
+
+        let borrowed = Segment::from_sorted(IndexOrder::Eavt, datoms.iter());
+        let owned = Segment::from_sorted(IndexOrder::Eavt, datoms.clone());
+        assert_eq!(
+            borrowed.keys().collect::<Vec<_>>(),
+            owned.keys().collect::<Vec<_>>()
+        );
+
+        let from_refs = borrowed.apply(IndexOrder::Eavt, tail.iter());
+        let from_values = owned.apply(IndexOrder::Eavt, tail);
+        assert_eq!(
+            from_refs.keys().collect::<Vec<_>>(),
+            from_values.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(from_refs.len(), 2_000);
+
+        assert_eq!(
+            Segment::build(IndexOrder::Eavt, datoms.iter())
+                .keys()
+                .collect::<Vec<_>>(),
+            borrowed.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shared_key_count_compares_two_sorted_streams() {
+        let original = Segment::from_sorted(IndexOrder::Eavt, many(1_000));
+        assert_eq!(original.shared_key_count(&original), 1_000);
+        assert_eq!(original.shared_key_count(&Segment::default()), 0);
+        assert_eq!(Segment::default().shared_key_count(&original), 0);
+
+        // Disjoint runs share nothing even though both are non-empty; an
+        // overlapping one shares exactly its overlap.
+        let disjoint = Segment::from_sorted(
+            IndexOrder::Eavt,
+            (2_000..3_000u64).map(|e| datom(e, 1, i64::try_from(e).expect("fits i64"))),
+        );
+        assert_eq!(original.shared_key_count(&disjoint), 0);
+        let overlapping = original.apply(IndexOrder::Eavt, [retraction(0, 1, 0)]);
+        assert_eq!(overlapping.shared_key_count(&original), 999);
     }
 
     #[test]

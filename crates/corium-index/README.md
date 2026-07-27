@@ -12,7 +12,9 @@ transaction tail into it without rebuilding it:
   whole datom, so a segment is just its key stream.
 - **`Segment::apply`** — the current-value fold (assert replaces the fact,
   retract removes it) of a transaction tail into a segment, rebuilding only
-  the leaves the tail touches.
+  the leaves the tail touches. Datoms are read by reference and kept only as
+  the key they encode to, so folding a tail — or rebuilding from the
+  database's covering index — copies no datoms.
 - **`Leaf`** — one content-defined run of keys. Leaves are `Arc`-shared, and
   `Leaf::id` reports which ones a fold carried across untouched.
 

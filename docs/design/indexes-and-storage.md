@@ -88,6 +88,10 @@ over by handle keeps the blob id it was published under, so the pass encodes,
 hashes, and uploads only the leaves the tail rebuilt. Work per pass tracks
 the tail plus one pointer per leaf, not the size of the database.
 
+Datoms enter the fold by reference and leave as the key they encode to, so
+neither the tail nor — on a rebuild — the database's own covering index is
+copied to be indexed.
+
 Because boundaries depend only on the boundary key, a transactor that has to
 rebuild a segment from scratch — its first publication, or after a takeover —
 reproduces the chunks the previous process published and re-uploads only what
