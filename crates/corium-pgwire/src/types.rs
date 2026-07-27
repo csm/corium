@@ -6,6 +6,7 @@
 
 use std::fmt::Write as _;
 
+use chrono::DateTime;
 use corium_sql::{SqlType, SqlValue};
 
 // PostgreSQL built-in type OIDs (from `pg_type`).
@@ -318,15 +319,25 @@ fn decode_text_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
             .map(SqlValue::Float)
             .map_err(|error| format!("invalid floating-point parameter: {error}")),
         OID_BYTEA => decode_bytea(text).map(SqlValue::Bytes),
-        OID_TIMESTAMPTZ => Err(
-            "text timestamptz parameters are not supported yet; bind an integer epoch expression"
-                .into(),
-        ),
+        OID_TIMESTAMPTZ => decode_text_timestamp(text).map(SqlValue::TimestampMillis),
         oid if is_array_oid(oid) => {
             Err("array parameters are not supported yet; use an ARRAY expression".into())
         }
         other => Err(format!("parameter type OID {other} is not supported")),
     }
+}
+
+fn decode_text_timestamp(text: &str) -> Result<i64, String> {
+    DateTime::parse_from_rfc3339(text)
+        .or_else(|_| DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z"))
+        .or_else(|_| DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f%#z"))
+        .map(|timestamp| timestamp.timestamp_millis())
+        .map_err(|_| {
+            format!(
+                "invalid timestamptz parameter {text:?}; expected a timestamp with an \
+                 explicit UTC offset, e.g. 2021-01-01T00:00:00Z"
+            )
+        })
 }
 
 fn decode_binary_parameter(oid: i32, bytes: &[u8]) -> Result<SqlValue, String> {
@@ -590,6 +601,9 @@ fn push_array_element(out: &mut String, value: &SqlValue) {
 
 /// Formats epoch milliseconds as a `timestamptz` in UTC (`YYYY-MM-DD HH:MM:SS[.mmm]+00`).
 fn format_timestamp(millis: i64) -> String {
+    // Keep the integer calendar conversion rather than routing output through
+    // chrono: SqlValue can hold the full i64 millisecond range, which is wider
+    // than chrono's representable DateTime range.
     let days = millis.div_euclid(86_400_000);
     let time_of_day = millis.rem_euclid(86_400_000);
     let (year, month, day) = civil_from_days(days);
@@ -683,6 +697,46 @@ mod tests {
             decode_parameter(OID_NUMERIC, 0, Some(b"18446744073709551615")).unwrap(),
             SqlValue::Unsigned(u64::MAX)
         );
+    }
+
+    #[test]
+    fn text_timestamptz_accepts_iso_8601_and_postgresql_offsets() {
+        assert_eq!(
+            decode_parameter(OID_TIMESTAMPTZ, 0, Some(b"2021-01-01T00:00:00.123Z")).unwrap(),
+            SqlValue::TimestampMillis(1_609_459_200_123)
+        );
+        assert_eq!(
+            decode_parameter(OID_TIMESTAMPTZ, 0, Some(b"2021-01-01 01:30:00+01:30")).unwrap(),
+            SqlValue::TimestampMillis(1_609_459_200_000)
+        );
+        for text in [
+            "2021-01-01T00:00:00+00",
+            "2021-01-01T00:00:00+0000",
+            "2021-01-01 00:00:00Z",
+        ] {
+            assert_eq!(decode_text_timestamp(text), Ok(1_609_459_200_000), "{text}");
+        }
+    }
+
+    #[test]
+    fn text_timestamptz_round_trips_output_and_handles_pre_epoch_values() {
+        for millis in [0, 1_609_459_200_123, -500, i64::from(i32::MAX) * 1_000] {
+            let text = format_timestamp(millis);
+            assert_eq!(decode_text_timestamp(&text), Ok(millis), "{text}");
+        }
+        assert_eq!(
+            decode_text_timestamp("1970-01-01T00:00:00.999999Z"),
+            Ok(999)
+        );
+    }
+
+    #[test]
+    fn text_timestamptz_errors_explain_that_an_offset_is_required() {
+        for text in ["not-a-timestamp", "2021-01-01 00:00:00"] {
+            let error = decode_text_timestamp(text).unwrap_err();
+            assert!(error.contains(text), "{error}");
+            assert!(error.contains("explicit UTC offset"), "{error}");
+        }
     }
 
     #[test]
