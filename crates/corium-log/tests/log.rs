@@ -1,8 +1,12 @@
 //! Durable log conformance tests.
 
 use corium_core::{Datom, EntityId, Value};
-use corium_log::{FileLog, MemLogRegistry, TransactionLog, TxRecord, VersionedLog};
+use corium_log::{
+    FileLog, LogError, MemLogRegistry, TransactionLog, TxRecord, VersionedLog,
+    append_framed_record, decode_framed_records,
+};
 use std::io::Write;
+
 fn record(t: u64) -> TxRecord {
     let signed_t = i64::try_from(t).expect("test transaction fits i64");
     TxRecord {
@@ -34,6 +38,19 @@ fn big_record(t: u64, bytes: usize) -> TxRecord {
         }],
     }
 }
+
+/// Encodes the length-only frame emitted before checksums were introduced.
+fn legacy_frame(record: &TxRecord) -> Vec<u8> {
+    let mut frame = Vec::new();
+    append_framed_record(&mut frame, record).expect("frame");
+    let encoded_len = u64::from_be_bytes(frame[..8].try_into().expect("length"));
+    assert_ne!(encoded_len >> 63, 0, "new frames must carry the format bit");
+    let payload_len = encoded_len & !(1_u64 << 63);
+    frame[..8].copy_from_slice(&payload_len.to_be_bytes());
+    frame.truncate(8 + usize::try_from(payload_len).expect("payload length"));
+    frame
+}
+
 #[test]
 fn filesystem_log_replays_and_ranges_after_reopen() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -45,6 +62,41 @@ fn filesystem_log_replays_and_ranges_after_reopen() {
     let log = FileLog::open(path).expect("reopen");
     assert_eq!(log.replay().expect("replay"), vec![record(1), record(2)]);
     assert_eq!(log.tx_range(2, Some(3)).expect("range"), vec![record(2)]);
+}
+
+#[test]
+fn filesystem_log_detects_a_fully_written_corrupt_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transactions.log");
+    let log = FileLog::open(&path).expect("open");
+    log.append(&record(1)).expect("append");
+    drop(log);
+
+    // Change only the low byte of tx_instant. The payload remains structurally
+    // valid and would decode without an integrity check.
+    let mut bytes = std::fs::read(&path).expect("read log");
+    bytes[8 + 15] ^= 1;
+    std::fs::write(&path, bytes).expect("rewrite corrupt log");
+
+    assert!(matches!(FileLog::open(&path), Err(LogError::Corrupt)));
+}
+
+#[test]
+fn filesystem_log_reads_legacy_frames_then_appends_checksummed_frames() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transactions.log");
+    std::fs::write(&path, legacy_frame(&record(1))).expect("seed legacy log");
+
+    let log = FileLog::open(&path).expect("open legacy log");
+    assert_eq!(log.replay().expect("legacy replay"), vec![record(1)]);
+    log.append(&record(2)).expect("append checksummed record");
+    drop(log);
+
+    let log = FileLog::open(&path).expect("reopen mixed log");
+    assert_eq!(
+        log.replay().expect("mixed replay"),
+        vec![record(1), record(2)]
+    );
 }
 
 #[test]
@@ -74,6 +126,49 @@ fn torn_tail_from_crash_is_dropped_and_log_stays_appendable() {
     assert_eq!(
         log.replay().expect("replay"),
         vec![record(1), record(2), record(3)]
+    );
+}
+
+#[test]
+fn torn_checksum_is_dropped_with_its_unacked_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transactions.log");
+    let log = FileLog::open(&path).expect("open");
+    log.append(&record(1)).expect("append 1");
+    log.append(&record(2)).expect("append 2");
+    drop(log);
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open raw");
+    file.set_len(file.metadata().expect("metadata").len() - 2)
+        .expect("tear checksum");
+    drop(file);
+
+    let log = FileLog::open(&path).expect("drop torn checksummed frame");
+    assert_eq!(log.replay().expect("replay"), vec![record(1)]);
+    log.append(&record(2)).expect("append replacement");
+}
+
+#[test]
+fn framed_records_verify_checksums_and_accept_legacy_frames() {
+    let mut checksummed = Vec::new();
+    append_framed_record(&mut checksummed, &record(1)).expect("frame");
+    assert_eq!(
+        decode_framed_records(&checksummed).expect("decode"),
+        vec![record(1)]
+    );
+
+    // As in the filesystem test, this mutation leaves a decodable payload.
+    checksummed[8 + 15] ^= 1;
+    assert!(matches!(
+        decode_framed_records(&checksummed),
+        Err(LogError::Corrupt)
+    ));
+    assert_eq!(
+        decode_framed_records(&legacy_frame(&record(1))).expect("decode legacy"),
+        vec![record(1)]
     );
 }
 
@@ -486,11 +581,10 @@ async fn native_versioned_log_replays_legacy_chunks_then_appends_records() {
     let storage = std::sync::Arc::new(TestNativeStorage::default());
     let mut chunk0 = Vec::new();
     for t in 1..=3 {
-        corium_log::append_framed_record(&mut chunk0, &record(t)).expect("frame");
+        chunk0.extend_from_slice(&legacy_frame(&record(t)));
     }
     storage.seed_legacy_chunk("db", 1, 0, chunk0);
-    let mut chunk1 = Vec::new();
-    corium_log::append_framed_record(&mut chunk1, &record(4)).expect("frame");
+    let chunk1 = legacy_frame(&record(4));
     storage.seed_legacy_chunk("db", 1, 1, chunk1);
 
     // The upgraded binary opens under a fresh lease version and replays the

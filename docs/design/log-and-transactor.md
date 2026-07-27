@@ -19,6 +19,22 @@ append + fsync; object stores later: small per-tx objects compacted into
 chunks by the indexing job). The `corium-log` crate hides this behind
 `append(tx) -> t` and `replay(range)`.
 
+Each transaction uses this frame:
+
+```text
+payload-length | (1 << 63): u64 big-endian
+payload: [u8; payload-length]
+crc32c: u32 big-endian
+```
+
+The CRC32C covers the encoded length word and payload, so replay rejects a
+fully written record changed by storage corruption even when its transaction
+payload would still decode. A crash before the checksum is durable leaves an
+unacknowledged torn tail, which filesystem recovery truncates with the whole
+incomplete frame. Readers also accept the earlier length-only framing (high bit
+clear and no checksum) for backward-compatible replay; all new file, native
+object, and backup record writes use the checksummed form.
+
 > **Status:** the filesystem layout (per-lease-version files under the data
 > directory) and the shared-storage layout are both implemented. The native
 > backends (PostgreSQL, Turso, S3) store the log through the root store as

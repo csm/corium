@@ -10,6 +10,7 @@ description = "Durable append-only transaction logs with replay and range scans"
 [dependencies]
 corium-core = { workspace = true }
 async-trait = "0.1"
+crc32c = "0.6"
 thiserror = "2"
 tokio = { version = "1.53.0", features = ["sync"] }
 
