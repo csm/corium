@@ -25,7 +25,7 @@ pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheMetrics, S
 mod snapshot;
 pub use snapshot::{
     INDEX_MANIFEST_MAGIC, chunk_segment_keys, decode_index_manifest, decode_segment_keys,
-    encode_index_manifest, index_blob_children, is_index_manifest,
+    encode_index_manifest, encode_segment_chunk, index_blob_children, is_index_manifest,
 };
 
 #[cfg(feature = "postgres")]

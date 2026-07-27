@@ -89,8 +89,8 @@ A single Cargo workspace. Dependency edges point strictly downward.
 
 | Crate | Contents |
 |---|---|
-| `corium-core` | `Value`, sortable encoding, `Datom`, entity/tx ids, partitions, schema model, errors |
-| `corium-index` | Persistent segment trees, EAVT/AEVT/AVET/VAET, in-memory live index, merge iterators |
+| `corium-core` | `Value`, sortable encoding, `Datom`, entity/tx ids, partitions, schema model, chunk boundaries, errors |
+| `corium-index` | Immutable covering-index segments (EAVT/AEVT/AVET/VAET) whose leaves are the published chunks; incremental apply with structural sharing, iterators/seek |
 | `corium-store` | `BlobStore` + `RootStore` traits; memory and filesystem impls; segment cache |
 | `corium-log` | Log chunk format, append/replay, tx-range access |
 | `corium-tx` | Transaction data expansion, tempid resolution, schema validation, built-in tx functions |

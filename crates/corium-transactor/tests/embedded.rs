@@ -220,19 +220,19 @@ async fn blob_ids(store: &FsStore) -> HashSet<BlobId> {
     ids
 }
 
-#[tokio::test]
-async fn republication_uploads_only_the_chunks_a_change_touches() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (schema, a) = schema();
-    let store = FsStore::open(dir.path().join("store")).expect("store");
-    // Enough datoms that every covering index spans several leaf chunks
-    // (content-defined boundaries average one per ~2k keys). The load goes
-    // straight into the durable log — this test is about publication, and
-    // per-item transaction validation over a database this size would
-    // dominate its runtime.
-    let log: Arc<dyn TransactionLog> =
-        Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
-    let datoms: Vec<_> = (0u64..30_000)
+/// Loads a database of `count` datoms straight from the durable log.
+///
+/// The load bypasses the transaction pipeline on purpose: these tests are
+/// about publication, and per-item validation over a database this size would
+/// dominate their runtime.
+fn bulk_loaded(
+    dir: &std::path::Path,
+    schema: Schema,
+    a: EntityId,
+    count: u64,
+) -> EmbeddedTransactor {
+    let log: Arc<dyn TransactionLog> = Arc::new(FileLog::open(dir.join("tx.log")).expect("log"));
+    let datoms: Vec<_> = (0..count)
         .map(|n| corium_core::Datom {
             e: EntityId::new(Partition::User as u32, corium_db::FIRST_USER_ID + n),
             a,
@@ -247,16 +247,190 @@ async fn republication_uploads_only_the_chunks_a_change_touches() {
         datoms,
     })
     .expect("bulk log append");
-    let tx = EmbeddedTransactor::recover(schema, log).expect("recover");
+    EmbeddedTransactor::recover(schema, log).expect("recover")
+}
+
+async fn index_chunks(store: &FsStore, root: &DbRoot) -> Vec<Vec<BlobId>> {
+    use corium_store::decode_index_manifest;
+    let mut per_index = Vec::new();
+    for id in root.roots.as_ref().expect("published roots") {
+        let blob = store
+            .get(id)
+            .await
+            .expect("get manifest")
+            .expect("manifest");
+        per_index.push(decode_index_manifest(&blob).expect("manifest decodes"));
+    }
+    per_index
+}
+
+/// A blob store that counts how many blobs each publication touches, so a
+/// test can tell "folded the tail in" apart from "rebuilt and re-uploaded
+/// only what changed" — both leave the same bytes in the store.
+#[derive(Default)]
+struct CountingStore {
+    inner: corium_store::MemoryStore,
+    touched: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingStore {
+    /// Blob reads, writes, and presence probes since the last call.
+    fn take_touched(&self) -> usize {
+        self.touched.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn touch(&self) {
+        self.touched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[async_trait::async_trait]
+impl BlobStore for CountingStore {
+    async fn put(&self, bytes: &[u8]) -> Result<BlobId, corium_store::StoreError> {
+        self.touch();
+        self.inner.put(bytes).await
+    }
+    async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, corium_store::StoreError> {
+        self.touch();
+        self.inner.get(id).await
+    }
+    async fn contains(&self, id: &BlobId) -> Result<bool, corium_store::StoreError> {
+        self.touch();
+        self.inner.contains(id).await
+    }
+    async fn delete(&self, id: &BlobId) -> Result<(), corium_store::StoreError> {
+        self.inner.delete(id).await
+    }
+    async fn list(&self) -> Result<corium_store::BlobIdStream, corium_store::StoreError> {
+        self.inner.list().await
+    }
+}
+
+#[async_trait::async_trait]
+impl RootStore for CountingStore {
+    async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, corium_store::StoreError> {
+        self.inner.get_root(name).await
+    }
+    async fn cas_root(
+        &self,
+        name: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), corium_store::StoreError> {
+        self.inner.cas_root(name, expected, new).await
+    }
+    async fn delete_root(&self, name: &str) -> Result<(), corium_store::StoreError> {
+        self.inner.delete_root(name).await
+    }
+    async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, corium_store::StoreError> {
+        self.inner.list_roots(prefix).await
+    }
+}
+
+/// Blobs the first publication of a `count`-datom database stages, and the
+/// most any later single-commit pass stages.
+async fn publication_cost(dir: &std::path::Path, count: u64) -> (usize, usize) {
+    let (schema, a) = schema();
+    let store = CountingStore::default();
+    let tx = bulk_loaded(dir, schema, a, count);
     tx.publish_indexes(&store, "db:main", 1)
         .await
         .expect("first publish");
-    let before = blob_ids(&store).await;
+    let full = store.take_touched();
+
+    let mut incremental = 0;
+    for value in 0..3 {
+        tx.transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp(format!("e{value}")),
+            a,
+            Value::Long(1_000_000 + value),
+        ))])
+        .expect("transact");
+        tx.publish_indexes(&store, "db:main", 1)
+            .await
+            .expect("incremental publish");
+        incremental = incremental.max(store.take_touched());
+    }
+
+    // Republishing an unchanged basis must stage nothing new, and must leave
+    // the next pass still able to fold rather than rebuild.
+    tx.publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("idempotent publish");
+    let idle = store.take_touched();
+    assert!(idle <= 8, "a no-op pass staged {idle} blobs");
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp("after-idle".into()),
+        a,
+        Value::Long(2_000_000),
+    ))])
+    .expect("transact");
+    tx.publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("publish after idle pass");
+    let after_idle = store.take_touched();
     assert!(
-        before.len() >= 24,
-        "expected several chunks per index, found {} blobs",
-        before.len()
+        after_idle <= incremental,
+        "a no-op pass cost the next one its incremental basis ({after_idle} \
+         blobs against {incremental})"
     );
+    (full, incremental)
+}
+
+#[tokio::test]
+async fn indexing_a_tail_costs_the_tail_and_not_the_database() {
+    let small = tempfile::tempdir().expect("tempdir");
+    let large = tempfile::tempdir().expect("tempdir");
+    let (small_full, small_incremental) = publication_cost(small.path(), 30_000).await;
+    let (large_full, large_incremental) = publication_cost(large.path(), 90_000).await;
+
+    // A rebuild stages every chunk of every index, so its cost grows with the
+    // database. Folding a one-datom tail into the last publication stages only
+    // the leaves that datom rebuilt, so its cost does not.
+    assert!(
+        large_full > small_full,
+        "tripling the database did not make a full publication stage more \
+         blobs ({small_full} then {large_full}) — the measurement is wrong"
+    );
+    assert_eq!(
+        small_incremental, large_incremental,
+        "an incremental pass staged {small_incremental} blobs on a 30k-datom \
+         database and {large_incremental} on a 90k-datom one; publication \
+         still scales with the database"
+    );
+    assert!(
+        large_incremental * 2 < large_full,
+        "an incremental pass staged {large_incremental} of the {large_full} \
+         blobs a full publication does; publication fell back to a rebuild"
+    );
+}
+
+#[tokio::test]
+async fn republication_uploads_only_the_chunks_a_change_touches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let store = FsStore::open(dir.path().join("store")).expect("store");
+    // Enough datoms that the full covering indexes span several leaf chunks
+    // (content-defined boundaries average one per ~2k keys).
+    let tx = bulk_loaded(dir.path(), schema, a, 30_000);
+    let first = tx
+        .publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("first publish");
+    let before = blob_ids(&store).await;
+    let chunks_before = index_chunks(&store, &first).await;
+    assert!(
+        chunks_before[IndexOrder::Eavt as usize].len() >= 4,
+        "expected EAVT to span several chunks, found {}",
+        chunks_before[IndexOrder::Eavt as usize].len()
+    );
+
+    // Republishing at an unchanged basis must upload nothing at all.
+    tx.publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("idempotent publish");
+    assert_eq!(blob_ids(&store).await, before, "a no-op pass wrote blobs");
 
     // One appended datom (largest entity id and value, so it lands in the
     // tail chunk of every order) must not re-upload the settled chunks.
@@ -266,21 +440,97 @@ async fn republication_uploads_only_the_chunks_a_change_touches() {
         Value::Long(1_000_000),
     ))])
     .expect("tail transact");
-    tx.publish_indexes(&store, "db:main", 1)
+    let second = tx
+        .publish_indexes(&store, "db:main", 1)
         .await
         .expect("second publish");
     let after = blob_ids(&store).await;
     let fresh = after.difference(&before).count();
-    assert!(fresh >= 4, "each index publishes a new manifest");
     // Each index re-uploads its manifest plus the chunks the transaction
     // dirtied: the appended datom's tail chunk, and the chunk holding the
     // transaction partition, where the commit's own `:db/txInstant` lands.
     // Both regions grow at their own tail, so this stays O(1) per commit.
     assert!(
-        fresh <= 16,
+        fresh <= 12,
         "appending one datom re-uploaded {fresh} blobs of {} (expected only \
          each index's manifest and the chunks it appends to)",
         after.len()
+    );
+    let chunks_after = index_chunks(&store, &second).await;
+    let eavt = IndexOrder::Eavt as usize;
+    let carried = chunks_after[eavt]
+        .iter()
+        .filter(|id| chunks_before[eavt].contains(id))
+        .count();
+    assert!(
+        carried >= chunks_before[eavt].len() - 2,
+        "EAVT carried only {carried} of {} chunks across an append",
+        chunks_before[eavt].len()
+    );
+}
+
+#[tokio::test]
+async fn incremental_publication_matches_a_rebuild_from_scratch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let store = FsStore::open(dir.path().join("store")).expect("store");
+    let tx = bulk_loaded(dir.path(), schema, a, 8_000);
+    let base = tx
+        .publish_indexes(&store, "db:incremental", 1)
+        .await
+        .expect("base publish");
+
+    // A tail that asserts, supersedes a cardinality-one value, and retracts
+    // an entity outright — every shape the current-value fold has to handle.
+    let kept = tx
+        .transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp("kept".into()),
+            a,
+            Value::Long(7),
+        ))])
+        .expect("assert")
+        .tx
+        .tempids["kept"];
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Id(kept),
+        a,
+        Value::Long(8),
+    ))])
+    .expect("supersede");
+    let doomed = tx
+        .transact([TxItem::Op(TxOp::Add(
+            EntityRef::Temp("doomed".into()),
+            a,
+            Value::Long(9),
+        ))])
+        .expect("assert doomed")
+        .tx
+        .tempids["doomed"];
+    tx.transact([TxItem::Op(TxOp::RetractEntity(EntityRef::Id(doomed)))])
+        .expect("retract entity");
+    let incremental = tx
+        .publish_indexes(&store, "db:incremental", 1)
+        .await
+        .expect("incremental publish");
+    assert!(incremental.index_basis_t > base.index_basis_t);
+
+    // A transactor that has never published anything rebuilds every index
+    // from its own in-memory covering indexes. The two paths must agree
+    // exactly — same chunk boundaries, same blob ids, same manifests.
+    let cold = EmbeddedTransactor::recover_from_snapshot(
+        tx.db(),
+        incremental.next_entity_id,
+        incremental.last_tx_instant,
+        Arc::new(corium_log::MemoryLog::default()),
+    )
+    .expect("cold transactor");
+    let rebuilt = cold
+        .publish_indexes(&store, "db:rebuilt", 1)
+        .await
+        .expect("rebuild publish");
+    assert_eq!(
+        rebuilt.roots, incremental.roots,
+        "folding the tail in published different indexes than a full rebuild"
     );
 }
 

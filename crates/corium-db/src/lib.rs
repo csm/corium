@@ -368,6 +368,36 @@ impl Db {
         self.recorded.len()
     }
 
+    /// The datoms transactions after `t` recorded, in the order they were
+    /// recorded.
+    ///
+    /// `recorded` is append-ordered, so the answer is a suffix: the scan
+    /// walks back from the end and stops at the first datom at or before `t`,
+    /// costing time proportional to the tail rather than to the whole
+    /// history. This is what an indexing pass folds into the segments it last
+    /// published ([`corium_index::Segment::apply`]) instead of rebuilding
+    /// them.
+    ///
+    /// A value opened from a published snapshot carries that snapshot's live
+    /// datoms as its prefix rather than a transaction-ordered history; every
+    /// one of them is at or before the snapshot's basis, so the same scan
+    /// still stops at the boundary for any `t` at or after it.
+    pub fn recorded_since(&self, t: u64) -> impl Iterator<Item = &Datom> {
+        let mut start = self.recorded.len();
+        while start > 0
+            && self
+                .recorded
+                .get(start - 1)
+                .is_some_and(|datom| datom.tx.sequence() > t)
+        {
+            start -= 1;
+        }
+        // Indexed access rather than `iter().skip(start)`: the persistent
+        // vector's iterator would have to walk the whole prefix to reach the
+        // tail, which is the cost this method exists to avoid.
+        (start..self.recorded.len()).filter_map(|index| self.recorded.get(index))
+    }
+
     /// Returns the as-of view at basis `t`: facts as they stood then.
     #[must_use]
     pub fn as_of(&self, t: u64) -> Self {
@@ -715,7 +745,15 @@ fn insert_datom(indexes: &mut [Index; 4], datom: &Datom, schema: &Schema, with_t
     }
 }
 
-fn covered(schema: &Schema, order: IndexOrder, datom: &Datom) -> bool {
+/// Whether `datom` belongs in `order`'s covering index.
+///
+/// EAVT and AEVT hold every datom; AVET holds only indexed/unique
+/// attributes and VAET only reference values, mirroring Datomic's covering
+/// index composition. An indexing pass folding a transaction tail into
+/// published segments filters it through the same rule the in-memory
+/// indexes use, so the two cannot drift.
+#[must_use]
+pub fn covered(schema: &Schema, order: IndexOrder, datom: &Datom) -> bool {
     match order {
         IndexOrder::Eavt | IndexOrder::Aevt => true,
         IndexOrder::Avet => avet_covered(schema, datom.a),
@@ -828,6 +866,30 @@ mod tests {
             vec![Value::Str("alicia".into())]
         );
         assert_eq!(db.stats().datoms, 3);
+    }
+
+    #[test]
+    fn recorded_since_returns_the_transaction_tail() {
+        let db = sample();
+        assert_eq!(db.recorded_since(2).count(), 0);
+        let tail: Vec<_> = db.recorded_since(1).collect();
+        assert_eq!(tail.len(), 3);
+        assert!(tail.iter().all(|datom| datom.tx.sequence() == 2));
+        assert_eq!(db.recorded_since(0).count(), db.recorded_len());
+
+        // A value opened from a published snapshot carries live datoms rather
+        // than a transaction-ordered history; the tail after it still scans.
+        let snapshot = Db::from_current_snapshot(
+            2,
+            schema(),
+            Idents::default(),
+            KeywordInterner::default(),
+            db.datoms(),
+        )
+        .with_transaction(3, &[datom(3, 1, Value::Str("carol".into()), 3, true)]);
+        let tail: Vec<_> = snapshot.recorded_since(2).collect();
+        assert_eq!(tail.len(), 1);
+        assert!(tail.iter().all(|datom| datom.tx.sequence() == 3));
     }
 
     #[test]

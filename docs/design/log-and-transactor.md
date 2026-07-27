@@ -155,19 +155,30 @@ it fail fast with a busy error (clients retry with backoff).
 
 ## Background indexing job
 
-The live index (a persistent in-memory sorted structure holding datoms since
-`index-basis-t`) grows with every transaction. When it exceeds a threshold
-(bytes or datom count) or a time limit, the indexing job:
+The live index — the `Db` value's own four covering index maps, persistent
+structures the pipeline folds each commit into — runs ahead of
+`index-basis-t` by the datoms transacted since. When that tail exceeds a
+threshold (bytes or datom count) or a time limit, the indexing job:
 
-1. Takes the current basis `t*` and the live-index snapshot up to `t*`
-   (persistent structure ⇒ snapshot is free; pipeline keeps running).
-2. Merges it into each covering index tree, writing new leaf/inner segments
-   bottom-up, reusing unchanged subtrees by hash.
-3. Uploads all new segments, then CASes a new DbRoot with
-   `index-basis-t = t*` and the new roots.
+1. Takes the current basis `t*` and the database value at `t*` (persistent
+   structure ⇒ snapshot is free; pipeline keeps running).
+2. Folds the tail `(index-basis-t, t*]` into the segments the last
+   publication produced, rebuilding only the leaves it touches and carrying
+   every other leaf across by handle (`Segment::apply`).
+3. Encodes and uploads only the rebuilt leaves — a carried leaf is already
+   stored under the blob id the last pass gave it — then CASes a new DbRoot
+   with `index-basis-t = t*` and the new roots.
 4. Notifies peers (via the tx-report stream) that a new index basis is
    available; peers adopt it and drop their log tail below `t*`.
-5. Marks the pre-`t*` live index droppable once adopted locally.
+
+Steps 2 and 3 cost the tail plus one pointer per leaf, not the size of the
+database; see [indexes-and-storage.md](indexes-and-storage.md) for why a
+segment's leaf is exactly one published chunk. A job that cannot reuse the
+last publication — the first pass of a process, or a root that is no longer
+the one this transactor installed — rebuilds each segment from the database's
+own covering index instead. That is a full re-encode but not a full re-upload:
+chunk boundaries are content-defined, so a rebuild lands on the chunks the
+previous process published.
 
 Indexing runs concurrently with transaction processing; only step 3's CAS
 touches shared state. If the transactor crashes mid-index, the orphan segments

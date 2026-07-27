@@ -20,9 +20,11 @@ datom key composition tested for all four index orders; clippy/fmt gates on.
 ## M1 — Storage engine
 
 `corium-store` (BlobStore/RootStore traits, memory + filesystem impls with
-CAS-fenced roots, segment cache) and `corium-index` (immutable segment trees:
-build, merge with structural sharing, iterators/seek; live in-memory index;
-merged live+durable iterator).
+CAS-fenced roots, segment cache) and `corium-index` (immutable segments:
+build, incremental apply with structural sharing, iterators/seek). The live
+in-memory index is the `Db` value itself (`corium-db`), which already folds
+each commit into its four covering indexes; segments hold the published
+snapshot the indexing job merges that tail into.
 
 **Accept:** tree property tests vs model; structural-sharing bound test;
 crash-during-publish simulation shows either old or new root, both fully

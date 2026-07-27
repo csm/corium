@@ -19,6 +19,9 @@ representation of everything the engine stores and moves around:
 - **`encoding`** — the order-preserving, tagged byte encoding (`Encodable`,
   `encode_value`) that makes index keys sort correctly and is reused by the
   segment and wire formats.
+- **`chunk`** — the content-defined rule for where a sorted index key stream
+  is cut, shared by the in-memory segment (`corium-index`) and the published
+  snapshot format (`corium-store`) so a segment leaf is exactly one chunk.
 
 ## Dependencies
 
