@@ -678,15 +678,20 @@ impl EmbeddedTransactor {
     /// has. Only rebuilt leaves are encoded, hashed, and uploaded, under a
     /// manifest blob naming every chunk in key order.
     ///
-    /// Falling back to a full rebuild is always available and always correct:
-    /// it happens on the first publication of a process, and whenever the
-    /// published root is no longer the one this transactor last installed (a
-    /// takeover, a concurrent publisher, a root rolled back), because only
-    /// then can a carried-over chunk have stopped being reachable from a live
-    /// root — which is what keeps garbage collection from sweeping a chunk
-    /// this pass assumes is present. A rebuild reproduces the same chunk
-    /// boundaries the previous process published, so it re-uploads only what
-    /// genuinely changed even though it re-encodes everything.
+    /// A carried-over chunk is published by id without being re-uploaded, and
+    /// nothing but the root that names it keeps it from being swept. So a pass
+    /// carries chunks over only while it can prove that root is live: it
+    /// requires the published root to be the one this transactor last
+    /// installed, *and* pins that index state through the CAS, which installs
+    /// only if the root never changed in between. A takeover, a concurrent
+    /// publisher, or a root rolled back therefore costs a rebuild rather than
+    /// a manifest naming chunks the sweep is free to delete.
+    ///
+    /// Rebuilding is always available and always correct — it is also what the
+    /// first publication of a process does — and it reuses no chunk id, so it
+    /// cannot be raced this way. It re-encodes every chunk, but reproduces the
+    /// boundaries the previous publication cut, so it re-uploads only what
+    /// genuinely changed.
     ///
     /// Blobs are uploaded before the root CAS. Transactions may continue while
     /// the immutable snapshot is encoded; a later run indexes any remaining
@@ -707,6 +712,40 @@ impl EmbeddedTransactor {
         root_name: &str,
         lease_version: u64,
     ) -> Result<DbRoot, TransactError> {
+        let previous = self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let PassOutcome::Published(root) = self
+            .publish_pass(store, root_name, lease_version, previous)
+            .await?
+        {
+            return Ok(root);
+        }
+        // The root's index state moved under a pass that was carrying chunks
+        // over from the last publication, so nothing was installed. Rebuilding
+        // reuses no chunk id, so the retry has nothing left to be raced for.
+        match self
+            .publish_pass(store, root_name, lease_version, None)
+            .await?
+        {
+            PassOutcome::Published(root) => Ok(root),
+            PassOutcome::Raced => {
+                unreachable!("a pass that carries nothing over publishes unconditionally")
+            }
+        }
+    }
+
+    /// One publication attempt, optionally folding the tail into `previous`
+    /// rather than rebuilding.
+    async fn publish_pass(
+        &self,
+        store: &(impl BlobStore + RootStore),
+        root_name: &str,
+        lease_version: u64,
+        previous: Option<PublishedIndexes>,
+    ) -> Result<PassOutcome, TransactError> {
         let stored = store
             .get_root(root_name)
             .await?
@@ -719,19 +758,18 @@ impl EmbeddedTransactor {
         }
         let (snapshot, next_entity_id, last_tx_instant) = self.recovery_snapshot();
         let basis_t = snapshot.basis_t();
-        // Taking the cache rather than borrowing it keeps the reused segments
-        // out of the shared slot for the whole pass: whatever this pass
-        // produces is what goes back, and a pass that fails leaves the next
-        // one to rebuild rather than to trust a snapshot that was never
-        // installed.
-        let previous = self
-            .published
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .filter(|previous| {
-                previous.is_current(stored.as_ref(), lease_version) && previous.basis_t <= basis_t
-            });
+        let previous = previous.filter(|previous| {
+            previous.is_current(stored.as_ref(), lease_version) && previous.basis_t <= basis_t
+        });
+        // Carrying a chunk over publishes its blob id without re-uploading it,
+        // and nothing but the root that names it keeps it from being swept.
+        // Pinning the index state this pass validated makes the root CAS the
+        // fence for those blobs too: it installs only if the root never
+        // changed in between, so the carried chunks stayed referenced by the
+        // live root from the check right through to the write.
+        let pinned = previous
+            .as_ref()
+            .map(|_| RootIndexState::of(stored.as_ref()));
 
         let (segments, planned) =
             tokio::task::spawn_blocking(move || plan_indexes(&snapshot, previous.as_ref()))
@@ -767,7 +805,10 @@ impl EmbeddedTransactor {
             next_entity_id,
             last_tx_instant,
         };
-        let outcome = publish_root(store, root_name, &root).await?;
+        let outcome = publish_root_pinned(store, root_name, &root, pinned.as_ref()).await?;
+        if outcome == RootPublication::Raced {
+            return Ok(PassOutcome::Raced);
+        }
         let next = PublishedIndexes {
             lease_version,
             basis_t,
@@ -788,7 +829,38 @@ impl EmbeddedTransactor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
         }
-        Ok(root)
+        Ok(PassOutcome::Published(root))
+    }
+}
+
+/// What one publication attempt produced.
+enum PassOutcome {
+    /// The attempt published this root (installed, or superseded by an equal
+    /// or newer basis).
+    Published(DbRoot),
+    /// The attempt carried chunks over from an earlier publication and the
+    /// root stopped vouching for them before the CAS, so nothing was
+    /// installed and the caller must retry from a rebuild.
+    Raced,
+}
+
+/// The published index state a publication pins the stored root to.
+///
+/// Only the index roots and their basis: the lease fields of the same record
+/// change under an ordinary renewal, which neither drops a chunk nor makes a
+/// carried blob id unsafe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootIndexState {
+    index_basis_t: u64,
+    roots: Option<[BlobId; 4]>,
+}
+
+impl RootIndexState {
+    fn of(root: Option<&DbRoot>) -> Self {
+        Self {
+            index_basis_t: root.map_or(0, |root| root.index_basis_t),
+            roots: root.and_then(|root| root.roots.clone()),
+        }
     }
 }
 
@@ -871,6 +943,10 @@ pub enum RootPublication {
     /// was not installed and the blobs behind it are left for garbage
     /// collection.
     Superseded,
+    /// The publication pinned the index state it was replacing and that state
+    /// changed, so this root was not installed. Only a caller that supplies a
+    /// pin can see this; [`publish_root`] never returns it.
+    Raced,
 }
 
 /// Publishes `root` under the fencing rules described on
@@ -884,9 +960,37 @@ pub async fn publish_root(
     root_name: &str,
     root: &DbRoot,
 ) -> Result<RootPublication, TransactError> {
+    publish_root_pinned(store, root_name, root, None).await
+}
+
+/// Publishes `root`, optionally only while the stored record still carries
+/// `pinned` as its index state.
+///
+/// A publication that names blobs it did not upload — an indexing pass
+/// carrying chunks over from the last one — has to pin: those blobs are kept
+/// alive only by the root that references them, so installing over a root
+/// that had already dropped them would leave the live root pointing at chunks
+/// the sweep is free to delete. The pin is re-checked against the record read
+/// immediately before each CAS attempt, and the CAS is conditional on exactly
+/// those bytes, so there is no window between the check and the write.
+///
+/// The pin covers the index roots and their basis, not the lease fields of
+/// the same record: an ordinary renewal rewrites those, and losing a pass to
+/// one would be a needless rebuild.
+async fn publish_root_pinned(
+    store: &dyn RootStore,
+    root_name: &str,
+    root: &DbRoot,
+    pinned: Option<&RootIndexState>,
+) -> Result<RootPublication, TransactError> {
     loop {
         let previous = store.get_root(root_name).await?;
         let stored = previous.as_deref().and_then(DbRoot::decode);
+        if let Some(pinned) = pinned
+            && RootIndexState::of(stored.as_ref()) != *pinned
+        {
+            return Ok(RootPublication::Raced);
+        }
         let mut next = root.clone();
         if let Some(stored) = stored {
             if stored.lease_version > root.lease_version {

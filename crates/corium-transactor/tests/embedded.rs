@@ -250,7 +250,7 @@ fn bulk_loaded(
     EmbeddedTransactor::recover(schema, log).expect("recover")
 }
 
-async fn index_chunks(store: &FsStore, root: &DbRoot) -> Vec<Vec<BlobId>> {
+async fn index_chunks(store: &impl BlobStore, root: &DbRoot) -> Vec<Vec<BlobId>> {
     use corium_store::decode_index_manifest;
     let mut per_index = Vec::new();
     for id in root.roots.as_ref().expect("published roots") {
@@ -267,36 +267,92 @@ async fn index_chunks(store: &FsStore, root: &DbRoot) -> Vec<Vec<BlobId>> {
 /// A blob store that counts how many blobs each publication touches, so a
 /// test can tell "folded the tail in" apart from "rebuilt and re-uploaded
 /// only what changed" — both leave the same bytes in the store.
+///
+/// It can also stand in for a second publisher, replacing the root behind a
+/// publication's back at a chosen point in that publication's own reads.
 #[derive(Default)]
 struct CountingStore {
     inner: corium_store::MemoryStore,
     touched: std::sync::atomic::AtomicUsize,
+    touched_ids: std::sync::Mutex<HashSet<BlobId>>,
+    root_reads: std::sync::atomic::AtomicUsize,
+    /// Root bytes to install just before the root read with this ordinal,
+    /// counting from the arming call.
+    ambush: std::sync::Mutex<Option<(usize, Vec<u8>)>>,
 }
 
 impl CountingStore {
     /// Blob reads, writes, and presence probes since the last call.
     fn take_touched(&self) -> usize {
+        self.touched_ids.lock().expect("touched ids").clear();
         self.touched.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The blobs named since the last [`Self::take_touched`]. A publication
+    /// that rebuilds an index names every one of its chunks, if only to probe
+    /// whether the store already has it; one that carries a chunk over never
+    /// mentions it.
+    fn touched_ids(&self) -> HashSet<BlobId> {
+        self.touched_ids.lock().expect("touched ids").clone()
     }
 
     fn touch(&self) {
         self.touched
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+
+    fn touch_id(&self, id: &BlobId) {
+        self.touch();
+        self.touched_ids
+            .lock()
+            .expect("touched ids")
+            .insert(id.clone());
+    }
+
+    /// Arms a one-shot root replacement to land just before the `nth` root
+    /// read from now — a second publisher winning the record while this
+    /// process is midway through a publication.
+    fn ambush_root_read(&self, nth: usize, root: &DbRoot) {
+        self.root_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        *self.ambush.lock().expect("ambush") = Some((nth, root.encode()));
+    }
+
+    /// Fires the armed replacement when this read is its target.
+    async fn maybe_ambush(&self, name: &str) {
+        let read = self
+            .root_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let due = {
+            let mut ambush = self.ambush.lock().expect("ambush");
+            match ambush.as_ref() {
+                Some((nth, _)) if *nth == read => ambush.take().map(|(_, bytes)| bytes),
+                _ => None,
+            }
+        };
+        if let Some(bytes) = due {
+            let current = self.inner.get_root(name).await.expect("read root");
+            self.inner
+                .cas_root(name, current.as_deref(), &bytes)
+                .await
+                .expect("ambush root");
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl BlobStore for CountingStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobId, corium_store::StoreError> {
-        self.touch();
+        self.touch_id(&corium_store::digest(bytes));
         self.inner.put(bytes).await
     }
     async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, corium_store::StoreError> {
-        self.touch();
+        self.touch_id(id);
         self.inner.get(id).await
     }
     async fn contains(&self, id: &BlobId) -> Result<bool, corium_store::StoreError> {
-        self.touch();
+        self.touch_id(id);
         self.inner.contains(id).await
     }
     async fn delete(&self, id: &BlobId) -> Result<(), corium_store::StoreError> {
@@ -310,6 +366,7 @@ impl BlobStore for CountingStore {
 #[async_trait::async_trait]
 impl RootStore for CountingStore {
     async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, corium_store::StoreError> {
+        self.maybe_ambush(name).await;
         self.inner.get_root(name).await
     }
     async fn cas_root(
@@ -376,6 +433,111 @@ async fn publication_cost(dir: &std::path::Path, count: u64) -> (usize, usize) {
          blobs against {incremental})"
     );
     (full, incremental)
+}
+
+#[tokio::test]
+async fn losing_the_root_mid_pass_rebuilds_rather_than_republishing_reused_chunks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let store = CountingStore::default();
+    let tx = bulk_loaded(dir.path(), schema, a, 30_000);
+    let published = tx
+        .publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("first publish");
+
+    // Every comparison below is against the chunks of the publication
+    // immediately before it, since each commit does replace a few of them.
+    let mut settled: HashSet<BlobId> = index_chunks(&store, &published)
+        .await
+        .concat()
+        .into_iter()
+        .collect();
+    store.take_touched();
+
+    // Baseline: an undisturbed pass carries those chunks over, so it never
+    // names them — that is exactly the reuse the race has to disarm.
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp("first".into()),
+        a,
+        Value::Long(1_000_000),
+    ))])
+    .expect("transact");
+    let undisturbed = tx
+        .publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("undisturbed publish");
+    let touched = store.touched_ids();
+    let after: HashSet<BlobId> = index_chunks(&store, &undisturbed)
+        .await
+        .concat()
+        .into_iter()
+        .collect();
+    // Chunks in both publications are the ones a fold carries over by id; a
+    // commit does replace a few, and those are not part of the comparison.
+    let carried = &settled & &after;
+    assert!(!carried.is_empty(), "nothing was carried across the commit");
+    assert!(
+        (&touched & &carried).is_empty(),
+        "an undisturbed pass named {} of the {} chunks it carried over; it is \
+         not reusing them and the race below proves nothing",
+        (&touched & &carried).len(),
+        carried.len()
+    );
+    settled = after;
+    store.take_touched();
+
+    // Now a second publisher replaces the root after this pass has checked it
+    // and decided its cached chunks are reusable, but before the pass writes
+    // over it. That root's index state no longer names those chunks, so a
+    // sweep between the two publications is free to delete them — carrying
+    // their blob ids into a new manifest would leave the live root pointing at
+    // nothing. The root this pass would install carries the newer basis, so
+    // the CAS alone would happily accept it. Root reads from here: 1 is the
+    // pass's own check, 2 is the one inside the root CAS.
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Temp("second".into()),
+        a,
+        Value::Long(2_000_000),
+    ))])
+    .expect("transact");
+    let interloper = DbRoot {
+        index_basis_t: published.index_basis_t.saturating_sub(1),
+        roots: Some(std::array::from_fn(|slot| {
+            corium_store::digest(format!("another publisher's index {slot}").as_bytes())
+        })),
+        ..published.clone()
+    };
+    store.ambush_root_read(2, &interloper);
+    let raced = tx
+        .publish_indexes(&store, "db:main", 1)
+        .await
+        .expect("publish under a racing publisher");
+    assert!(raced.index_basis_t > published.index_basis_t);
+
+    // Having lost the root that vouched for them, the pass must republish
+    // every chunk it would have carried over from its own bytes rather than by
+    // id — which means naming each one, if only to find the store already has
+    // it.
+    let touched = store.touched_ids();
+    let chunks = index_chunks(&store, &raced).await.concat();
+    let carried = &settled & &chunks.iter().cloned().collect::<HashSet<_>>();
+    assert!(!carried.is_empty(), "nothing was carried across the commit");
+    assert_eq!(
+        (&touched & &carried).len(),
+        carried.len(),
+        "a pass that lost the root named only {} of the {} chunks it had \
+         carried over; it republished ids it could no longer vouch for",
+        (&touched & &carried).len(),
+        carried.len()
+    );
+    // And the root it did publish must be fully dereferenceable.
+    for chunk in chunks {
+        assert!(
+            store.contains(&chunk).await.expect("probe chunk"),
+            "published root references a chunk that is not in the store"
+        );
+    }
 }
 
 #[tokio::test]

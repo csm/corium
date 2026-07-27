@@ -91,10 +91,27 @@ the tail plus one pointer per leaf, not the size of the database.
 Because boundaries depend only on the boundary key, a transactor that has to
 rebuild a segment from scratch — its first publication, or after a takeover —
 reproduces the chunks the previous process published and re-uploads only what
-genuinely changed. Rebuilding is also the safety valve: a pass reuses a
-carried leaf's blob id only when the published root is still exactly the one
-this transactor installed, since only then is that chunk provably reachable
-from a live root and therefore safe from the sweep.
+genuinely changed.
+
+Rebuilding is also the safety valve, and the rule that decides when it is
+required is a garbage-collection rule. A carried leaf is published *by id*,
+without its bytes being uploaded, and nothing but the root that names it keeps
+it from being swept. So a pass may carry chunks over only while it can prove
+that root is live throughout: it requires the published root to be the one
+this transactor last installed, and then **pins that index state through the
+root CAS** — the CAS re-checks the pin against the record it read immediately
+before writing, and is conditional on exactly those bytes, so there is no
+window in which another publisher can replace the root between the check and
+the write. If the pin fails, nothing is installed and the pass retries from a
+rebuild, which names no chunk it did not upload and so cannot be raced this
+way. The pin deliberately ignores the lease fields of the same record: an
+ordinary renewal rewrites them without dropping a chunk.
+
+Without that pin the sequence *read root A → plan and upload → another
+publisher installs B → GC marks from B and sweeps chunks reachable only
+through A → install C naming those chunks* leaves the live root pointing at
+deleted blobs, and the basis-monotonicity check alone does not prevent it,
+because C's basis can legitimately exceed B's.
 
 The implemented peer bootstrap follows that rule for the current value: a
 peer initialized with a blob/root storage connection reads `meta:<db>` and
