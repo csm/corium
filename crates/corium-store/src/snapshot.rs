@@ -10,20 +10,14 @@
 //! format 3 stored the whole key stream as one flat blob; readers accept
 //! both by sniffing the manifest magic.
 
+use corium_core::chunk;
+
 use crate::{BlobId, StoreError};
 
 /// First line of every index-manifest blob. A flat key-stream blob can
 /// never start with these bytes: its first eight bytes are a big-endian key
 /// length, and this text decodes to an impossible length.
 pub const INDEX_MANIFEST_MAGIC: &str = "corium-index-manifest-v1";
-
-/// Average number of keys per chunk (must be a power of two: boundaries are
-/// taken where a key's hash has this many trailing zero bits).
-const CHUNK_TARGET_ENTRIES: u64 = 2_048;
-/// Minimum keys in a chunk before a content boundary may cut it.
-const CHUNK_MIN_ENTRIES: usize = 512;
-/// Maximum keys in a chunk before an unconditional cut.
-const CHUNK_MAX_ENTRIES: usize = 8_192;
 
 /// Reports whether blob bytes are an index manifest (vs a flat key stream).
 #[must_use]
@@ -99,25 +93,29 @@ pub fn decode_segment_keys(bytes: &[u8]) -> Result<Vec<Vec<u8>>, StoreError> {
     Ok(keys)
 }
 
-fn boundary_hash(key: &[u8]) -> u64 {
-    // FNV-1a; any stable hash works, but it must never change: chunk
-    // boundaries are part of the published format's sharing behavior.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in key {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Encodes one chunk's worth of keys: a run of `(u64 big-endian length,
+/// key)` records — the same framing as a whole pre-format-3 segment, so one
+/// decoder reads both.
+///
+/// Callers that already hold a chunk's keys (an index segment's leaf, whose
+/// boundaries are the ones [`chunk_segment_keys`] cuts at) encode it
+/// directly instead of re-chunking the stream around it.
+#[must_use]
+pub fn encode_segment_chunk<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for key in keys {
+        out.extend_from_slice(&(key.len() as u64).to_be_bytes());
+        out.extend_from_slice(key);
     }
-    hash
+    out
 }
 
 /// Splits a sorted key stream into encoded leaf chunks.
 ///
-/// Each chunk is a run of `(u64 big-endian length, key)` records — the same
-/// framing as a whole pre-format-3 segment, so one decoder reads both.
-/// Boundaries fall after keys whose hash selects them (about one in
-/// [`CHUNK_TARGET_ENTRIES`]), clamped to at least [`CHUNK_MIN_ENTRIES`] and
-/// at most [`CHUNK_MAX_ENTRIES`] keys, and depend only on the boundary key
-/// itself: inserting or removing keys re-chunks only the runs they touch.
+/// Boundaries come from [`corium_core::chunk`], the one rule that also
+/// decides where an in-memory index segment cuts its leaves — so a segment's
+/// leaf is exactly one chunk of this stream, and an indexing pass re-encodes
+/// only the leaves it rebuilt.
 #[must_use]
 pub fn chunk_segment_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
     let mut chunks = Vec::new();
@@ -127,9 +125,7 @@ pub fn chunk_segment_keys<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Vec<V
         chunk.extend_from_slice(&(key.len() as u64).to_be_bytes());
         chunk.extend_from_slice(key);
         entries += 1;
-        let content_cut = entries >= CHUNK_MIN_ENTRIES
-            && boundary_hash(key) % CHUNK_TARGET_ENTRIES == CHUNK_TARGET_ENTRIES - 1;
-        if content_cut || entries >= CHUNK_MAX_ENTRIES {
+        if chunk::cut_after(key, entries) {
             chunks.push(std::mem::take(&mut chunk));
             entries = 0;
         }
@@ -199,6 +195,21 @@ mod tests {
             }
         }
         assert_eq!(decoded, keys);
+    }
+
+    #[test]
+    fn encoding_a_chunks_keys_matches_the_chunker() {
+        let keys = keys(10_000);
+        let chunks = chunk_segment_keys(keys.iter().map(Vec::as_slice));
+        let mut offset = 0;
+        for chunk in &chunks {
+            let count = decode_segment_keys(chunk).unwrap().len();
+            let encoded =
+                encode_segment_chunk(keys[offset..offset + count].iter().map(Vec::as_slice));
+            assert_eq!(&encoded, chunk);
+            offset += count;
+        }
+        assert_eq!(offset, keys.len());
     }
 
     #[test]

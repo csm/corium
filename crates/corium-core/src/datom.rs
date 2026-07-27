@@ -33,6 +33,22 @@ pub enum IndexOrder {
     Vaet,
 }
 
+/// Byte width of the trailing `(tx, added)` component every covering-index
+/// key ends with (see [`encode_tx_added`]).
+pub const KEY_TX_SUFFIX_LEN: usize = 8;
+
+/// The `(e, a, v)` component prefix of a complete covering-index key.
+///
+/// Two datoms share a prefix exactly when they state the same fact, so a
+/// current-value index holds at most one entry per prefix and a retraction
+/// can find the assertion it cancels without knowing which transaction made
+/// it. Component encodings are self-delimiting, so no prefix is ever a byte
+/// prefix of another and sorting by prefix agrees with sorting by full key.
+#[must_use]
+pub fn key_components(key: &[u8]) -> &[u8] {
+    &key[..key.len().saturating_sub(KEY_TX_SUFFIX_LEN)]
+}
+
 impl Datom {
     /// Returns this datom's byte key for the requested index order.
     #[must_use]
@@ -145,6 +161,39 @@ mod tests {
         ] {
             let key = datom.key(order);
             assert_eq!(Datom::from_key(order, &key), Ok(datom.clone()));
+        }
+    }
+
+    #[test]
+    fn key_components_strips_only_the_transaction_suffix() {
+        let datom = Datom {
+            e: EntityId::from_raw(42),
+            a: EntityId::from_raw(7),
+            v: Value::Str("a\0z".into()),
+            tx: EntityId::from_raw(19),
+            added: true,
+        };
+        // The same fact retracted by a later transaction shares the prefix,
+        // which is how a retraction finds the assertion it cancels.
+        let retraction = Datom {
+            tx: EntityId::from_raw(20),
+            added: false,
+            ..datom.clone()
+        };
+        for order in [
+            IndexOrder::Eavt,
+            IndexOrder::Aevt,
+            IndexOrder::Avet,
+            IndexOrder::Vaet,
+        ] {
+            let key = datom.key(order);
+            assert_eq!(key_components(&key).len(), key.len() - KEY_TX_SUFFIX_LEN);
+            assert!(key.starts_with(key_components(&key)));
+            assert_eq!(
+                key_components(&key),
+                key_components(&retraction.key(order)),
+                "a retraction must share the asserted fact's prefix"
+            );
         }
     }
 

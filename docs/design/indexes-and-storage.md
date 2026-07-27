@@ -72,10 +72,46 @@ reader replays the tail from storage.
 The implemented publication (storage format 3) is a first cut of the
 segment-tree design: each covering index is stored as a manifest blob
 naming content-defined leaf chunks (`corium-store`'s `snapshot` module),
-and only chunks absent from the store are uploaded, so consecutive roots
-share every untouched chunk. Inner tree levels (and with them seek-without-
-full-download) are still future work; readers concatenate a manifest's
-chunks and accept pre-format-3 flat snapshots.
+so consecutive roots share every untouched chunk. Inner tree levels (and
+with them seek-without-full-download) are still future work; readers
+concatenate a manifest's chunks and accept pre-format-3 flat snapshots.
+
+One rule (`corium-core`'s `chunk` module) decides where a sorted key stream
+is cut, and both the published format and the in-memory segment
+(`corium-index`) obey it — so **a segment's leaf is exactly one published
+chunk**. That is what makes the indexing job incremental rather than a
+rebuild: the transactor keeps the segments it last published, folds the log
+tail since that basis into them (`Segment::apply`, the same current-value
+fold the `Db` value applies to its own covering indexes), and gets back
+segments whose untouched leaves are the *same allocations*. A leaf carried
+over by handle keeps the blob id it was published under, so the pass encodes,
+hashes, and uploads only the leaves the tail rebuilt. Work per pass tracks
+the tail plus one pointer per leaf, not the size of the database.
+
+Because boundaries depend only on the boundary key, a transactor that has to
+rebuild a segment from scratch — its first publication, or after a takeover —
+reproduces the chunks the previous process published and re-uploads only what
+genuinely changed.
+
+Rebuilding is also the safety valve, and the rule that decides when it is
+required is a garbage-collection rule. A carried leaf is published *by id*,
+without its bytes being uploaded, and nothing but the root that names it keeps
+it from being swept. So a pass may carry chunks over only while it can prove
+that root is live throughout: it requires the published root to be the one
+this transactor last installed, and then **pins that index state through the
+root CAS** — the CAS re-checks the pin against the record it read immediately
+before writing, and is conditional on exactly those bytes, so there is no
+window in which another publisher can replace the root between the check and
+the write. If the pin fails, nothing is installed and the pass retries from a
+rebuild, which names no chunk it did not upload and so cannot be raced this
+way. The pin deliberately ignores the lease fields of the same record: an
+ordinary renewal rewrites them without dropping a chunk.
+
+Without that pin the sequence *read root A → plan and upload → another
+publisher installs B → GC marks from B and sweeps chunks reachable only
+through A → install C naming those chunks* leaves the live root pointing at
+deleted blobs, and the basis-monotonicity check alone does not prevent it,
+because C's basis can legitimately exceed B's.
 
 The implemented peer bootstrap follows that rule for the current value: a
 peer initialized with a blob/root storage connection reads `meta:<db>` and
