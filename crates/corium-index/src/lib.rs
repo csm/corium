@@ -90,14 +90,33 @@ impl Segment {
     ///
     /// A current-value index map (`corium_db`'s covering indexes) iterates in
     /// exactly this order, so publication never re-sorts what the transaction
-    /// pipeline already sorted. Datoms are taken by reference — only the key
-    /// each one encodes to is kept — so a rebuild reads the database's index
-    /// in place instead of copying it.
+    /// pipeline already sorted.
+    ///
+    /// Only the key each datom encodes to is kept, so a caller that already
+    /// holds the datoms — publication reading the database's own covering
+    /// index — should use [`Segment::from_sorted_ref`] and hand over
+    /// references rather than copies.
     ///
     /// # Panics
     /// Debug builds assert the input really is strictly increasing by key.
     #[must_use]
-    pub fn from_sorted(
+    pub fn from_sorted(order: IndexOrder, datoms: impl IntoIterator<Item = Datom>) -> Self {
+        Self::from_sorted_borrowed(order, datoms)
+    }
+
+    /// [`Segment::from_sorted`] over datoms the caller keeps.
+    ///
+    /// # Panics
+    /// Debug builds assert the input really is strictly increasing by key.
+    #[must_use]
+    pub fn from_sorted_ref<'a>(
+        order: IndexOrder,
+        datoms: impl IntoIterator<Item = &'a Datom>,
+    ) -> Self {
+        Self::from_sorted_borrowed(order, datoms)
+    }
+
+    fn from_sorted_borrowed(
         order: IndexOrder,
         datoms: impl IntoIterator<Item = impl Borrow<Datom>>,
     ) -> Self {
@@ -116,10 +135,10 @@ impl Segment {
     /// Unsorted input has to be ordered somewhere; [`Segment::from_sorted`]
     /// is the path publication takes.
     #[must_use]
-    pub fn build(order: IndexOrder, datoms: impl IntoIterator<Item = impl Borrow<Datom>>) -> Self {
+    pub fn build(order: IndexOrder, datoms: impl IntoIterator<Item = Datom>) -> Self {
         let mut by_fact: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for datom in datoms {
-            let key = datom.borrow().key(order);
+            let key = datom.key(order);
             by_fact.insert(key_components(&key).to_vec(), key);
         }
         Self::from_keys(by_fact.into_values())
@@ -194,10 +213,26 @@ impl Segment {
     /// every other leaf is carried over by handle, so the result shares its
     /// allocations — and therefore its published chunks — with `self`.
     ///
-    /// The tail is taken by reference and collapsed to its net key per fact,
-    /// so folding costs the tail rather than a copy of it.
+    /// The tail is collapsed to its net key per fact, so only those keys are
+    /// kept; a caller that already holds the tail — publication reading the
+    /// log tail since the last basis — should use [`Segment::apply_ref`] and
+    /// hand over references rather than copies.
     #[must_use]
-    pub fn apply(
+    pub fn apply(&self, order: IndexOrder, changes: impl IntoIterator<Item = Datom>) -> Self {
+        self.apply_borrowed(order, changes)
+    }
+
+    /// [`Segment::apply`] over a tail the caller keeps.
+    #[must_use]
+    pub fn apply_ref<'a>(
+        &self,
+        order: IndexOrder,
+        changes: impl IntoIterator<Item = &'a Datom>,
+    ) -> Self {
+        self.apply_borrowed(order, changes)
+    }
+
+    fn apply_borrowed(
         &self,
         order: IndexOrder,
         changes: impl IntoIterator<Item = impl Borrow<Datom>>,
@@ -484,7 +519,7 @@ mod tests {
     #[test]
     fn an_empty_tail_reuses_every_leaf() {
         let segment = Segment::from_sorted(IndexOrder::Eavt, many(5_000));
-        let after = segment.apply(IndexOrder::Eavt, std::iter::empty::<&Datom>());
+        let after = segment.apply(IndexOrder::Eavt, []);
         assert_eq!(after.shared_leaf_count(&segment), segment.leaves().len());
     }
 
@@ -558,21 +593,22 @@ mod tests {
     }
 
     /// Publication indexes the database's own covering index and the log tail
-    /// in place, so both builders have to take datoms by reference — a `Vec`
-    /// of them is never copied just to be indexed.
+    /// in place, so the borrowed variants have to agree with the owned ones
+    /// key for key — they are the same fold, differing only in what the
+    /// caller gives up.
     #[test]
-    fn segments_build_from_borrowed_datoms() {
+    fn borrowed_and_owned_folds_agree() {
         let datoms = many(2_000);
         let tail = [datom(2_000, 1, 2_000), retraction(0, 1, 0)];
 
-        let borrowed = Segment::from_sorted(IndexOrder::Eavt, datoms.iter());
+        let borrowed = Segment::from_sorted_ref(IndexOrder::Eavt, datoms.iter());
         let owned = Segment::from_sorted(IndexOrder::Eavt, datoms.clone());
         assert_eq!(
             borrowed.keys().collect::<Vec<_>>(),
             owned.keys().collect::<Vec<_>>()
         );
 
-        let from_refs = borrowed.apply(IndexOrder::Eavt, tail.iter());
+        let from_refs = borrowed.apply_ref(IndexOrder::Eavt, tail.iter());
         let from_values = owned.apply(IndexOrder::Eavt, tail);
         assert_eq!(
             from_refs.keys().collect::<Vec<_>>(),
@@ -580,12 +616,9 @@ mod tests {
         );
         assert_eq!(from_refs.len(), 2_000);
 
-        assert_eq!(
-            Segment::build(IndexOrder::Eavt, datoms.iter())
-                .keys()
-                .collect::<Vec<_>>(),
-            borrowed.keys().collect::<Vec<_>>()
-        );
+        // The owned entry points still infer an untyped empty tail.
+        assert_eq!(borrowed.apply(IndexOrder::Eavt, []).len(), 2_000);
+        assert_eq!(borrowed.apply_ref(IndexOrder::Eavt, []).len(), 2_000);
     }
 
     #[test]

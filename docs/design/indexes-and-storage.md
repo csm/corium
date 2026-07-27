@@ -88,9 +88,10 @@ over by handle keeps the blob id it was published under, so the pass encodes,
 hashes, and uploads only the leaves the tail rebuilt. Work per pass tracks
 the tail plus one pointer per leaf, not the size of the database.
 
-Datoms enter the fold by reference and leave as the key they encode to, so
-neither the tail nor — on a rebuild — the database's own covering index is
-copied to be indexed.
+A fold keeps only the key each datom encodes to, and the transactor holds the
+datoms it is indexing already, so it hands them over by reference
+(`Segment::apply_ref`, `Segment::from_sorted_ref`): neither the tail nor — on
+a rebuild — the database's own covering index is copied to be indexed.
 
 Because boundaries depend only on the boundary key, a transactor that has to
 rebuild a segment from scratch — its first publication, or after a takeover —

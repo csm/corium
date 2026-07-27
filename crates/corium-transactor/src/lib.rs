@@ -880,13 +880,13 @@ fn plan_indexes(
     let mut planned: Vec<Vec<ChunkPlan>> = Vec::with_capacity(ORDERS.len());
     for (slot, order) in ORDERS.into_iter().enumerate() {
         let segment = match previous {
-            Some(previous) => previous.segments[slot].apply(
+            Some(previous) => previous.segments[slot].apply_ref(
                 order,
                 snapshot
                     .recorded_since(previous.basis_t)
                     .filter(|datom| corium_db::covered(snapshot.schema(), order, datom)),
             ),
-            None => Segment::from_sorted(order, snapshot.datoms_at(order)),
+            None => Segment::from_sorted_ref(order, snapshot.datoms_at(order)),
         };
         let stored = previous.map(|previous| &previous.chunks[slot]);
         planned.push(
