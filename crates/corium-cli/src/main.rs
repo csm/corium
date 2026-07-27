@@ -15,6 +15,14 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "s3")]
+use aws_credential_types::{
+    Credentials,
+    provider::{
+        ProvideCredentials, SharedCredentialsProvider, error::CredentialsError,
+        future::ProvideCredentials as ProvideCredentialsFuture,
+    },
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
@@ -193,6 +201,19 @@ impl ClientFlags {
             .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
         let (spec, data_dir) = StoreSpec::from_connection(storage)
             .map_err(|error| format!("cannot use transactor storage backend: {error}"))?;
+        #[cfg(feature = "s3")]
+        let mut spec = spec;
+        #[cfg(feature = "s3")]
+        if let StoreSpec::S3 { client, .. } = &mut spec {
+            let initial = sdk_credentials(client)?;
+            client.credentials_provider = Some(SharedCredentialsProvider::new(
+                StorageInfoCredentialsProvider {
+                    client: self.clone(),
+                    db: db.clone(),
+                    initial: std::sync::Mutex::new(Some(initial)),
+                },
+            ));
+        }
         let store = corium_transactor::NodeStore::open_existing(&spec, &data_dir)
             .await
             .map_err(|error| format!("cannot open peer storage: {error}"))?;
@@ -205,6 +226,92 @@ impl ClientFlags {
             Ok(config.with_storage(storage))
         }
     }
+}
+
+#[cfg(feature = "s3")]
+struct StorageInfoCredentialsProvider {
+    client: ClientFlags,
+    db: String,
+    initial: std::sync::Mutex<Option<Credentials>>,
+}
+
+#[cfg(feature = "s3")]
+impl std::fmt::Debug for StorageInfoCredentialsProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StorageInfoCredentialsProvider")
+            .field("transactor", &self.client.primary())
+            .field("db", &self.db)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "s3")]
+impl ProvideCredentials for StorageInfoCredentialsProvider {
+    fn provide_credentials<'a>(&'a self) -> ProvideCredentialsFuture<'a>
+    where
+        Self: 'a,
+    {
+        if let Some(credentials) = self
+            .initial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return ProvideCredentialsFuture::ready(Ok(credentials));
+        }
+        ProvideCredentialsFuture::new(async move {
+            self.fetch()
+                .await
+                .map_err(|error| CredentialsError::provider_error(std::io::Error::other(error)))
+        })
+    }
+}
+
+#[cfg(feature = "s3")]
+impl StorageInfoCredentialsProvider {
+    async fn fetch(&self) -> Result<Credentials, String> {
+        let mut admin = Admin::connect(
+            &self.client.primary(),
+            self.client.token(),
+            self.client.tls()?,
+        )
+        .await
+        .map_err(|error| format!("cannot connect to transactor: {error}"))?;
+        let storage = admin
+            .get_storage_info(&self.db)
+            .await
+            .map_err(|error| format!("cannot refresh storage info: {error}"))?
+            .storage
+            .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
+        let (spec, _) = StoreSpec::from_connection(storage)
+            .map_err(|error| format!("cannot use refreshed storage info: {error}"))?;
+        let StoreSpec::S3 { client, .. } = spec else {
+            return Err(
+                "transactor storage backend changed while refreshing S3 credentials".into(),
+            );
+        };
+        sdk_credentials(&client)
+    }
+}
+
+#[cfg(feature = "s3")]
+fn sdk_credentials(config: &S3ClientConfig) -> Result<Credentials, String> {
+    let access_key_id = config
+        .access_key_id
+        .as_deref()
+        .ok_or_else(|| "S3 storage info omitted the access key id".to_owned())?;
+    let secret_access_key = config
+        .secret_access_key
+        .as_deref()
+        .ok_or_else(|| "S3 storage info omitted the secret access key".to_owned())?;
+    Ok(Credentials::new(
+        access_key_id,
+        secret_access_key,
+        config.session_token.clone(),
+        config.expires_after,
+        "corium-storage-info-refresh",
+    ))
 }
 
 /// Server-side TLS/auth flags.
@@ -857,18 +964,18 @@ async fn run(cli: Cli) -> Result<(), String> {
             )?;
             let mut config = NodeConfig::new(data_dir);
             config.store = store_spec;
-            config.storage_info = storage_info_config(
+            config.storage_info = storage_info_config(StorageInfoOptions {
                 postgres_read_only_url,
                 s3_region,
                 s3_endpoint_url,
-                s3_read_only_access_key_id,
-                s3_read_only_secret_access_key,
-                s3_read_only_session_token,
-                s3_read_only_role_arn,
-                s3_read_only_role_session_name,
-                s3_read_only_role_duration_seconds,
-                s3_read_only_role_external_id,
-            )?;
+                access_key_id: s3_read_only_access_key_id,
+                secret_access_key: s3_read_only_secret_access_key,
+                session_token: s3_read_only_session_token,
+                role_arn: s3_read_only_role_arn,
+                session_name: s3_read_only_role_session_name,
+                duration_seconds: s3_read_only_role_duration_seconds,
+                external_id: s3_read_only_role_external_id,
+            })?;
             if let Some(owner) = owner {
                 config.owner = owner;
             }
@@ -1385,10 +1492,9 @@ fn config_store(value: &Edn) -> Result<StoreKind, String> {
     }
 }
 
-#[cfg(feature = "s3")]
-#[allow(clippy::too_many_arguments)]
-fn storage_info_config(
-    postgres_connection_string: Option<String>,
+#[derive(Default)]
+struct StorageInfoOptions {
+    postgres_read_only_url: Option<String>,
     s3_region: Option<String>,
     s3_endpoint_url: Option<String>,
     access_key_id: Option<String>,
@@ -1398,7 +1504,22 @@ fn storage_info_config(
     session_name: Option<String>,
     duration_seconds: Option<i32>,
     external_id: Option<String>,
-) -> Result<StorageInfoConfig, String> {
+}
+
+#[cfg(feature = "s3")]
+fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
+    let StorageInfoOptions {
+        postgres_read_only_url,
+        s3_region,
+        s3_endpoint_url,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        role_arn,
+        session_name,
+        duration_seconds,
+        external_id,
+    } = options;
     let static_present =
         access_key_id.is_some() || secret_access_key.is_some() || session_token.is_some();
     if static_present && role_arn.is_some() {
@@ -1437,29 +1558,26 @@ fn storage_info_config(
         None
     };
     Ok(StorageInfoConfig {
-        postgres_connection_string,
-        s3: credentials.map(|credentials| S3ReadOnlyConfig {
-            region: s3_region,
-            endpoint_url: s3_endpoint_url,
-            credentials,
-        }),
+        postgres_connection_string: postgres_read_only_url,
+        s3: credentials
+            .map(|credentials| S3ReadOnlyConfig::new(s3_region, s3_endpoint_url, credentials)),
     })
 }
 
 #[cfg(not(feature = "s3"))]
-#[allow(clippy::too_many_arguments)]
-fn storage_info_config(
-    postgres_connection_string: Option<String>,
-    s3_region: Option<String>,
-    s3_endpoint_url: Option<String>,
-    access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    session_token: Option<String>,
-    role_arn: Option<String>,
-    session_name: Option<String>,
-    duration_seconds: Option<i32>,
-    external_id: Option<String>,
-) -> Result<StorageInfoConfig, String> {
+fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
+    let StorageInfoOptions {
+        postgres_read_only_url,
+        s3_region,
+        s3_endpoint_url,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        role_arn,
+        session_name,
+        duration_seconds,
+        external_id,
+    } = options;
     if [
         s3_region,
         s3_endpoint_url,
@@ -1477,7 +1595,7 @@ fn storage_info_config(
         return Err("this build lacks S3 support; rebuild corium-cli with --features s3".into());
     }
     Ok(StorageInfoConfig {
-        postgres_connection_string,
+        postgres_connection_string: postgres_read_only_url,
     })
 }
 
@@ -1920,33 +2038,19 @@ mod tests {
     #[cfg(feature = "s3")]
     #[test]
     fn s3_read_only_credentials_must_be_complete_and_unambiguous() {
-        let incomplete = storage_info_config(
-            None,
-            None,
-            None,
-            Some("ACCESS".into()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let incomplete = storage_info_config(StorageInfoOptions {
+            access_key_id: Some("ACCESS".into()),
+            ..StorageInfoOptions::default()
+        })
         .expect_err("missing secret");
         assert!(incomplete.contains("supplied together"));
 
-        let conflicting = storage_info_config(
-            None,
-            None,
-            None,
-            Some("ACCESS".into()),
-            Some("SECRET".into()),
-            None,
-            Some("arn:aws:iam::123456789012:role/reader".into()),
-            None,
-            None,
-            None,
-        )
+        let conflicting = storage_info_config(StorageInfoOptions {
+            access_key_id: Some("ACCESS".into()),
+            secret_access_key: Some("SECRET".into()),
+            role_arn: Some("arn:aws:iam::123456789012:role/reader".into()),
+            ..StorageInfoOptions::default()
+        })
         .expect_err("static and role conflict");
         assert!(conflicting.contains("conflict"));
     }

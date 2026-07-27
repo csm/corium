@@ -496,6 +496,14 @@ impl TransactorNode {
     /// Returns an error when the store cannot be opened or a database cannot
     /// be recovered.
     pub async fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
+        #[cfg(feature = "s3")]
+        if matches!(config.store, StoreSpec::S3 { .. }) && config.storage_info.s3.is_none() {
+            tracing::warn!(
+                "S3 read-only credentials are not configured; GetStorageInfo will reject \
+                 peer bootstrap and direct-storage backup requests"
+            );
+        }
+        config.storage_info.initialize().await;
         let store = Arc::new(NodeStore::open(&config.store, &config.data_dir).await?);
         let log_backend = LogBackend::for_spec(&config.store, &config.data_dir, Arc::clone(&store));
         let node = Arc::new(Self {

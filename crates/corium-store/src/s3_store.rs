@@ -1,6 +1,7 @@
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -27,6 +28,11 @@ pub struct S3ClientConfig {
     pub secret_access_key: Option<String>,
     /// Optional temporary-credential session token.
     pub session_token: Option<String>,
+    /// Expiration time for explicit temporary credentials.
+    pub expires_after: Option<SystemTime>,
+    /// Refreshing credential provider for long-lived clients. When supplied,
+    /// this takes precedence over the explicit access-key fields.
+    pub credentials_provider: Option<SharedCredentialsProvider>,
 }
 
 impl std::fmt::Debug for S3ClientConfig {
@@ -37,7 +43,8 @@ impl std::fmt::Debug for S3ClientConfig {
             .field("endpoint_url", &self.endpoint_url)
             .field(
                 "credentials",
-                &self.access_key_id.as_ref().map(|_| "[REDACTED]"),
+                &(self.access_key_id.is_some() || self.credentials_provider.is_some())
+                    .then_some("[REDACTED]"),
             )
             .finish_non_exhaustive()
     }
@@ -109,7 +116,7 @@ impl S3BlobStore {
         Ok(Self {
             client: Self::client(options).await?,
             bucket: bucket.into(),
-            prefix: normalize_prefix(prefix.into()),
+            prefix: normalize_s3_prefix(prefix.into()),
         })
     }
 
@@ -123,14 +130,16 @@ impl S3BlobStore {
         if let Some(region) = &options.region {
             loader = loader.region(aws_sdk_s3::config::Region::new(region.clone()));
         }
-        if let (Some(access_key_id), Some(secret_access_key)) =
+        if let Some(provider) = &options.credentials_provider {
+            loader = loader.credentials_provider(provider.clone());
+        } else if let (Some(access_key_id), Some(secret_access_key)) =
             (&options.access_key_id, &options.secret_access_key)
         {
             loader = loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
                 access_key_id,
                 secret_access_key,
                 options.session_token.clone(),
-                None,
+                options.expires_after,
                 "corium-storage-info",
             ));
         }
@@ -167,7 +176,7 @@ impl S3BlobStore {
         let store = Self {
             client,
             bucket: bucket.into(),
-            prefix: normalize_prefix(prefix.into()),
+            prefix: normalize_s3_prefix(prefix.into()),
         };
         store
             .client
@@ -335,7 +344,9 @@ impl S3BlobStore {
     }
 }
 
-fn normalize_prefix(prefix: String) -> String {
+/// Normalizes an S3 namespace prefix to empty or trailing-slash form.
+#[must_use]
+pub fn normalize_s3_prefix(prefix: String) -> String {
     if prefix.is_empty() || prefix.ends_with('/') {
         prefix
     } else {
@@ -612,5 +623,17 @@ impl RootStore for S3BlobStore {
         }
         names.sort();
         Ok(names)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_s3_prefix;
+
+    #[test]
+    fn normalizes_prefix_once() {
+        assert_eq!(normalize_s3_prefix(String::new()), "");
+        assert_eq!(normalize_s3_prefix("tenant".into()), "tenant/");
+        assert_eq!(normalize_s3_prefix("tenant/".into()), "tenant/");
     }
 }
