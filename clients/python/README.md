@@ -24,5 +24,7 @@ async with await LocalPeer.connect(
 Explicit `close()` (or `async with`) is required for deterministic shutdown.
 Wall-clock database views accept timezone-aware `datetime` values only.
 `https://` endpoints automatically enable platform TLS roots, and bearer
-tokens are rejected for plaintext `http://` endpoints. Datom scans use
+tokens are rejected for plaintext `http://` endpoints by default. Local
+development may opt in explicitly with `allow_insecure_token=True`. Every
+endpoint must include an `http://` or `https://` scheme. Datom scans use
 `limit=None` for an explicitly unbounded scan.

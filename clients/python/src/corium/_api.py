@@ -285,7 +285,8 @@ class _BasePeer(Peer):
 
     def _require_backend(self) -> _PeerBackend:
         self._state.ensure_open()
-        assert self._backend is not None
+        if self._backend is None:
+            raise ClosedError("peer is closed")
         return self._backend
 
     async def db(self) -> Db:
@@ -342,18 +343,22 @@ def _native_module() -> Any:
         ) from error
 
 
-def _tls_from_endpoints(endpoints: Sequence[str], token: str | None) -> bool:
+def _tls_from_endpoints(
+    endpoints: Sequence[str],
+    token: str | None,
+    allow_insecure_token: bool,
+) -> bool:
     if not endpoints:
         raise ValueError("at least one endpoint is required")
-    schemes = {
-        endpoint.split("://", 1)[0].lower()
-        for endpoint in endpoints
-        if "://" in endpoint
-    }
+    schemes = set()
+    for endpoint in endpoints:
+        if "://" not in endpoint:
+            raise ValueError(f"endpoint must include a scheme: {endpoint}")
+        schemes.add(endpoint.split("://", 1)[0].lower())
     if len(schemes) != 1 or schemes not in ({"http"}, {"https"}):
         raise ValueError("endpoints must consistently use http:// or https://")
     tls = schemes == {"https"}
-    if token is not None and not tls:
+    if token is not None and not tls and not allow_insecure_token:
         raise ValueError("bearer tokens require https:// endpoints")
     return tls
 
@@ -368,11 +373,16 @@ class LocalPeer(_BasePeer):
         *,
         database: str,
         token: str | None = None,
+        allow_insecure_token: bool = False,
     ) -> LocalPeer:
-        """Connect a full peer; ``https://`` endpoints enable platform TLS."""
+        """Connect a full peer; ``https://`` endpoints enable platform TLS.
+
+        Set ``allow_insecure_token=True`` only for deliberate local development
+        over plaintext HTTP.
+        """
 
         endpoint_list = [endpoints] if isinstance(endpoints, str) else list(endpoints)
-        tls = _tls_from_endpoints(endpoint_list, token)
+        tls = _tls_from_endpoints(endpoint_list, token, allow_insecure_token)
         backend = await _native_module().connect_local(
             endpoint_list,
             database=database,
@@ -392,10 +402,15 @@ class RemotePeer(_BasePeer):
         *,
         database: str,
         token: str | None = None,
+        allow_insecure_token: bool = False,
     ) -> RemotePeer:
-        """Connect to a peer server; ``https://`` enables platform TLS."""
+        """Connect to a peer server; ``https://`` enables platform TLS.
 
-        tls = _tls_from_endpoints([endpoint], token)
+        Set ``allow_insecure_token=True`` only for deliberate local development
+        over plaintext HTTP.
+        """
+
+        tls = _tls_from_endpoints([endpoint], token, allow_insecure_token)
         backend = await _native_module().connect_remote(
             endpoint,
             database=database,

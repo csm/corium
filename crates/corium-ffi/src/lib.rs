@@ -88,6 +88,8 @@ impl FfiError {
             Code::PermissionDenied => ErrorKind::PermissionDenied,
             Code::Unavailable | Code::DeadlineExceeded => ErrorKind::Connection,
             Code::ResourceExhausted => ErrorKind::FuelExhausted,
+            Code::InvalidArgument => ErrorKind::Query,
+            Code::FailedPrecondition | Code::Aborted => ErrorKind::Transaction,
             _ => ErrorKind::Protocol,
         };
         Self {
@@ -134,11 +136,13 @@ pub struct CompositeValue(Edn);
 impl CompositeValue {
     /// Validates and owns one standalone composite value.
     ///
+    /// [`Self::to_bytes`] canonically re-encodes the decoded value, so its
+    /// output may differ from a valid but non-canonical input byte sequence.
+    ///
     /// # Errors
     /// Returns [`ErrorKind::Decode`] for malformed or trailing bytes.
-    #[allow(clippy::needless_pass_by_value)] // adapters transfer owned buffers
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, FfiError> {
-        codec::decode_edn(&bytes)
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FfiError> {
+        codec::decode_edn(bytes)
             .map(Self)
             .map_err(|error| FfiError::new(ErrorKind::Decode, error.to_string()))
     }
@@ -812,7 +816,7 @@ mod tests {
         let value = CompositeValue::from_edn(&form);
         assert_eq!(value.decode(), form);
         assert_eq!(
-            CompositeValue::from_bytes(vec![0xff])
+            CompositeValue::from_bytes(&[0xff])
                 .expect_err("unknown tag")
                 .kind(),
             ErrorKind::Decode
@@ -842,6 +846,32 @@ mod tests {
     fn query_fuel_has_a_stable_category() {
         let error = FfiError::from_client(ClientError::Query(QueryError::FuelExhausted));
         assert_eq!(error.kind(), ErrorKind::FuelExhausted);
+    }
+
+    #[test]
+    fn remote_caller_and_transaction_statuses_have_stable_categories() {
+        let local_query = FfiError::from_client(ClientError::Query(QueryError::Arity(
+            "missing argument".into(),
+        )));
+        let remote_query = FfiError::from_client(ClientError::Rpc(Status::invalid_argument(
+            "missing argument",
+        )));
+        assert_eq!(local_query.kind(), ErrorKind::Query);
+        assert_eq!(
+            remote_query.kind(),
+            local_query.kind(),
+            "local and remote caller-input failures must share a category"
+        );
+
+        for status in [
+            Status::failed_precondition("transaction cannot run"),
+            Status::aborted("basis changed"),
+        ] {
+            assert_eq!(
+                FfiError::from_client(ClientError::Rpc(status)).kind(),
+                ErrorKind::Transaction
+            );
+        }
     }
 
     #[test]

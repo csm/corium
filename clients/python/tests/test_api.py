@@ -209,6 +209,28 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             await LocalPeer.connect(
                 "http://local.test", database="people", token="token"
             )
+        with self.assertRaisesRegex(ValueError, "include a scheme"):
+            await LocalPeer.connect(
+                ["https://local.test", "local.test"],
+                database="people",
+            )
+
+        with patch.object(api, "_native_module", return_value=native):
+            await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                token="dev",
+                allow_insecure_token=True,
+            )
+            await RemotePeer.connect(
+                "http://127.0.0.1:4335",
+                database="people",
+                token="dev",
+                allow_insecure_token=True,
+            )
+        self.assertEqual(native.calls[-2][2]["tls"], False)
+        self.assertNotIn("allow_insecure_token", native.calls[-2][2])
+        self.assertEqual(native.calls[-1][2]["tls"], False)
 
     def test_missing_native_extension_has_a_dedicated_error(self) -> None:
         with patch.object(
