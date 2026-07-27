@@ -300,7 +300,21 @@ impl Db {
     /// # Errors
     /// Returns [`ClientError`] for malformed queries or execution failures.
     pub async fn query_edn(&self, query: Edn, args: Vec<Edn>) -> Result<QueryResult, ClientError> {
-        self.backend.query(self.view, query, args, None).await
+        self.query_edn_with_fuel(query, args, None).await
+    }
+
+    /// Runs a raw boundary-[`Edn`] query with positional argument forms and
+    /// an optional execution-fuel limit.
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] for malformed queries or execution failures.
+    pub async fn query_edn_with_fuel(
+        &self,
+        query: Edn,
+        args: Vec<Edn>,
+        fuel: Option<u64>,
+    ) -> Result<QueryResult, ClientError> {
+        self.backend.query(self.view, query, args, fuel).await
     }
 
     /// Pulls a typed [`Pull`] specification for one entity.
@@ -312,9 +326,15 @@ impl Db {
     /// # Errors
     /// Returns [`ClientError`] for malformed patterns or unknown idents.
     pub async fn pull(&self, pattern: &Pull, entity: impl IntoEdn) -> Result<Edn, ClientError> {
-        self.backend
-            .pull(self.view, pattern.to_edn(), entity.into_edn())
-            .await
+        self.pull_edn(pattern.to_edn(), entity.into_edn()).await
+    }
+
+    /// Pulls a raw boundary-[`Edn`] pattern for one entity.
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] for malformed patterns or unknown idents.
+    pub async fn pull_edn(&self, pattern: Edn, entity: Edn) -> Result<Edn, ClientError> {
+        self.backend.pull(self.view, pattern, entity).await
     }
 
     /// Scans datoms from a covering index, binding `components` as a leading

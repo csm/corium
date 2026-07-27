@@ -1964,6 +1964,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "corium-ffi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "corium-client",
+ "corium-peer",
+ "corium-protocol",
+ "corium-query",
+ "corium-transactor",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "corium-forms"
 version = "0.1.0"
 dependencies = [
