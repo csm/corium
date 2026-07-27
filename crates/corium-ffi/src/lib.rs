@@ -7,6 +7,7 @@
 //! operations and releases the live peer held by the facade.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
 use corium_client::{
@@ -124,48 +125,41 @@ impl FfiError {
             ClientError::Decode(message) => Self::new(ErrorKind::Decode, message),
         }
     }
-
-    fn for_operation(mut self, fallback: ErrorKind) -> Self {
-        if matches!(self.kind, ErrorKind::Protocol) && self.grpc_code.is_none() {
-            self.kind = fallback;
-        }
-        self
-    }
 }
 
 /// One validated, owned Corium composite-protocol value.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompositeValue(Vec<u8>);
+pub struct CompositeValue(Edn);
 
 impl CompositeValue {
     /// Validates and owns one standalone composite value.
     ///
     /// # Errors
     /// Returns [`ErrorKind::Decode`] for malformed or trailing bytes.
+    #[allow(clippy::needless_pass_by_value)] // adapters transfer owned buffers
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, FfiError> {
         codec::decode_edn(&bytes)
-            .map_err(|error| FfiError::new(ErrorKind::Decode, error.to_string()))?;
-        Ok(Self(bytes))
+            .map(Self)
+            .map_err(|error| FfiError::new(ErrorKind::Decode, error.to_string()))
     }
 
     /// Copies the encoded bytes for a language adapter.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.0.clone()
+        codec::encode_edn(&self.0)
     }
 
     fn from_edn(value: &Edn) -> Self {
-        Self(codec::encode_edn(value))
+        Self(value.clone())
     }
 
-    fn decode(&self) -> Result<Edn, FfiError> {
-        codec::decode_edn(&self.0)
-            .map_err(|error| FfiError::new(ErrorKind::Decode, error.to_string()))
+    fn decode(&self) -> Edn {
+        self.0.clone()
     }
 }
 
 /// Options for an in-process full peer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LocalConnectOptions {
     /// Ordered transactor endpoints.
     pub endpoints: Vec<String>,
@@ -178,7 +172,7 @@ pub struct LocalConnectOptions {
 }
 
 /// Options for a lightweight peer-server client.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RemoteConnectOptions {
     /// Peer-server endpoint.
     pub endpoint: String,
@@ -188,6 +182,30 @@ pub struct RemoteConnectOptions {
     pub token: Option<String>,
     /// Use platform TLS roots for the endpoint.
     pub tls: bool,
+}
+
+impl fmt::Debug for LocalConnectOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalConnectOptions")
+            .field("endpoints", &self.endpoints)
+            .field("database_name", &self.database_name)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("tls", &self.tls)
+            .finish()
+    }
+}
+
+impl fmt::Debug for RemoteConnectOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteConnectOptions")
+            .field("endpoint", &self.endpoint)
+            .field("database_name", &self.database_name)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 struct PeerState {
@@ -215,6 +233,10 @@ impl PeerState {
     }
 
     fn close(&self) {
+        // Never hold `peer` while acquiring `dbs`: `register_db` takes the
+        // inverse (`dbs` then `peer`) so it can make registration atomic with
+        // the closed-state check. Releasing this temporary peer guard before
+        // locking `dbs` is the lock-ordering invariant that prevents deadlock.
         self.peer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -282,6 +304,12 @@ impl PeerHandle {
     /// # Errors
     /// Returns a categorized connection or protocol failure.
     pub async fn connect_remote(options: RemoteConnectOptions) -> Result<Self, FfiError> {
+        if options.endpoint.trim().is_empty() {
+            return Err(FfiError::new(
+                ErrorKind::Connection,
+                "a peer-server endpoint is required",
+            ));
+        }
         let peer = RemotePeer::connect(
             options.endpoint,
             options.database_name,
@@ -339,7 +367,7 @@ impl PeerHandle {
     /// Returns [`ErrorKind::Decode`] unless `forms` is a vector, or a
     /// categorized transaction/client failure.
     pub async fn transact(&self, forms: CompositeValue) -> Result<TxReport, FfiError> {
-        let Edn::Vector(forms) = forms.decode()? else {
+        let Edn::Vector(forms) = forms.decode() else {
             return Err(FfiError::new(
                 ErrorKind::Decode,
                 "transaction data must be a vector of forms",
@@ -350,8 +378,7 @@ impl PeerHandle {
             .peer()?
             .transact(TxData::from(forms))
             .await
-            .map_err(FfiError::from_client)
-            .map_err(|error| error.for_operation(ErrorKind::Transaction))?;
+            .map_err(FfiError::from_client)?;
         Ok(TxReport {
             basis_before: report.basis_before,
             basis_t: report.basis_t,
@@ -493,16 +520,12 @@ impl DbHandle {
         fuel: Option<u64>,
     ) -> Result<QueryOutput, FfiError> {
         let db = self.db()?;
-        let query = query.decode()?;
-        let args = args
-            .into_iter()
-            .map(|arg| arg.decode())
-            .collect::<Result<Vec<_>, _>>()?;
+        let query = query.decode();
+        let args = args.into_iter().map(|arg| arg.decode()).collect();
         let result = db
             .query_edn_with_fuel(query, args, fuel)
             .await
-            .map_err(FfiError::from_client)
-            .map_err(|error| error.for_operation(ErrorKind::Query))?;
+            .map_err(FfiError::from_client)?;
         Ok(QueryOutput {
             shape: result.shape().into(),
             value: CompositeValue::from_edn(&result.into_edn()),
@@ -520,10 +543,9 @@ impl DbHandle {
     ) -> Result<CompositeValue, FfiError> {
         let db = self.db()?;
         let value = db
-            .pull_edn(pattern.decode()?, entity.decode()?)
+            .pull_edn(pattern.decode(), entity.decode())
             .await
-            .map_err(FfiError::from_client)
-            .map_err(|error| error.for_operation(ErrorKind::Query))?;
+            .map_err(FfiError::from_client)?;
         Ok(CompositeValue::from_edn(&value))
     }
 
@@ -541,9 +563,9 @@ impl DbHandle {
         let components = components
             .into_iter()
             .map(|component| component.decode())
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         let limit = usize::try_from(limit)
-            .map_err(|_| FfiError::new(ErrorKind::Protocol, "datom limit is out of range"))?;
+            .map_err(|_| FfiError::new(ErrorKind::Decode, "datom limit is out of range"))?;
         db.datoms(index.into(), components, limit)
             .await
             .map(|rows| {
@@ -558,7 +580,6 @@ impl DbHandle {
                     .collect()
             })
             .map_err(FfiError::from_client)
-            .map_err(|error| error.for_operation(ErrorKind::Query))
     }
 
     /// Returns coarse statistics for this database view.
@@ -695,7 +716,13 @@ pub struct TxReport {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::time::Duration;
+
     use async_trait::async_trait;
+    use corium_peer::Admin;
+    use corium_protocol::authz::Guard;
+    use corium_transactor::node::{NodeConfig, TransactorNode};
 
     use super::*;
 
@@ -721,6 +748,60 @@ mod tests {
         }
     }
 
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port()
+    }
+
+    async fn connected_peer() -> (
+        PeerHandle,
+        tokio::sync::oneshot::Sender<()>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = NodeConfig::new(dir.path().join("data"));
+        config.owner = "ffi-test".into();
+        config.lease_ttl_ms = 600_000;
+        config.index_interval = Duration::from_secs(600);
+        config.heartbeat_interval = Duration::from_secs(600);
+        let node = TransactorNode::open(config).await.expect("open node");
+        let address: std::net::SocketAddr =
+            format!("127.0.0.1:{}", free_port()).parse().expect("addr");
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(corium_transactor::server::serve(
+            node,
+            address,
+            Guard::disabled(),
+            None,
+            async move {
+                let _ = stop_rx.await;
+            },
+        ));
+        let endpoint = format!("http://{address}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut admin = loop {
+            if let Ok(admin) = Admin::connect(&endpoint, None, None).await {
+                break admin;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transactor never ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        admin
+            .create_database("test", &[])
+            .await
+            .expect("create database");
+        let peer = LocalPeer::connect(ConnectConfig::new(endpoint, "test"))
+            .await
+            .expect("connect local peer");
+        (PeerHandle::new(Arc::new(peer)), stop_tx, dir)
+    }
+
     #[test]
     fn composite_values_validate_and_round_trip() {
         let form = Edn::Vector(vec![
@@ -729,7 +810,7 @@ mod tests {
             Edn::Tagged("eid".into(), Box::new(Edn::Long(42))),
         ]);
         let value = CompositeValue::from_edn(&form);
-        assert_eq!(value.decode().expect("valid composite value"), form);
+        assert_eq!(value.decode(), form);
         assert_eq!(
             CompositeValue::from_bytes(vec![0xff])
                 .expect_err("unknown tag")
@@ -761,5 +842,106 @@ mod tests {
     fn query_fuel_has_a_stable_category() {
         let error = FfiError::from_client(ClientError::Query(QueryError::FuelExhausted));
         assert_eq!(error.kind(), ErrorKind::FuelExhausted);
+    }
+
+    #[test]
+    fn connect_options_redact_bearer_tokens() {
+        let local = LocalConnectOptions {
+            endpoints: vec!["https://example.test".into()],
+            database_name: "people".into(),
+            token: Some("local-secret".into()),
+            tls: true,
+        };
+        let remote = RemoteConnectOptions {
+            endpoint: "https://example.test".into(),
+            database_name: "people".into(),
+            token: Some("remote-secret".into()),
+            tls: true,
+        };
+        let rendered = format!("{local:?} {remote:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("local-secret"));
+        assert!(!rendered.contains("remote-secret"));
+    }
+
+    #[tokio::test]
+    async fn close_invalidates_database_handles_and_prunes_registry() {
+        let (peer, stop, _dir) = connected_peer().await;
+        let db = peer.db().await.expect("database");
+        db.stats().await.expect("open database works");
+        let query =
+            corium_query::edn::read_one("[:find ?e :in $ ?ident :where [?e :db/ident ?ident]]")
+                .expect("query");
+        assert_eq!(
+            db.query(CompositeValue::from_edn(&query), Vec::new(), None)
+                .await
+                .expect_err("missing query argument")
+                .kind(),
+            ErrorKind::Query,
+            "local caller errors retain the query category without a facade heuristic"
+        );
+        assert_eq!(peer.state.dbs.lock().expect("registry").len(), 1);
+
+        let derived = db.history().expect("derive history");
+        assert_eq!(peer.state.dbs.lock().expect("registry").len(), 2);
+        drop(derived);
+        let replacement = db.since(0).expect("derive since");
+        assert_eq!(
+            peer.state.dbs.lock().expect("registry").len(),
+            2,
+            "dead weak handles are pruned during registration"
+        );
+        drop(replacement);
+
+        let raw_db = db.db().expect("raw database for close race");
+        peer.close();
+        assert_eq!(
+            db.stats().await.expect_err("closed database").kind(),
+            ErrorKind::Closed
+        );
+        let Err(error) = db.as_of(0) else {
+            panic!("closed as-of unexpectedly returned a handle");
+        };
+        assert_eq!(error.kind(), ErrorKind::Closed);
+        let Err(error) = db.since(0) else {
+            panic!("closed since unexpectedly returned a handle");
+        };
+        assert_eq!(error.kind(), ErrorKind::Closed);
+        let Err(error) = db.history() else {
+            panic!("closed history unexpectedly returned a handle");
+        };
+        assert_eq!(error.kind(), ErrorKind::Closed);
+
+        let registered_after_close = DbHandle::new(raw_db, Arc::clone(&peer.state));
+        assert_eq!(
+            registered_after_close
+                .stats()
+                .await
+                .expect_err("late handle closes immediately")
+                .kind(),
+            ErrorKind::Closed
+        );
+        let _ = stop.send(());
+    }
+
+    #[tokio::test]
+    async fn transact_requires_a_vector_and_remote_requires_an_endpoint() {
+        let peer = PeerHandle::new(Arc::new(FailingPeer));
+        let Err(error) = peer.transact(CompositeValue::from_edn(&Edn::Long(1))).await else {
+            panic!("non-vector transaction unexpectedly succeeded");
+        };
+        assert_eq!(error.kind(), ErrorKind::Decode);
+
+        let Err(error) = PeerHandle::connect_remote(RemoteConnectOptions {
+            endpoint: " ".into(),
+            database_name: "test".into(),
+            token: None,
+            tls: false,
+        })
+        .await
+        else {
+            panic!("empty endpoint unexpectedly connected");
+        };
+        assert_eq!(error.kind(), ErrorKind::Connection);
     }
 }

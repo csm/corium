@@ -11,8 +11,12 @@ class CoriumError(Exception):
         self.grpc_code = grpc_code
 
 
-class ConnectionError(CoriumError):
+class ConnectionFailedError(CoriumError):
     """A peer or peer server could not be reached."""
+
+
+class NativeExtensionError(CoriumError):
+    """The native extension is unavailable or failed to load."""
 
 
 class AuthenticationError(CoriumError):

@@ -1972,6 +1972,8 @@ dependencies = [
  "corium-peer",
  "corium-protocol",
  "corium-query",
+ "corium-transactor",
+ "tempfile",
  "thiserror",
  "tokio",
  "tonic",

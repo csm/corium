@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
+import corium._api as api
 from corium import (
     ClosedError,
     Datom,
@@ -12,12 +14,18 @@ from corium import (
     Index,
     Keyword,
     LocalPeer,
+    NativeExtensionError,
     Peer,
     RemotePeer,
     Symbol,
     Tagged,
 )
 from corium._api import _TxReportData, _View
+
+if TYPE_CHECKING:
+
+    def _assert_peer_types(local: LocalPeer, remote: RemotePeer) -> tuple[Peer, Peer]:
+        return local, remote
 
 
 class FakeDbBackend:
@@ -58,10 +66,11 @@ class FakeDbBackend:
 class FakePeerBackend:
     database_name = "people"
 
-    def __init__(self) -> None:
+    def __init__(self, *, fail_close_once: bool = False) -> None:
         self.db_backend = FakeDbBackend()
         self.close_count = 0
         self.transactions: list[Any] = []
+        self.fail_close_once = fail_close_once
 
     async def db(self) -> FakeDbBackend:
         return self.db_backend
@@ -81,6 +90,24 @@ class FakePeerBackend:
 
     async def close(self) -> None:
         self.close_count += 1
+        if self.fail_close_once:
+            self.fail_close_once = False
+            raise RuntimeError("close failed")
+
+
+class FakeNative:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    async def connect_local(
+        self, endpoints: list[str], **options: Any
+    ) -> FakePeerBackend:
+        self.calls.append(("local", endpoints, options))
+        return FakePeerBackend()
+
+    async def connect_remote(self, endpoint: str, **options: Any) -> FakePeerBackend:
+        self.calls.append(("remote", endpoint, options))
+        return FakePeerBackend()
 
 
 class PeerApiTests(unittest.IsolatedAsyncioTestCase):
@@ -93,11 +120,14 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
 
             db = await peer.db()
             self.assertEqual(await db.query(["query"], "Ada", fuel=20), [["Ada"]])
+            self.assertEqual((await peer.sync()).database_name, "people")
             report = await peer.transact([{"person/name": "Ada"}])
             self.assertEqual(report.tempids, {"ada": 42})
             self.assertEqual(await report.db_after.basis_t(), 7)
 
-    async def test_database_views_are_immutable_and_forward_raw_operations(self) -> None:
+    async def test_database_views_are_immutable_and_forward_raw_operations(
+        self,
+    ) -> None:
         backend = FakePeerBackend()
         db = await LocalPeer._from_backend(backend).db()
         viewed = db.as_of(4).history()
@@ -109,10 +139,10 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             await db.pull([Keyword("person/name")], EntityId(1)),
             {Keyword("person/name"): "Ada"},
         )
-        self.assertEqual(
-            await db.datoms("eavt", EntityId(1), limit=1),
-            [Datom(1, 2, "Ada", 3, True)],
-        )
+        for index in Index:
+            datoms = await db.datoms(index, EntityId(1), limit=1)
+            self.assertEqual(datoms, [Datom(1, 2, "Ada", 3, True)])
+            self.assertEqual(datoms[0].value, "Ada")
         self.assertEqual(await db.stats(), DbStats(7, 5, 2, 3))
 
     async def test_context_manager_closes_exactly_once(self) -> None:
@@ -121,11 +151,33 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
 
         async with peer as entered:
             self.assertIs(entered, peer)
+            db = await peer.db()
+            report = await peer.transact([])
 
         await peer.close()
         self.assertEqual(backend.close_count, 1)
         with self.assertRaises(ClosedError):
             await peer.db()
+        with self.assertRaises(ClosedError):
+            await db.query(["query"])
+        with self.assertRaises(ClosedError):
+            await report.db_after.stats()
+        with self.assertRaises(ClosedError):
+            db.history()
+
+    async def test_failed_close_can_be_retried(self) -> None:
+        backend = FakePeerBackend(fail_close_once=True)
+        peer = LocalPeer._from_backend(backend)
+        db = await peer.db()
+
+        with self.assertRaisesRegex(RuntimeError, "close failed"):
+            await peer.close()
+        self.assertEqual(await db.basis_t(), 7, "failed close restores open state")
+
+        await peer.close()
+        self.assertEqual(backend.close_count, 2)
+        with self.assertRaises(ClosedError):
+            await db.stats()
 
     async def test_query_and_scan_limits_reject_invalid_values(self) -> None:
         db = await LocalPeer._from_backend(FakePeerBackend()).db()
@@ -134,7 +186,36 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             await db.datoms(Index.EAVT, limit=True)
         with self.assertRaises(ValueError):
+            await db.datoms(Index.EAVT, limit=0)
+        with self.assertRaises(ValueError):
             await db.datoms("nope")
+        await db.datoms(Index.EAVT, limit=None)
+
+    async def test_tls_is_inferred_and_tokens_require_https(self) -> None:
+        native = FakeNative()
+        with patch.object(api, "_native_module", return_value=native):
+            await LocalPeer.connect(
+                "https://local.test", database="people", token="token"
+            )
+            await RemotePeer.connect(
+                "https://remote.test", database="people", token="token"
+            )
+
+        self.assertEqual(native.calls[0][2]["tls"], True)
+        self.assertNotIn("storage", native.calls[0][2])
+        self.assertEqual(native.calls[1][2]["tls"], True)
+
+        with self.assertRaisesRegex(ValueError, "require https"):
+            await LocalPeer.connect(
+                "http://local.test", database="people", token="token"
+            )
+
+    def test_missing_native_extension_has_a_dedicated_error(self) -> None:
+        with patch.object(
+            api.importlib, "import_module", side_effect=ImportError("missing")
+        ):
+            with self.assertRaises(NativeExtensionError):
+                api._native_module()
 
 
 class ValueAndTimeTests(unittest.IsolatedAsyncioTestCase):
@@ -160,6 +241,10 @@ class ValueAndTimeTests(unittest.IsolatedAsyncioTestCase):
         viewed = database.as_of_instant(aware)
         expected = int(aware.timestamp() * 1000)
         self.assertEqual(viewed._view, _View("as_of_instant", expected))
+        self.assertEqual(
+            database.since_instant(aware)._view,
+            _View("since_instant", expected),
+        )
 
 
 if __name__ == "__main__":
