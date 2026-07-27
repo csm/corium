@@ -9,7 +9,10 @@
 //! * [`corium_tx::prepare`] + [`Db::with_transaction`] apply a transaction,
 //!   mirroring `corium_transactor::Transactor::transact` minus the durable
 //!   log and wall-clock instant (neither is meaningful for a memory-only,
-//!   ephemeral database).
+//!   ephemeral database). Having no clock, this engine asserts no
+//!   `:db/txInstant`, so its transactions are ordered by `t` alone and
+//!   instant-named views resolve to basis 0; `as-of`/`since` by `t` work as
+//!   they do everywhere else.
 //! * [`corium_query`] runs EDN Datalog against the current [`Db`] value.
 
 use std::fmt;

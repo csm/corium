@@ -9,7 +9,7 @@ use corium_core::{EntityId, IndexOrder};
 use corium_db::{Db as DbValue, key_prefix};
 use corium_peer::{ConnectConfig, Connection};
 use corium_query::edn::Edn;
-use corium_query::{ExecOptions, QInput, ast, boundary, exec};
+use corium_query::{ExecOptions, QInput, QueryError, ast, boundary, exec};
 
 use crate::result::{QueryResult, ResultShape};
 use crate::{ClientError, DatomRow, Db, DbBackend, DbStats, Index, Peer, TxData, TxReport, View};
@@ -93,6 +93,8 @@ impl LocalDbBackend {
             View::AsOf(t) => self.snapshot.as_of(t),
             View::Since(t) => self.snapshot.since(t),
             View::History => self.snapshot.history(),
+            View::AsOfInstant(instant) => self.snapshot.as_of_instant(instant),
+            View::SinceInstant(instant) => self.snapshot.since_instant(instant),
         }
     }
 }
@@ -124,13 +126,13 @@ impl DbBackend for LocalDbBackend {
                     bound_db = true;
                 }
                 ast::InSpec::Db(_) => {
-                    return Err(ClientError::Protocol(
+                    return Err(ClientError::Query(QueryError::Arity(
                         "the local fluent API binds a single database source".into(),
-                    ));
+                    )));
                 }
                 _ => {
                     let arg = next_arg.next().ok_or_else(|| {
-                        ClientError::Protocol("query needs more arguments".into())
+                        ClientError::Query(QueryError::Arity("query needs more arguments".into()))
                     })?;
                     inputs.push(QInput::Edn(arg.clone()));
                 }

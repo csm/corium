@@ -2,11 +2,13 @@
 //! schema model, used by `CreateDatabase`.
 
 use corium_core::{Attribute, Cardinality, EntityId, Partition, Schema, Unique, ValueType};
-use corium_db::Idents;
+use corium_db::{Idents, bootstrap};
 use corium_query::edn::Edn;
 use thiserror::Error;
 
 /// Sequence of the first installable attribute entity in the db partition.
+/// Lower sequences are reserved for the engine's own attributes
+/// (`corium_db::bootstrap`).
 pub const FIRST_ATTR_ID: u64 = 100;
 
 /// Schema form conversion failure.
@@ -39,13 +41,16 @@ fn kw(text: &str) -> Edn {
 /// Parses Datomic-style attribute maps into a schema and ident registry.
 ///
 /// Attribute entity ids are assigned sequentially in the `Db` partition
-/// starting at [`FIRST_ATTR_ID`].
+/// starting at [`FIRST_ATTR_ID`]. The engine's own attributes are installed
+/// first, so every database created this way — and every peer that receives
+/// the resulting handshake — knows `:db/txInstant`.
 ///
 /// # Errors
 /// Returns [`SchemaFormError`] for malformed attribute definitions.
 pub fn schema_from_edn(forms: &[Edn]) -> Result<(Schema, Idents), SchemaFormError> {
     let mut schema = Schema::default();
     let mut idents = Idents::default();
+    bootstrap::install(&mut schema, &mut idents);
     for (index, form) in forms.iter().enumerate() {
         if !matches!(form, Edn::Map(_)) {
             return Err(SchemaFormError::NotAMap(form.to_string()));

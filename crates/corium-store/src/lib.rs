@@ -19,6 +19,9 @@ use fs2::FileExt;
 use thiserror::Error;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
+mod segment_cache;
+pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheMetrics, SegmentReader};
+
 mod snapshot;
 pub use snapshot::{
     INDEX_MANIFEST_MAGIC, chunk_segment_keys, decode_index_manifest, decode_segment_keys,
@@ -36,7 +39,7 @@ pub use turso_store::TursoBlobStore;
 #[cfg(feature = "s3")]
 mod s3_store;
 #[cfg(feature = "s3")]
-pub use s3_store::S3BlobStore;
+pub use s3_store::{S3BlobStore, S3ClientConfig, normalize_s3_prefix};
 
 /// A content identifier for immutable blobs.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -898,40 +901,5 @@ impl Drop for RootLock {
         // Keep the lock file in place so every contender locks the same inode.
         // Unlinking it here would let a new opener lock a replacement file while
         // a waiter still holds a descriptor for the unlinked original.
-    }
-}
-
-/// Small read-through segment cache keyed by blob id.
-#[derive(Default)]
-pub struct SegmentCache {
-    entries: RwLock<HashMap<BlobId, Arc<[u8]>>>,
-}
-impl SegmentCache {
-    /// Returns cached bytes, loading from `store` on miss.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the backing store cannot load the blob.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal cache lock is poisoned.
-    pub async fn get_or_load(
-        &self,
-        store: &dyn BlobStore,
-        id: &BlobId,
-    ) -> Result<Option<Arc<[u8]>>, StoreError> {
-        if let Some(v) = self.entries.read().expect("poisoned cache lock").get(id) {
-            return Ok(Some(v.clone()));
-        }
-        let Some(bytes) = store.get(id).await? else {
-            return Ok(None);
-        };
-        let bytes: Arc<[u8]> = bytes.into();
-        self.entries
-            .write()
-            .expect("poisoned cache lock")
-            .insert(id.clone(), bytes.clone());
-        Ok(Some(bytes))
     }
 }

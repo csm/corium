@@ -21,7 +21,7 @@ postgres = ["corium-transactor/postgres"]
 # Enables the Turso storage backend for `corium transactor --store turso`.
 turso = ["corium-transactor/turso"]
 # Enables the S3 storage backend for `corium transactor --store s3`.
-s3 = ["corium-transactor/s3"]
+s3 = ["corium-transactor/s3", "dep:aws-credential-types"]
 # OIDC/JWT bearer-token authentication for the transactor and peer server.
 # `oidc` verifies tokens against a JWKS supplied with `--oidc-jwks-file`;
 # `oidc-discovery` also fetches the issuer's JWKS over HTTP (`--oidc-issuer`).
@@ -30,10 +30,12 @@ oidc-discovery = ["oidc", "corium-protocol/oidc-discovery"]
 
 [dependencies]
 async-trait = "0.1"
+aws-credential-types = { version = "1", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 corium-authz = { workspace = true }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
+corium-forms = { workspace = true, features = ["toml"] }
 corium-log = { workspace = true }
 corium-peer = { workspace = true }
 corium-pgwire = { workspace = true }

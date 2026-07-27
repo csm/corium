@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corium"
+version = "0.1.0"
+description = "Async local and remote Python client for Corium"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0 OR MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10",
+    "ruff>=0.5",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+corium = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

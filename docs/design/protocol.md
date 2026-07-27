@@ -47,6 +47,14 @@ service Transactor {
   cross-service transaction.
 - All requests carry the database name and a protocol version; the transactor
   rejects mismatched `format-version` roots with a clear upgrade error.
+- Protocol v2 adds `TransactRequest.expected_basis_t`. When present, the
+  transactor rejects a stale request before transaction preparation or durable
+  append; peer-local read/modify/write adapters use this fence.
+- Version checks use a supported range to permit server-first rolling
+  upgrades. A v2 server accepts v1 clients (which cannot request the new
+  fence); a v2 client still sends version 2 and is rejected by a v1 server
+  before that older server can ignore the fence. Upgrade transactors first,
+  then peers and clients.
 
 #### Future fleet routing
 
@@ -95,8 +103,9 @@ service PeerServer {
 }
 ```
 
-Requests name a db view as `{db-name, as-of?, since?, history?}` so thin
-clients get the full time model. Result streams are chunked with a
+Requests name a db view as
+`{db-name, as-of?, since?, history?, as-of-instant?, since-instant?}` so thin
+clients get the full time model, by basis or by wall clock. Result streams are chunked with a
 server-enforced fuel/deadline per query. This service definition plus the
 codec spec **is** the public thin-client protocol; a conformance doc and test
 vectors ship with it so third parties can write clients.
@@ -105,10 +114,12 @@ vectors ship with it so third parties can write clients.
 
 - TLS via tonic/rustls everywhere; mTLS or bearer-token auth per endpoint
   (pluggable `Authenticator` trait; static tokens in v1).
-- Request-scoped identity and authorization are a spike in `corium-protocol::authz`
-  (optional per-surface enforcement, external identity providers, per-principal
-  views for multi-tenant serving); see [auth.md](auth.md) and
-  [ADR-0012](../adr/0012-optional-authn-authz.md). Not yet wired into the servers.
+- Request-scoped identity and authorization live in
+  `corium-protocol::authz` (optional per-surface enforcement, external
+  identity providers, and per-principal view decisions). Guards are wired into
+  the transactor and peer gRPC services; a filtered decision is rejected on
+  surfaces that cannot enforce it yet. See [auth.md](auth.md) and
+  [ADR-0012](../adr/0012-optional-authn-authz.md).
 - Peer servers enforce per-request fuel, result-size, and concurrency limits;
   the transactor enforces tx-size and queue limits.
 - The blob store is assumed private to the deployment (peers have direct

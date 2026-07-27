@@ -1,6 +1,7 @@
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -9,6 +10,45 @@ use aws_sdk_s3::primitives::ByteStream;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+
+/// Explicit client settings used for an independently opened S3 store.
+///
+/// An empty value uses the standard AWS configuration chain. Storage-info
+/// clients receive a populated value containing the transactor's separately
+/// configured read-only credentials.
+#[derive(Clone, Default)]
+pub struct S3ClientConfig {
+    /// AWS region override.
+    pub region: Option<String>,
+    /// Custom S3-compatible endpoint.
+    pub endpoint_url: Option<String>,
+    /// Access-key id. Must be paired with [`Self::secret_access_key`].
+    pub access_key_id: Option<String>,
+    /// Secret access key.
+    pub secret_access_key: Option<String>,
+    /// Optional temporary-credential session token.
+    pub session_token: Option<String>,
+    /// Expiration time for explicit temporary credentials.
+    pub expires_after: Option<SystemTime>,
+    /// Refreshing credential provider for long-lived clients. When supplied,
+    /// this takes precedence over the explicit access-key fields.
+    pub credentials_provider: Option<SharedCredentialsProvider>,
+}
+
+impl std::fmt::Debug for S3ClientConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("S3ClientConfig")
+            .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
+            .field(
+                "credentials",
+                &(self.access_key_id.is_some() || self.credentials_provider.is_some())
+                    .then_some("[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
 
 /// Content-addressed blob and fenced-root storage backed by an S3 (or
 /// S3-compatible) bucket.
@@ -39,9 +79,71 @@ impl S3BlobStore {
         bucket: impl Into<String>,
         prefix: impl Into<String>,
     ) -> Result<Self, StoreError> {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .load()
-            .await;
+        Self::connect_with_config(bucket, prefix, &S3ClientConfig::default()).await
+    }
+
+    /// Connects with explicit region, endpoint, and credential overrides.
+    ///
+    /// Unspecified settings still come from the standard AWS configuration
+    /// chain. Supplying an endpoint enables path-style addressing.
+    ///
+    /// # Errors
+    /// Returns an error when only half of the access-key pair is supplied, or
+    /// when the bucket cannot be reached.
+    pub async fn connect_with_config(
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        options: &S3ClientConfig,
+    ) -> Result<Self, StoreError> {
+        let client = Self::client(options).await?;
+        Self::from_client(client, bucket, prefix).await
+    }
+
+    /// Opens an existing store without a bucket-wide `HeadBucket` probe.
+    ///
+    /// This is the read-only entry point: prefix-scoped IAM credentials can
+    /// list and fetch Corium objects without permission to inspect the bucket
+    /// itself. The first actual read surfaces connectivity or permission
+    /// errors.
+    ///
+    /// # Errors
+    /// Returns an error when explicit client credentials are incomplete.
+    pub async fn connect_existing_with_config(
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        options: &S3ClientConfig,
+    ) -> Result<Self, StoreError> {
+        Ok(Self {
+            client: Self::client(options).await?,
+            bucket: bucket.into(),
+            prefix: normalize_s3_prefix(prefix.into()),
+        })
+    }
+
+    async fn client(options: &S3ClientConfig) -> Result<Client, StoreError> {
+        if options.access_key_id.is_some() != options.secret_access_key.is_some() {
+            return Err(StoreError::S3(
+                "S3 access key id and secret access key must be supplied together".into(),
+            ));
+        }
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(region) = &options.region {
+            loader = loader.region(aws_sdk_s3::config::Region::new(region.clone()));
+        }
+        if let Some(provider) = &options.credentials_provider {
+            loader = loader.credentials_provider(provider.clone());
+        } else if let (Some(access_key_id), Some(secret_access_key)) =
+            (&options.access_key_id, &options.secret_access_key)
+        {
+            loader = loader.credentials_provider(aws_sdk_s3::config::Credentials::new(
+                access_key_id,
+                secret_access_key,
+                options.session_token.clone(),
+                options.expires_after,
+                "corium-storage-info",
+            ));
+        }
+        let config = loader.load().await;
         // Local S3-compatible servers (MinIO, Garage, LocalStack) are reached
         // by host/IP, where virtual-hosted addressing would fold the bucket
         // into a subdomain that does not resolve; they need path-style keys.
@@ -49,10 +151,12 @@ impl S3BlobStore {
         // same heuristic the crate's S3 test harness uses. AWS itself ignores
         // the setting (its endpoints are DNS-addressable).
         let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
-        if std::env::var_os("AWS_ENDPOINT_URL").is_some() {
+        if let Some(endpoint_url) = &options.endpoint_url {
+            s3_config = s3_config.endpoint_url(endpoint_url).force_path_style(true);
+        } else if std::env::var_os("AWS_ENDPOINT_URL").is_some() {
             s3_config = s3_config.force_path_style(true);
         }
-        Self::from_client(Client::from_conf(s3_config.build()), bucket, prefix).await
+        Ok(Client::from_conf(s3_config.build()))
     }
 
     /// Creates a store from an existing S3 client, verifying the bucket is
@@ -72,7 +176,7 @@ impl S3BlobStore {
         let store = Self {
             client,
             bucket: bucket.into(),
-            prefix: normalize_prefix(prefix.into()),
+            prefix: normalize_s3_prefix(prefix.into()),
         };
         store
             .client
@@ -221,13 +325,10 @@ impl S3BlobStore {
             let _ = self.delete_root(&name).await;
             return Err(unenforced("If-Match:<etag> (compare-and-swap)"));
         }
-        let etag = match self.get_root_with_etag(&name).await? {
-            Some((_, etag)) => etag,
-            None => {
-                return Err(StoreError::S3(
-                    "conditional-write probe: probe key vanished mid-check".into(),
-                ));
-            }
+        let Some((_, etag)) = self.get_root_with_etag(&name).await? else {
+            return Err(StoreError::S3(
+                "conditional-write probe: probe key vanished mid-check".into(),
+            ));
         };
         if !self
             .put_conditional(&key, b"4".to_vec(), Some(&etag), false)
@@ -243,7 +344,9 @@ impl S3BlobStore {
     }
 }
 
-fn normalize_prefix(prefix: String) -> String {
+/// Normalizes an S3 namespace prefix to empty or trailing-slash form.
+#[must_use]
+pub fn normalize_s3_prefix(prefix: String) -> String {
     if prefix.is_empty() || prefix.ends_with('/') {
         prefix
     } else {
@@ -520,5 +623,17 @@ impl RootStore for S3BlobStore {
         }
         names.sort();
         Ok(names)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_s3_prefix;
+
+    #[test]
+    fn normalizes_prefix_once() {
+        assert_eq!(normalize_s3_prefix(String::new()), "");
+        assert_eq!(normalize_s3_prefix("tenant".into()), "tenant/");
+        assert_eq!(normalize_s3_prefix("tenant/".into()), "tenant/");
     }
 }

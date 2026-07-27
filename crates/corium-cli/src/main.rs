@@ -3,22 +3,31 @@
 
 mod authz;
 mod console;
+mod instant;
 mod metrics_http;
 mod pg_catalog;
 mod sql;
 mod tui;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "s3")]
+use aws_credential_types::{
+    Credentials,
+    provider::{
+        ProvideCredentials, SharedCredentialsProvider, error::CredentialsError,
+        future::ProvideCredentials as ProvideCredentialsFuture,
+    },
+};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
 use corium_peer::server::PeerServerConfig;
-use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings};
+use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings, SegmentCacheConfig};
 use corium_protocol::auth::{DEFAULT_DEV_TOKEN, client_tls, server_tls};
 use corium_protocol::authz::{
     ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, Principal,
@@ -26,9 +35,13 @@ use corium_protocol::authz::{
 };
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
+#[cfg(feature = "s3")]
+use corium_store::S3ClientConfig;
 use corium_store::{DbRoot, FsStore, RootStore};
-use corium_transactor::StoreSpec;
 use corium_transactor::node::{NodeConfig, TransactorNode};
+#[cfg(feature = "s3")]
+use corium_transactor::{S3ReadOnlyConfig, S3ReadOnlyCredentials};
+use corium_transactor::{StorageInfoConfig, StoreSpec};
 
 /// Corium database system command line.
 #[derive(Parser)]
@@ -45,6 +58,31 @@ struct Cli {
 enum LogFormat {
     Human,
     Json,
+}
+
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(split);
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| format!("invalid byte size {value:?}"))?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kib" => 1_u64 << 10,
+        "mib" => 1_u64 << 20,
+        "gib" => 1_u64 << 30,
+        "tib" => 1_u64 << 40,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        _ => return Err(format!("unknown byte-size suffix in {value:?}")),
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size {value:?} exceeds u64"))
 }
 
 /// Storage-service backend for a transactor's blobs and roots.
@@ -133,6 +171,14 @@ impl ClientFlags {
     }
 
     async fn connect_config(&self, db: impl Into<String>) -> Result<ConnectConfig, String> {
+        self.connect_config_cache(db, None).await
+    }
+
+    async fn connect_config_cache(
+        &self,
+        db: impl Into<String>,
+        cache: Option<SegmentCacheConfig>,
+    ) -> Result<ConnectConfig, String> {
         let db = db.into();
         let mut config = ConnectConfig::with_failover(self.endpoints(), db.clone());
         config.token = self.token();
@@ -155,11 +201,117 @@ impl ClientFlags {
             .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
         let (spec, data_dir) = StoreSpec::from_connection(storage)
             .map_err(|error| format!("cannot use transactor storage backend: {error}"))?;
+        #[cfg(feature = "s3")]
+        let mut spec = spec;
+        #[cfg(feature = "s3")]
+        if let StoreSpec::S3 { client, .. } = &mut spec {
+            let initial = sdk_credentials(client)?;
+            client.credentials_provider = Some(SharedCredentialsProvider::new(
+                StorageInfoCredentialsProvider {
+                    client: self.clone(),
+                    db: db.clone(),
+                    initial: std::sync::Mutex::new(Some(initial)),
+                },
+            ));
+        }
         let store = corium_transactor::NodeStore::open_existing(&spec, &data_dir)
             .await
             .map_err(|error| format!("cannot open peer storage: {error}"))?;
-        Ok(config.with_storage(Arc::new(store)))
+        let storage = Arc::new(store);
+        if let Some(cache) = cache {
+            config
+                .with_storage_cache(storage, &cache)
+                .map_err(|error| format!("cannot open segment cache: {error}"))
+        } else {
+            Ok(config.with_storage(storage))
+        }
     }
+}
+
+#[cfg(feature = "s3")]
+struct StorageInfoCredentialsProvider {
+    client: ClientFlags,
+    db: String,
+    initial: std::sync::Mutex<Option<Credentials>>,
+}
+
+#[cfg(feature = "s3")]
+impl std::fmt::Debug for StorageInfoCredentialsProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StorageInfoCredentialsProvider")
+            .field("transactor", &self.client.primary())
+            .field("db", &self.db)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "s3")]
+impl ProvideCredentials for StorageInfoCredentialsProvider {
+    fn provide_credentials<'a>(&'a self) -> ProvideCredentialsFuture<'a>
+    where
+        Self: 'a,
+    {
+        if let Some(credentials) = self
+            .initial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return ProvideCredentialsFuture::ready(Ok(credentials));
+        }
+        ProvideCredentialsFuture::new(async move {
+            self.fetch()
+                .await
+                .map_err(|error| CredentialsError::provider_error(std::io::Error::other(error)))
+        })
+    }
+}
+
+#[cfg(feature = "s3")]
+impl StorageInfoCredentialsProvider {
+    async fn fetch(&self) -> Result<Credentials, String> {
+        let mut admin = Admin::connect(
+            &self.client.primary(),
+            self.client.token(),
+            self.client.tls()?,
+        )
+        .await
+        .map_err(|error| format!("cannot connect to transactor: {error}"))?;
+        let storage = admin
+            .get_storage_info(&self.db)
+            .await
+            .map_err(|error| format!("cannot refresh storage info: {error}"))?
+            .storage
+            .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
+        let (spec, _) = StoreSpec::from_connection(storage)
+            .map_err(|error| format!("cannot use refreshed storage info: {error}"))?;
+        let StoreSpec::S3 { client, .. } = spec else {
+            return Err(
+                "transactor storage backend changed while refreshing S3 credentials".into(),
+            );
+        };
+        sdk_credentials(&client)
+    }
+}
+
+#[cfg(feature = "s3")]
+fn sdk_credentials(config: &S3ClientConfig) -> Result<Credentials, String> {
+    let access_key_id = config
+        .access_key_id
+        .as_deref()
+        .ok_or_else(|| "S3 storage info omitted the access key id".to_owned())?;
+    let secret_access_key = config
+        .secret_access_key
+        .as_deref()
+        .ok_or_else(|| "S3 storage info omitted the secret access key".to_owned())?;
+    Ok(Credentials::new(
+        access_key_id,
+        secret_access_key,
+        config.session_token.clone(),
+        config.expires_after,
+        "corium-storage-info-refresh",
+    ))
 }
 
 /// Server-side TLS/auth flags.
@@ -353,12 +505,17 @@ impl ServeFlags {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run a transactor process over a data directory.
     Transactor {
+        /// EDN configuration file for storage and read-only discovery
+        /// credentials. Explicit CLI flags override file values.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Storage-service backend for blobs and roots.
-        #[arg(long, value_enum, default_value_t = StoreKind::Fs)]
-        store: StoreKind,
+        #[arg(long, value_enum)]
+        store: Option<StoreKind>,
         /// Turso database path for `--store turso` (defaults to
         /// `{data_dir}/store.db`).
         #[arg(long)]
@@ -366,15 +523,59 @@ enum Command {
         /// `PostgreSQL` connection string for `--store postgres`.
         #[arg(long)]
         postgres_url: Option<String>,
+        /// Separately provisioned read-only `PostgreSQL` connection string
+        /// returned by `GetStorageInfo`.
+        #[arg(long, env = "CORIUM_POSTGRES_READ_ONLY_URL")]
+        postgres_read_only_url: Option<String>,
         /// S3 bucket for `--store s3`.
         #[arg(long)]
         s3_bucket: Option<String>,
         /// S3 key prefix for `--store s3` (defaults to the bucket root).
-        #[arg(long, default_value = "")]
-        s3_prefix: String,
+        #[arg(long)]
+        s3_prefix: Option<String>,
+        /// Region advertised to storage-aware S3 clients.
+        #[arg(long)]
+        s3_region: Option<String>,
+        /// Custom endpoint advertised to storage-aware S3-compatible clients.
+        #[arg(long)]
+        s3_endpoint_url: Option<String>,
+        /// Static read-only S3 access-key id returned by `GetStorageInfo`.
+        #[arg(
+            long,
+            env = "CORIUM_S3_READ_ONLY_ACCESS_KEY_ID",
+            conflicts_with = "s3_read_only_role_arn"
+        )]
+        s3_read_only_access_key_id: Option<String>,
+        /// Static read-only S3 secret access key returned by `GetStorageInfo`.
+        #[arg(
+            long,
+            env = "CORIUM_S3_READ_ONLY_SECRET_ACCESS_KEY",
+            conflicts_with = "s3_read_only_role_arn"
+        )]
+        s3_read_only_secret_access_key: Option<String>,
+        /// Optional session token paired with static read-only S3 keys.
+        #[arg(
+            long,
+            env = "CORIUM_S3_READ_ONLY_SESSION_TOKEN",
+            conflicts_with = "s3_read_only_role_arn"
+        )]
+        s3_read_only_session_token: Option<String>,
+        /// IAM role assumed through AWS STS for short-lived read-only S3
+        /// credentials returned by each `GetStorageInfo` call.
+        #[arg(long, env = "CORIUM_S3_READ_ONLY_ROLE_ARN")]
+        s3_read_only_role_arn: Option<String>,
+        /// STS session name for `--s3-read-only-role-arn`.
+        #[arg(long)]
+        s3_read_only_role_session_name: Option<String>,
+        /// STS token lifetime in seconds (default 900).
+        #[arg(long)]
+        s3_read_only_role_duration_seconds: Option<i32>,
+        /// Optional external id required by the read-only role's trust policy.
+        #[arg(long, env = "CORIUM_S3_READ_ONLY_ROLE_EXTERNAL_ID")]
+        s3_read_only_role_external_id: Option<String>,
         /// Data directory (filesystem store, logs). Ignored by `--store mem`.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Listen address.
         #[arg(long, default_value = "127.0.0.1:4334")]
         listen: SocketAddr,
@@ -445,14 +646,23 @@ enum Command {
         /// Prometheus HTTP listen address (`/metrics`); disabled when omitted.
         #[arg(long)]
         metrics_listen: Option<SocketAddr>,
+        /// Dedicated directory for the optional local SSD segment cache.
+        #[arg(long, requires = "segment_cache_capacity")]
+        segment_cache_dir: Option<PathBuf>,
+        /// SSD segment-cache capacity (for example `256GiB`).
+        #[arg(long, value_parser = parse_byte_size, requires = "segment_cache_dir")]
+        segment_cache_capacity: Option<u64>,
+        /// Bounded memory front tier (defaults to 64MiB when SSD cache is enabled).
+        #[arg(long, value_parser = parse_byte_size, requires = "segment_cache_dir")]
+        segment_cache_memory: Option<u64>,
         #[command(flatten)]
         client: ClientFlags,
         #[command(flatten)]
         serve: ServeFlags,
     },
-    /// Serve the database catalog over the `PostgreSQL` wire protocol
-    /// (read-only). Clients pick a database with the startup `database`
-    /// parameter or `USE <db>`, and list them with `SHOW DATABASES`.
+    /// Serve the database catalog over the `PostgreSQL` wire protocol.
+    /// Clients pick a database with the startup `database` parameter or
+    /// `USE <db>`, and list them with `SHOW DATABASES`.
     PostgresServer {
         /// Restrict the databases clients may reach (repeatable). When
         /// omitted, every database in the transactor's catalog is exposed.
@@ -464,6 +674,10 @@ enum Command {
         /// Require this cleartext password from clients (trust when omitted).
         #[arg(long)]
         password: Option<String>,
+        /// Enable guarded autocommit INSERT, UPDATE, and DELETE. Without this
+        /// flag the server remains read-only.
+        #[arg(long)]
+        allow_writes: bool,
         #[command(flatten)]
         client: ClientFlags,
     },
@@ -577,11 +791,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DbCommand {
-    /// Create a database (optionally with an EDN schema file).
+    /// Create a database (optionally with an EDN or TOML schema file).
     Create {
         /// Database name.
         name: String,
-        /// EDN file containing a vector of attribute maps.
+        /// Schema file: `.toml` for hierarchical TOML, otherwise EDN.
         #[arg(long)]
         schema: Option<PathBuf>,
         #[command(flatten)]
@@ -653,6 +867,7 @@ enum DbCommand {
 }
 
 #[tokio::main]
+#[allow(clippy::large_futures)]
 async fn main() -> ExitCode {
     // The binary links two rustls crypto backends (`ring` via tonic, and
     // `aws-lc-rs` transitively through the cljrs runtime), so rustls cannot
@@ -677,11 +892,22 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Transactor {
+            config: config_file,
             store,
             turso_path,
             postgres_url,
+            postgres_read_only_url,
             s3_bucket,
             s3_prefix,
+            s3_region,
+            s3_endpoint_url,
+            s3_read_only_access_key_id,
+            s3_read_only_secret_access_key,
+            s3_read_only_session_token,
+            s3_read_only_role_arn,
+            s3_read_only_role_session_name,
+            s3_read_only_role_duration_seconds,
+            s3_read_only_role_external_id,
             data_dir,
             listen,
             owner,
@@ -701,6 +927,31 @@ async fn run(cli: Cli) -> Result<(), String> {
             db_fn_memory_bytes,
             serve,
         } => {
+            let file = TransactorFileConfig::load(config_file.as_deref())?;
+            let store = store.or(file.store).unwrap_or_default();
+            let data_dir = data_dir
+                .or(file.data_dir)
+                .ok_or_else(|| "--data-dir or :data-dir in --config is required".to_owned())?;
+            let turso_path = turso_path.or(file.turso_path);
+            let postgres_url = postgres_url.or(file.postgres_url);
+            let postgres_read_only_url = postgres_read_only_url.or(file.postgres_read_only_url);
+            let s3_bucket = s3_bucket.or(file.s3_bucket);
+            let s3_prefix = s3_prefix.or(file.s3_prefix).unwrap_or_default();
+            let s3_region = s3_region.or(file.s3_region);
+            let s3_endpoint_url = s3_endpoint_url.or(file.s3_endpoint_url);
+            let s3_read_only_access_key_id =
+                s3_read_only_access_key_id.or(file.s3_read_only_access_key_id);
+            let s3_read_only_secret_access_key =
+                s3_read_only_secret_access_key.or(file.s3_read_only_secret_access_key);
+            let s3_read_only_session_token =
+                s3_read_only_session_token.or(file.s3_read_only_session_token);
+            let s3_read_only_role_arn = s3_read_only_role_arn.or(file.s3_read_only_role_arn);
+            let s3_read_only_role_session_name =
+                s3_read_only_role_session_name.or(file.s3_read_only_role_session_name);
+            let s3_read_only_role_duration_seconds =
+                s3_read_only_role_duration_seconds.or(file.s3_read_only_role_duration_seconds);
+            let s3_read_only_role_external_id =
+                s3_read_only_role_external_id.or(file.s3_read_only_role_external_id);
             let store_spec = store_spec(
                 store,
                 &data_dir,
@@ -708,9 +959,23 @@ async fn run(cli: Cli) -> Result<(), String> {
                 postgres_url,
                 s3_bucket,
                 s3_prefix,
+                s3_region.clone(),
+                s3_endpoint_url.clone(),
             )?;
             let mut config = NodeConfig::new(data_dir);
             config.store = store_spec;
+            config.storage_info = storage_info_config(StorageInfoOptions {
+                postgres_read_only_url,
+                s3_region,
+                s3_endpoint_url,
+                access_key_id: s3_read_only_access_key_id,
+                secret_access_key: s3_read_only_secret_access_key,
+                session_token: s3_read_only_session_token,
+                role_arn: s3_read_only_role_arn,
+                session_name: s3_read_only_role_session_name,
+                duration_seconds: s3_read_only_role_duration_seconds,
+                external_id: s3_read_only_role_external_id,
+            })?;
             if let Some(owner) = owner {
                 config.owner = owner;
             }
@@ -816,11 +1081,22 @@ async fn run(cli: Cli) -> Result<(), String> {
             listen,
             max_fuel,
             metrics_listen,
+            segment_cache_dir,
+            segment_cache_capacity,
+            segment_cache_memory,
             client,
             serve,
         } => {
             let tls = serve.tls()?;
-            let config = client.connect_config(db).await?;
+            let cache = segment_cache_dir.map(|directory| SegmentCacheConfig {
+                directory,
+                capacity_bytes: segment_cache_capacity.expect("required with cache directory"),
+                memory_capacity_bytes: segment_cache_memory.unwrap_or(64 * 1024 * 1024),
+            });
+            if cache.is_some() && !client.peer_bootstrap {
+                return Err("segment cache requires --peer-bootstrap".into());
+            }
+            let config = client.connect_config_cache(db, cache).await?;
             let connection = Arc::new(
                 Connection::connect(config)
                     .await
@@ -883,18 +1159,30 @@ async fn run(cli: Cli) -> Result<(), String> {
             databases,
             listen,
             password,
+            allow_writes,
             client,
         } => {
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|error| format!("cannot bind {listen}: {error}"))?;
-            let catalog = Arc::new(pg_catalog::PeerCatalog::new(client, databases));
+            let catalog = Arc::new(pg_catalog::PeerCatalog::new(
+                client,
+                databases,
+                allow_writes,
+            ));
             let pg_config = corium_pgwire::PgWireConfig {
                 password,
                 ..corium_pgwire::PgWireConfig::default()
             };
-            tracing::info!(%listen, "postgres server serving");
-            eprintln!("corium postgres-server: serving the database catalog on {listen}");
+            tracing::info!(%listen, allow_writes, "postgres server serving");
+            let access = if allow_writes {
+                "guarded autocommit writes enabled"
+            } else {
+                "read-only"
+            };
+            eprintln!(
+                "corium postgres-server: serving the database catalog on {listen} ({access})"
+            );
             corium_pgwire::serve(listener, catalog, pg_config, async {
                 let _ = tokio::signal::ctrl_c().await;
             })
@@ -1085,7 +1373,234 @@ fn init_logging(format: LogFormat) {
     }
 }
 
+#[derive(Default)]
+struct TransactorFileConfig {
+    store: Option<StoreKind>,
+    data_dir: Option<PathBuf>,
+    turso_path: Option<PathBuf>,
+    postgres_url: Option<String>,
+    postgres_read_only_url: Option<String>,
+    s3_bucket: Option<String>,
+    s3_prefix: Option<String>,
+    s3_region: Option<String>,
+    s3_endpoint_url: Option<String>,
+    s3_read_only_access_key_id: Option<String>,
+    s3_read_only_secret_access_key: Option<String>,
+    s3_read_only_session_token: Option<String>,
+    s3_read_only_role_arn: Option<String>,
+    s3_read_only_role_session_name: Option<String>,
+    s3_read_only_role_duration_seconds: Option<i32>,
+    s3_read_only_role_external_id: Option<String>,
+}
+
+impl TransactorFileConfig {
+    fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read config {}: {error}", path.display()))?;
+        let form = corium_query::edn::read_one(&text)
+            .map_err(|error| format!("bad config EDN in {}: {error}", path.display()))?;
+        let Edn::Map(entries) = form else {
+            return Err(format!(
+                "config {} must contain one EDN map",
+                path.display()
+            ));
+        };
+        let mut config = Self::default();
+        for (key, value) in entries {
+            let Edn::Keyword(key) = key else {
+                return Err(format!(
+                    "config {} contains a non-keyword key",
+                    path.display()
+                ));
+            };
+            if key.namespace.is_some() {
+                return Err(format!("unknown config key {key}"));
+            }
+            match key.name.as_str() {
+                "store" => config.store = Some(config_store(&value)?),
+                "data-dir" => config.data_dir = Some(PathBuf::from(config_string(&key, value)?)),
+                "turso-path" => {
+                    config.turso_path = Some(PathBuf::from(config_string(&key, value)?));
+                }
+                "postgres-url" => config.postgres_url = Some(config_string(&key, value)?),
+                "postgres-read-only-url" => {
+                    config.postgres_read_only_url = Some(config_string(&key, value)?);
+                }
+                "s3-bucket" => config.s3_bucket = Some(config_string(&key, value)?),
+                "s3-prefix" => config.s3_prefix = Some(config_string(&key, value)?),
+                "s3-region" => config.s3_region = Some(config_string(&key, value)?),
+                "s3-endpoint-url" => {
+                    config.s3_endpoint_url = Some(config_string(&key, value)?);
+                }
+                "s3-read-only-access-key-id" => {
+                    config.s3_read_only_access_key_id = Some(config_string(&key, value)?);
+                }
+                "s3-read-only-secret-access-key" => {
+                    config.s3_read_only_secret_access_key = Some(config_string(&key, value)?);
+                }
+                "s3-read-only-session-token" => {
+                    config.s3_read_only_session_token = Some(config_string(&key, value)?);
+                }
+                "s3-read-only-role-arn" => {
+                    config.s3_read_only_role_arn = Some(config_string(&key, value)?);
+                }
+                "s3-read-only-role-session-name" => {
+                    config.s3_read_only_role_session_name = Some(config_string(&key, value)?);
+                }
+                "s3-read-only-role-duration-seconds" => {
+                    let Edn::Long(seconds) = value else {
+                        return Err(format!("config key {key} must be an integer"));
+                    };
+                    config.s3_read_only_role_duration_seconds = Some(
+                        i32::try_from(seconds)
+                            .map_err(|_| format!("config key {key} is out of range"))?,
+                    );
+                }
+                "s3-read-only-role-external-id" => {
+                    config.s3_read_only_role_external_id = Some(config_string(&key, value)?);
+                }
+                _ => return Err(format!("unknown config key {key}")),
+            }
+        }
+        Ok(config)
+    }
+}
+
+fn config_string(key: &corium_core::Keyword, value: Edn) -> Result<String, String> {
+    let Edn::Str(value) = value else {
+        return Err(format!("config key {key} must be a string"));
+    };
+    Ok(value)
+}
+
+fn config_store(value: &Edn) -> Result<StoreKind, String> {
+    let value = match value {
+        Edn::Keyword(keyword) if keyword.namespace.is_none() => keyword.name.as_str(),
+        Edn::Str(value) => value,
+        _ => return Err("config key :store must be a keyword or string".into()),
+    };
+    match value {
+        "mem" => Ok(StoreKind::Mem),
+        "fs" => Ok(StoreKind::Fs),
+        "postgres" => Ok(StoreKind::Postgres),
+        "turso" => Ok(StoreKind::Turso),
+        "s3" => Ok(StoreKind::S3),
+        _ => Err(format!("unknown config :store value {value:?}")),
+    }
+}
+
+#[derive(Default)]
+struct StorageInfoOptions {
+    postgres_read_only_url: Option<String>,
+    s3_region: Option<String>,
+    s3_endpoint_url: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+    role_arn: Option<String>,
+    session_name: Option<String>,
+    duration_seconds: Option<i32>,
+    external_id: Option<String>,
+}
+
+#[cfg(feature = "s3")]
+fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
+    let StorageInfoOptions {
+        postgres_read_only_url,
+        s3_region,
+        s3_endpoint_url,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        role_arn,
+        session_name,
+        duration_seconds,
+        external_id,
+    } = options;
+    let static_present =
+        access_key_id.is_some() || secret_access_key.is_some() || session_token.is_some();
+    if static_present && role_arn.is_some() {
+        return Err("static S3 read-only credentials conflict with --s3-read-only-role-arn".into());
+    }
+    let credentials = if let Some(role_arn) = role_arn {
+        let duration_seconds = duration_seconds.unwrap_or(900);
+        if !(900..=43_200).contains(&duration_seconds) {
+            return Err("S3 read-only role duration must be between 900 and 43200 seconds".into());
+        }
+        Some(S3ReadOnlyCredentials::AssumeRole {
+            role_arn,
+            session_name: session_name.unwrap_or_else(|| "corium-read-only".into()),
+            duration_seconds,
+            external_id,
+        })
+    } else if static_present {
+        let access_key_id = access_key_id.ok_or_else(|| {
+            "S3 read-only access key id and secret access key must be supplied together".to_owned()
+        })?;
+        let secret_access_key = secret_access_key.ok_or_else(|| {
+            "S3 read-only access key id and secret access key must be supplied together".to_owned()
+        })?;
+        if session_name.is_some() || duration_seconds.is_some() || external_id.is_some() {
+            return Err("S3 role options require --s3-read-only-role-arn".into());
+        }
+        Some(S3ReadOnlyCredentials::Static {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })
+    } else {
+        if session_name.is_some() || duration_seconds.is_some() || external_id.is_some() {
+            return Err("S3 role options require --s3-read-only-role-arn".into());
+        }
+        None
+    };
+    Ok(StorageInfoConfig {
+        postgres_connection_string: postgres_read_only_url,
+        s3: credentials
+            .map(|credentials| S3ReadOnlyConfig::new(s3_region, s3_endpoint_url, credentials)),
+    })
+}
+
+#[cfg(not(feature = "s3"))]
+fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
+    let StorageInfoOptions {
+        postgres_read_only_url,
+        s3_region,
+        s3_endpoint_url,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        role_arn,
+        session_name,
+        duration_seconds,
+        external_id,
+    } = options;
+    if [
+        s3_region,
+        s3_endpoint_url,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        role_arn,
+        session_name,
+        external_id,
+    ]
+    .iter()
+    .any(Option::is_some)
+        || duration_seconds.is_some()
+    {
+        return Err("this build lacks S3 support; rebuild corium-cli with --features s3".into());
+    }
+    Ok(StorageInfoConfig {
+        postgres_connection_string: postgres_read_only_url,
+    })
+}
+
 /// Resolves the `--store` flag and backend connection options into a [`StoreSpec`].
+#[allow(clippy::too_many_arguments)]
 fn store_spec(
     store: StoreKind,
     data_dir: &std::path::Path,
@@ -1093,13 +1608,15 @@ fn store_spec(
     postgres_url: Option<String>,
     s3_bucket: Option<String>,
     s3_prefix: String,
+    s3_region: Option<String>,
+    s3_endpoint_url: Option<String>,
 ) -> Result<StoreSpec, String> {
     match store {
         StoreKind::Mem => Ok(StoreSpec::Memory),
         StoreKind::Fs => Ok(StoreSpec::Fs),
         StoreKind::Postgres => postgres_spec(postgres_url),
         StoreKind::Turso => turso_spec(data_dir, turso_path),
-        StoreKind::S3 => s3_spec(s3_bucket, s3_prefix),
+        StoreKind::S3 => s3_spec(s3_bucket, s3_prefix, s3_region, s3_endpoint_url),
     }
 }
 
@@ -1140,16 +1657,31 @@ fn turso_spec(
 }
 
 #[cfg(feature = "s3")]
-fn s3_spec(s3_bucket: Option<String>, s3_prefix: String) -> Result<StoreSpec, String> {
+fn s3_spec(
+    s3_bucket: Option<String>,
+    s3_prefix: String,
+    region: Option<String>,
+    endpoint_url: Option<String>,
+) -> Result<StoreSpec, String> {
     let bucket = s3_bucket.ok_or_else(|| "--s3-bucket is required with --store s3".to_owned())?;
     Ok(StoreSpec::S3 {
         bucket,
         prefix: s3_prefix,
+        client: S3ClientConfig {
+            region,
+            endpoint_url,
+            ..S3ClientConfig::default()
+        },
     })
 }
 
 #[cfg(not(feature = "s3"))]
-fn s3_spec(_s3_bucket: Option<String>, _s3_prefix: String) -> Result<StoreSpec, String> {
+fn s3_spec(
+    _s3_bucket: Option<String>,
+    _s3_prefix: String,
+    _region: Option<String>,
+    _endpoint_url: Option<String>,
+) -> Result<StoreSpec, String> {
     Err("this build lacks the S3 backend; rebuild corium-cli with --features s3".into())
 }
 
@@ -1242,21 +1774,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             client,
         } => {
             let forms = match schema {
-                Some(path) => {
-                    let text = std::fs::read_to_string(&path)
-                        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-                    let mut forms =
-                        read_all(&text).map_err(|error| format!("bad schema EDN: {error}"))?;
-                    // Accept either one vector of maps or bare maps.
-                    if forms.len() == 1 && matches!(forms[0], Edn::Vector(_)) {
-                        let Edn::Vector(items) = forms.remove(0) else {
-                            unreachable!()
-                        };
-                        items
-                    } else {
-                        forms
-                    }
-                }
+                Some(path) => read_schema_file(&path)?,
                 None => Vec::new(),
             };
             let mut admin = admin_client(&client).await?;
@@ -1332,6 +1850,30 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             };
             run_db_index_policy(&name, update, &client).await
         }
+    }
+}
+
+fn read_schema_file(path: &Path) -> Result<Vec<Edn>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+    {
+        return corium_forms::toml_schema::parse_edn(&text)
+            .map_err(|error| format!("bad schema TOML: {error}"));
+    }
+
+    let mut forms = read_all(&text).map_err(|error| format!("bad schema EDN: {error}"))?;
+    // Accept either one vector of maps or bare maps.
+    if forms.len() == 1 && matches!(forms[0], Edn::Vector(_)) {
+        let Edn::Vector(items) = forms.remove(0) else {
+            unreachable!()
+        };
+        Ok(items)
+    } else {
+        Ok(forms)
     }
 }
 
@@ -1443,5 +1985,128 @@ fn format_value(value: &corium_core::Value, interner: &KeywordInterner) -> Strin
         Value::Str(v) => format!("{v:?}"),
         Value::Bytes(bytes) => format!("#bytes[{}]", bytes.len()),
         Value::Ref(e) => format!("#eid {}", e.raw()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transactor_edn_config_loads_storage_and_read_only_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("corium.edn");
+        std::fs::write(
+            &path,
+            r#"{
+              :store :s3
+              :data-dir "/srv/corium"
+              :s3-bucket "corium-prod"
+              :s3-prefix "tenant/"
+              :s3-region "us-west-2"
+              :s3-read-only-role-arn "arn:aws:iam::123456789012:role/corium-reader"
+              :s3-read-only-role-duration-seconds 1200
+            }"#,
+        )
+        .expect("write config");
+
+        let config = TransactorFileConfig::load(Some(&path)).expect("load config");
+        assert!(matches!(config.store, Some(StoreKind::S3)));
+        assert_eq!(config.data_dir, Some(PathBuf::from("/srv/corium")));
+        assert_eq!(config.s3_bucket.as_deref(), Some("corium-prod"));
+        assert_eq!(config.s3_prefix.as_deref(), Some("tenant/"));
+        assert_eq!(config.s3_region.as_deref(), Some("us-west-2"));
+        assert_eq!(
+            config.s3_read_only_role_arn.as_deref(),
+            Some("arn:aws:iam::123456789012:role/corium-reader")
+        );
+        assert_eq!(config.s3_read_only_role_duration_seconds, Some(1200));
+    }
+
+    #[test]
+    fn transactor_edn_config_rejects_unknown_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("corium.edn");
+        std::fs::write(&path, "{:data-dir \"data\" :postgress-url \"typo\"}")
+            .expect("write config");
+        let error = TransactorFileConfig::load(Some(&path))
+            .err()
+            .expect("unknown key");
+        assert!(error.contains(":postgress-url"));
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn s3_read_only_credentials_must_be_complete_and_unambiguous() {
+        let incomplete = storage_info_config(StorageInfoOptions {
+            access_key_id: Some("ACCESS".into()),
+            ..StorageInfoOptions::default()
+        })
+        .expect_err("missing secret");
+        assert!(incomplete.contains("supplied together"));
+
+        let conflicting = storage_info_config(StorageInfoOptions {
+            access_key_id: Some("ACCESS".into()),
+            secret_access_key: Some("SECRET".into()),
+            role_arn: Some("arn:aws:iam::123456789012:role/reader".into()),
+            ..StorageInfoOptions::default()
+        })
+        .expect_err("static and role conflict");
+        assert!(conflicting.contains("conflict"));
+    }
+}
+
+#[cfg(test)]
+mod schema_file_tests {
+    use corium_core::{Cardinality, Keyword};
+    use corium_protocol::schemaform::schema_from_edn;
+
+    use super::read_schema_file;
+
+    #[test]
+    fn reads_toml_schema_by_extension() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("schema.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[entity]]
+name = "person"
+
+[entity.attributes]
+name = { type = "string", unique = "identity" }
+tags = { type = "keyword", many = true }
+"#,
+        )
+        .expect("write schema");
+
+        let forms = read_schema_file(&path).expect("read TOML schema");
+        let (schema, idents) = schema_from_edn(&forms).expect("install schema");
+        let tags = idents
+            .entid(&Keyword::new(Some("person"), "tags"))
+            .expect("tags ident");
+        assert_eq!(
+            schema.get(tags).expect("tags attribute").cardinality,
+            Cardinality::Many
+        );
+    }
+
+    #[test]
+    fn continues_to_read_edn_schema() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("schema.edn");
+        std::fs::write(
+            &path,
+            "[{:db/ident :person/name :db/valueType :db.type/string}]",
+        )
+        .expect("write schema");
+
+        let forms = read_schema_file(&path).expect("read EDN schema");
+        let (_, idents) = schema_from_edn(&forms).expect("install schema");
+        assert!(
+            idents
+                .entid(&Keyword::new(Some("person"), "name"))
+                .is_some()
+        );
     }
 }

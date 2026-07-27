@@ -25,6 +25,39 @@ pub struct Datom {
 - Transaction entities carry `:db/txInstant` (wall-clock, monotonic-corrected)
   and any user-asserted tx metadata.
 
+## Transaction time is data
+
+`:db/txInstant` is not log metadata sitting beside the datoms — it *is* a
+datom, asserted on the transaction entity by every commit path:
+
+```
+[<tx entity> :db/txInstant #inst"…" <tx entity> true]
+```
+
+Consequences, all of them the point of doing it this way:
+
+- It joins like anything else: `[?tx :db/txInstant ?inst]`, and from a datom's
+  `tx` position to its commit time in one clause.
+- It is AVET-indexed, so resolving a wall clock instant to a basis is an index
+  seek, which is what makes the instant-named views in
+  [time-model.md](time-model.md) cheap.
+- It rides along for free: the log record, the tx-report, every peer's live
+  index, and the published snapshot all carry the same datom, so there is no
+  second representation of transaction time to keep in sync. (`:db/txInstant`
+  datoms are never retracted, so they are live facts and survive into
+  current-state snapshots.)
+- Transaction entities are therefore ordinary entities with at least one datom
+  each. Datom and entity counts include them.
+
+The engine installs the attribute itself (`corium_db::bootstrap`), reserving
+`:db.part/db` sequence 50 — the same id Datomic uses. Sequences below the first
+user-installable attribute id are reserved for the engine; a user schema that
+declares `:db/txInstant` is rejected as a duplicate ident.
+
+Logs written before transaction time became a datom are unaffected: replay
+synthesizes the datom from the record's timestamp field, so an old database
+gains instant-named views without a rewrite.
+
 ## Value model
 
 The engine-internal value type is a compact Rust enum, **not** a cljrs value
@@ -121,6 +154,18 @@ values (or built programmatically in Rust via a builder API):
   attributes (upsert).
 - **Lookup refs**: `[attr v]` where `attr` is unique, usable anywhere an
   entity id is expected.
+- **Transaction metadata**: the reserved tempid `"datomic.tx"` (spelled as in
+  Datomic so ported transaction data works unchanged) and the keyword
+  `:db/current-tx` both name the transaction entity being built, so
+  `[:db/add "datomic.tx" :audit/actor "alice"]` records who and why beside the
+  engine's when. The reserved tempid allocates nothing and never upserts
+  through a `:db.unique/identity` attribute — metadata stays on the
+  transaction.
+- **Supplying `:db/txInstant`**: asserting it against the transaction entity
+  dates the commit explicitly, which is how a backfilled import keeps its
+  original timestamps. The transactor stamps `max(now, last + 1)` when the
+  data does not, and rejects a supplied instant that does not advance the
+  clock — instants must stay monotone for `as-of` by instant to mean anything.
 
 Expansion, tempid resolution, and validation live in `corium-tx` and are pure
 functions of `(db, tx-data)` — the transactor applies them, and the

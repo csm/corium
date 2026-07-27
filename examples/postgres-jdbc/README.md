@@ -1,7 +1,7 @@
 # PostgreSQL JDBC example
 
-This Maven project runs ordinary Java JDBC queries against Corium's read-only
-PostgreSQL wire-protocol server. Its one-command test harness:
+This Maven project runs ordinary Java JDBC queries against Corium's PostgreSQL
+wire-protocol server. Its one-command test harness:
 
 1. builds `corium` and the MusicBrainz loader;
 2. starts an in-memory transactor;
@@ -22,9 +22,10 @@ release-to-medium-to-track join for *OK Computer*. A failed result exits
 non-zero, so the same command is used by CI. The harness removes its temporary
 in-memory deployment on exit and prints the Corium process logs on failure.
 
-Java 11 or newer and Maven are required. Set `CORIUM_SKIP_BUILD=1` to reuse
-existing debug binaries. The listen addresses and database can be overridden
-with `CORIUM_TRANSACTOR_HOST`, `CORIUM_TRANSACTOR_PORT`,
+Java 11 or newer is required. The harness uses Maven when available; in a
+Maven-free environment, set `CORIUM_POSTGRES_JDBC_JAR` to an existing PgJDBC
+jar. Set `CORIUM_SKIP_BUILD=1` to reuse existing debug binaries. The listen
+addresses and database can be overridden with `CORIUM_TRANSACTOR_HOST`, `CORIUM_TRANSACTOR_PORT`,
 `CORIUM_POSTGRES_HOST`, `CORIUM_POSTGRES_PORT`, and `CORIUM_DATABASE`.
 
 ## Run only the Java client
@@ -42,7 +43,7 @@ CORIUM_JDBC_URL=jdbc:postgresql://127.0.0.1:5432/mbrainz \
 the empty string. If `corium postgres-server` was launched with `--password`,
 set the latter to that password.
 
-The client deliberately uses plain `Statement` queries. Corium currently
-supports JDBC's extended query protocol for statements without bound
-parameters, but PostgreSQL bound parameters and binary result formats are not
-yet implemented.
+The release-count check executes a `PreparedStatement` six times, crossing
+PgJDBC's default server-prepare threshold and exercising binary results. Corium
+also supports guarded autocommit `INSERT`/`UPDATE`/`DELETE` when the server is
+started with `--allow-writes`.

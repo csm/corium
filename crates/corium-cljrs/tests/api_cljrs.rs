@@ -168,6 +168,41 @@ fn api_surface_from_cljrs() {
     );
     assert_eq!(datoms, Edn::Long(1));
 
+    // Transaction time is data: the commit's instant is an ordinary datom on
+    // the transaction entity, joinable from any query.
+    let instants =
+        client.eval_edn("(d/q '[:find [?inst ...] :where [?tx :db/txInstant ?inst]] (d/db conn))");
+    // Results arrive in index order, which is transaction order.
+    let Edn::Vector(instants) = &instants else {
+        panic!("expected two transaction instants, got {instants}");
+    };
+    let [
+        Edn::Tagged(first_tag, first),
+        Edn::Tagged(second_tag, second),
+    ] = instants.as_slice()
+    else {
+        panic!("expected two #inst values, got {instants:?}");
+    };
+    assert_eq!((first_tag.as_str(), second_tag.as_str()), ("inst", "inst"));
+    assert!(first < second, "instants are monotone in t");
+
+    // `as-of`/`since` accept either a basis t or an instant value, the way
+    // Datomic accepts a t or a Date: naming the first commit's instant names
+    // basis 1. (The instant must be an engine instant, not a bare long —
+    // cljrs's `#inst` reader is still a passthrough.)
+    let by_instant = client.eval_edn(
+        "(let [inst (first (d/q '[:find [?inst ...] :where [?tx :db/txInstant ?inst]]
+                                (d/db conn)))]
+           (d/q '[:find ?a . :where [?e :person/age ?a]] (d/as-of (d/db conn) inst)))",
+    );
+    assert_eq!(by_instant, Edn::Long(42));
+    let since_instant = client.eval_edn(
+        "(let [inst (first (d/q '[:find [?inst ...] :where [?tx :db/txInstant ?inst]]
+                                (d/db conn)))]
+           (d/q '[:find ?a . :where [?e :person/age ?a]] (d/since (d/db conn) inst)))",
+    );
+    assert_eq!(since_instant, Edn::Long(43));
+
     server.abort();
     runtime.shutdown_background();
 }

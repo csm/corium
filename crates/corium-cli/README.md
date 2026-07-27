@@ -12,13 +12,15 @@ Ships the `corium` command. Subcommands:
   indexing options.
 - **`peer-server`** — host a peer as a gRPC endpoint for thin clients.
 - **`postgres-server`** — serve the database catalog over the PostgreSQL wire
-  protocol (read-only) for standard PostgreSQL clients and drivers; clients
-  pick a database with `USE`/the startup parameter and list them with
+  protocol for standard PostgreSQL clients and drivers. It is read-only by
+  default; `--allow-writes` enables guarded autocommit DML. Clients pick a
+  database with `USE`/the startup parameter and list them with
   `SHOW DATABASES`.
 - **`db create` / `delete` / `fork` / `list` / `stats`** — database
   administration, including restore-as-clone forks.
 - **`db request-index` / `index-policy`** — drive and tune background indexing.
-- **`console`** — interactive query console with as-of/since/history views,
+- **`console`** — interactive query console with as-of/since/history views
+  (named by basis `t` or by UTC timestamp),
   schema/stats/basis inspection, timing, and live tx-report watch.
 - **`tui`** — a full-screen terminal dashboard (query workbench, live store
   metrics, transaction feed, schema browser).
@@ -47,7 +49,9 @@ runnable processes and interactive tools but holds little logic of its own. The
 transactor and peer-server subcommands construct and run `corium-transactor` and
 `corium-peer` servers; `postgres-server` serves the `corium-pgwire` protocol
 over a catalog of lazily cached peer connections; the `console`, `tui`, `sql`,
-and `db *` subcommands drive a peer `Connection` and render results. Storage-backend selection and TLS/token
-auth are surfaced as flags and forwarded down to the relevant crate. See
+and `db *` subcommands drive a peer `Connection` and render results.
+Storage-backend selection and separately provisioned read-only discovery
+credentials are surfaced as flags or an EDN `transactor --config` file;
+TLS/token auth remains available as flags. See
 [`docs/getting-started.md`](../../docs/getting-started.md) and
 [`docs/operations.md`](../../docs/operations.md).

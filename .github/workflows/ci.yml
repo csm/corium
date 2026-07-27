@@ -6,6 +6,21 @@ on:
   pull_request:
 
 jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: clients/python/pyproject.toml
+      - run: python -m pip install -e './clients/python[dev]'
+      - run: ruff check clients/python
+      - run: ruff format --check clients/python
+      - run: mypy clients/python/src clients/python/tests
+      - run: python -m unittest discover -s clients/python/tests -v
+
   rust:
     runs-on: ubuntu-latest
     services:

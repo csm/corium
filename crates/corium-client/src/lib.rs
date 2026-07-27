@@ -99,6 +99,12 @@ pub enum View {
     Since(u64),
     /// The full history view, including retractions.
     History,
+    /// The value as of the last transaction committed at or before this
+    /// instant (Unix milliseconds).
+    AsOfInstant(i64),
+    /// Only assertions since the last transaction committed at or before this
+    /// instant (Unix milliseconds).
+    SinceInstant(i64),
 }
 
 /// A covering index, naming a datom-scan order.
@@ -200,8 +206,9 @@ pub(crate) trait DbBackend: Send + Sync {
 
 /// An immutable database value.
 ///
-/// A `Db` names a snapshot to read from; [`Db::as_of`], [`Db::since`], and
-/// [`Db::history`] derive new views cheaply. Every read method is async
+/// A `Db` names a snapshot to read from; [`Db::as_of`], [`Db::since`],
+/// [`Db::history`], and the wall-clock [`Db::as_of_instant`] /
+/// [`Db::since_instant`] derive new views cheaply. Every read method is async
 /// because the remote backend may need a round trip; the local backend
 /// resolves in-process.
 #[derive(Clone)]
@@ -254,6 +261,26 @@ impl Db {
         }
     }
 
+    /// The value as of wall-clock `instant` (Unix milliseconds): the last
+    /// transaction committed at or before it.
+    #[must_use]
+    pub fn as_of_instant(&self, instant: i64) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            view: View::AsOfInstant(instant),
+        }
+    }
+
+    /// The value including only assertions since wall-clock `instant`
+    /// (Unix milliseconds).
+    #[must_use]
+    pub fn since_instant(&self, instant: i64) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            view: View::SinceInstant(instant),
+        }
+    }
+
     /// Runs a typed [`Query`] with input arguments.
     ///
     /// The receiver binds the query's default `$` source; additional
@@ -273,7 +300,21 @@ impl Db {
     /// # Errors
     /// Returns [`ClientError`] for malformed queries or execution failures.
     pub async fn query_edn(&self, query: Edn, args: Vec<Edn>) -> Result<QueryResult, ClientError> {
-        self.backend.query(self.view, query, args, None).await
+        self.query_edn_with_fuel(query, args, None).await
+    }
+
+    /// Runs a raw boundary-[`Edn`] query with positional argument forms and
+    /// an optional execution-fuel limit.
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] for malformed queries or execution failures.
+    pub async fn query_edn_with_fuel(
+        &self,
+        query: Edn,
+        args: Vec<Edn>,
+        fuel: Option<u64>,
+    ) -> Result<QueryResult, ClientError> {
+        self.backend.query(self.view, query, args, fuel).await
     }
 
     /// Pulls a typed [`Pull`] specification for one entity.
@@ -285,9 +326,15 @@ impl Db {
     /// # Errors
     /// Returns [`ClientError`] for malformed patterns or unknown idents.
     pub async fn pull(&self, pattern: &Pull, entity: impl IntoEdn) -> Result<Edn, ClientError> {
-        self.backend
-            .pull(self.view, pattern.to_edn(), entity.into_edn())
-            .await
+        self.pull_edn(pattern.to_edn(), entity.into_edn()).await
+    }
+
+    /// Pulls a raw boundary-[`Edn`] pattern for one entity.
+    ///
+    /// # Errors
+    /// Returns [`ClientError`] for malformed patterns or unknown idents.
+    pub async fn pull_edn(&self, pattern: Edn, entity: Edn) -> Result<Edn, ClientError> {
+        self.backend.pull(self.view, pattern, entity).await
     }
 
     /// Scans datoms from a covering index, binding `components` as a leading

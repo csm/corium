@@ -1,0 +1,25 @@
+[package]
+name = "corium-ffi"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Owned facade for Corium language bindings"
+
+[dependencies]
+corium-client = { workspace = true }
+corium-peer = { workspace = true }
+corium-protocol = { workspace = true }
+corium-query = { workspace = true }
+thiserror = "2"
+tonic = { version = "0.14.5", features = ["tls-ring"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+corium-transactor = { workspace = true }
+tempfile = "3"
+tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true
