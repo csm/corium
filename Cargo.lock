@@ -2108,9 +2108,7 @@ dependencies = [
  "corium-log",
  "corium-tx",
  "criterion",
- "indexmap",
  "proptest",
- "rpds",
  "thiserror",
 ]
 

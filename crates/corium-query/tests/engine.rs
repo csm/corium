@@ -1,12 +1,18 @@
 //! End-to-end engine tests over a hand-built database value.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use corium_core::{
     Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, Partition, Schema, Unique,
     Value, ValueType,
 };
 use corium_db::{Db, Idents};
+use corium_query::builtins::CallResult;
 use corium_query::edn::{Edn, read_one};
-use corium_query::{Entity, QInput, QueryCache, pull, q_str};
+use corium_query::{Entity, ExecOptions, QInput, QueryCache, pull, q_str, run};
 
 fn attr_id(n: u64) -> EntityId {
     EntityId::new(Partition::Db as u32, n)
@@ -251,6 +257,47 @@ fn not_and_or_clauses() {
     )
     .expect("or");
     assert_eq!(rows(&or_result).len(), 2);
+}
+
+#[test]
+fn duplicate_intermediate_frames_are_removed_before_the_next_clause() {
+    let db = fixture();
+    let query = corium_query::ast::parse_query(
+        &read_one(
+            "[:find ?name
+              :where [?e :person/name ?name]
+                     (or [?e :person/age ?age] [?e :person/age ?age])
+                     [(observed? ?age)]]",
+        )
+        .expect("edn"),
+    )
+    .expect("query");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let (result, _) = run(
+        &query,
+        &[QInput::Db(&db)],
+        ExecOptions {
+            extern_call: Some(Arc::new(move |name, _| {
+                (name == "observed?").then(|| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    Ok(CallResult::Test(true))
+                })
+            })),
+            ..ExecOptions::default()
+        },
+    )
+    .expect("query");
+
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        rows(&result),
+        vec![
+            Edn::Vector(vec![Edn::Str("alice".into())]),
+            Edn::Vector(vec![Edn::Str("bob".into())]),
+            Edn::Vector(vec![Edn::Str("carol".into())]),
+        ]
+    );
 }
 
 #[test]
