@@ -199,6 +199,14 @@ Design constraints on the traits (so future backends fit without change):
   - **FileStore** — segments as `objects/ab/cdef…` files (write-temp +
     rename), roots as files updated by lock-file-guarded atomic rename.
 
+Encryption at rest ([encryption.md](encryption.md),
+[ADR-0017](../adr/0017-encryption-at-rest.md)) is proposed as a `BlobStore`
+decorator above the cache: blobs are sealed under a per-database data key, and
+a blob id becomes the digest of the stored *encrypted* object. Because that
+encryption is deterministic for a given (epoch, content), idempotent `put`,
+structural sharing, keyless integrity verification, GC, and backup all keep
+working exactly as described above.
+
 A read-through, size-bounded **segment cache** wraps `BlobStore` reads. The
 peer's optional SSD tier, LRU and capacity semantics, crash behavior, operator
 configuration, and metrics are specified in

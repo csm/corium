@@ -86,6 +86,15 @@ definite current basis and the underlying storage connection; the backup
 client then leaves the transactor and reads the bounded native log range
 directly.
 
+### OperatorService (operator tools → operator peer service) *(proposed)*
+
+Job submission, planning, approval, cancellation, and watching; schedules; and
+fleet, database, storage, and key inspection — with a JSON/HTTP gateway over the
+same surface for the UI and for scripting. It is a separate service from
+`Catalog` on purpose: the transactor's latency belongs to the commit pipeline,
+so it is called by the operator service rather than extended into it. See
+[operator-service.md](operator-service.md).
+
 ### PeerServerService (thin clients → peer server)
 
 For languages without the peer library; queries run server-side on a hosted
@@ -123,7 +132,15 @@ vectors ship with it so third parties can write clients.
 - Peer servers enforce per-request fuel, result-size, and concurrency limits;
   the transactor enforces tx-size and queue limits.
 - The blob store is assumed private to the deployment (peers have direct
-  credentials to it, as in Datomic).
+  credentials to it, as in Datomic). Encryption at rest
+  ([encryption.md](encryption.md)) is proposed to remove that assumption for
+  blobs, log records, backups, and cached segments.
+- Attribute protection classes (proposed) seal values under per-class keys
+  before they leave the writing peer, so tx-data, tx-reports, datom streams,
+  and query results may carry sealed values that only a key-holding reader can
+  hydrate. This adds a value tag to the codec and a thin-client protocol
+  version; a peer server either hydrates per request or forwards sealed values
+  (`--seal-through`) for end-to-end protection.
 
 ## Embedded transport
 

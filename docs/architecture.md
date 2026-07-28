@@ -68,6 +68,15 @@ immutable database value on which **all query execution happens locally**:
 Datalog, Pull, entity API, index scans, time-travel views. Getting a database
 value never blocks on the transactor.
 
+### Operator service *(proposed)*
+
+A peer whose workload is operations rather than queries: it runs backup,
+restore, fork, GC, index publication, and the encryption migrations as
+resumable, auditable jobs, and serves an operator API (and eventually a web UI)
+over them. Nothing in the data plane depends on it, and it holds no authority
+the policy database has not granted. See
+[design/operator-service.md](design/operator-service.md).
+
 ### Peer server + thin clients
 
 A peer hosted as a standalone process exposing query/transact/pull over gRPC
@@ -104,6 +113,8 @@ A single Cargo workspace. Dependency edges point strictly downward.
 | `corium-cljrs` | Clojurust bindings: value conversion, `(d/q …)` API, db-function sandbox host |
 | `corium-cli` | `corium` binary: admin commands, query console, standalone transactor/peer-server launchers |
 | `corium-sim` | Deterministic simulation harness for tests (not published) |
+| `corium-crypt` *(proposed)* | AEAD primitives, deterministic value sealing, key derivation, `KeyId`/`SecretKey`/`Keyring` and its static and KMS-backed implementations ([encryption.md](design/encryption.md)) |
+| `corium-operator` *(proposed)* | Operator peer service: job model and checkpointing, registry database, schedules and approvals, `Operator` gRPC and JSON gateway ([operator-service.md](design/operator-service.md)) |
 
 `corium-core`, `corium-index`, `corium-store`, `corium-log`, `corium-tx`,
 `corium-query`, and `corium-db` are pure library code with no tokio/network

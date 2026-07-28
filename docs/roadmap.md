@@ -203,6 +203,50 @@ Security and multi-tenancy:
   value-level view filtering in the query engine (executor predicate plus
   query-cache keying), which is what an `AllowFiltered` decision needs before a
   read path can serve it, and mTLS subject extraction.
+- **Encryption at rest.** *(Specified.)* Envelope-encrypt every durable
+  artifact — index blobs, log record payloads, backup archives, cached
+  segments — under a per-database data key wrapped by a KMS or operator file,
+  with a new `corium-crypt` crate and a `Keyring` seam. Encryption is a
+  `BlobStore` decorator above the segment cache, and a blob id becomes the
+  digest of the stored encrypted object, so idempotent `put`, structural
+  sharing, keyless integrity verification, GC, and backup are all preserved.
+  Storage format 4, backup format 2. See
+  [encryption.md](design/encryption.md) and
+  [ADR-0017](adr/0017-encryption-at-rest.md).
+- **Attribute protection classes.** *(Specified.)* Per-attribute confidentiality
+  under separate keys: a class names a key id, the writing peer seals values
+  before tx-data leaves it, and only a reader whose keyring resolves that class
+  hydrates them — the transactor never holds a class key and cannot forge a
+  protected fact. Sealing is deterministic so retraction pairing, supersession,
+  deduplication, and `:db/cas` keep working bytewise; protected datoms are
+  excluded from AVET and VAET, so filtering one means scanning it. Protecting,
+  unprotecting, and re-classifying a populated attribute are legal and
+  forward-only — old datoms keep the form they were asserted in — with legacy
+  plaintext redacted on read by default, a sweep that seals the current values,
+  and `corium keys audit` reporting what plaintext remains. Needs
+  `Value::Sealed` and its encoding, schema validation, peer-side sealing,
+  hydration in `ExecOptions` with key-set-aware query caching, `ReserveEntityIds`
+  plus a basis fence for entity-scoped classes, thin-client protocol v3, SQL
+  redaction, and the `corium keys` surface. See
+  [ADR-0018](adr/0018-attribute-protection-classes.md).
+
+- **Operator peer service.** *(Specified.)* A peer whose workload is operations:
+  backup, restore, fork, GC, index publication, and the encryption migrations
+  become resumable, idempotent, singleton-per-target **jobs** with progress,
+  cancellation, plan/apply, and two-person approval for the irreversible ones.
+  Its registry — jobs, schedules, approvals, fleet observations, audit — is an
+  ordinary Corium database, so operational history is backed up and
+  time-travelable. An `Operator` gRPC service plus a JSON/HTTP gateway (the
+  first customer for the gateway item below) carries it, the CLI becomes a
+  client that still works with no service configured, and a web UI follows once
+  the API has been stable through a release. Nothing in the data plane may ever
+  depend on it — which is also what keeps multi-tenant operations open, since a
+  component nothing depends on can be run once per slice. Tenancy itself is not
+  designed; the design instead keeps the implicitly global things out (per-target
+  leases, globally unique job ids, recorded job scope, approval checked on the
+  target, per-database key configuration, a scoped fleet view). See
+  [operator-service.md](design/operator-service.md) and
+  [ADR-0019](adr/0019-operator-peer-service.md).
 
 Engine and API:
 

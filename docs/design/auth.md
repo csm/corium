@@ -460,6 +460,41 @@ straightforward while allowing Corium-only deployments to avoid another
 service, another consistency boundary, and another cache layer.
 
 
+## Operator actions
+
+The proposed [operator peer service](operator-service.md) authorizes through
+this same seam rather than inventing policy of its own: new `Action` variants
+(`SubmitJob`, `ApproveJob`, `CancelJob`, `ReadFleet`, `ManageSchedule`,
+`ManageKeys`) against object names the ReBAC model already expresses
+(`job:backup`, `database:music`, `catalog:*`, `class:protect/pii`). Its registry
+is an ordinary Corium database for the same reasons the policy database is one,
+and `corium authz check` explains an operator denial exactly as it explains an
+application one.
+
+Authority over a *group* of databases — one operator service dedicated to a
+slice of the system — needs no new policy language either: a `parent` tuple from
+each database to a grouping object, plus a rewrite deriving `owner` on the
+database from `owner` on its parent, is the existing mechanism doing exactly
+what it was built for. The missing piece is smaller and worth landing early:
+**database creation should be able to record the object that owns it**, so the
+parent tuple exists from the first transaction rather than being backfilled
+across an established catalog later.
+
+## Relationship to encryption
+
+Authorization and encryption are two independent controls over the same facts,
+and [encryption.md](encryption.md) specifies the second one. A `ViewFilter` is
+enforced by the process that already holds the plaintext, so it answers "who
+*should* see this"; an attribute protection class withholds the key, so it
+answers "who *can*". A compromised or misconfigured peer defeats the first and
+not the second, which is why the design keeps both rather than choosing.
+
+They meet at one seam: a `KeyPolicy` maps a `Principal` onto the key ids a
+request may hydrate, so the same policy database can express both, while the
+enforcement stays independent. Attribute redaction driven by an absent key is
+also the cheapest first customer for the filtering work below — it is
+enforceable directly in the datom scan, with no executor predicate.
+
 ## Open questions
 
 - **View filtering in the query engine.** This is now the gap that matters: an

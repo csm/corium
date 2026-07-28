@@ -22,6 +22,15 @@ corium tui <uri>                           # full-screen dashboard (queries + me
 Config files are EDN (read via cljrs-reader): storage backend + credentials,
 listen addresses, TLS, memory/fuel budgets, index thresholds.
 
+For several of these the CLI is not a client but the implementation: `backup`
+and `restore` open the blob store and native log directly, and offline `gc` runs
+mark-and-sweep in-process with the transactor stopped. The proposed
+[operator peer service](operator-service.md) moves those duties — plus fork,
+index publication, and the encryption migrations — into a process that can
+outlive a shell, checkpoint, resume, and record what it did, leaving the CLI as
+a client of them. Every command keeps working with no service configured, which
+is what keeps a development database free of a control plane.
+
 ## Query console
 
 `corium console` embeds a peer and a line editor (rustyline):
