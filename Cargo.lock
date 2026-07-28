@@ -1956,6 +1956,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "corium-crypt"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "blake3",
+ "proptest",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "corium-db"
 version = "0.1.0"
 dependencies = [
@@ -2147,6 +2160,7 @@ dependencies = [
  "aws-sdk-s3",
  "blake3",
  "corium-core",
+ "corium-crypt",
  "deadpool-postgres",
  "fs2",
  "rustls 0.23.42",

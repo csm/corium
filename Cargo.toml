@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/corium-crypt",
     "crates/corium-core",
     "crates/corium-index",
     "crates/corium-store",
@@ -29,6 +30,7 @@ members = [
 # Build and test them standalone (`cargo test -p corium-cljrs`, `-p
 # corium-mbrainz`), where they keep GC mode; `--workspace` builds still unify.
 default-members = [
+    "crates/corium-crypt",
     "crates/corium-core",
     "crates/corium-index",
     "crates/corium-store",
@@ -70,6 +72,7 @@ corium-authz = { path = "crates/corium-authz", version = "0.1.0" }
 corium-cli = { path = "crates/corium-cli", version = "0.1.0" }
 corium-client = { path = "crates/corium-client", version = "0.1.0" }
 corium-cljrs = { path = "crates/corium-cljrs", version = "0.1.0" }
+corium-crypt = { path = "crates/corium-crypt", version = "0.1.0" }
 corium-core = { path = "crates/corium-core", version = "0.1.0" }
 corium-db = { path = "crates/corium-db", version = "0.1.0" }
 corium-ffi = { path = "crates/corium-ffi", version = "0.1.0" }

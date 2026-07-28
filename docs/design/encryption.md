@@ -1,7 +1,9 @@
 # Encryption at Rest and Attribute Protection
 
-Status: **specified, not implemented.** This document proposes two independent
-layers — envelope encryption of every durable artifact
+Status: **implementation in progress.** The storage-encryption primitives and
+blob-store decorator are implemented; log, manifest, backup, process wiring,
+and attribute protection remain. This document specifies two independent layers
+— envelope encryption of every durable artifact
 ([ADR-0017](../adr/0017-encryption-at-rest.md)) and per-attribute protection
 classes keyed by separate data keys
 ([ADR-0018](../adr/0018-attribute-protection-classes.md)) — and fixes the
@@ -164,7 +166,7 @@ computes it before `put`. Under encryption the id becomes **the hash of the
 stored (encrypted) object**:
 
 ```
-object := header ‖ ciphertext ‖ tag
+object := header ‖ nonce ‖ ciphertext ‖ tag
 header := magic "CORIUMB1" ‖ alg:u8 ‖ epoch:u32 ‖ plaintext-len:u64
 nonce  := BLAKE3_keyed(dek, "corium/blob-nonce" ‖ header ‖ blake3(plaintext))[..12]
 AAD    := header
@@ -173,7 +175,11 @@ id     := blake3(object)
 
 Deriving the nonce from the plaintext digest makes encryption **deterministic
 for a given (epoch, content)**, which is what preserves every property the
-segment design depends on:
+segment design depends on. The nonce is stored because a reader cannot derive
+it from the plaintext digest until after decryption; it is non-secret, and any
+tampering is detected by the AEAD tag.
+
+The resulting properties are:
 
 - `put` stays idempotent, and re-publishing an unchanged leaf produces the same
   id, so structural sharing and incremental publication are untouched.
@@ -188,10 +194,11 @@ multi-tenant deployment, an improvement.
 
 API shape: encryption is a **decorator** — `EncryptedBlobStore<S: BlobStore>` —
 so `mark_and_sweep`, `index_blob_children`, backup, and every reader see
-plaintext and stay unchanged. The one signature adjustment is that the store,
-not the caller, now computes the id: `put_content(bytes) -> BlobId` alongside
-the existing `put(&id, bytes)` (which a plaintext store keeps and an encrypted
-store rejects for non-matching ids).
+plaintext and stay unchanged. `BlobStore::put(bytes) -> BlobId` already makes
+the store responsible for computing the id, so the decorator encrypts before
+delegating. It also overrides `put_if_absent`, deriving the ciphertext id before
+the presence check rather than using the plaintext digest from the trait's
+default implementation.
 
 **Placement in the read stack matters:**
 
