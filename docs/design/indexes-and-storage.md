@@ -72,10 +72,65 @@ reader replays the tail from storage.
 The implemented publication (storage format 3) is a first cut of the
 segment-tree design: each covering index is stored as a manifest blob
 naming content-defined leaf chunks (`corium-store`'s `snapshot` module),
-and only chunks absent from the store are uploaded, so consecutive roots
-share every untouched chunk. Inner tree levels (and with them seek-without-
-full-download) are still future work; readers concatenate a manifest's
-chunks and accept pre-format-3 flat snapshots.
+so consecutive roots share every untouched chunk. Inner tree levels (and
+with them seek-without-full-download) are still future work; readers
+concatenate a manifest's chunks and accept pre-format-3 flat snapshots.
+
+The consequence on the read side is worth being explicit about: because a
+reader cannot yet seek into a published index, **a peer materializes the whole
+thing in memory**. Its database value keeps every datom it has seen — the full
+history, retractions included — and folds four covering indexes over that log
+per time view, lazily and cached. Facts are allocated once and shared by handle
+across the log and every index, so the indexes cost keys and pointers rather
+than copies, but nothing is evicted and a cold time view costs a fold of the
+entire history rather than of the view. So a peer today is an in-memory
+database whose durable storage reconstructs its state rather than bounds it:
+size peers against total history, and expect first-touch latency on a distinct
+`as-of`/`since`/`history` view to scale with history rather than with the
+answer. Lazy descent through the segment cache is what closes this, and
+`docs/design/time-model.md` records the current costs per view.
+
+One rule (`corium-core`'s `chunk` module) decides where a sorted key stream
+is cut, and both the published format and the in-memory segment
+(`corium-index`) obey it — so **a segment's leaf is exactly one published
+chunk**. That is what makes the indexing job incremental rather than a
+rebuild: the transactor keeps the segments it last published, folds the log
+tail since that basis into them (`Segment::apply`, the same current-value
+fold the `Db` value applies to its own covering indexes), and gets back
+segments whose untouched leaves are the *same allocations*. A leaf carried
+over by handle keeps the blob id it was published under, so the pass encodes,
+hashes, and uploads only the leaves the tail rebuilt. Work per pass tracks
+the tail plus one pointer per leaf, not the size of the database.
+
+A fold keeps only the key each datom encodes to, and the transactor holds the
+datoms it is indexing already, so it hands them over by reference
+(`Segment::apply_ref`, `Segment::from_sorted_ref`): neither the tail nor — on
+a rebuild — the database's own covering index is copied to be indexed.
+
+Because boundaries depend only on the boundary key, a transactor that has to
+rebuild a segment from scratch — its first publication, or after a takeover —
+reproduces the chunks the previous process published and re-uploads only what
+genuinely changed.
+
+Rebuilding is also the safety valve, and the rule that decides when it is
+required is a garbage-collection rule. A carried leaf is published *by id*,
+without its bytes being uploaded, and nothing but the root that names it keeps
+it from being swept. So a pass may carry chunks over only while it can prove
+that root is live throughout: it requires the published root to be the one
+this transactor last installed, and then **pins that index state through the
+root CAS** — the CAS re-checks the pin against the record it read immediately
+before writing, and is conditional on exactly those bytes, so there is no
+window in which another publisher can replace the root between the check and
+the write. If the pin fails, nothing is installed and the pass retries from a
+rebuild, which names no chunk it did not upload and so cannot be raced this
+way. The pin deliberately ignores the lease fields of the same record: an
+ordinary renewal rewrites them without dropping a chunk.
+
+Without that pin the sequence *read root A → plan and upload → another
+publisher installs B → GC marks from B and sweeps chunks reachable only
+through A → install C naming those chunks* leaves the live root pointing at
+deleted blobs, and the basis-monotonicity check alone does not prevent it,
+because C's basis can legitimately exceed B's.
 
 The implemented peer bootstrap follows that rule for the current value: a
 peer initialized with a blob/root storage connection reads `meta:<db>` and

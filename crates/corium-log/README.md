@@ -26,10 +26,13 @@ Pure, synchronous library code — no async or network dependencies.
 
 Logs are append-only and replayable: given the log, the entire index state is
 reconstructible, which is what makes peer crash/restart lossless and GC safe.
-Records are length-framed and value-encoded with `corium-core`'s codec so a
-partial trailing write is detectable (`LogError::Corrupt`) rather than silently
-accepted. For high availability the log is split into per-lease-version files;
-merged replay orders them by lease version and drops appends from a fenced-out
-writer, so a standby that takes over never replays a deposed transactor's
-uncommitted tail. See
+Records are length-framed, value-encoded with `corium-core`'s codec, and
+protected by a per-record CRC32C over the frame header and payload. Replay
+rejects a fully written frame whose contents changed, while a partial trailing
+write is discarded as an unacknowledged torn tail. The format bit in the length
+word lets upgraded readers continue to replay legacy length-only frames; every
+new append is checksummed. For high availability the log is split into
+per-lease-version files; merged replay orders them by lease version and drops
+appends from a fenced-out writer, so a standby that takes over never replays a
+deposed transactor's uncommitted tail. See
 [`docs/design/log-and-transactor.md`](../../docs/design/log-and-transactor.md).

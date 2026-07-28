@@ -71,7 +71,7 @@ processes. Each crate has its own README.
 | Crate | What it does |
 |---|---|
 | [`corium-core`](crates/corium-core/README.md) | `Value`, sortable encoding, `Datom`, ids, partitions, schema model, errors |
-| [`corium-index`](crates/corium-index/README.md) | Immutable segment trees, EAVT/AEVT/AVET/VAET indexes, live index, merge iterators |
+| [`corium-index`](crates/corium-index/README.md) | Immutable covering-index segments (EAVT/AEVT/AVET/VAET) whose leaves are the published chunks; incremental apply with structural sharing |
 | [`corium-store`](crates/corium-store/README.md) | `BlobStore` + `RootStore` traits; memory/fs/postgres/turso/s3 backends; segment cache |
 | [`corium-log`](crates/corium-log/README.md) | Durable append-only transaction log: format, append/replay, range scans |
 | [`corium-tx`](crates/corium-tx/README.md) | Transaction expansion, tempid/lookup resolution, schema validation, built-in tx fns |

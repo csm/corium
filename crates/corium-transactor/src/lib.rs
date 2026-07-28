@@ -17,15 +17,25 @@ pub use backend::{S3ReadOnlyConfig, S3ReadOnlyCredentials};
 
 use corium_core::{EntityId, IndexOrder, KeywordInterner, Partition, Schema};
 use corium_db::{Db, FIRST_USER_ID, Idents};
-use corium_index::Segment;
+use corium_index::{Leaf, LeafId, Segment};
 use corium_log::{LogError, TransactionLog, TxRecord};
-use corium_store::{BlobStore, RootStore, StoreError};
+use corium_store::{BlobId, BlobStore, RootStore, StoreError};
 use corium_tx::{PreparedTx, TxError, TxItem, prepare};
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, mpsc},
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+
+/// The covering indexes a database publishes, in the slot order [`DbRoot`]
+/// stores their blob ids in.
+const ORDERS: [IndexOrder; 4] = [
+    IndexOrder::Eavt,
+    IndexOrder::Aevt,
+    IndexOrder::Avet,
+    IndexOrder::Vaet,
+];
 
 /// Result delivered after a transaction is durable and visible.
 #[derive(Clone, Debug)]
@@ -217,11 +227,54 @@ impl BatchCursor {
     }
 }
 
+/// The snapshot this transactor last installed at the published root, kept so
+/// the next indexing pass folds the log tail into it instead of rebuilding
+/// every covering index from scratch.
+struct PublishedIndexes {
+    /// Lease version and index basis the published root carries; both are
+    /// checked against that root before the pass trusts anything below.
+    lease_version: u64,
+    basis_t: u64,
+    /// Segments in [`ORDERS`] slot order, whose leaves are the chunks named
+    /// by `manifests`.
+    segments: [Segment; 4],
+    /// Manifest blob id per index, matched against the stored root to prove
+    /// a live root still references the chunks this pass carries over — so
+    /// garbage collection cannot have swept one out from under it.
+    manifests: [BlobId; 4],
+    /// The chunk each leaf was published as. A leaf carried over from this
+    /// snapshot is already in the store under this id, so the next pass
+    /// neither re-encodes nor re-uploads it.
+    chunks: [HashMap<LeafId, BlobId>; 4],
+}
+
+impl PublishedIndexes {
+    /// Whether `root` is still exactly the root this snapshot published.
+    fn is_current(&self, root: Option<&DbRoot>, lease_version: u64) -> bool {
+        root.is_some_and(|root| {
+            self.lease_version == lease_version
+                && root.lease_version == lease_version
+                && root.index_basis_t == self.basis_t
+                && root.roots.as_ref() == Some(&self.manifests)
+        })
+    }
+}
+
+/// One index's chunk after a pass has decided what to do with it.
+enum ChunkPlan {
+    /// A leaf carried over from the last publication; already stored under
+    /// this id, so the pass neither encodes nor uploads it.
+    Published(BlobId),
+    /// A rebuilt leaf, encoded and awaiting upload.
+    Rebuilt(Vec<u8>),
+}
+
 /// A serialized, in-process transactor. The log append is the commit point.
 pub struct EmbeddedTransactor {
     log: Arc<dyn TransactionLog>,
     state: Mutex<State>,
     async_commit: tokio::sync::Mutex<()>,
+    published: Mutex<Option<PublishedIndexes>>,
 }
 impl EmbeddedTransactor {
     /// Recovers a transactor by replaying the durable log exactly once.
@@ -259,6 +312,7 @@ impl EmbeddedTransactor {
                 async_pending: false,
             }),
             async_commit: tokio::sync::Mutex::new(()),
+            published: Mutex::new(None),
         })
     }
 
@@ -296,6 +350,7 @@ impl EmbeddedTransactor {
                 async_pending: false,
             }),
             async_commit: tokio::sync::Mutex::new(()),
+            published: Mutex::new(None),
         }
     }
 
@@ -351,6 +406,7 @@ impl EmbeddedTransactor {
                 async_pending: false,
             }),
             async_commit: tokio::sync::Mutex::new(()),
+            published: Mutex::new(None),
         })
     }
 
@@ -386,6 +442,7 @@ impl EmbeddedTransactor {
                 async_pending: false,
             }),
             async_commit: tokio::sync::Mutex::new(()),
+            published: Mutex::new(None),
         })
     }
 
@@ -611,16 +668,34 @@ impl EmbeddedTransactor {
         state.db = state.db.clone().with_naming(idents, interner);
     }
 
-    /// Builds a consistent snapshot of all four indexes and publishes their blob ids.
+    /// Publishes a consistent snapshot of all four covering indexes.
     ///
-    /// Each index is chunked into content-defined leaf blobs under a
-    /// manifest blob ([`corium_store::chunk_segment_keys`]), and only
-    /// chunks absent from the store are uploaded — consecutive publications
-    /// share every unchanged chunk, so a small change re-uploads a few
-    /// chunks instead of the whole index.
+    /// The pass folds the log tail since the last publication into the
+    /// segments that publication produced ([`corium_index::Segment::apply`]),
+    /// so its cost tracks the tail rather than the size of the database: a
+    /// segment's leaf is exactly one published chunk, and a leaf the tail did
+    /// not touch is carried over by handle and keeps the blob id it already
+    /// has. Only rebuilt leaves are encoded, hashed, and uploaded, under a
+    /// manifest blob naming every chunk in key order.
     ///
-    /// Blobs are uploaded before the root CAS. Transactions may continue while the
-    /// immutable snapshot is encoded; a later run indexes any remaining log tail.
+    /// A carried-over chunk is published by id without being re-uploaded, and
+    /// nothing but the root that names it keeps it from being swept. So a pass
+    /// carries chunks over only while it can prove that root is live: it
+    /// requires the published root to be the one this transactor last
+    /// installed, *and* pins that index state through the CAS, which installs
+    /// only if the root never changed in between. A takeover, a concurrent
+    /// publisher, or a root rolled back therefore costs a rebuild rather than
+    /// a manifest naming chunks the sweep is free to delete.
+    ///
+    /// Rebuilding is always available and always correct — it is also what the
+    /// first publication of a process does — and it reuses no chunk id, so it
+    /// cannot be raced this way. It re-encodes every chunk, but reproduces the
+    /// boundaries the previous publication cut, so it re-uploads only what
+    /// genuinely changed.
+    ///
+    /// Blobs are uploaded before the root CAS. Transactions may continue while
+    /// the immutable snapshot is encoded; a later run indexes any remaining
+    /// log tail.
     ///
     /// Publication is fenced by `lease_version` and monotone in
     /// `index_basis_t`: a root already published under a newer lease version
@@ -637,53 +712,241 @@ impl EmbeddedTransactor {
         root_name: &str,
         lease_version: u64,
     ) -> Result<DbRoot, TransactError> {
+        let previous = self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let PassOutcome::Published(root) = self
+            .publish_pass(store, root_name, lease_version, previous)
+            .await?
+        {
+            return Ok(root);
+        }
+        // The root's index state moved under a pass that was carrying chunks
+        // over from the last publication, so nothing was installed. Rebuilding
+        // reuses no chunk id, so the retry has nothing left to be raced for.
+        match self
+            .publish_pass(store, root_name, lease_version, None)
+            .await?
+        {
+            PassOutcome::Published(root) => Ok(root),
+            PassOutcome::Raced => {
+                unreachable!("a pass that carries nothing over publishes unconditionally")
+            }
+        }
+    }
+
+    /// One publication attempt, optionally folding the tail into `previous`
+    /// rather than rebuilding.
+    async fn publish_pass(
+        &self,
+        store: &(impl BlobStore + RootStore),
+        root_name: &str,
+        lease_version: u64,
+        previous: Option<PublishedIndexes>,
+    ) -> Result<PassOutcome, TransactError> {
+        let stored = store
+            .get_root(root_name)
+            .await?
+            .as_deref()
+            .and_then(DbRoot::decode);
+        if let Some(published) = stored.as_ref().map(|root| root.lease_version)
+            && published > lease_version
+        {
+            return Err(TransactError::Deposed { published });
+        }
         let (snapshot, next_entity_id, last_tx_instant) = self.recovery_snapshot();
-        let datoms = snapshot.datoms();
-        let chunked = tokio::task::spawn_blocking(move || {
-            [
-                IndexOrder::Eavt,
-                IndexOrder::Aevt,
-                IndexOrder::Avet,
-                IndexOrder::Vaet,
-            ]
-            .into_iter()
-            .map(|order| {
-                let segment = Segment::build(order, datoms.clone());
-                corium_store::chunk_segment_keys(segment.entries().map(|(key, _)| key.as_slice()))
-            })
-            .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|error| TransactError::IndexTask(error.to_string()))?;
-        let mut ids = Vec::new();
-        for chunks in chunked {
-            let mut children = Vec::new();
+        let basis_t = snapshot.basis_t();
+        let previous = previous.filter(|previous| {
+            previous.is_current(stored.as_ref(), lease_version) && previous.basis_t <= basis_t
+        });
+        // Carrying a chunk over publishes its blob id without re-uploading it,
+        // and nothing but the root that names it keeps it from being swept.
+        // Pinning the index state this pass validated makes the root CAS the
+        // fence for those blobs too: it installs only if the root never
+        // changed in between, so the carried chunks stayed referenced by the
+        // live root from the check right through to the write.
+        let pinned = previous
+            .as_ref()
+            .map(|_| RootIndexState::of(stored.as_ref()));
+
+        let (segments, planned) =
+            tokio::task::spawn_blocking(move || plan_indexes(&snapshot, previous.as_ref()))
+                .await
+                .map_err(|error| TransactError::IndexTask(error.to_string()))?;
+
+        let mut manifests = Vec::with_capacity(ORDERS.len());
+        let mut chunk_ids = Vec::with_capacity(ORDERS.len());
+        for chunks in &planned {
+            let mut children = Vec::with_capacity(chunks.len());
             for chunk in chunks {
-                children.push(store.put_if_absent(&chunk).await?);
+                children.push(match chunk {
+                    ChunkPlan::Published(id) => id.clone(),
+                    ChunkPlan::Rebuilt(bytes) => store.put_if_absent(bytes).await?,
+                });
             }
             let manifest = corium_store::encode_index_manifest(&children);
-            ids.push(store.put_if_absent(&manifest).await?);
+            manifests.push(store.put_if_absent(&manifest).await?);
+            chunk_ids.push(children);
         }
+        let manifests: [BlobId; 4] = manifests
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one manifest per covering index"));
         let root = DbRoot {
             format_version: corium_store::FORMAT_VERSION,
             lease_version,
             owner: String::new(),
             lease_expires_unix_ms: 0,
             owner_endpoint: String::new(),
-            index_basis_t: snapshot.basis_t(),
-            roots: Some([
-                ids[0].clone(),
-                ids[1].clone(),
-                ids[2].clone(),
-                ids[3].clone(),
-            ]),
+            index_basis_t: basis_t,
+            roots: Some(manifests.clone()),
             // Recovery hints for opening from this root without full replay.
             next_entity_id,
             last_tx_instant,
         };
-        publish_root(store, root_name, &root).await?;
-        Ok(root)
+        let outcome = publish_root_pinned(store, root_name, &root, pinned.as_ref()).await?;
+        if outcome == RootPublication::Raced {
+            return Ok(PassOutcome::Raced);
+        }
+        let next = PublishedIndexes {
+            lease_version,
+            basis_t,
+            chunks: chunk_ids_by_leaf(&segments, chunk_ids),
+            segments,
+            manifests,
+        };
+        // Keep the pass's segments only when the published root is the one
+        // that describes them — either because this CAS installed it, or
+        // because a publication at this basis had already stored the same
+        // manifests (an indexing run over an unchanged basis). Anything else
+        // leaves these chunks unreferenced, so the next pass must rebuild
+        // rather than assume they survived a sweep.
+        if outcome == RootPublication::Installed || next.is_current(stored.as_ref(), lease_version)
+        {
+            *self
+                .published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
+        }
+        Ok(PassOutcome::Published(root))
     }
+}
+
+/// What one publication attempt produced.
+enum PassOutcome {
+    /// The attempt published this root (installed, or superseded by an equal
+    /// or newer basis).
+    Published(DbRoot),
+    /// The attempt carried chunks over from an earlier publication and the
+    /// root stopped vouching for them before the CAS, so nothing was
+    /// installed and the caller must retry from a rebuild.
+    Raced,
+}
+
+/// The published index state a publication pins the stored root to.
+///
+/// Only the index roots and their basis: the lease fields of the same record
+/// change under an ordinary renewal, which neither drops a chunk nor makes a
+/// carried blob id unsafe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootIndexState {
+    index_basis_t: u64,
+    roots: Option<[BlobId; 4]>,
+}
+
+impl RootIndexState {
+    fn of(root: Option<&DbRoot>) -> Self {
+        Self {
+            index_basis_t: root.map_or(0, |root| root.index_basis_t),
+            roots: root.and_then(|root| root.roots.clone()),
+        }
+    }
+}
+
+/// Builds the four covering-index segments for `snapshot` and decides, leaf by
+/// leaf, which chunks the pass has to encode.
+///
+/// With a usable previous publication this folds only the tail since its basis
+/// into each segment; without one it rebuilds each segment from the database's
+/// own covering index, which is already in key order — so even the fallback
+/// path never sorts. Either way the datoms are read in place and kept only as
+/// the key they encode to, so a pass never copies the facts it indexes.
+fn plan_indexes(
+    snapshot: &Db,
+    previous: Option<&PublishedIndexes>,
+) -> ([Segment; 4], [Vec<ChunkPlan>; 4]) {
+    let mut segments: Vec<Segment> = Vec::with_capacity(ORDERS.len());
+    let mut planned: Vec<Vec<ChunkPlan>> = Vec::with_capacity(ORDERS.len());
+    for (slot, order) in ORDERS.into_iter().enumerate() {
+        let segment = match previous {
+            Some(previous) => previous.segments[slot].apply_ref(
+                order,
+                snapshot
+                    .recorded_since(previous.basis_t)
+                    .filter(|datom| corium_db::covered(snapshot.schema(), order, datom)),
+            ),
+            None => Segment::from_sorted_ref(order, snapshot.datoms_at(order)),
+        };
+        let stored = previous.map(|previous| &previous.chunks[slot]);
+        planned.push(
+            segment
+                .leaves()
+                .map(|leaf| plan_chunk(leaf, stored))
+                .collect(),
+        );
+        segments.push(segment);
+    }
+    (
+        segments
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one segment per covering index")),
+        planned
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one chunk plan per covering index")),
+    )
+}
+
+/// Reuses the blob id a leaf was last published under, or encodes the leaf
+/// when the pass rebuilt it.
+fn plan_chunk(leaf: &Leaf, stored: Option<&HashMap<LeafId, BlobId>>) -> ChunkPlan {
+    match stored.and_then(|stored| stored.get(&leaf.id())) {
+        Some(id) => ChunkPlan::Published(id.clone()),
+        None => ChunkPlan::Rebuilt(corium_store::encode_segment_chunk(
+            leaf.keys().iter().map(Vec::as_slice),
+        )),
+    }
+}
+
+/// Indexes each segment's published chunk ids by leaf, so the next pass can
+/// recognize a carried-over leaf as a chunk it has already stored.
+fn chunk_ids_by_leaf(
+    segments: &[Segment; 4],
+    chunk_ids: Vec<Vec<BlobId>>,
+) -> [HashMap<LeafId, BlobId>; 4] {
+    let mut per_index = chunk_ids.into_iter();
+    std::array::from_fn(|slot| {
+        segments[slot]
+            .leaves()
+            .map(Leaf::id)
+            .zip(per_index.next().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// Whether a fenced root publication installed the root it was given.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootPublication {
+    /// The published root is now this one.
+    Installed,
+    /// A root at an equal or newer basis was already published, so this one
+    /// was not installed and the blobs behind it are left for garbage
+    /// collection.
+    Superseded,
+    /// The publication pinned the index state it was replacing and that state
+    /// changed, so this root was not installed. Only a caller that supplies a
+    /// pin can see this; [`publish_root`] never returns it.
+    Raced,
 }
 
 /// Publishes `root` under the fencing rules described on
@@ -696,10 +959,38 @@ pub async fn publish_root(
     store: &dyn RootStore,
     root_name: &str,
     root: &DbRoot,
-) -> Result<(), TransactError> {
+) -> Result<RootPublication, TransactError> {
+    publish_root_pinned(store, root_name, root, None).await
+}
+
+/// Publishes `root`, optionally only while the stored record still carries
+/// `pinned` as its index state.
+///
+/// A publication that names blobs it did not upload — an indexing pass
+/// carrying chunks over from the last one — has to pin: those blobs are kept
+/// alive only by the root that references them, so installing over a root
+/// that had already dropped them would leave the live root pointing at chunks
+/// the sweep is free to delete. The pin is re-checked against the record read
+/// immediately before each CAS attempt, and the CAS is conditional on exactly
+/// those bytes, so there is no window between the check and the write.
+///
+/// The pin covers the index roots and their basis, not the lease fields of
+/// the same record: an ordinary renewal rewrites those, and losing a pass to
+/// one would be a needless rebuild.
+async fn publish_root_pinned(
+    store: &dyn RootStore,
+    root_name: &str,
+    root: &DbRoot,
+    pinned: Option<&RootIndexState>,
+) -> Result<RootPublication, TransactError> {
     loop {
         let previous = store.get_root(root_name).await?;
         let stored = previous.as_deref().and_then(DbRoot::decode);
+        if let Some(pinned) = pinned
+            && RootIndexState::of(stored.as_ref()) != *pinned
+        {
+            return Ok(RootPublication::Raced);
+        }
         let mut next = root.clone();
         if let Some(stored) = stored {
             if stored.lease_version > root.lease_version {
@@ -710,7 +1001,7 @@ pub async fn publish_root(
             if stored.lease_version == root.lease_version
                 && stored.index_basis_t >= root.index_basis_t
             {
-                return Ok(());
+                return Ok(RootPublication::Superseded);
             }
             // The stored record carries the live lease fields (renewals CAS
             // the same key); publication must not clobber them.
@@ -724,7 +1015,7 @@ pub async fn publish_root(
             .cas_root(root_name, previous.as_deref(), &next.encode())
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(RootPublication::Installed),
             Err(StoreError::CasFailed { .. }) => {}
             Err(error) => return Err(error.into()),
         }
