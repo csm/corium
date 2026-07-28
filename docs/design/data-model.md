@@ -140,8 +140,9 @@ installed through ordinary transactions. v1 supports:
 - `:db/doc`, `:db/noHistory` (skip history index for high-churn attributes).
 - `:db/protection` (proposed) — name a protection class whose key seals this
   attribute's values; mutually exclusive with `:db/index`, `:db/unique`, and
-  `:db.type/ref`, since protected datoms cannot be indexed
-  ([encryption.md](encryption.md)).
+  `:db.type/ref`, since protected datoms cannot be indexed. Alterable, but
+  forward-only like every other fact: datoms asserted before the change keep
+  the form they were written in ([encryption.md](encryption.md)).
 
 The transactor materializes schema into an immutable in-memory `SchemaCache`
 (AttrId → attribute record) rebuilt per basis-t; peers build the same cache

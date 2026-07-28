@@ -285,7 +285,8 @@ Two additions, both ordinary data:
  :db.protect/algorithm      :db.protect.alg/aes-256-gcm-siv
  :db.protect/scope          :db.protect.scope/attribute   ; or /entity
  :db.protect/padding        64                            ; optional, bytes
- :db.protect/on-missing-key :db.protect.missing/redact}   ; or /hide, /error
+ :db.protect/on-missing-key :db.protect.missing/redact    ; or /hide, /error
+ :db.protect/legacy-plaintext :db.protect.legacy/redact}  ; or /pass-through
 
 ;; An attribute in that class.
 {:db/ident       :person/ssn
@@ -304,17 +305,27 @@ Rules the transactor enforces, all without holding any key:
    indexed" rule, made checkable at schema-install time.
 2. `:db/protection` may not be asserted on schema attributes, `:db/ident`,
    `:db/txInstant`, or any attribute in the reserved id range.
-3. Protection is **fixed at attribute install**. Adding, removing, or changing
-   the class of an attribute that already has datoms is rejected: the existing
-   datoms would silently stay in the old state, which is the worst possible
-   outcome. Migration is an explicit rewrite (new attribute, transact the
-   values through a key-holding peer, retract the old one) or a
-   backup/restore-shaped rebuild.
-4. A protected attribute accepts **only** sealed values; an unprotected
-   attribute rejects them. A client that does not understand protection cannot
-   accidentally write plaintext into a protected column.
-5. A sealed value's cleartext header must name the attribute's class and a
-   known epoch, and its declared value type must match `:db/valueType`.
+3. `:db/protection` may be asserted, retracted, or changed on a populated
+   attribute, and takes effect **forward only** — see
+   [Changing protection](#changing-protection). An attribute that has ever been
+   protected may never afterwards gain `:db/index` or `:db/unique`.
+4. **Assertions** must use the form the attribute has *now*: sealed under the
+   current class and current epoch if it is protected, plaintext if it is not.
+   A client that does not understand protection cannot accidentally write
+   plaintext into a protected attribute.
+5. **Retractions**, and the old-value position of `:db/cas`, may use any form
+   the attribute has ever had — plaintext, or sealed under any class and epoch
+   in its protection timeline. A fact can only be retracted by naming the bytes
+   it was asserted as, and those bytes do not change when the schema does.
+6. A sealed value's cleartext header must name a class in the attribute's
+   timeline and a known epoch, and its declared value type must match
+   `:db/valueType`.
+
+Rules 4 and 5 make the schema cache carry a **protection timeline** per
+attribute — the `(t, class)` pairs its `:db/protection` datoms already record —
+rather than a single current class. The form required at basis `t` is what the
+timeline says at `t`; the forms *accepted* for a retraction are every entry in
+it.
 
 ### The sealed value
 
@@ -446,6 +457,137 @@ feature keeps that price visible. (An engine-level `:db.protect/blind-index`
 that derives and maintains the second attribute automatically is a plausible
 follow-up; it would not change any of the above.)
 
+### Changing protection
+
+Protecting an attribute, unprotecting it, or moving it to another class are all
+legal alterations, and all of them are **forward-only**: a datom keeps the form
+it was asserted in, forever. Nothing rewrites the log, and nothing re-encrypts
+history, because that is the one thing an immutable database does not do.
+
+That is the consistent answer, and it is also the surprising one — "I protected
+the attribute" reads as "the data is now protected", and cryptographically it is
+not. The design's job is to make the gap visible, bounded, and closable rather
+than to pretend the flip did more than it did. Three mechanisms do that, in
+increasing order of strength and cost.
+
+#### What each transition does
+
+| Alteration | Datoms before `t` | Datoms after `t` |
+|---|---|---|
+| **Protect** (assert `:db/protection`) | plaintext, in the log, the indexes, every peer's memory, and every existing backup | sealed under the new class |
+| **Unprotect** (retract it) | sealed; still need the class key to read, forever | plaintext |
+| **Re-classify** (change the class) | sealed under the old class; readable by holders of the *old* key | sealed under the new class |
+| **Rotate the class key** | sealed under the old epoch | sealed under the new epoch |
+
+A sealed value carries its class and epoch in its cleartext header, so a mixed
+attribute needs no schema archaeology to read: each datom says what it needs.
+That is why re-classification works at all, and why the timeline in schema rule 5
+is a validation device rather than a decoding one.
+
+The one hard prohibition is re-indexing. An attribute that has ever held sealed
+datoms may never gain `:db/index` or `:db/unique`, because AVET would then mix
+value-ordered plaintext with byte-ordered ciphertext: range scans would return
+silently wrong answers and uniqueness would silently not be enforced. Excluding
+the sealed datoms instead would make AVET *incomplete*, which is worse — a
+lookup ref would miss them. Symmetrically, protecting an attribute that is
+currently `:db/index` or `:db/unique` requires retracting those in the same
+transaction; the next publication stops emitting AVET entries for it, and
+**lookup refs through that attribute stop working**, which is usually the part
+that breaks application code.
+
+#### 1. Legacy plaintext is redacted on read, by default
+
+A reader that cannot hydrate an attribute's sealed values does not get its
+legacy plaintext either. `:db.protect/legacy-plaintext` defaults to `redact`:
+a plaintext datom on an attribute that is *currently* protected is treated
+exactly like a sealed value the reader has no key for, following the class's
+`on-missing-key` policy. `pass-through` restores the literal behaviour for
+deployments that want it.
+
+This is policy, not cryptography — the same strength as a `ViewFilter`, enforced
+by the serving process, defeated by anyone who can read segments directly. But
+it is immediate, free, and it means the *ordinary* consequence of protecting an
+attribute is that keyless readers stop seeing its values, which is what the
+operator expected in the first place. Key holders are unaffected: they see
+plaintext for old datoms and hydrated values for new ones, uniformly.
+
+Deliberate wrinkle: this policy is evaluated against the **current** schema, not
+the schema of the time view being read. An `as-of` before the protection basis
+would otherwise hand back the plaintext by time-travelling under the policy.
+Schema-as-data says the old view had no protection; confidentiality says the
+answer is no. Confidentiality wins, and the exception is documented here
+because it is the one place where a read does not see the schema of its own
+basis.
+
+#### 2. The sweep makes the current value cryptographically protected
+
+Redaction does not help against a reader with storage access, and protection
+alone does not seal a value that nobody has re-asserted since. `corium keys
+protect <attr> --class <c> --sweep` performs the alteration and then, from a
+key-holding peer, walks AEVT and re-asserts every current value in sealed form
+(retracting the plaintext datom and asserting its sealed twin, chunked into
+bounded transactions, resumable, and idempotent — a value already sealed under
+the current class is skipped).
+
+After a sweep the *current* database value holds no plaintext for that
+attribute. History still does, and `as-of` before the sweep still yields it,
+subject to the redaction policy above. A `:db/noHistory` attribute is the happy
+exception: nothing retains the superseded plaintext in any index, so a sweep
+leaves it only in the log — which is the closest thing to retroactive protection
+that does not involve rebuilding or shredding.
+
+Cardinality-many needs care in both directions: across an unswept transition an
+entity can hold both a plaintext and a sealed copy of the same value — they are
+distinct datoms with distinct keys, so a key holder sees a duplicate. The sweep
+removes it; without the sweep it is a real artifact of a mid-life change and
+worth stating plainly. Cardinality-one cannot exhibit this, since supersession
+keys on `(e, a)`.
+
+#### 3. Retroactivity, when it is actually required
+
+Only two things make a protection change retroactive, and both are heavy:
+
+- **Rebuild.** Restore or fork through a key-holding peer that seals on the way
+  in, producing a database whose log never contained the plaintext. This is the
+  only option that also clears history, existing backups (they are new
+  artifacts), and the published index roots. It yields a new database identity.
+- **Re-classify, then shred.** Sweep the current values into a new class, then
+  destroy the old class key. The old ciphertext stays where it is and becomes
+  permanently unreadable — including in history, in every backup, and on every
+  peer. This is the composition that makes crypto-shredding worth having:
+  key destruction is what turns a forward-only change into a retroactive one,
+  and it works *because* the past is immutable rather than in spite of it.
+
+Shredding is class-granular, so it only expresses "this attribute's history"
+when the attribute owns its class. The operational rule that follows: **give an
+attribute its own class whenever you might want to re-classify or shred it
+independently.** Classes are cheap; entanglement is not.
+
+The mirror-image hazard is unprotecting: once an attribute has sealed datoms,
+its class key must be retained for as long as that history matters. Shredding
+after unprotecting destroys the old values while the attribute reads as
+unprotected in the schema, which is the most confusing possible state to arrive
+at by accident.
+
+#### Making the gap measurable
+
+A change this consequential should not be silent, and its residue should be a
+number rather than a worry:
+
+- The alteration is rejected unless the transaction acknowledges it —
+  `[:db/add "datomic.tx" :db.protect/acknowledge-forward-only true]`, which the
+  CLI sets for `corium keys protect` and which a hand-written transaction must
+  set deliberately. The point is not ceremony; it is that the acknowledgement
+  is recorded on the transaction entity, so the schema history says who
+  accepted the semantics and when.
+- `corium keys audit <attr>` reports the exposure directly: the protection
+  basis `t`, how many *current* values are still plaintext, how many historical
+  plaintext datoms exist below `t`, and how many published index roots and
+  backup archives still contain them. A sweep drives the first to zero; only a
+  rebuild or a shred drives the rest there.
+- `corium keys status` prints each attribute's protection timeline, so
+  "protected since" is answerable without querying the schema history by hand.
+
 ### Write path
 
 Sealing happens in the **writing peer**, in `corium-peer`'s transact path,
@@ -454,10 +596,20 @@ it knows every attribute's class:
 
 1. Expand map/list forms far enough to see `(a, v)` pairs (`corium-tx`'s
    expansion is a pure function and already reusable here).
-2. For each protected attribute, resolve the class, get key material from the
-   keyring, seal, and substitute.
+2. For each attribute protected *at the peer's current basis*, resolve the
+   class, get key material from the keyring, seal, and substitute. Retractions
+   are the exception: a retraction carries the bytes of the fact being
+   retracted, which the peer takes from its own `Db` rather than re-sealing, so
+   it names the right form even when that form predates the current class (or
+   predates protection entirely).
 3. Missing key for a class the transaction writes → refuse the transaction with
    `PeerError::MissingKey(class)`. Writing is never partial.
+
+Because sealing reads the peer's schema and the transactor validates against
+its own, a protection change committed between the two rejects the transaction
+rather than storing a value in the stale form — the same staleness the
+`expected_basis_t` fence exists for, and the peer retries against the new
+schema.
 
 The transactor validates, orders, logs, and indexes sealed values without ever
 resolving a key. Specifically it still performs: tempid resolution, cardinality
@@ -502,6 +654,13 @@ decides, and a request may narrow (never widen) it:
 | `hide` | The datom is filtered out of scan results entirely, so `[?e :person/ssn ?s]` binds nothing and the entity drops out of that join — the same shape as an attribute denylist `ViewFilter`. |
 | `error` | The read fails with `QueryError::Protected(class)`. For deployments that would rather see a loud failure than a quiet hole. |
 
+The same three policies cover legacy plaintext — a datom asserted before the
+attribute was protected, when `:db.protect/legacy-plaintext` is `redact` (see
+[Changing protection](#changing-protection)). Both checks happen at the same
+place in the scan, against the same key set: the question "can this reader have
+this attribute's values?" is asked once, and its answer does not depend on which
+side of a schema change the datom fell on.
+
 Under every policy, an unhydratable value never satisfies a value-position
 constant and never satisfies a predicate. It binds, or it disappears, or it
 raises — it never matches by accident.
@@ -532,6 +691,15 @@ datoms keep the old one, because the database is immutable and history is not
 rewritten. A reader needs every epoch it wants to read, and
 `corium keys status --class :protect/pii` prints the epochs in use with datom
 counts per epoch.
+
+An **epoch pins the whole crypto parameter set** — key material, algorithm,
+scope, and padding — because all four are baked into existing ciphertext and its
+AAD. Changing any of them on a class therefore mints a new epoch and is
+forward-only in exactly the way a key rotation is; a class whose scope changes
+from attribute to entity protects new values more strongly and cannot
+retroactively protect old ones. The class's *read* policies —
+`:db.protect/on-missing-key` and `:db.protect/legacy-plaintext` — are not crypto
+parameters, so they change freely and apply immediately to every epoch.
 
 The corollary is a genuinely useful primitive: **destroying a class key makes
 its ciphertext unrecoverable, including in history, in every backup, and on
@@ -582,8 +750,13 @@ corium db create people --schema schema.toml --storage-key awskms:arn:…:key/2f
 # A protection class and an attribute in it (ordinary schema, ordinary transaction).
 corium keys class add :protect/pii --key awskms:arn:…:key/9ab3… --scope entity
 
+# Protect an existing attribute: alter the schema, then seal the current values.
+corium keys protect :person/ssn --class :protect/pii --sweep
+corium keys audit   :person/ssn          # plaintext still current / in history / in backups
+corium keys unprotect :person/legacy-note  # forward-only; old values stay sealed
+
 # Who can read what.
-corium keys status                       # epochs, live-object counts, class key ids
+corium keys status                       # timelines, epochs, live-object counts, key ids
 corium keys rotate --class :protect/pii  # forward-only; new writes use the new epoch
 corium keys rewrap --kek awskms:arn:…    # KEK rotation; no data rewritten
 corium keys shred :protect/pii           # destroys material; irreversible; audited
@@ -606,7 +779,10 @@ Failure modes, all of which must be distinguishable in logs and metrics:
 | Class key missing | reads follow `on-missing-key`; writes to that class refuse |
 | Class key wrong (unwrap succeeds, AEAD fails) | `QueryError::Protected` with the class and epoch, never a decode error |
 | KMS unreachable | cached material keeps serving; new epochs fail; `corium_keys_unavailable` gauge set |
-| Sealed value on an unprotected attribute, or vice versa | transaction rejected at validation |
+| Assertion in the wrong form for the attribute's current state | transaction rejected at validation |
+| Retraction naming a form the attribute never had | transaction rejected at validation |
+| Protection altered without the acknowledgement | transaction rejected, with the remedy in the message |
+| Legacy plaintext read by a keyless reader | follows `legacy-plaintext` (default `redact`); counted in `corium_legacy_plaintext_reads_total` |
 
 Metrics: `corium_seal_ops_total{op,class}`, `corium_seal_errors_total{kind}`,
 `corium_hydrate_cache_{hits,misses}_total`, `corium_blob_decrypt_seconds`,
@@ -643,9 +819,12 @@ records key grants, rotations, and shreds.
 - An existing unencrypted database keeps working untouched, forever. Turning on
   storage encryption for one is a backup/restore into a new database created
   with `--storage-key`.
-- Adding a protection class to an existing schema is additive; protecting an
-  *existing populated attribute* is not, and is rejected (schema rule 3). The
-  migration is the explicit rewrite described there.
+- Adding a protection class to an existing schema is additive, and so is
+  protecting a populated attribute — forward only, per
+  [Changing protection](#changing-protection). The alteration that is *not*
+  available is re-indexing an attribute that has ever been protected, and the
+  one that breaks callers is protecting an attribute currently used in lookup
+  refs, whose `:db/unique` must be retracted at the same time.
 - `Value::Sealed` is a new variant on an enum matched exhaustively in roughly
   thirty places across `corium-query`, `corium-sql`, `corium-pgwire`,
   `corium-cljrs`, `corium-ffi`, and `corium-cli`. That mechanical blast radius
@@ -664,17 +843,22 @@ records key grants, rotations, and shreds.
    init|status|rotate|rewrap`. Deliverable acceptance: a byte scan of a
    populated data directory and blob store finds no sentinel plaintext, and a
    full backup/restore round-trips across a DEK rotation.
-3. **Layer 2 core.** `Value::Sealed`, the `0xA0` encoding, class entities,
-   schema validation rules 1–5, peer-side sealing, transactor keyless
-   validation, EAVT/AEVT-only membership, planner rules.
-4. **Layer 2 read path.** Hydration in `ExecOptions`, redaction policies, query
-   cache keying, pull/entity/datoms surfaces, `corium-cljrs` rendering, console
-   output.
-5. **Entity scope.** `ReserveEntityIds`, local upsert pre-resolution, the
+3. **Layer 2 core.** `Value::Sealed`, the `0xA0` encoding, class entities, the
+   per-attribute protection timeline in the schema cache, schema validation
+   rules 1–6, peer-side sealing, transactor keyless validation, EAVT/AEVT-only
+   membership, planner rules.
+4. **Layer 2 read path.** Hydration in `ExecOptions`, redaction policies
+   (including legacy plaintext), query cache keying, pull/entity/datoms
+   surfaces, `corium-cljrs` rendering, console output.
+5. **Protection changes.** Removing `:db/index`/`:db/unique` as a supported
+   alteration (the prerequisite for protecting an indexed attribute), the
+   forward-only transitions and their acknowledgement, `corium keys
+   protect|unprotect|audit`, and the resumable, chunked sweep.
+6. **Entity scope.** `ReserveEntityIds`, local upsert pre-resolution, the
    `expected_basis_t` fence, and its retry loop.
-6. **Surfaces.** Peer server `KeyPolicy` and `--seal-through`, thin-client
+7. **Surfaces.** Peer server `KeyPolicy` and `--seal-through`, thin-client
    protocol v3, SQL/pgwire redaction and pushdown rules, schema-TOML fields.
-7. **Operations.** Rotation, shredding, metrics, audit events, and the
+8. **Operations.** Rotation, shredding, metrics, audit events, and the
    operations-guide runbook.
 
 Acceptance tests, beyond unit coverage:
@@ -695,6 +879,12 @@ Acceptance tests, beyond unit coverage:
 - **Rotation and shredding:** mixed-epoch trees read correctly; a retired
   storage epoch is drained by a rebuild; after a class shred the database stays
   healthy and reads of that class fail with the documented error.
+- **Protection transitions:** an attribute protected mid-life keeps its old
+  plaintext readable to key holders and redacted to everyone else; a retraction
+  of a pre-protection fact still cancels it; a re-classified attribute is
+  readable only by a holder of *both* keys; a swept attribute has no plaintext
+  current value while `as-of` before the sweep still does; and re-indexing an
+  ever-protected attribute is rejected.
 - **No plaintext at rest:** the sentinel scan of step 2, extended to the log,
   the SSD cache directory, and a backup archive.
 - **Fuzz:** the sealed-value decoder and the encrypted blob/log headers, which
@@ -714,6 +904,19 @@ Acceptance tests, beyond unit coverage:
   ask.
 - **Per-subject keys.** Sketched above and deliberately deferred. The open part
   is the key store's durability and availability contract, not the crypto.
+- **Sweep cost and who runs it.** The sweep must run where the keys are, so it
+  is a peer-side job that rewrites every current value of an attribute —
+  proportional to entity count, not to the change. On a large attribute that is
+  a long-running background migration with its own progress, resumption, and
+  throttling story, and it competes with ordinary writes for the transactor.
+  Whether that belongs in the CLI, in a peer-side job runner, or as a
+  transactor-coordinated duty (which cannot hold the key and so can only
+  schedule it) is unresolved.
+- **Redaction of legacy plaintext under `as-of`.** Evaluating the policy against
+  the current schema rather than the view's is the safe choice and the one
+  inconsistency with schema-as-data in the whole design. A future `:db/protection`
+  that participates in time views properly would need reads to consult two
+  schemas and explain which one answered.
 - **Cross-database class keys.** A class key id is stable across fork and
   restore by design, so two databases can share a class and hydrate each
   other's values. Whether that is a feature (tenant-wide keys) or a footgun

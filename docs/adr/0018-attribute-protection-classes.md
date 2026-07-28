@@ -58,6 +58,24 @@ it, and are hydrated only by readers whose keyring resolves the class key.
   runtime surprise. Protected datoms live in EAVT and AEVT only, and the planner
   treats a bound protected value position as unbound for selectivity, refuses
   range access, and never selects AVET.
+- **Protection changes are legal and forward-only.** Protecting, unprotecting,
+  and re-classifying a populated attribute all take effect from the basis they
+  are transacted at; a datom keeps the form it was asserted in, because
+  rewriting the past is the one thing an immutable database does not do. A
+  sealed value carries its class and epoch inline, so a mixed attribute decodes
+  without schema archaeology, while the schema cache carries a per-attribute
+  protection *timeline* so validation can require the current form for
+  assertions and accept any historical form for retractions and `:db/cas` old
+  values. An attribute that has ever been protected may never afterwards gain
+  `:db/index` or `:db/unique`, because a mixed AVET would silently misorder
+  ranges and silently stop enforcing uniqueness.
+- **The non-retroactivity gap is closed in three graded steps,** not papered
+  over: legacy plaintext on a now-protected attribute is redacted on read by
+  default (policy, immediate, free); a sweep re-asserts current values in sealed
+  form (cryptographic, current view only); and a rebuild — or a re-classify
+  followed by destroying the old class key — is what makes the change reach
+  history. `corium keys audit` reports how much plaintext remains and where, and
+  the alteration must acknowledge its own semantics on the transaction entity.
 - **Keys stay out of the transactor.** It validates the sealed header against
   the schema, orders, logs, indexes, publishes, GCs, and backs up — all without
   a class key, and without the ability to forge a protected fact.
@@ -109,3 +127,18 @@ it, and are hydrated only by readers whose keyring resolves the class key.
 - Erasure is class-granular. Per-subject shredding needs per-subject keys and a
   key store that becomes a durability dependency; the class model is shaped to
   accept it later, and v1 does not attempt it.
+- "I protected the attribute" does not mean "the data is protected", and no
+  amount of documentation fully removes that surprise. The mitigations make the
+  residue measurable and closable rather than invisible, and they make the good
+  path one command (`corium keys protect --sweep`) — but an operator who
+  protects an attribute and stops there has changed what ordinary readers see
+  and *not* what a reader with storage access can recover. That is the honest
+  cost of forward-only semantics, and it is preferred to the alternatives:
+  rejecting the alteration outright pushes every deployment into a manual
+  attribute-renaming migration, and silently rewriting history would break
+  immutability, the log's authority, and every existing backup and peer.
+- Key retention becomes a lifecycle obligation in both directions. An
+  unprotected attribute may still need its old class key forever, and shredding
+  a class after unprotecting destroys values whose schema now says they are not
+  protected — the most confusing state the model can reach, and one only
+  reachable deliberately.

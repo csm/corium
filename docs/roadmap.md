@@ -219,7 +219,11 @@ Security and multi-tenancy:
   hydrates them — the transactor never holds a class key and cannot forge a
   protected fact. Sealing is deterministic so retraction pairing, supersession,
   deduplication, and `:db/cas` keep working bytewise; protected datoms are
-  excluded from AVET and VAET, so filtering one means scanning it. Needs
+  excluded from AVET and VAET, so filtering one means scanning it. Protecting,
+  unprotecting, and re-classifying a populated attribute are legal and
+  forward-only — old datoms keep the form they were asserted in — with legacy
+  plaintext redacted on read by default, a sweep that seals the current values,
+  and `corium keys audit` reporting what plaintext remains. Needs
   `Value::Sealed` and its encoding, schema validation, peer-side sealing,
   hydration in `ExecOptions` with key-set-aware query caching, `ReserveEntityIds`
   plus a basis fence for entity-scoped classes, thin-client protocol v3, SQL
