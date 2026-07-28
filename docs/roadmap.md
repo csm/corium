@@ -230,6 +230,19 @@ Security and multi-tenancy:
   redaction, and the `corium keys` surface. See
   [ADR-0018](adr/0018-attribute-protection-classes.md).
 
+- **Operator peer service.** *(Specified.)* A peer whose workload is operations:
+  backup, restore, fork, GC, index publication, and the encryption migrations
+  become resumable, idempotent, singleton-per-target **jobs** with progress,
+  cancellation, plan/apply, and two-person approval for the irreversible ones.
+  Its registry — jobs, schedules, approvals, fleet observations, audit — is an
+  ordinary Corium database, so operational history is backed up and
+  time-travelable. An `Operator` gRPC service plus a JSON/HTTP gateway (the
+  first customer for the gateway item below) carries it, the CLI becomes a
+  client that still works with no service configured, and a web UI follows once
+  the API has been stable through a release. Nothing in the data plane may ever
+  depend on it. See [operator-service.md](design/operator-service.md) and
+  [ADR-0019](adr/0019-operator-peer-service.md).
+
 Engine and API:
 
 - Fulltext (`tantivy`) and tuple value types; excision (design reserved in

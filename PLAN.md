@@ -22,6 +22,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |
 | [docs/design/auth.md](docs/design/auth.md) | Request-scoped identity, the authorization seam, and the self-hosted ReBAC policy database |
 | [docs/design/encryption.md](docs/design/encryption.md) | Encryption at rest, attribute protection classes and per-class keys, hydration and redaction |
+| [docs/design/operator-service.md](docs/design/operator-service.md) | Operator peer service: jobs, schedules, approvals, fleet view, JSON gateway, UI |
 | [docs/design/clojurust-integration.md](docs/design/clojurust-integration.md) | Boundary conversion, sandboxed database functions, cljrs client API |
 | [docs/design/clients-and-ops.md](docs/design/clients-and-ops.md) | CLI, query console, backup/restore, metrics |
 | [docs/design/backup-format.md](docs/design/backup-format.md) | Versioned binary backup container and checkpoint framing |
@@ -174,3 +175,15 @@ is unchanged — a keyless peer still reads storage, holds a `Db`, and queries
 locally, with protected values redacted — and protected datoms are excluded
 from AVET and VAET, which the schema enforces by rejecting `:db/protection`
 alongside `:db/index`, `:db/unique`, and `:db.type/ref`.
+
+Operator-level management is specified as its own surface
+([docs/design/operator-service.md](docs/design/operator-service.md),
+[ADR-0019](docs/adr/0019-operator-peer-service.md)): a peer whose workload is
+operations, running backup, restore, fork, GC, index publication, and the
+encryption migrations as resumable, auditable jobs with progress, cancellation,
+plan/apply, and two-person approval for irreversible ones. Its registry is an
+ordinary Corium database, so operational history is queryable and
+time-travelable; an `Operator` gRPC service and a JSON/HTTP gateway carry it,
+with a web UI behind a stable API. The CLI keeps its full surface as a client
+and still runs every duty in-process when no service is configured — nothing in
+the data plane depends on the control plane.

@@ -460,6 +460,17 @@ straightforward while allowing Corium-only deployments to avoid another
 service, another consistency boundary, and another cache layer.
 
 
+## Operator actions
+
+The proposed [operator peer service](operator-service.md) authorizes through
+this same seam rather than inventing policy of its own: new `Action` variants
+(`SubmitJob`, `ApproveJob`, `CancelJob`, `ReadFleet`, `ManageSchedule`,
+`ManageKeys`) against object names the ReBAC model already expresses
+(`job:backup`, `database:music`, `catalog:*`, `class:protect/pii`). Its registry
+is an ordinary Corium database for the same reasons the policy database is one,
+and `corium authz check` explains an operator denial exactly as it explains an
+application one.
+
 ## Relationship to encryption
 
 Authorization and encryption are two independent controls over the same facts,

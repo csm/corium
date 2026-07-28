@@ -86,6 +86,15 @@ definite current basis and the underlying storage connection; the backup
 client then leaves the transactor and reads the bounded native log range
 directly.
 
+### OperatorService (operator tools → operator peer service) *(proposed)*
+
+Job submission, planning, approval, cancellation, and watching; schedules; and
+fleet, database, storage, and key inspection — with a JSON/HTTP gateway over the
+same surface for the UI and for scripting. It is a separate service from
+`Catalog` on purpose: the transactor's latency belongs to the commit pipeline,
+so it is called by the operator service rather than extended into it. See
+[operator-service.md](operator-service.md).
+
 ### PeerServerService (thin clients → peer server)
 
 For languages without the peer library; queries run server-side on a hosted

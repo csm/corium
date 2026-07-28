@@ -1,5 +1,12 @@
 # Operations guide
 
+> **Proposed:** the duties below that the CLI currently implements in-process —
+> backup, restore, fork, GC, index publication, and the encryption migrations —
+> are specified to move behind the
+> [operator peer service](design/operator-service.md) as resumable, auditable
+> jobs, with the CLI becoming a client of them. Every command in this guide
+> keeps working with no service configured. Nothing here has changed yet.
+
 ## Processes and logging
 
 `corium transactor` owns writes, logs, indexing, leases, and scheduled GC.

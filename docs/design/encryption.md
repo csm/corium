@@ -770,6 +770,17 @@ corium peer-server --db people --storage-key file:… --seal-through
 Environment overrides `CORIUM_STORAGE_KEY`, `CORIUM_KEYRING`, and
 `CORIUM_KEYS` follow the existing `CORIUM_*` conventions.
 
+The long-running ones — the sweep, an epoch drain, a rewrap across a large
+database, and the audit that must precede a shred — are hour-scale jobs that
+need a process outliving the shell that started them, and the sweep additionally
+needs to *hold a class key while it runs*. Those are duties of the proposed
+[operator peer service](operator-service.md): `corium keys protect --sweep`
+submits a job and follows it, key custody for the job is an explicit opt-in
+grant recorded with it, and `shred` requires a fresh plan plus a second
+approver. Without a service configured the commands still run in-process, which
+is fine for a small database and is exactly what you do not want for a migration
+measured in hours.
+
 Failure modes, all of which must be distinguishable in logs and metrics:
 
 | Condition | Behaviour |
@@ -904,14 +915,12 @@ Acceptance tests, beyond unit coverage:
   ask.
 - **Per-subject keys.** Sketched above and deliberately deferred. The open part
   is the key store's durability and availability contract, not the crypto.
-- **Sweep cost and who runs it.** The sweep must run where the keys are, so it
-  is a peer-side job that rewrites every current value of an attribute —
-  proportional to entity count, not to the change. On a large attribute that is
-  a long-running background migration with its own progress, resumption, and
-  throttling story, and it competes with ordinary writes for the transactor.
-  Whether that belongs in the CLI, in a peer-side job runner, or as a
-  transactor-coordinated duty (which cannot hold the key and so can only
-  schedule it) is unresolved.
+- **Sweep cost.** The sweep rewrites every current value of an attribute —
+  proportional to entity count, not to the change — and competes with ordinary
+  writes for the transactor. *Where* it runs is now answered: the
+  [operator peer service](operator-service.md) hosts it as a resumable job. What
+  it should do about throttling, and whether a very large attribute wants
+  several workers rather than one, is not.
 - **Redaction of legacy plaintext under `as-of`.** Evaluating the policy against
   the current schema rather than the view's is the safe choice and the one
   inconsistency with schema-as-data in the whole design. A future `:db/protection`
