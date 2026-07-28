@@ -31,8 +31,12 @@ protected by a per-record CRC32C over the frame header and payload. Replay
 rejects a fully written frame whose contents changed, while a partial trailing
 write is discarded as an unacknowledged torn tail. The format bit in the length
 word lets upgraded readers continue to replay legacy length-only frames; every
-new append is checksummed. For high availability the log is split into
-per-lease-version files; merged replay orders them by lease version and drops
-appends from a fenced-out writer, so a standby that takes over never replays a
-deposed transactor's uncommitted tail. See
+new append is checksummed. Filesystem logs retain their open descriptors and a
+per-record `(t, byte offset, frame length)` index: recovery scans each file
+once, appends extend the index, and range reads seek directly to the selected
+frames. Long-lived readers scan only newly appended tail bytes and open a new
+descriptor only when a new lease-version segment appears. For high availability
+the log is split into per-lease-version files; merged replay orders them by
+lease version and drops appends from a fenced-out writer, so a standby that
+takes over never replays a deposed transactor's uncommitted tail. See
 [`docs/design/log-and-transactor.md`](../../docs/design/log-and-transactor.md).
