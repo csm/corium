@@ -8,7 +8,7 @@ use corium_core::{
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
 };
@@ -16,6 +16,8 @@ use thiserror::Error;
 
 const CHECKSUMMED_FRAME: u64 = 1 << 63;
 const FRAME_CHECKSUM_LEN: usize = size_of::<u32>();
+const RANGE_READ_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CACHED_READ_VERSION_FILES: usize = 8;
 
 /// One committed transaction record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,13 +137,17 @@ impl TransactionLog for MemoryLog {
 
 /// Filesystem append log. Each append is flushed and `fsync`ed before returning.
 ///
+/// The file descriptor remains open for the lifetime of the log. An in-memory
+/// `(t, byte offset, frame length)` index is built during recovery, extended
+/// on append, and used to read only the frames selected by a range scan.
+///
 /// A crash mid-append leaves a torn, never-acked record at the tail; `open`
 /// truncates it away so replay stops at the durability point of the last
 /// acked transaction and later appends extend a clean tail.
 pub struct FileLog {
-    path: PathBuf,
-    next_t: RwLock<u64>,
+    state: RwLock<IndexedFile>,
 }
+
 impl FileLog {
     /// Opens or creates a log file, dropping any torn tail left by a crash.
     ///
@@ -153,40 +159,40 @@ impl FileLog {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        OpenOptions::new().create(true).append(true).open(&path)?;
-        let (records, durable_len) = read_records(&path)?;
-        if fs::metadata(&path)?.len() > durable_len {
-            let file = OpenOptions::new().write(true).open(&path)?;
-            file.set_len(durable_len)?;
-            file.sync_all()?;
-        }
+        let file = IndexedFile::open(&path, true, true)?;
+        file.validate_contiguous_prefix(file.frames.len())?;
         Ok(Self {
-            path,
-            next_t: RwLock::new(records.last().map_or(1, |r| r.t + 1)),
+            state: RwLock::new(file),
         })
     }
 }
 impl TransactionLog for FileLog {
     fn append(&self, record: &TxRecord) -> Result<(), LogError> {
-        let mut next_t = self.next_t.write().expect("poisoned log lock");
-        if *next_t != record.t {
+        let mut state = self.state.write().expect("poisoned log lock");
+        state.refresh()?;
+        state.validate_contiguous_prefix(state.frames.len())?;
+        if next_t(&state.frames)? != record.t {
             return Err(LogError::Corrupt);
         }
-        let mut frame = Vec::new();
-        append_framed_record(&mut frame, record)?;
-        let mut file = OpenOptions::new().append(true).open(&self.path)?;
-        file.write_all(&frame)?;
-        file.sync_all()?;
-        *next_t += 1;
-        Ok(())
+        state.append(record)
     }
     fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
-        let _guard = self.next_t.read().expect("poisoned log lock");
-        Ok(read_records(&self.path)?
-            .0
-            .into_iter()
-            .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
-            .collect())
+        if end.is_some_and(|end| end <= start) {
+            return Ok(Vec::new());
+        }
+        let indexed = {
+            let state = self.state.read().expect("poisoned log lock");
+            range_is_indexed(&state.frames, end)?
+        };
+        if !indexed {
+            let mut state = self.state.write().expect("poisoned log lock");
+            state.refresh()?;
+            state.validate_contiguous_prefix(state.frames.len())?;
+        }
+        self.state
+            .read()
+            .expect("poisoned log lock")
+            .tx_range(start, end)
     }
 }
 
@@ -204,8 +210,18 @@ impl TransactionLog for FileLog {
 pub struct VersionedLog {
     dir: PathBuf,
     name: String,
-    write_path: PathBuf,
-    next_t: RwLock<u64>,
+    state: RwLock<VersionedLogState>,
+}
+
+struct VersionedLogState {
+    files: Vec<VersionedFile>,
+    write_version: Option<u64>,
+    next_t: u64,
+}
+
+struct VersionedFile {
+    version: u64,
+    file: IndexedFile,
 }
 
 impl VersionedLog {
@@ -220,22 +236,33 @@ impl VersionedLog {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let write_path = version_path(&dir, name, write_version);
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&write_path)?;
-        let (_, durable_len) = read_records(&write_path)?;
-        if fs::metadata(&write_path)?.len() > durable_len {
-            let file = OpenOptions::new().write(true).open(&write_path)?;
-            file.set_len(durable_len)?;
-            file.sync_all()?;
+        let mut files = Vec::new();
+        for (version, path) in version_files(&dir, name) {
+            let writable = version == write_version;
+            files.push(VersionedFile {
+                version,
+                file: IndexedFile::open(&path, writable, writable)?,
+            });
+            close_cold_version_files(&mut files);
         }
-        let records = read_merged(&dir, name)?;
+        if !files.iter().any(|file| file.version == write_version) {
+            files.push(VersionedFile {
+                version: write_version,
+                file: IndexedFile::open(&write_path, true, true)?,
+            });
+            files.sort_by_key(|file| file.version);
+        }
+        close_cold_version_files(&mut files);
+        let cutoffs = validated_version_cutoffs(&files)?;
+        let next_t = merged_next_t(&files, &cutoffs)?;
         Ok(Self {
             dir,
             name: name.to_owned(),
-            write_path,
-            next_t: RwLock::new(records.last().map_or(1, |r| r.t + 1)),
+            state: RwLock::new(VersionedLogState {
+                files,
+                write_version: Some(write_version),
+                next_t,
+            }),
         })
     }
 
@@ -246,10 +273,16 @@ impl VersionedLog {
     /// written record is corrupt.
     pub fn open_read_only(dir: impl AsRef<Path>, name: &str) -> Result<Self, LogError> {
         let dir = dir.as_ref().to_path_buf();
+        let mut files = open_version_files(&dir, name)?;
+        close_cold_version_files(&mut files);
+        let cutoffs = validated_version_cutoffs(&files)?;
         Ok(Self {
-            write_path: PathBuf::new(),
             name: name.to_owned(),
-            next_t: RwLock::new(u64::MAX),
+            state: RwLock::new(VersionedLogState {
+                next_t: merged_next_t(&files, &cutoffs)?,
+                write_version: None,
+                files,
+            }),
             dir,
         })
     }
@@ -278,32 +311,59 @@ impl VersionedLog {
 
 impl TransactionLog for VersionedLog {
     fn append(&self, record: &TxRecord) -> Result<(), LogError> {
-        let mut next_t = self.next_t.write().expect("poisoned log lock");
-        if *next_t != record.t {
+        let mut state = self.state.write().expect("poisoned log lock");
+        if state.next_t != record.t {
             return Err(LogError::Corrupt);
         }
-        let mut frame = Vec::new();
-        append_framed_record(&mut frame, record)?;
-        let mut file = OpenOptions::new().append(true).open(&self.write_path)?;
-        file.write_all(&frame)?;
-        file.sync_all()?;
-        *next_t += 1;
+        let write_version = state
+            .write_version
+            .ok_or_else(|| LogError::Native("transaction log is read-only".into()))?;
+        let write_index = state
+            .files
+            .iter()
+            .position(|file| file.version == write_version)
+            .ok_or(LogError::Corrupt)?;
+        let cutoffs = version_cutoffs(&state.files);
+        // A current-version writer must extend its own local tail. A deposed
+        // writer may append beyond a later version's cutoff; that harmless gap
+        // lives entirely in the dead suffix and is discarded during merge.
+        if cutoffs[write_index] == u64::MAX
+            && !state.files[write_index].file.frames.is_empty()
+            && next_t(&state.files[write_index].file.frames)? != record.t
+        {
+            return Err(LogError::Corrupt);
+        }
+        state.files[write_index].file.append(record)?;
+        state.next_t = state.next_t.checked_add(1).ok_or(LogError::Corrupt)?;
         Ok(())
     }
 
     fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
-        let _guard = self.next_t.read().expect("poisoned log lock");
-        Ok(read_merged(&self.dir, &self.name)?
-            .into_iter()
-            .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
-            .collect())
+        if end.is_some_and(|end| end <= start) {
+            return Ok(Vec::new());
+        }
+        {
+            let state = self.state.read().expect("poisoned log lock");
+            let cutoffs = validated_version_cutoffs(&state.files)?;
+            if range_is_merged_indexed(&state.files, &cutoffs, end)? {
+                return read_merged_range(&state.files, &cutoffs, start, end);
+            }
+        }
+        {
+            let mut state = self.state.write().expect("poisoned log lock");
+            refresh_version_files(&self.dir, &self.name, &mut state.files)?;
+            close_cold_version_files(&mut state.files);
+            validated_version_cutoffs(&state.files)?;
+        }
+        let state = self.state.read().expect("poisoned log lock");
+        let cutoffs = validated_version_cutoffs(&state.files)?;
+        read_merged_range(&state.files, &cutoffs, start, end)
     }
 }
 
-/// Applies the takeover cutoff rule to per-version record lists, in the same
-/// way [`read_merged`] does for on-disk files: a record in an older version
-/// dies once any later version begins at or below its `t`, dropping only the
-/// never-acked stale appends of a deposed writer.
+/// Applies the takeover cutoff rule to per-version record lists: a record in
+/// an older version dies once any later version begins at or below its `t`,
+/// dropping only the never-acked stale appends of a deposed writer.
 fn merge_versions(mut per_version: Vec<Vec<TxRecord>>) -> Vec<TxRecord> {
     let mut cutoff = u64::MAX;
     for records in per_version.iter_mut().rev() {
@@ -709,6 +769,262 @@ impl TransactionLog for MemVersionedLog {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FrameIndex {
+    t: u64,
+    offset: u64,
+    len: u64,
+}
+
+/// One cached file descriptor and its in-memory transaction-to-byte index.
+///
+/// Opening scans and validates the durable prefix once. Later refreshes scan
+/// only bytes appended after that prefix, and concurrent range readers use
+/// positional I/O for the selected frames instead of decoding from byte zero.
+struct IndexedFile {
+    path: PathBuf,
+    file: Option<Arc<File>>,
+    writable: bool,
+    poisoned: bool,
+    frames: Vec<FrameIndex>,
+    durable_len: u64,
+    first_gap: Option<usize>,
+}
+
+impl IndexedFile {
+    fn open(path: &Path, writable: bool, truncate_torn: bool) -> Result<Self, LogError> {
+        let file = Arc::new(open_index_file(path, writable)?);
+        let (frames, durable_len) = scan_frames(file.as_ref(), 0)?;
+        validate_sorted_frames(&frames)?;
+        if truncate_torn && file.metadata()?.len() > durable_len {
+            file.set_len(durable_len)?;
+            file.sync_all()?;
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(file),
+            writable,
+            poisoned: false,
+            first_gap: first_gap_index(&frames),
+            frames,
+            durable_len,
+        })
+    }
+
+    fn refresh(&mut self) -> Result<(), LogError> {
+        self.ensure_healthy()?;
+        let file_len = self.physical_len()?;
+        if file_len < self.durable_len {
+            let file = self.open_for_read()?;
+            let (frames, durable_len) = scan_frames(file.as_ref(), 0)?;
+            validate_sorted_frames(&frames)?;
+            self.first_gap = first_gap_index(&frames);
+            self.frames = frames;
+            self.durable_len = durable_len;
+        } else if file_len > self.durable_len {
+            let file = self.open_for_read()?;
+            let (new_frames, durable_len) = scan_frames(file.as_ref(), self.durable_len)?;
+            validate_sorted_extension(&self.frames, &new_frames)?;
+            let existing_len = self.frames.len();
+            if self.first_gap.is_none() {
+                self.first_gap =
+                    extension_first_gap(&self.frames, &new_frames).map(|gap| existing_len + gap);
+            }
+            self.frames.extend(new_frames);
+            self.durable_len = durable_len;
+        }
+        Ok(())
+    }
+
+    fn append(&mut self, record: &TxRecord) -> Result<(), LogError> {
+        self.ensure_healthy()?;
+        if !self.writable {
+            return Err(LogError::Native("transaction log is read-only".into()));
+        }
+        let file = self.open_for_read()?;
+        // Never truncate here: durable_len belongs to this handle, and bytes
+        // beyond it may be an acknowledged append made by another handle.
+        if file.metadata()?.len() != self.durable_len {
+            return Err(LogError::Corrupt);
+        }
+
+        let mut frame = Vec::new();
+        append_framed_record(&mut frame, record)?;
+        let frame_len = u64::try_from(frame.len()).map_err(|_| LogError::Corrupt)?;
+        let offset = self.durable_len;
+        let mut writer = file.as_ref();
+        if let Err(error) = writer.write_all(&frame) {
+            // A short write makes the tail uncertain. Poison this handle so a
+            // retry cannot adopt or append beyond a never-acknowledged frame.
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        if let Err(error) = file.sync_all() {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        self.durable_len = self
+            .durable_len
+            .checked_add(frame_len)
+            .ok_or(LogError::Corrupt)?;
+        if self.first_gap.is_none()
+            && self
+                .frames
+                .last()
+                .is_some_and(|previous| previous.t.checked_add(1) != Some(record.t))
+        {
+            self.first_gap = Some(self.frames.len());
+        }
+        self.frames.push(FrameIndex {
+            t: record.t,
+            offset,
+            len: frame_len,
+        });
+        Ok(())
+    }
+
+    fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
+        self.ensure_healthy()?;
+        let first = self.frames.partition_point(|frame| frame.t < start);
+        let last = end.map_or(self.frames.len(), |end| {
+            self.frames.partition_point(|frame| frame.t < end)
+        });
+        if first >= last {
+            return Ok(Vec::new());
+        }
+
+        let file = self.open_for_read()?;
+        let mut records = Vec::with_capacity(last - first);
+        let mut chunk_first = first;
+        while chunk_first < last {
+            let offset = self.frames[chunk_first].offset;
+            let mut chunk_last = chunk_first + 1;
+            while chunk_last < last {
+                let candidate_end = frame_end(self.frames[chunk_last])?;
+                if candidate_end.checked_sub(offset).ok_or(LogError::Corrupt)?
+                    > RANGE_READ_CHUNK_BYTES
+                {
+                    break;
+                }
+                chunk_last += 1;
+            }
+            let byte_end = frame_end(self.frames[chunk_last - 1])?;
+            let byte_len = usize::try_from(byte_end.checked_sub(offset).ok_or(LogError::Corrupt)?)
+                .map_err(|_| LogError::Corrupt)?;
+            let mut bytes = vec![0; byte_len];
+            read_exact_at(file.as_ref(), &mut bytes, offset)?;
+            let chunk_records = decode_framed_records(&bytes)?;
+            if chunk_records.len() != chunk_last - chunk_first
+                || chunk_records
+                    .iter()
+                    .zip(&self.frames[chunk_first..chunk_last])
+                    .any(|(record, frame)| record.t != frame.t)
+            {
+                return Err(LogError::Corrupt);
+            }
+            records.extend(chunk_records);
+            chunk_first = chunk_last;
+        }
+        Ok(records)
+    }
+
+    fn validate_contiguous_prefix(&self, retained: usize) -> Result<(), LogError> {
+        if self.first_gap.is_some_and(|gap| gap < retained) {
+            return Err(LogError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn ensure_healthy(&self) -> Result<(), LogError> {
+        if self.poisoned {
+            return Err(io::Error::other("transaction log handle is poisoned").into());
+        }
+        Ok(())
+    }
+
+    fn open_for_read(&self) -> Result<Arc<File>, LogError> {
+        self.file.as_ref().map_or_else(
+            || Ok(Arc::new(open_index_file(&self.path, false)?)),
+            |file| Ok(Arc::clone(file)),
+        )
+    }
+
+    fn physical_len(&self) -> Result<u64, LogError> {
+        Ok(self
+            .file
+            .as_ref()
+            .map_or_else(|| fs::metadata(&self.path), |file| file.metadata())?
+            .len())
+    }
+
+    fn close_cached_reader(&mut self) {
+        if !self.writable {
+            self.file = None;
+        }
+    }
+}
+
+fn open_index_file(path: &Path, writable: bool) -> Result<File, io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    if writable {
+        options.create(true).write(true).append(true);
+    }
+    options.open(path)
+}
+
+fn validate_sorted_frames(frames: &[FrameIndex]) -> Result<(), LogError> {
+    for pair in frames.windows(2) {
+        if pair[0].t >= pair[1].t {
+            return Err(LogError::Corrupt);
+        }
+    }
+    Ok(())
+}
+
+fn validate_sorted_extension(
+    existing: &[FrameIndex],
+    appended: &[FrameIndex],
+) -> Result<(), LogError> {
+    validate_sorted_frames(appended)?;
+    if let (Some(previous), Some(next)) = (existing.last(), appended.first())
+        && previous.t >= next.t
+    {
+        return Err(LogError::Corrupt);
+    }
+    Ok(())
+}
+
+fn first_gap_index(frames: &[FrameIndex]) -> Option<usize> {
+    frames
+        .windows(2)
+        .position(|pair| pair[0].t.checked_add(1) != Some(pair[1].t))
+        .map(|index| index + 1)
+}
+
+fn extension_first_gap(existing: &[FrameIndex], appended: &[FrameIndex]) -> Option<usize> {
+    if let (Some(previous), Some(next)) = (existing.last(), appended.first())
+        && previous.t.checked_add(1) != Some(next.t)
+    {
+        return Some(0);
+    }
+    first_gap_index(appended)
+}
+
+fn frame_end(frame: FrameIndex) -> Result<u64, LogError> {
+    frame.offset.checked_add(frame.len).ok_or(LogError::Corrupt)
+}
+
+fn next_t(frames: &[FrameIndex]) -> Result<u64, LogError> {
+    frames.last().map_or(Ok(1), |frame| {
+        frame.t.checked_add(1).ok_or(LogError::Corrupt)
+    })
+}
+
+fn range_is_indexed(frames: &[FrameIndex], end: Option<u64>) -> Result<bool, LogError> {
+    end.map_or(Ok(false), |end| Ok(end <= next_t(frames)?))
+}
+
 fn version_path(dir: &Path, name: &str, version: u64) -> PathBuf {
     if version == 0 {
         dir.join(format!("{name}.log"))
@@ -745,25 +1061,121 @@ fn version_files(dir: &Path, name: &str) -> Vec<(u64, PathBuf)> {
     files
 }
 
-/// Merges every version file, applying the takeover cutoff rule, and
-/// verifies the surviving sequence is contiguous.
-fn read_merged(dir: &Path, name: &str) -> Result<Vec<TxRecord>, LogError> {
-    let files = version_files(dir, name);
-    let mut per_file: Vec<Vec<TxRecord>> = Vec::with_capacity(files.len());
-    for (_, path) in &files {
-        per_file.push(read_records(path)?.0);
+fn open_version_files(dir: &Path, name: &str) -> Result<Vec<VersionedFile>, LogError> {
+    let mut files = Vec::new();
+    for (version, path) in version_files(dir, name) {
+        files.push(VersionedFile {
+            version,
+            file: IndexedFile::open(&path, false, false)?,
+        });
+        close_cold_version_files(&mut files);
     }
-    // A record in an older file is dead once any later file starts at or
-    // below its t: every record acked under version v precedes the first
-    // record of every later version (the successor replayed it before
-    // choosing its own first t), so only never-acked stale appends die.
-    let merged = merge_versions(per_file);
-    for pair in merged.windows(2) {
-        if pair[1].t != pair[0].t + 1 {
-            return Err(LogError::Corrupt);
+    Ok(files)
+}
+
+fn refresh_version_files(
+    dir: &Path,
+    name: &str,
+    files: &mut Vec<VersionedFile>,
+) -> Result<(), LogError> {
+    for file in &mut *files {
+        file.file.refresh()?;
+    }
+
+    for (version, path) in version_files(dir, name) {
+        if files.iter().all(|file| file.version != version) {
+            files.push(VersionedFile {
+                version,
+                file: IndexedFile::open(&path, false, false)?,
+            });
+            close_cold_version_files(files);
         }
     }
-    Ok(merged)
+    files.sort_by_key(|file| file.version);
+    Ok(())
+}
+
+fn close_cold_version_files(files: &mut [VersionedFile]) {
+    let mut cached_readers = 0;
+    for file in files.iter_mut().rev() {
+        if file.file.writable {
+            continue;
+        }
+        if file.file.file.is_some() {
+            if cached_readers < MAX_CACHED_READ_VERSION_FILES {
+                cached_readers += 1;
+            } else {
+                file.file.close_cached_reader();
+            }
+        }
+    }
+}
+
+/// For each version, the first transaction in any later version. Frames at
+/// or beyond this cutoff are stale appends from a deposed writer.
+fn version_cutoffs(files: &[VersionedFile]) -> Vec<u64> {
+    let mut cutoffs = vec![u64::MAX; files.len()];
+    let mut cutoff = u64::MAX;
+    for (index, file) in files.iter().enumerate().rev() {
+        cutoffs[index] = cutoff;
+        if let Some(first) = file.file.frames.first() {
+            cutoff = cutoff.min(first.t);
+        }
+    }
+    cutoffs
+}
+
+fn validated_version_cutoffs(files: &[VersionedFile]) -> Result<Vec<u64>, LogError> {
+    let cutoffs = version_cutoffs(files);
+    let mut previous_t: Option<u64> = None;
+    for (file, cutoff) in files.iter().zip(&cutoffs) {
+        let retained = file.file.frames.partition_point(|frame| frame.t < *cutoff);
+        if retained == 0 {
+            continue;
+        }
+        file.file.validate_contiguous_prefix(retained)?;
+        let first_t = file.file.frames[0].t;
+        if previous_t.is_some_and(|previous| previous.checked_add(1) != Some(first_t)) {
+            return Err(LogError::Corrupt);
+        }
+        previous_t = Some(file.file.frames[retained - 1].t);
+    }
+    Ok(cutoffs)
+}
+
+fn merged_next_t(files: &[VersionedFile], cutoffs: &[u64]) -> Result<u64, LogError> {
+    for (file, cutoff) in files.iter().zip(cutoffs).rev() {
+        let retained = file.file.frames.partition_point(|frame| frame.t < *cutoff);
+        if retained > 0 {
+            return file.file.frames[retained - 1]
+                .t
+                .checked_add(1)
+                .ok_or(LogError::Corrupt);
+        }
+    }
+    Ok(1)
+}
+
+fn range_is_merged_indexed(
+    files: &[VersionedFile],
+    cutoffs: &[u64],
+    end: Option<u64>,
+) -> Result<bool, LogError> {
+    end.map_or(Ok(false), |end| Ok(end <= merged_next_t(files, cutoffs)?))
+}
+
+fn read_merged_range(
+    files: &[VersionedFile],
+    cutoffs: &[u64],
+    start: u64,
+    end: Option<u64>,
+) -> Result<Vec<TxRecord>, LogError> {
+    let mut records = Vec::new();
+    for (file, cutoff) in files.iter().zip(cutoffs) {
+        let end = Some(end.map_or(*cutoff, |end| end.min(*cutoff)));
+        records.extend(file.file.tx_range(start, end)?);
+    }
+    Ok(records)
 }
 
 fn encode_record(record: &TxRecord) -> Vec<u8> {
@@ -846,25 +1258,70 @@ fn frame_checksum(header: [u8; 8], payload: &[u8]) -> u32 {
     crc32c::crc32c_append(crc32c::crc32c(&header), payload)
 }
 
-/// Reads fully written records plus the byte length of that durable prefix.
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !bytes.is_empty() {
+        match file.read_at(bytes, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => {
+                offset = offset
+                    .checked_add(u64::try_from(read).expect("read length fits u64"))
+                    .ok_or_else(|| io::Error::other("file offset overflow"))?;
+                bytes = &mut bytes[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !bytes.is_empty() {
+        match file.seek_read(bytes, offset) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => {
+                offset = offset
+                    .checked_add(u64::try_from(read).expect("read length fits u64"))
+                    .ok_or_else(|| io::Error::other("file offset overflow"))?;
+                bytes = &mut bytes[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
+}
+
+/// Indexes fully written records starting at `offset`, returning the byte end
+/// of that durable prefix.
 ///
 /// A record cut short by a crash mid-append (truncated length prefix or
 /// payload/checksum) ends the scan; a fully present record with a checksum
 /// mismatch or invalid payload is genuine corruption and errors. Legacy
 /// length-only records remain readable, while newly written records set the
 /// high bit of the length word and carry a trailing CRC32C.
-fn read_records(path: &Path) -> Result<(Vec<TxRecord>, u64), LogError> {
-    let mut file = File::open(path)?;
+fn scan_frames(file: &File, offset: u64) -> Result<(Vec<FrameIndex>, u64), LogError> {
     let file_len = file.metadata()?.len();
-    let mut records = Vec::new();
-    let mut durable_len = 0_u64;
+    let mut frames = Vec::new();
+    let mut durable_len = offset;
     loop {
-        let mut len = [0; 8];
-        match file.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+        if file_len.saturating_sub(durable_len) < 8 {
+            break;
         }
+        let mut len = [0; 8];
+        read_exact_at(file, &mut len, durable_len)?;
         let (payload_len, checksummed) = frame_payload_len(len)?;
         let frame_len = 8_u64
             .checked_add(u64::try_from(payload_len).map_err(|_| LogError::Corrupt)?)
@@ -882,28 +1339,29 @@ fn read_records(path: &Path) -> Result<(Vec<TxRecord>, u64), LogError> {
             break;
         }
         let mut payload = vec![0; payload_len];
-        match file.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
+        let payload_offset = durable_len.checked_add(8).ok_or(LogError::Corrupt)?;
+        read_exact_at(file, &mut payload, payload_offset)?;
         if checksummed {
             let mut stored_checksum = [0; FRAME_CHECKSUM_LEN];
-            match file.read_exact(&mut stored_checksum) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
+            let checksum_offset = payload_offset
+                .checked_add(u64::try_from(payload_len).map_err(|_| LogError::Corrupt)?)
+                .ok_or(LogError::Corrupt)?;
+            read_exact_at(file, &mut stored_checksum, checksum_offset)?;
             if u32::from_be_bytes(stored_checksum) != frame_checksum(len, &payload) {
                 return Err(LogError::Corrupt);
             }
         }
-        records.push(decode_record(&payload)?);
+        let record = decode_record(&payload)?;
+        frames.push(FrameIndex {
+            t: record.t,
+            offset: durable_len,
+            len: frame_len,
+        });
         durable_len = durable_len
             .checked_add(frame_len)
             .ok_or(LogError::Corrupt)?;
     }
-    Ok((records, durable_len))
+    Ok((frames, durable_len))
 }
 
 /// Appends one checksummed, length-prefixed encoded record to `out`.
@@ -959,4 +1417,30 @@ pub fn decode_framed_records(mut bytes: &[u8]) -> Result<Vec<TxRecord>, LogError
         records.push(decode_record(payload)?);
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versioned_log_bounds_cached_read_descriptors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let segment_count = MAX_CACHED_READ_VERSION_FILES + 5;
+        for version in 1..=u64::try_from(segment_count).expect("segment count fits u64") {
+            File::create(version_path(dir.path(), "db", version)).expect("create segment");
+        }
+
+        let log = VersionedLog::open_read_only(dir.path(), "db").expect("open log");
+        let state = log.state.read().expect("log lock");
+        assert_eq!(state.files.len(), segment_count);
+        assert!(
+            state
+                .files
+                .iter()
+                .filter(|file| file.file.file.is_some())
+                .count()
+                <= MAX_CACHED_READ_VERSION_FILES
+        );
+    }
 }
