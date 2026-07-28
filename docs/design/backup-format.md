@@ -71,6 +71,17 @@ a temporary name, then atomically renamed into place.
 An archive with no complete checkpoint is invalid. Unknown frame tags and
 `BLOB` frames after the first checkpoint are also invalid.
 
+## Proposed version 2 (encryption at rest)
+
+[encryption.md](encryption.md) adds two header fields — `Content encryption:
+u32` and `Key manifest: bytes` (the wrapped data keys, never material) — and
+otherwise leaves the container untouched: `BLOB` frames carry stored objects
+verbatim, so backup remains a byte copy, and `CKPT` transaction records stay
+log-framed and therefore encrypted with them. An archive is restorable given
+access to the key-encryption key and nothing else; restoring without a
+protection class's key yields a working database whose attributes in that class
+are permanently redacted.
+
 Corium currently reads and writes version 1 only. It deliberately does not
 interpret the former directory-shaped backup output or expose human, JSON, or
 EDN backup variants. A future dump/export command can render a binary archive

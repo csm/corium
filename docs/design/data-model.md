@@ -82,6 +82,12 @@ pub enum Value {
 Deferred to post-v1: `:db.type/fulltext` behavior, tuple types, `:db.type/uri`,
 `:db.type/symbol` (trivial to add; kept out to hold v1 scope).
 
+A proposed tenth variant, `Sealed`, carries a value encrypted under a
+protection class's key: opaque to the engine, hydrated only by a reader holding
+that key, and forbidden on indexed, unique, and ref attributes. See
+[encryption.md](encryption.md) and
+[ADR-0018](../adr/0018-attribute-protection-classes.md).
+
 Keywords are interned per-database in a keyword table (itself stored as
 datoms on schema entities where applicable, plus a side table in the index
 root for non-ident keywords), so `Value::Keyword` comparisons are integer
@@ -132,6 +138,10 @@ installed through ordinary transactions. v1 supports:
 - `:db/index` — request AVET coverage for this attribute (AVET contains only
   indexed and unique attributes; VAET contains all ref attributes).
 - `:db/doc`, `:db/noHistory` (skip history index for high-churn attributes).
+- `:db/protection` (proposed) — name a protection class whose key seals this
+  attribute's values; mutually exclusive with `:db/index`, `:db/unique`, and
+  `:db.type/ref`, since protected datoms cannot be indexed
+  ([encryption.md](encryption.md)).
 
 The transactor materializes schema into an immutable in-memory `SchemaCache`
 (AttrId → attribute record) rebuilt per basis-t; peers build the same cache

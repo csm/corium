@@ -198,7 +198,11 @@ an LRU cache.
 
 Cached segments contain database data at rest. The peer creates directories
 and files owner-only, does not expose the path in metrics, and relies on the
-host's filesystem encryption and access controls. Authorization remains at the
+host's filesystem encryption and access controls. When storage encryption is
+enabled ([encryption.md](encryption.md)), the encryption decorator sits *above*
+this cache, so cached entries hold ciphertext and their digest check is
+unchanged — the host's filesystem encryption stops being the only thing
+protecting them. Authorization remains at the
 peer request boundary: sharing by content hash cannot grant a caller a way to
 name or read a segment. Operators must include cache SSD bandwidth, inode
 availability, and wear in capacity planning, but must exclude the cache from

@@ -203,6 +203,28 @@ Security and multi-tenancy:
   value-level view filtering in the query engine (executor predicate plus
   query-cache keying), which is what an `AllowFiltered` decision needs before a
   read path can serve it, and mTLS subject extraction.
+- **Encryption at rest.** *(Specified.)* Envelope-encrypt every durable
+  artifact — index blobs, log record payloads, backup archives, cached
+  segments — under a per-database data key wrapped by a KMS or operator file,
+  with a new `corium-crypt` crate and a `Keyring` seam. Encryption is a
+  `BlobStore` decorator above the segment cache, and a blob id becomes the
+  digest of the stored encrypted object, so idempotent `put`, structural
+  sharing, keyless integrity verification, GC, and backup are all preserved.
+  Storage format 4, backup format 2. See
+  [encryption.md](design/encryption.md) and
+  [ADR-0017](adr/0017-encryption-at-rest.md).
+- **Attribute protection classes.** *(Specified.)* Per-attribute confidentiality
+  under separate keys: a class names a key id, the writing peer seals values
+  before tx-data leaves it, and only a reader whose keyring resolves that class
+  hydrates them — the transactor never holds a class key and cannot forge a
+  protected fact. Sealing is deterministic so retraction pairing, supersession,
+  deduplication, and `:db/cas` keep working bytewise; protected datoms are
+  excluded from AVET and VAET, so filtering one means scanning it. Needs
+  `Value::Sealed` and its encoding, schema validation, peer-side sealing,
+  hydration in `ExecOptions` with key-set-aware query caching, `ReserveEntityIds`
+  plus a basis fence for entity-scoped classes, thin-client protocol v3, SQL
+  redaction, and the `corium keys` surface. See
+  [ADR-0018](adr/0018-attribute-protection-classes.md).
 
 Engine and API:
 

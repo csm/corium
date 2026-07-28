@@ -460,6 +460,21 @@ straightforward while allowing Corium-only deployments to avoid another
 service, another consistency boundary, and another cache layer.
 
 
+## Relationship to encryption
+
+Authorization and encryption are two independent controls over the same facts,
+and [encryption.md](encryption.md) specifies the second one. A `ViewFilter` is
+enforced by the process that already holds the plaintext, so it answers "who
+*should* see this"; an attribute protection class withholds the key, so it
+answers "who *can*". A compromised or misconfigured peer defeats the first and
+not the second, which is why the design keeps both rather than choosing.
+
+They meet at one seam: a `KeyPolicy` maps a `Principal` onto the key ids a
+request may hydrate, so the same policy database can express both, while the
+enforcement stays independent. Attribute redaction driven by an absent key is
+also the cheapest first customer for the filtering work below — it is
+enforceable directly in the datom scan, with no executor predicate.
+
 ## Open questions
 
 - **View filtering in the query engine.** This is now the gap that matters: an

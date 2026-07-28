@@ -21,6 +21,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/query-engine.md](docs/design/query-engine.md) | Datalog compiler/planner, rules, aggregates, Pull, entity API |
 | [docs/design/protocol.md](docs/design/protocol.md) | gRPC services, value wire encoding, peer sync, thin-client protocol |
 | [docs/design/auth.md](docs/design/auth.md) | Request-scoped identity, the authorization seam, and the self-hosted ReBAC policy database |
+| [docs/design/encryption.md](docs/design/encryption.md) | Encryption at rest, attribute protection classes and per-class keys, hydration and redaction |
 | [docs/design/clojurust-integration.md](docs/design/clojurust-integration.md) | Boundary conversion, sandboxed database functions, cljrs client API |
 | [docs/design/clients-and-ops.md](docs/design/clients-and-ops.md) | CLI, query console, backup/restore, metrics |
 | [docs/design/backup-format.md](docs/design/backup-format.md) | Versioned binary backup container and checkpoint framing |
@@ -154,9 +155,22 @@ operates it; [docs/design/auth.md](docs/design/auth.md) records the model and
 [docs/operations.md](docs/operations.md) the runbook.
 
 Transaction time is now data rather than log metadata
-([ADR-0015](docs/adr/0015-transaction-time-as-data.md)): every commit asserts
+([ADR-0016](docs/adr/0016-transaction-time-as-data.md)): every commit asserts
 `:db/txInstant` on its transaction entity, so `[?tx :db/txInstant ?inst]` joins
 like any other clause, transaction metadata can be attached through the
 reserved `"datomic.tx"` tempid (or `:db/current-tx`), and `as-of`/`since`
 accept a wall-clock instant as well as a basis `t` — in Rust, cljrs, the wire
 protocol, the console, and the SQL shell.
+
+Confidentiality is specified but not yet built
+([docs/design/encryption.md](docs/design/encryption.md)). Two layers:
+envelope encryption of every durable artifact — index blobs, log records,
+backups, cached segments — under a per-database data key wrapped by a KMS
+([ADR-0017](docs/adr/0017-encryption-at-rest.md)); and attribute **protection
+classes**, where values on a protected attribute are sealed with that class's
+key by the writing peer and hydrated only by readers granted it
+([ADR-0018](docs/adr/0018-attribute-protection-classes.md)). The peer interface
+is unchanged — a keyless peer still reads storage, holds a `Db`, and queries
+locally, with protected values redacted — and protected datoms are excluded
+from AVET and VAET, which the schema enforces by rejecting `:db/protection`
+alongside `:db/index`, `:db/unique`, and `:db.type/ref`.

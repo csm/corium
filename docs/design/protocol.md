@@ -123,7 +123,15 @@ vectors ship with it so third parties can write clients.
 - Peer servers enforce per-request fuel, result-size, and concurrency limits;
   the transactor enforces tx-size and queue limits.
 - The blob store is assumed private to the deployment (peers have direct
-  credentials to it, as in Datomic).
+  credentials to it, as in Datomic). Encryption at rest
+  ([encryption.md](encryption.md)) is proposed to remove that assumption for
+  blobs, log records, backups, and cached segments.
+- Attribute protection classes (proposed) seal values under per-class keys
+  before they leave the writing peer, so tx-data, tx-reports, datom streams,
+  and query results may carry sealed values that only a key-holding reader can
+  hydrate. This adds a value tag to the codec and a thin-client protocol
+  version; a peer server either hydrates per request or forwards sealed values
+  (`--seal-through`) for end-to-end protection.
 
 ## Embedded transport
 

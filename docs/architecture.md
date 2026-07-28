@@ -104,6 +104,7 @@ A single Cargo workspace. Dependency edges point strictly downward.
 | `corium-cljrs` | Clojurust bindings: value conversion, `(d/q …)` API, db-function sandbox host |
 | `corium-cli` | `corium` binary: admin commands, query console, standalone transactor/peer-server launchers |
 | `corium-sim` | Deterministic simulation harness for tests (not published) |
+| `corium-crypt` *(proposed)* | AEAD primitives, deterministic value sealing, key derivation, `KeyId`/`SecretKey`/`Keyring` and its static and KMS-backed implementations ([encryption.md](design/encryption.md)) |
 
 `corium-core`, `corium-index`, `corium-store`, `corium-log`, `corium-tx`,
 `corium-query`, and `corium-db` are pure library code with no tokio/network
