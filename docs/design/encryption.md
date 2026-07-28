@@ -83,10 +83,15 @@ Four kinds of key material, in one hierarchy:
 
 | Key | Scope | Lives | Held by |
 |---|---|---|---|
-| **KEK** (key-encryption key) | deployment or database | KMS / HSM / operator file; never in Corium | nothing in-process; used to unwrap |
+| **KEK** (key-encryption key) | deployment or **database** | KMS / HSM / operator file; never in Corium | nothing in-process; used to unwrap |
 | **Storage DEK** | one database, per epoch | wrapped, in the `keys:<db>` root record | transactor, GC, backup, any peer reading storage directly |
 | **Class key** | one protection class, per epoch | resolved by key id from the reader's keyring; **never stored in Corium** | only processes granted that class |
 | **Derived subkeys** | per blob / per record / per fact | derived, never stored | whoever holds the parent DEK |
+
+The manifest records the KEK **per database**, not per deployment, so a
+deployment that later wants per-tenant key isolation — separate KEKs, separately
+grantable, separately destroyable — already has the field it needs.
+Deployment-wide is simply the case where every database names the same one.
 
 The asymmetry is the point. Storage DEKs are stored wrapped, because a restore
 must be able to bootstrap itself from the archive plus KMS access. Class keys
@@ -930,7 +935,14 @@ Acceptance tests, beyond unit coverage:
   restore by design, so two databases can share a class and hydrate each
   other's values. Whether that is a feature (tenant-wide keys) or a footgun
   (unintended reach after a fork) probably wants an explicit
-  `:db.protect/lineage` marker.
+  `:db.protect/lineage` marker — and the answer sharpens under multi-tenancy,
+  where a shared class id is the difference between "one key per tenant" and
+  "one tenant's peer can open another's values if it ever obtains the datoms".
+  One property already helps: the seal context binds the attribute's **entity
+  id**, which is per database, so two databases sharing a class key still
+  produce different ciphertext for the same plaintext and no cross-database
+  equality oracle exists. Fork and restore preserve ids, which is exactly where
+  determinism must hold.
 - **Blind index as an engine feature.** Automating the second attribute would
   make the common case correct by default; it also embeds a deterministic,
   indexed hash of protected data in the schema, which is exactly the thing this

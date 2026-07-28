@@ -471,6 +471,15 @@ is an ordinary Corium database for the same reasons the policy database is one,
 and `corium authz check` explains an operator denial exactly as it explains an
 application one.
 
+Authority over a *group* of databases — one operator service dedicated to a
+slice of the system — needs no new policy language either: a `parent` tuple from
+each database to a grouping object, plus a rewrite deriving `owner` on the
+database from `owner` on its parent, is the existing mechanism doing exactly
+what it was built for. The missing piece is smaller and worth landing early:
+**database creation should be able to record the object that owns it**, so the
+parent tuple exists from the first transaction rather than being backfilled
+across an established catalog later.
+
 ## Relationship to encryption
 
 Authorization and encryption are two independent controls over the same facts,

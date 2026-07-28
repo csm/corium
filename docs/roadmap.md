@@ -240,7 +240,12 @@ Security and multi-tenancy:
   first customer for the gateway item below) carries it, the CLI becomes a
   client that still works with no service configured, and a web UI follows once
   the API has been stable through a release. Nothing in the data plane may ever
-  depend on it. See [operator-service.md](design/operator-service.md) and
+  depend on it — which is also what keeps multi-tenant operations open, since a
+  component nothing depends on can be run once per slice. Tenancy itself is not
+  designed; the design instead keeps the implicitly global things out (per-target
+  leases, globally unique job ids, recorded job scope, approval checked on the
+  target, per-database key configuration, a scoped fleet view). See
+  [operator-service.md](design/operator-service.md) and
   [ADR-0019](adr/0019-operator-peer-service.md).
 
 Engine and API:

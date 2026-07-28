@@ -52,7 +52,9 @@ duties.
 - **Everything long-running is a job:** resumable from a checkpoint, idempotent,
   singleton per target, cancellable at a boundary, and attributable to a
   requester. Execution is serialized across replicas by the same CAS-fenced
-  lease pattern the transactor uses for writes.
+  lease pattern the transactor uses for writes, held **per job target rather
+  than per service**, so two service instances responsible for disjoint
+  databases never contend.
 - **Destructive jobs require a plan, and the irreversible ones require a second
   person.** `shred`, `delete database`, and restore-over-an-existing-name need a
   fresh plan and an approval from a principal other than the requester.
@@ -93,6 +95,19 @@ duties.
 - The UI is deferred behind a stable API on purpose. Shipping it first would
   produce capabilities reachable only from a browser; shipping the API first
   means the UI, the CLI, and `curl` are equally capable and equally audited.
+- Multi-tenant operations are not designed here, and are deliberately not
+  foreclosed. The likely shape — a service authenticated and dedicated to a
+  slice, with a deployment running several — is affordable precisely because
+  nothing depends on the service, so it can be run N times over disjoint slices
+  with no coordination. What this ADR commits to is keeping the implicitly
+  global things out: leases per target, globally unique job ids, a `scope`
+  recorded on every job, approval authority checked on the job's target rather
+  than the service, key and credential configuration keyed by database, a
+  configurable registry name, and a fleet view that reports scope and
+  observation time instead of promising deployment-wide truth. Grouping
+  databases under a tenant needs no new policy language — ADR-0014's rewrites
+  already express it — but database creation should be able to record its owning
+  object so the grouping exists from the start.
 - Fleet visibility is an observation, not a source of truth. Transactors are
   discoverable from root records with no coupling; peer servers may self-register
   best-effort, and a failed announcement is ignored — otherwise the

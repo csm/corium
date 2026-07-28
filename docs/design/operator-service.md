@@ -109,7 +109,9 @@ The job model is the core of the API; everything long-running is one.
 
 ```
 Job {
-  id, kind, database?, params,
+  id,                                           // opaque and globally unique (ULID), never
+                                                // a per-registry sequence — see Multi-tenancy
+  kind, database?, params,
   state: Queued | Running | Succeeded | Failed{error} | Cancelled,
   requested-by, approved-by?, requested-at, started-at?, finished-at?,
   progress: { unit, done, total?, phase },     // total absent when unknowable
@@ -165,6 +167,15 @@ checkpoint. No new coordination primitive, and no new failure mode to reason
 about — the argument in
 [log-and-transactor.md](log-and-transactor.md) transfers directly.
 
+**The lease is per job target, not per service.** One record per
+`(kind, database)` — the same granularity as the singleton rule — rather than a
+single "scheduler" lease that a service instance holds for everything it does.
+The distinction does not matter for one service instance and matters entirely
+for two: a global scheduler lease would make two operator services responsible
+for two disjoint sets of databases contend with each other for the right to run
+anything at all, which is precisely the corner
+[Multi-tenancy](#multi-tenancy-posture) exists to avoid.
+
 ## Its state is a Corium database
 
 The operator service keeps its registry — jobs, schedules, approvals, fleet
@@ -187,7 +198,7 @@ Schema shape, tuple-flat in the style of the authz database:
 
 | Entity | Attributes |
 |---|---|
-| Job | `:op.job/id`, `/kind`, `/database`, `/params`, `/state`, `/progress-done`, `/progress-total`, `/phase`, `/checkpoint`, `/basis-t`, `/requested-by`, `/approved-by`, `/result`, `/error` |
+| Job | `:op.job/id`, `/kind`, `/database`, `/scope`, `/params`, `/state`, `/progress-done`, `/progress-total`, `/phase`, `/checkpoint`, `/basis-t`, `/requested-by`, `/approved-by`, `/result`, `/error` |
 | Schedule | `:op.schedule/id`, `/kind`, `/database`, `/cron`, `/params`, `/enabled`, `/last-run`, `/retention` |
 | Approval | `:op.approval/job`, `/principal`, `/at`, `/plan-id` |
 | Node | `:op.node/endpoint`, `/role`, `/database`, `/last-seen`, `/version`, `/lease-state` |
@@ -197,6 +208,12 @@ Progress updates are transactions, so a chatty job would be a write amplifier.
 Rule: progress is committed at checkpoints and at a bounded interval (default
 5s), never per unit of work, and `:db/noHistory` on the progress attributes
 keeps the churn out of the history indexes.
+
+`:op.job/scope` names the object the job's authority derives from — the tenant,
+the catalog, or the database itself. It is redundant for a single deployment-wide
+service and is recorded anyway, so that later work can filter, partition, or
+aggregate registries without a schema migration or a re-interpretation of
+existing rows.
 
 The registry database is a **convenience, not a dependency**: a job that cannot
 write its progress keeps working and reports on completion. The service does not
@@ -225,7 +242,7 @@ service Operator {
   rpc ListSchedules(ListSchedulesRequest) returns (ListSchedulesResponse);
 
   // Inspection
-  rpc GetFleet(GetFleetRequest) returns (FleetView);
+  rpc GetFleet(GetFleetRequest) returns (FleetView);   // scoped + observed-at, never "everything"
   rpc WatchFleet(WatchFleetRequest) returns (stream FleetEvent);
   rpc GetDatabase(GetDatabaseRequest) returns (DatabaseStatus);
   rpc GetStorage(GetStorageRequest) returns (StorageStatus);
@@ -272,13 +289,63 @@ narrow, and observable.
   principal other than the requester before they leave `Queued`. This is the
   capability a CLI structurally cannot offer, and it is the strongest single
   argument for a service: the operations that cannot be undone are exactly the
-  ones that should not be one typo deep.
+  ones that should not be one typo deep. The approver's `ApproveJob` is checked
+  against **the job's target object**, not against the service — so authority to
+  approve is scoped by the same policy that scopes authority to submit, and a
+  future tenant-scoped deployment does not need a second approval model.
 - **Everything is audited** to the `AuditSink` `corium-authz` already defines,
   and to the registry. Denials, grants, approvals, plans, applies, and key
   grants all carry the principal, the authz basis, and the job id.
 - **The service authenticates as itself** to the transactor and storage, so its
   actions are attributable at those layers too, rather than borrowing an
   operator's credential.
+
+## Multi-tenancy posture
+
+Multi-tenant operations are **not designed here**. What follows is the smaller
+commitment: this design must not make them harder later, and the natural shape
+they will take — *an operator service is authenticated and dedicated to a slice
+of the system, and a deployment runs several* — must remain available without
+reworking the job model, the registry, or the authorization story.
+
+That shape is affordable mainly because of an invariant already stated: nothing
+in the data plane depends on the operator service. A component nothing depends
+on can be run N times, over disjoint slices, with no coordination between the
+copies. So the corners to avoid are precisely the places where something is
+implicitly *global*.
+
+**Constraints this design accepts now, to keep that open:**
+
+| Constraint | The corner it avoids |
+|---|---|
+| Job leases are per `(kind, database)`, never one scheduler lease | Two services over disjoint databases contending for the right to run anything |
+| Job ids are opaque and globally unique | Registries that cannot later be merged, aggregated, or read side by side |
+| Every job records its `scope` object | Retrofitting tenancy onto rows that never said whose they were |
+| `ApproveJob` is checked on the job's target, not on the service | A tenant's operator approving another tenant's irreversible job |
+| Key and storage-credential configuration is keyed by database | A service that can only ever hold one deployment-wide storage key |
+| The registry database is named by configuration | One hardcoded `corium_operator` per deployment |
+| The fleet view is a scoped, authorized, timestamped *observation* | An API shape that promises deployment-wide truth and cannot narrow |
+
+**What a tenant-scoped deployment would then look like**, without new mechanism:
+one operator service per slice, each with its own registry database, its own
+credentials, and — importantly — only that slice's class keys. That is a
+materially better security posture than one service holding everything, and it
+is the reason the key-custody rules are already per class and declinable rather
+than per service.
+
+The authorization side needs no new language either. ADR-0014's rewrites already
+express "authority over a group of databases": a `parent` tuple from each
+database to a tenant object, plus a rewrite deriving `owner` on a database from
+`owner` on its parent, is the whole grouping mechanism. What is missing is
+smaller and worth doing early — **database creation should be able to record the
+object that owns it**, so the parent tuple exists from the start instead of being
+backfilled across an established catalog later.
+
+**What is genuinely deferred:** how slices are defined and administered, whether
+a cross-slice view exists and who may hold it, how a database moves between
+slices, and how tenancy interacts with the [fleet design](transactor-fleet.md)'s
+database placement. None of those are answered here, and none of them are
+foreclosed.
 
 ## Fleet visibility
 
@@ -296,6 +363,9 @@ Operators need to see what is running, and Corium mostly already knows:
   gone.
 - **Stale nodes** age out of the view by `last-seen`; the view reports
   observation time rather than pretending to be authoritative.
+- **The view is scoped and authorized**, and says so in its response rather than
+  implying it covers the deployment. A process may announce itself to more than
+  one operator service, or to none.
 
 The fleet view is an *observation*, and the UI says so. Corium's authority about
 who holds a lease is the root record, not this service's cache of it.
@@ -379,8 +449,8 @@ corium operator \
   --registry-db corium_operator \
   --listen 127.0.0.1:4338 \
   --http-listen 127.0.0.1:4339 \
-  --storage-key file:/etc/corium/storage.key \
-  --key :protect/pii=awskms:arn:… \
+  --storage-key people=file:/etc/corium/people.key \
+  --key people::protect/pii=awskms:arn:… \
   --authz-db corium_authz \
   --require-approval shred,delete-database,restore-over \
   --max-concurrent-jobs 1 \
@@ -390,6 +460,13 @@ corium operator \
 Ports follow the existing convention (transactor 4334, peer server 4336): gRPC
 on 4338, HTTP/UI on 4339. `ServeFlags` and `ClientFlags` are shared with the
 other servers, so TLS, tokens, OIDC, and `--authz-db` behave identically.
+
+Key and storage-credential flags are **keyed by database** (`--storage-key
+<db>=<uri>`, `--key <db>:<class>=<uri>`), with a bare `--storage-key <uri>`
+accepted as sugar for a single-database deployment. One service already manages
+several databases whose DEKs and KEKs differ per database
+([encryption.md](encryption.md)); making the flag shape assume otherwise is the
+kind of thing that is trivial now and a breaking change later.
 
 Metrics: `corium_operator_jobs{kind,state}`,
 `corium_operator_job_duration_seconds{kind}`,
@@ -451,7 +528,13 @@ Acceptance:
   with the [fleet design](transactor-fleet.md)'s many-database placement wants
   the service to span the fleet, which means discovering transactors from roots
   rather than configuration. Probably the same work as the fleet view, done
-  once.
+  once — and it is the same question as how a slice is defined, since a slice
+  and a discovery filter are likely the same object.
+- **How a slice is named.** [Multi-tenancy](#multi-tenancy-posture) records
+  scope on every job and keeps the mechanisms per-target, but does not say what
+  a slice *is* — a policy object, a naming convention, a configured database
+  list, or something the catalog knows about. Answering it early would be
+  guessing; the constraints above are chosen so the answer stays cheap.
 - **Where jobs execute.** Everything here runs jobs *in* the service. A sweep
   over a very large attribute may want to run several workers; that turns the
   registry into a work queue and the service into a scheduler, which is a
