@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
+use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use async_trait::async_trait;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -16,9 +16,9 @@ use zeroize::Zeroizing;
 /// Magic prefix for an encrypted content-addressed blob.
 pub const BLOB_MAGIC: &[u8; 8] = b"CORIUMB1";
 
-const ALGORITHM_AES_256_GCM: u8 = 1;
+const ALGORITHM_AES_256_GCM_SIV: u8 = 1;
 const BLOB_HEADER_LEN: usize = BLOB_MAGIC.len() + 1 + size_of::<u32>() + size_of::<u64>();
-const AES_GCM_TAG_LEN: usize = 16;
+const AEAD_TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
 /// Opaque, zeroized 256-bit key material.
@@ -108,6 +108,9 @@ pub enum CryptError {
     /// The object length disagrees with its authenticated header.
     #[error("encrypted blob length does not match its header")]
     InvalidBlobLength,
+    /// Encryption failed after inputs were validated.
+    #[error("encrypted blob encryption failed")]
+    EncryptionFailed,
     /// Authentication failed, including when the wrong key was supplied.
     #[error("encrypted blob authentication failed")]
     AuthenticationFailed,
@@ -229,8 +232,8 @@ impl Keyring for StaticKeyring {
                 actual: header.epoch,
             });
         }
-        let plaintext = decrypt_blob(&wrapping_key, wrapped)?;
-        SecretKey::from_slice(&plaintext).map_err(|_| KeyError::InvalidWrappedKey)
+        let plaintext = Zeroizing::new(decrypt_blob(&wrapping_key, wrapped)?);
+        SecretKey::from_slice(plaintext.as_slice()).map_err(|_| KeyError::InvalidWrappedKey)
     }
 
     fn key_ids(&self) -> &[KeyId] {
@@ -258,7 +261,7 @@ pub fn parse_blob_header(object: &[u8]) -> Result<BlobHeader, CryptError> {
         return Err(CryptError::InvalidBlobHeader);
     }
     let algorithm = object[BLOB_MAGIC.len()];
-    if algorithm != ALGORITHM_AES_256_GCM {
+    if algorithm != ALGORITHM_AES_256_GCM_SIV {
         return Err(CryptError::UnsupportedAlgorithm(algorithm));
     }
 
@@ -279,7 +282,7 @@ pub fn parse_blob_header(object: &[u8]) -> Result<BlobHeader, CryptError> {
     let expected_len = BLOB_HEADER_LEN
         .checked_add(NONCE_LEN)
         .and_then(|length| length.checked_add(plaintext_len))
-        .and_then(|length| length.checked_add(AES_GCM_TAG_LEN))
+        .and_then(|length| length.checked_add(AEAD_TAG_LEN))
         .ok_or(CryptError::InvalidBlobLength)?;
     if object.len() != expected_len {
         return Err(CryptError::InvalidBlobLength);
@@ -303,7 +306,7 @@ pub fn encrypt_blob(key: &SecretKey, epoch: u32, plaintext: &[u8]) -> Result<Vec
         u64::try_from(plaintext.len()).map_err(|_| CryptError::PlaintextTooLarge)?;
     let mut header = Vec::with_capacity(BLOB_HEADER_LEN);
     header.extend_from_slice(BLOB_MAGIC);
-    header.push(ALGORITHM_AES_256_GCM);
+    header.push(ALGORITHM_AES_256_GCM_SIV);
     header.extend_from_slice(&epoch.to_be_bytes());
     header.extend_from_slice(&plaintext_len.to_be_bytes());
 
@@ -315,7 +318,7 @@ pub fn encrypt_blob(key: &SecretKey, epoch: u32, plaintext: &[u8]) -> Result<Vec
     let nonce_digest = nonce_hasher.finalize();
     let nonce_bytes = &nonce_digest.as_bytes()[..NONCE_LEN];
     let cipher =
-        Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
+        Aes256GcmSiv::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(nonce_bytes),
@@ -324,7 +327,7 @@ pub fn encrypt_blob(key: &SecretKey, epoch: u32, plaintext: &[u8]) -> Result<Vec
                 aad: &header,
             },
         )
-        .map_err(|_| CryptError::AuthenticationFailed)?;
+        .map_err(|_| CryptError::EncryptionFailed)?;
     header.extend_from_slice(nonce_bytes);
     header.extend_from_slice(&ciphertext);
     Ok(header)
@@ -342,7 +345,7 @@ pub fn decrypt_blob(key: &SecretKey, object: &[u8]) -> Result<Vec<u8>, CryptErro
     let nonce = Nonce::from_slice(&object[BLOB_HEADER_LEN..nonce_end]);
     let ciphertext = &object[nonce_end..];
     let cipher =
-        Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
+        Aes256GcmSiv::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
     cipher
         .decrypt(
             nonce,
@@ -371,6 +374,10 @@ mod tests {
             let encrypted = encrypt_blob(&key(7), 3, &plaintext).expect("encrypt");
             let repeated = encrypt_blob(&key(7), 3, &plaintext).expect("repeat");
             prop_assert_eq!(&encrypted, &repeated);
+            prop_assert_ne!(
+                encrypt_blob(&key(7), 4, &plaintext).expect("different epoch"),
+                encrypted.clone()
+            );
             prop_assert_eq!(decrypt_blob(&key(7), &encrypted).expect("decrypt"), plaintext);
         }
     }
@@ -391,6 +398,10 @@ mod tests {
         let mut tampered = encrypted;
         *tampered.last_mut().expect("ciphertext") ^= 1;
         assert!(decrypt_blob(&key(1), &tampered).is_err());
+
+        let mut tampered_nonce = encrypt_blob(&key(1), 9, b"sentinel").expect("encrypt");
+        tampered_nonce[BLOB_HEADER_LEN] ^= 1;
+        assert!(decrypt_blob(&key(1), &tampered_nonce).is_err());
     }
 
     #[test]

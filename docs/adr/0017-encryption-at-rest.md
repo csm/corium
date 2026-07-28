@@ -86,8 +86,10 @@ resolution.
 - Three format versions move (storage 4, backup 2, plus the manifest record).
   Each is additive and version-checked; existing unencrypted databases keep
   working untouched, and the migration to an encrypted one is a backup/restore.
-- Deterministic content encryption means an adversary who can guess a blob's
-  exact plaintext can confirm the guess by re-deriving the object. For 50–100 KB
-  index leaves that is not a practical attack, and the alternative — random
-  nonces — would cost idempotent `put`, structural sharing, and keyless
-  integrity verification, which is far too much to pay.
+- Deterministic content encryption reveals repeated object ids within one
+  database and storage-key epoch. It does not create a plaintext-guess oracle
+  for a storage-only adversary: recomputing an object requires the DEK or an
+  encryption oracle, and different databases and epochs use different DEKs.
+  Randomized encryption would hide equality but would cost idempotent `put`,
+  structural sharing, and keyless integrity verification, which is far too much
+  to pay.

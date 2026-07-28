@@ -11,6 +11,8 @@ use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
 ///
 /// Blob identifiers are digests of the encrypted object. Listing, deletion,
 /// timestamps, and cleartext root records pass through to the wrapped store.
+/// The key set is an immutable snapshot; a manifest reload or rotation replaces
+/// the decorator rather than resolving a KMS key on each blob read.
 #[derive(Clone)]
 pub struct EncryptedBlobStore<S> {
     inner: S,
@@ -118,6 +120,9 @@ impl<S: BlobStore> BlobStore for EncryptedBlobStore<S> {
         if self.inner.contains(&expected).await? {
             return Ok(expected);
         }
+        // Another writer may store the same object after this check. That race
+        // is benign because deterministic encryption gives both writers the
+        // same bytes and content id, and BlobStore::put is idempotent.
         let actual = self.inner.put(&encrypted).await?;
         if actual != expected {
             return Err(StoreError::BlobIdMismatch { expected, actual });
