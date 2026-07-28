@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{AttrId, EntityId, IndexOrder, Value, ValueType};
 use corium_db::{Db, avet_covered, key_prefix};
+use indexmap::IndexSet;
+use rpds::RedBlackTreeMapSync;
 
 use crate::QueryError;
 use crate::ast::{BindTarget, Binding, Clause, Pattern, RuleDef, Term, Var};
@@ -19,7 +21,15 @@ use crate::edn::Edn;
 use crate::plan::{ScanChoice, choose_index, order_clauses};
 
 /// A partial assignment of variables to values.
-pub type Frame = BTreeMap<Var, Value>;
+///
+/// The persistent map makes a cloned frame share its bindings. Extending a
+/// clone copies only the tree path to the new binding rather than every
+/// variable and value already in the frame.
+pub type Frame = RedBlackTreeMapSync<Var, Value>;
+
+/// An insertion-ordered set keeps intermediate set semantics without an
+/// additional ordered-tree pass after every clause.
+type FrameSet = IndexSet<Frame>;
 
 /// Keyword id used for keyword literals absent from the database's
 /// interner: such literals can never equal a stored keyword value.
@@ -188,6 +198,16 @@ pub fn eval_clauses(
     frames: Vec<Frame>,
     stack: &mut Vec<RuleKey>,
 ) -> Result<Vec<Frame>, QueryError> {
+    eval_clause_set(ctx, clauses, frames.into_iter().collect(), stack)
+        .map(|frames| frames.into_iter().collect())
+}
+
+fn eval_clause_set(
+    ctx: &ExecCtx<'_>,
+    clauses: &[Clause],
+    frames: FrameSet,
+    stack: &mut Vec<RuleKey>,
+) -> Result<FrameSet, QueryError> {
     let initially_bound: BTreeSet<Var> = frames
         .first()
         .map(|frame| frame.keys().cloned().collect())
@@ -196,9 +216,6 @@ pub fn eval_clauses(
     let mut frames = frames;
     for index in order {
         frames = eval_clause(ctx, &clauses[index], frames, stack)?;
-        // Set semantics: identical frames carry no extra information.
-        let set: BTreeSet<Frame> = frames.into_iter().collect();
-        frames = set.into_iter().collect();
         if frames.is_empty() {
             return Ok(frames);
         }
@@ -209,9 +226,9 @@ pub fn eval_clauses(
 fn eval_clause(
     ctx: &ExecCtx<'_>,
     clause: &Clause,
-    frames: Vec<Frame>,
+    frames: FrameSet,
     stack: &mut Vec<RuleKey>,
-) -> Result<Vec<Frame>, QueryError> {
+) -> Result<FrameSet, QueryError> {
     match clause {
         Clause::Pattern(pattern) => eval_pattern(ctx, pattern, frames),
         Clause::Pred { name, args } => eval_pred(ctx, name, args, frames),
@@ -225,15 +242,15 @@ fn eval_clause(
             vars,
             clauses,
         } => {
-            let mut kept = Vec::new();
+            let mut kept = FrameSet::with_capacity(frames.len());
             for frame in frames {
                 let seed = match vars {
                     Some(vars) => restrict(&frame, vars),
                     None => frame.clone(),
                 };
-                let sub = eval_clauses(ctx, clauses, vec![seed], stack)?;
+                let sub = eval_clause_set(ctx, clauses, std::iter::once(seed).collect(), stack)?;
                 if sub.is_empty() {
-                    kept.push(frame);
+                    kept.insert(frame);
                 }
             }
             Ok(kept)
@@ -243,14 +260,16 @@ fn eval_clause(
             vars,
             branches,
         } => {
-            let mut out = Vec::new();
+            let mut out = FrameSet::with_capacity(frames.len());
             for frame in frames {
                 for branch in branches {
                     let seed = match vars {
                         Some(vars) => restrict(&frame, vars),
                         None => frame.clone(),
                     };
-                    for result in eval_clauses(ctx, branch, vec![seed], stack)? {
+                    for result in
+                        eval_clause_set(ctx, branch, std::iter::once(seed).collect(), stack)?
+                    {
                         let mut merged = frame.clone();
                         let mut consistent = true;
                         let exported: Vec<&Var> = match vars {
@@ -266,13 +285,13 @@ fn eval_clause(
                                     }
                                     Some(_) => {}
                                     None => {
-                                        merged.insert(var.clone(), value.clone());
+                                        merged.insert_mut(var.clone(), value.clone());
                                     }
                                 }
                             }
                         }
                         if consistent {
-                            out.push(merged);
+                            out.insert(merged);
                         }
                     }
                 }
@@ -394,12 +413,12 @@ enum Position {
 fn eval_pattern(
     ctx: &ExecCtx<'_>,
     pattern: &Pattern,
-    frames: Vec<Frame>,
-) -> Result<Vec<Frame>, QueryError> {
+    frames: FrameSet,
+) -> Result<FrameSet, QueryError> {
     let db = ctx
         .db(&pattern.src)
         .ok_or_else(|| QueryError::UnknownSource(pattern.src.clone()))?;
-    let mut out = Vec::new();
+    let mut out = FrameSet::with_capacity(frames.len());
     for frame in frames {
         // Attribute first: value coercion and index choice depend on it.
         let a_spec = resolve_term(ctx, db, &frame, &pattern.a, Position::A, None)?;
@@ -482,14 +501,14 @@ fn eval_pattern(
                             }
                         }
                         None => {
-                            extended.insert(var.clone(), actual);
+                            extended.insert_mut(var.clone(), actual);
                         }
                     },
                     Spec::Free(None) | Spec::NoMatch => {}
                 }
             }
             if matched {
-                out.push(extended);
+                out.insert(extended);
             }
         }
     }
@@ -518,16 +537,18 @@ fn eval_pred(
     ctx: &ExecCtx<'_>,
     name: &str,
     args: &[Term],
-    frames: Vec<Frame>,
-) -> Result<Vec<Frame>, QueryError> {
+    frames: FrameSet,
+) -> Result<FrameSet, QueryError> {
     if name == "missing?" {
         return eval_missing(ctx, args, frames);
     }
-    let mut out = Vec::new();
+    let mut out = FrameSet::with_capacity(frames.len());
     for frame in frames {
         let values = call_args(ctx, &frame, args)?;
         match ctx.call(name, &values)? {
-            CallResult::Test(true) | CallResult::Scalar(Value::Bool(true)) => out.push(frame),
+            CallResult::Test(true) | CallResult::Scalar(Value::Bool(true)) => {
+                out.insert(frame);
+            }
             CallResult::Test(false) | CallResult::Scalar(Value::Bool(false)) => {}
             _ => {
                 return Err(QueryError::Type(format!("{name} is not a predicate")));
@@ -542,15 +563,15 @@ fn eval_fn(
     name: &str,
     args: &[Term],
     binding: &Binding,
-    frames: Vec<Frame>,
-) -> Result<Vec<Frame>, QueryError> {
+    frames: FrameSet,
+) -> Result<FrameSet, QueryError> {
     if name == "ground" {
         return eval_ground(ctx, args, binding, frames);
     }
     if name == "get-else" {
         return eval_get_else(ctx, args, binding, frames);
     }
-    let mut out = Vec::new();
+    let mut out = FrameSet::with_capacity(frames.len());
     for frame in frames {
         let values = call_args(ctx, &frame, args)?;
         let result = match ctx.call(name, &values)? {
@@ -566,7 +587,7 @@ fn bind_result(
     frame: &Frame,
     binding: &Binding,
     result: CallResult,
-    out: &mut Vec<Frame>,
+    out: &mut FrameSet,
 ) -> Result<(), QueryError> {
     let scalar = |value: &Value, var: &Var, frame: &Frame| -> Option<Frame> {
         let mut next = frame.clone();
@@ -574,7 +595,7 @@ fn bind_result(
             Some(existing) if !value_match(existing, value) => None,
             Some(_) => Some(next),
             None => {
-                next.insert(var.clone(), value.clone());
+                next.insert_mut(var.clone(), value.clone());
                 Some(next)
             }
         }
@@ -591,7 +612,7 @@ fn bind_result(
                     Some(existing) if !value_match(existing, value) => return None,
                     Some(_) => {}
                     None => {
-                        next.insert(var.clone(), value.clone());
+                        next.insert_mut(var.clone(), value.clone());
                     }
                 },
             }
@@ -608,7 +629,7 @@ fn bind_result(
         (Binding::Coll(target), CallResult::Coll(values)) => match target {
             BindTarget::Blank => {
                 if !values.is_empty() {
-                    out.push(frame.clone());
+                    out.insert(frame.clone());
                 }
             }
             BindTarget::Var(var) => {
@@ -639,8 +660,8 @@ fn eval_ground(
     ctx: &ExecCtx<'_>,
     args: &[Term],
     binding: &Binding,
-    frames: Vec<Frame>,
-) -> Result<Vec<Frame>, QueryError> {
+    frames: FrameSet,
+) -> Result<FrameSet, QueryError> {
     let db = ctx
         .default_db()
         .ok_or_else(|| QueryError::UnknownSource("$".into()))?;
@@ -667,7 +688,7 @@ fn eval_ground(
         (Binding::Scalar(_), form) => CallResult::Scalar(value_of(form)?),
         _ => return Err(QueryError::Type(format!("cannot ground {form}"))),
     };
-    let mut out = Vec::new();
+    let mut out = FrameSet::with_capacity(frames.len());
     for frame in frames {
         bind_result(&frame, binding, result.clone(), &mut out)?;
     }
@@ -679,8 +700,8 @@ fn eval_get_else(
     ctx: &ExecCtx<'_>,
     args: &[Term],
     binding: &Binding,
-    frames: Vec<Frame>,
-) -> Result<Vec<Frame>, QueryError> {
+    frames: FrameSet,
+) -> Result<FrameSet, QueryError> {
     let (db, rest) = db_context_args(ctx, args)?;
     let [entity_term, attr_term, default_term] = rest else {
         return Err(QueryError::Arity(
@@ -689,7 +710,7 @@ fn eval_get_else(
     };
     let attr = attr_const(ctx, db, attr_term)?;
     let value_type = db.schema().get(attr).map(|meta| meta.value_type);
-    let mut out = Vec::new();
+    let mut out = FrameSet::with_capacity(frames.len());
     for frame in frames {
         let entity = entity_arg(db, &frame, entity_term)?;
         let value = entity
@@ -722,8 +743,8 @@ fn eval_get_else(
 fn eval_missing(
     ctx: &ExecCtx<'_>,
     args: &[Term],
-    frames: Vec<Frame>,
-) -> Result<Vec<Frame>, QueryError> {
+    frames: FrameSet,
+) -> Result<FrameSet, QueryError> {
     let (db, rest) = db_context_args(ctx, args)?;
     let [entity_term, attr_term] = rest else {
         return Err(QueryError::Arity(
@@ -731,12 +752,12 @@ fn eval_missing(
         ));
     };
     let attr = attr_const(ctx, db, attr_term)?;
-    let mut out = Vec::new();
+    let mut out = FrameSet::with_capacity(frames.len());
     for frame in frames {
         let entity = entity_arg(db, &frame, entity_term)?;
         let missing = entity.is_none_or(|e| db.values(e, attr).is_empty());
         if missing {
-            out.push(frame);
+            out.insert(frame);
         }
     }
     Ok(out)
@@ -791,11 +812,11 @@ fn eval_rule_call(
     ctx: &ExecCtx<'_>,
     name: &str,
     args: &[Term],
-    frames: Vec<Frame>,
+    frames: FrameSet,
     stack: &mut Vec<RuleKey>,
-) -> Result<Vec<Frame>, QueryError> {
+) -> Result<FrameSet, QueryError> {
     let db = ctx.default_db();
-    let mut out = Vec::new();
+    let mut out = FrameSet::with_capacity(frames.len());
     for frame in frames {
         let mut key_args: Vec<Option<Value>> = Vec::with_capacity(args.len());
         for term in args {
@@ -823,13 +844,13 @@ fn eval_rule_call(
                         }
                         Some(_) => {}
                         None => {
-                            extended.insert(var.clone(), value.clone());
+                            extended.insert_mut(var.clone(), value.clone());
                         }
                     },
                 }
             }
             if consistent {
-                out.push(extended);
+                out.insert(extended);
             }
         }
     }
@@ -903,13 +924,14 @@ fn eval_rule_once(
                     )));
                 }
             }
-            let mut seed = Frame::new();
+            let mut seed = Frame::default();
             for (var, value) in head.iter().zip(&key.1) {
                 if let Some(value) = value {
-                    seed.insert((*var).clone(), value.clone());
+                    seed.insert_mut((*var).clone(), value.clone());
                 }
             }
-            let frames = eval_clauses(ctx, &def.clauses, vec![seed], stack)?;
+            let frames =
+                eval_clause_set(ctx, &def.clauses, std::iter::once(seed).collect(), stack)?;
             for frame in frames {
                 let tuple = head
                     .iter()

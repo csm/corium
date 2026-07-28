@@ -91,6 +91,7 @@ corium-tx = { path = "crates/corium-tx", version = "0.1.0" }
 
 ratatui = "0.29"
 rpds = "1.2"
+indexmap = "2"
 
 cljrs-builtins = "0.1.228"
 cljrs-env = "0.1.228"

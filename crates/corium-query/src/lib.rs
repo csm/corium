@@ -152,7 +152,7 @@ pub fn run(
         .get(ast::DEFAULT_SRC)
         .copied()
         .or_else(|| dbs.values().next().copied());
-    let mut frames: Vec<Frame> = vec![Frame::new()];
+    let mut frames: Vec<Frame> = vec![Frame::default()];
     for (spec, input) in query.inputs.iter().zip(inputs) {
         match (spec, input) {
             (InSpec::Db(_), QInput::Db(_)) => {}
@@ -160,7 +160,7 @@ pub fn run(
             (InSpec::Scalar(var), QInput::Edn(form)) => {
                 let value = input_value(default_db, form)?;
                 for frame in &mut frames {
-                    frame.insert(var.clone(), value.clone());
+                    frame.insert_mut(var.clone(), value.clone());
                 }
             }
             (InSpec::Tuple(vars), QInput::Edn(form)) => {
@@ -173,7 +173,7 @@ pub fn run(
                 for (var, item) in vars.iter().zip(items) {
                     let value = input_value(default_db, item)?;
                     for frame in &mut frames {
-                        frame.insert(var.clone(), value.clone());
+                        frame.insert_mut(var.clone(), value.clone());
                     }
                 }
             }
@@ -188,7 +188,7 @@ pub fn run(
                 frames = cross_bind(&frames, |frame, out| {
                     for value in &values {
                         let mut next = frame.clone();
-                        next.insert(var.clone(), value.clone());
+                        next.insert_mut(var.clone(), value.clone());
                         out.push(next);
                     }
                 });
@@ -216,7 +216,7 @@ pub fn run(
                     for tuple in &converted {
                         let mut next = frame.clone();
                         for (var, value) in vars.iter().zip(tuple) {
-                            next.insert(var.clone(), value.clone());
+                            next.insert_mut(var.clone(), value.clone());
                         }
                         out.push(next);
                     }

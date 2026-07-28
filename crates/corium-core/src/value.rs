@@ -1,6 +1,10 @@
 //! Engine-internal values.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use crate::{EntityId, KwId};
 
@@ -37,8 +41,14 @@ impl Ord for TotalF64 {
     }
 }
 
+impl Hash for TotalF64 {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.sortable_bits().hash(state);
+    }
+}
+
 /// Core v1 Corium value types.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Value {
     /// Boolean.
     Bool(bool),

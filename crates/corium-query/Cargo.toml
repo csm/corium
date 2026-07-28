@@ -10,6 +10,8 @@ description = "Corium query implementation"
 [dependencies]
 corium-core = { workspace = true }
 corium-db = { workspace = true }
+indexmap = { workspace = true }
+rpds = { workspace = true }
 thiserror = "2"
 
 [dev-dependencies]
