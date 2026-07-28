@@ -33,10 +33,15 @@ write is discarded as an unacknowledged torn tail. The format bit in the length
 word lets upgraded readers continue to replay legacy length-only frames; every
 new append is checksummed. Filesystem logs retain their open descriptors and a
 per-record `(t, byte offset, frame length)` index: recovery scans each file
-once, appends extend the index, and range reads seek directly to the selected
-frames. Long-lived readers scan only newly appended tail bytes and open a new
-descriptor only when a new lease-version segment appears. For high availability
-the log is split into per-lease-version files; merged replay orders them by
-lease version and drops appends from a fenced-out writer, so a standby that
-takes over never replays a deposed transactor's uncommitted tail. See
+once, appends extend the index, and range reads use concurrent positional I/O
+for only the selected frames. Reads are decoded in chunks of at most 4 MiB
+(except for an individual larger frame), avoiding a whole-log byte allocation
+during recovery. The index costs 24 bytes per transaction per open log handle.
+Versioned logs cache at most eight read-only segment descriptors plus their
+writer; older segments retain their index but reopen a descriptor transiently
+when requested. Bounded ranges already covered by the index skip directory
+rescans, while open-ended tail reads discover and index new segments/bytes. For
+high availability the log is split into per-lease-version files; merged replay
+orders them by lease version and drops appends from a fenced-out writer, so a
+standby that takes over never replays a deposed transactor's uncommitted tail. See
 [`docs/design/log-and-transactor.md`](../../docs/design/log-and-transactor.md).

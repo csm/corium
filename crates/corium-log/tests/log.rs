@@ -7,6 +7,9 @@ use corium_log::{
 };
 use std::io::Write;
 
+// Frame header (8) + transaction number (8) + final byte of tx_instant (7).
+const TX_INSTANT_LOW_BYTE_OFFSET: usize = 8 + 8 + 7;
+
 fn record(t: u64) -> TxRecord {
     let signed_t = i64::try_from(t).expect("test transaction fits i64");
     TxRecord {
@@ -22,8 +25,7 @@ fn record(t: u64) -> TxRecord {
     }
 }
 
-/// A record whose value string is `bytes` long, for driving the chunked
-/// native log past its per-chunk size cap.
+/// A record whose value string is `bytes` long, for exercising chunked logs.
 fn big_record(t: u64, bytes: usize) -> TxRecord {
     let signed_t = i64::try_from(t).expect("test transaction fits i64");
     TxRecord {
@@ -62,6 +64,22 @@ fn filesystem_log_replays_and_ranges_after_reopen() {
     let log = FileLog::open(path).expect("reopen");
     assert_eq!(log.replay().expect("replay"), vec![record(1), record(2)]);
     assert_eq!(log.tx_range(2, Some(3)).expect("range"), vec![record(2)]);
+}
+
+#[test]
+fn filesystem_replay_streams_large_ranges_in_bounded_chunks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transactions.log");
+    let log = FileLog::open(path).expect("open");
+    let records = vec![
+        big_record(1, 2 * 1024 * 1024),
+        big_record(2, 2 * 1024 * 1024),
+        big_record(3, 2 * 1024 * 1024),
+    ];
+    for record in &records {
+        log.append(record).expect("append");
+    }
+    assert_eq!(log.replay().expect("chunked replay"), records);
 }
 
 #[cfg(unix)]
@@ -104,7 +122,7 @@ fn filesystem_range_reads_only_the_indexed_byte_span() {
     // Corrupt a same-length byte in the first frame after open. A tail range
     // uses its indexed offset and does not revisit or decode that prefix.
     let mut bytes = std::fs::read(&path).expect("read log");
-    bytes[8 + 15] ^= 1;
+    bytes[TX_INSTANT_LOW_BYTE_OFFSET] ^= 1;
     std::fs::write(&path, bytes).expect("rewrite corrupt prefix");
     assert_eq!(log.tx_range(3, None).expect("tail range"), vec![record(3)]);
     assert!(matches!(log.replay(), Err(LogError::Corrupt)));
@@ -121,7 +139,7 @@ fn filesystem_log_detects_a_fully_written_corrupt_record() {
     // Change only the low byte of tx_instant. The payload remains structurally
     // valid and would decode without an integrity check.
     let mut bytes = std::fs::read(&path).expect("read log");
-    bytes[8 + 15] ^= 1;
+    bytes[TX_INSTANT_LOW_BYTE_OFFSET] ^= 1;
     std::fs::write(&path, bytes).expect("rewrite corrupt log");
 
     assert!(matches!(FileLog::open(&path), Err(LogError::Corrupt)));
@@ -292,6 +310,58 @@ fn versioned_read_handle_indexes_only_new_file_tails() {
     let v2 = VersionedLog::open(dir.path(), "db", 2).expect("open v2");
     v2.append(&record(3)).expect("append 3");
     assert_eq!(reader.tx_range(3, None).expect("v2 tail"), vec![record(3)]);
+}
+
+#[test]
+fn stale_same_version_handle_never_truncates_an_acknowledged_append() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = VersionedLog::open(dir.path(), "db", 1).expect("open first");
+    first.append(&record(1)).expect("append 1");
+    let stale = VersionedLog::open(dir.path(), "db", 1).expect("open stale");
+
+    first.append(&record(2)).expect("append acknowledged t=2");
+    let mut replacement = record(2);
+    replacement.tx_instant = 999;
+    assert!(matches!(stale.append(&replacement), Err(LogError::Corrupt)));
+    drop((first, stale));
+
+    assert_eq!(
+        VersionedLog::open_read_only(dir.path(), "db")
+            .expect("reopen")
+            .replay()
+            .expect("replay"),
+        vec![record(1), record(2)]
+    );
+}
+
+#[test]
+fn cutoff_dead_suffix_may_have_a_gap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let v1 = VersionedLog::open(dir.path(), "db", 1).expect("open v1");
+    for t in 1..=3 {
+        v1.append(&record(t)).expect("append v1");
+    }
+    drop(v1);
+
+    let v2 = VersionedLog::open(dir.path(), "db", 2).expect("open v2");
+    v2.append(&record(4)).expect("append 4");
+    v2.append(&record(5)).expect("append 5");
+    drop(v2);
+
+    // Reopening the deposed version derives merged next_t=6, leaving a gap
+    // after its local t=3. That suffix is dead below v2's cutoff and must not
+    // make the otherwise contiguous merged log unreadable.
+    let deposed = VersionedLog::open(dir.path(), "db", 1).expect("reopen v1");
+    deposed.append(&record(6)).expect("append dead t=6");
+    drop(deposed);
+
+    assert_eq!(
+        VersionedLog::open_read_only(dir.path(), "db")
+            .expect("open merged")
+            .replay()
+            .expect("replay"),
+        (1..=5).map(record).collect::<Vec<_>>()
+    );
 }
 
 #[test]
