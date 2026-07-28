@@ -188,17 +188,24 @@ pub fn eval_clauses(
     frames: Vec<Frame>,
     stack: &mut Vec<RuleKey>,
 ) -> Result<Vec<Frame>, QueryError> {
-    let initially_bound: BTreeSet<Var> = frames
-        .first()
+    // Clause ordering may only assume variables present in every frame. This
+    // matters after `or`, whose branches can export different bindings.
+    let mut frame_iter = frames.iter();
+    let mut initially_bound: BTreeSet<Var> = frame_iter
+        .next()
         .map(|frame| frame.keys().cloned().collect())
         .unwrap_or_default();
+    for frame in frame_iter {
+        initially_bound.retain(|var| frame.contains_key(var));
+    }
     let order = order_clauses(clauses, &initially_bound, ctx);
     let mut frames = frames;
     for index in order {
         frames = eval_clause(ctx, &clauses[index], frames, stack)?;
-        // Set semantics: identical frames carry no extra information.
-        let set: BTreeSet<Frame> = frames.into_iter().collect();
-        frames = set.into_iter().collect();
+        // Set semantics: identical frames carry no extra information. Sorting
+        // in place avoids allocating an additional BTreeSet after each clause.
+        frames.sort_unstable();
+        frames.dedup();
         if frames.is_empty() {
             return Ok(frames);
         }
@@ -225,7 +232,7 @@ fn eval_clause(
             vars,
             clauses,
         } => {
-            let mut kept = Vec::new();
+            let mut kept = Vec::with_capacity(frames.len());
             for frame in frames {
                 let seed = match vars {
                     Some(vars) => restrict(&frame, vars),
@@ -243,7 +250,7 @@ fn eval_clause(
             vars,
             branches,
         } => {
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(frames.len().saturating_mul(branches.len().max(1)));
             for frame in frames {
                 for branch in branches {
                     let seed = match vars {
@@ -399,7 +406,7 @@ fn eval_pattern(
     let db = ctx
         .db(&pattern.src)
         .ok_or_else(|| QueryError::UnknownSource(pattern.src.clone()))?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
         // Attribute first: value coercion and index choice depend on it.
         let a_spec = resolve_term(ctx, db, &frame, &pattern.a, Position::A, None)?;
@@ -523,11 +530,13 @@ fn eval_pred(
     if name == "missing?" {
         return eval_missing(ctx, args, frames);
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
         let values = call_args(ctx, &frame, args)?;
         match ctx.call(name, &values)? {
-            CallResult::Test(true) | CallResult::Scalar(Value::Bool(true)) => out.push(frame),
+            CallResult::Test(true) | CallResult::Scalar(Value::Bool(true)) => {
+                out.push(frame);
+            }
             CallResult::Test(false) | CallResult::Scalar(Value::Bool(false)) => {}
             _ => {
                 return Err(QueryError::Type(format!("{name} is not a predicate")));
@@ -550,7 +559,7 @@ fn eval_fn(
     if name == "get-else" {
         return eval_get_else(ctx, args, binding, frames);
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
         let values = call_args(ctx, &frame, args)?;
         let result = match ctx.call(name, &values)? {
@@ -667,7 +676,7 @@ fn eval_ground(
         (Binding::Scalar(_), form) => CallResult::Scalar(value_of(form)?),
         _ => return Err(QueryError::Type(format!("cannot ground {form}"))),
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
         bind_result(&frame, binding, result.clone(), &mut out)?;
     }
@@ -689,7 +698,7 @@ fn eval_get_else(
     };
     let attr = attr_const(ctx, db, attr_term)?;
     let value_type = db.schema().get(attr).map(|meta| meta.value_type);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
         let entity = entity_arg(db, &frame, entity_term)?;
         let value = entity
@@ -731,7 +740,7 @@ fn eval_missing(
         ));
     };
     let attr = attr_const(ctx, db, attr_term)?;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
         let entity = entity_arg(db, &frame, entity_term)?;
         let missing = entity.is_none_or(|e| db.values(e, attr).is_empty());
@@ -795,7 +804,7 @@ fn eval_rule_call(
     stack: &mut Vec<RuleKey>,
 ) -> Result<Vec<Frame>, QueryError> {
     let db = ctx.default_db();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
         let mut key_args: Vec<Option<Value>> = Vec::with_capacity(args.len());
         for term in args {
