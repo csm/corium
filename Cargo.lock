@@ -64,6 +64,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm-siv"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae0784134ba9375416d469ec31e7c5f9fa94405049cf08c5ce5b4698be673e0d"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher",
+ "ctr",
+ "polyval",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "aes-kw"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1956,6 +1971,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "corium-crypt"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm-siv",
+ "async-trait",
+ "blake3",
+ "proptest",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "corium-db"
 version = "0.1.0"
 dependencies = [
@@ -2147,6 +2175,7 @@ dependencies = [
  "aws-sdk-s3",
  "blake3",
  "corium-core",
+ "corium-crypt",
  "deadpool-postgres",
  "fs2",
  "rustls 0.23.42",

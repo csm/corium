@@ -22,6 +22,9 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 mod segment_cache;
 pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheMetrics, SegmentReader};
 
+mod encrypted_store;
+pub use encrypted_store::EncryptedBlobStore;
+
 mod snapshot;
 pub use snapshot::{
     INDEX_MANIFEST_MAGIC, chunk_segment_keys, decode_index_manifest, decode_segment_keys,
@@ -86,6 +89,20 @@ pub enum StoreError {
     /// A live graph references a blob that is not present.
     #[error("reachable blob is missing: {0}")]
     MissingBlob(BlobId),
+    /// An encrypted blob references a key epoch that is not configured.
+    #[error("encrypted blob requires unavailable storage-key epoch {0}")]
+    MissingEncryptionKey(u32),
+    /// A wrapped backend returned an id other than the digest of stored bytes.
+    #[error("blob store returned id {actual}, expected {expected}")]
+    BlobIdMismatch {
+        /// Digest of the bytes supplied to the backend.
+        expected: BlobId,
+        /// Identifier returned by the backend.
+        actual: BlobId,
+    },
+    /// Encryption, authentication, or encrypted-format failure.
+    #[error("encrypted blob failed: {0}")]
+    Encryption(#[from] corium_crypt::CryptError),
     /// Root name cannot be safely represented on the filesystem.
     #[error("invalid root name {0:?}")]
     InvalidRootName(String),

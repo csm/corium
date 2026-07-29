@@ -1,7 +1,9 @@
 # Encryption at Rest and Attribute Protection
 
-Status: **specified, not implemented.** This document proposes two independent
-layers — envelope encryption of every durable artifact
+Status: **implementation in progress.** The storage-encryption primitives and
+blob-store decorator are implemented; log, manifest, backup, process wiring,
+and attribute protection remain. This document specifies two independent layers
+— envelope encryption of every durable artifact
 ([ADR-0017](../adr/0017-encryption-at-rest.md)) and per-attribute protection
 classes keyed by separate data keys
 ([ADR-0018](../adr/0018-attribute-protection-classes.md)) — and fixes the
@@ -138,9 +140,10 @@ its class keys from KMS.
 
 Primitives:
 
-- **AEAD:** AES-256-GCM for blobs and log records (unique derived nonce per
-  object); **AES-256-GCM-SIV** (RFC 8452, zero nonce, full context in the AAD)
-  for sealed values, because value sealing must be deterministic — see
+- **AEAD:** **AES-256-GCM-SIV** for blobs, where deterministic encryption makes
+  nonce misuse resistance mandatory; AES-256-GCM for log records, whose
+  `(log-version, t)` input is unique; and AES-256-GCM-SIV (RFC 8452, zero nonce,
+  full context in the AAD) for sealed values. See
   [Fact identity](#fact-identity-and-why-sealing-is-deterministic). The
   algorithm is a stored field everywhere it is used, so a future
   XChaCha20-Poly1305 or FIPS-mode backend is a value, not a rewrite.
@@ -164,16 +167,27 @@ computes it before `put`. Under encryption the id becomes **the hash of the
 stored (encrypted) object**:
 
 ```
-object := header ‖ ciphertext ‖ tag
+object := header ‖ nonce ‖ ciphertext ‖ tag
 header := magic "CORIUMB1" ‖ alg:u8 ‖ epoch:u32 ‖ plaintext-len:u64
 nonce  := BLAKE3_keyed(dek, "corium/blob-nonce" ‖ header ‖ blake3(plaintext))[..12]
 AAD    := header
+ciphertext ‖ tag := AES-256-GCM-SIV(dek, nonce, AAD, plaintext)
 id     := blake3(object)
 ```
 
 Deriving the nonce from the plaintext digest makes encryption **deterministic
 for a given (epoch, content)**, which is what preserves every property the
-segment design depends on:
+segment design depends on. The nonce is stored because a reader cannot derive
+it from the plaintext digest until after decryption; it is non-secret, and any
+tampering is detected by the AEAD tag.
+
+Truncating the keyed digest to a 96-bit nonce has a birthday collision bound.
+That is why blobs use GCM-SIV rather than GCM: a collision between two distinct
+plaintexts does not become the catastrophic key/nonce reuse failure it would be
+under ordinary GCM. The keyed derivation still makes collisions rare, while
+GCM-SIV removes collision-freedom as a safety precondition.
+
+The resulting properties are:
 
 - `put` stays idempotent, and re-publishing an unchanged leaf produces the same
   id, so structural sharing and incremental publication are untouched.
@@ -186,12 +200,26 @@ What is lost: cross-database blob deduplication (identical content in two
 databases with different DEKs is two objects). That is a fair price and, for a
 multi-tenant deployment, an improvement.
 
+Equality leakage is scoped to one database and storage-key epoch. An observer
+of ciphertext can recognize a repeated object id in that scope, but cannot test
+an arbitrary plaintext guess without the DEK or access to an encryption oracle.
+Different databases and epochs use different DEKs and produce unrelated object
+ids for the same plaintext.
+
 API shape: encryption is a **decorator** — `EncryptedBlobStore<S: BlobStore>` —
 so `mark_and_sweep`, `index_blob_children`, backup, and every reader see
-plaintext and stay unchanged. The one signature adjustment is that the store,
-not the caller, now computes the id: `put_content(bytes) -> BlobId` alongside
-the existing `put(&id, bytes)` (which a plaintext store keeps and an encrypted
-store rejects for non-matching ids).
+plaintext and stay unchanged. `BlobStore::put(bytes) -> BlobId` already makes
+the store responsible for computing the id, so the decorator encrypts before
+delegating. It also overrides `put_if_absent`, deriving the ciphertext id before
+the presence check rather than using the plaintext digest from the trait's
+default implementation. Its `contains`-then-`put` race is benign: concurrent
+writers produce identical bytes and the same content id.
+
+The decorator holds an immutable snapshot of already-unwrapped storage DEKs.
+`Keyring` and KMS access belong on database open and key-manifest reload, not on
+each blob read; a live rotation atomically replaces the process's decorator/key
+snapshot. The foundation implementation reconstructs the decorator, and the
+process-wiring work must provide that swap without requiring a restart.
 
 **Placement in the read stack matters:**
 
@@ -808,8 +836,8 @@ records key grants, rotations, and shreds.
 
 ## Performance
 
-- **Layer 1.** AES-256-GCM with AES-NI runs at multiple GB/s per core, well
-  under the zstd cost already paid on the same bytes. Order is
+- **Layer 1.** AES-256-GCM-SIV for blobs is a two-pass construction and
+  AES-256-GCM for log records is one pass. Order is
   encode → compress → encrypt, so compression ratios are unchanged for
   unprotected data. Expect single-digit percent on index publication and log
   append; the acceptance bar is <5% on the M3 benchmark suite.
