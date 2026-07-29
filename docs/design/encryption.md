@@ -270,6 +270,22 @@ acknowledged and truncated away on recovery. Key/nonce reuse is fatal under
 GCM; 12 stored bytes are not. Every binding property above lives in the AAD,
 so nothing is given up by making the nonce unpredictable.
 
+What a random nonce does introduce is a **budget**. Collision becomes a
+birthday problem — after `q` records the probability is about `q² / 2¹⁹⁷` — so
+a storage epoch must seal fewer than **2³² log records**, the standard ceiling
+for randomized GCM nonces. That bound is not a counter to maintain: the log
+seals exactly one record per transaction, so the records under an epoch are the
+span of `t` it covers. Each manifest entry records the `t` it opened at, the
+next entry (or the current basis) closes the span, and `corium keys status`
+reports the budget from arithmetic on two numbers already present. Rotating the
+storage key opens a fresh epoch and resets it; the warning fires at half the
+ceiling so the rotation is scheduled rather than urgent. Blobs are unaffected —
+their nonce is derived rather than random, which is exactly why they use
+GCM-SIV.
+
+Encryption costs about 49 bytes per record — a 21-byte header, the 12-byte
+nonce inside it, and a 16-byte tag — with framing unchanged.
+
 ### Roots and the key manifest
 
 Root records stay **cleartext**. They hold no user data — database name, basis
@@ -283,7 +299,7 @@ A new root record per database, `keys:<db>`, is the key manifest:
 KeyManifest {
   format-version,
   kek: KeyId,
-  storage-keys: [ { epoch, kek-epoch, alg, state, created-at,
+  storage-keys: [ { epoch, kek-epoch, alg, state, created-at, opened-at-t,
                     live-objects, wrapped-dek } ],   // active | retiring | retired
   classes:      [ { class-entity-id, current-epoch, key-id } ],  // ids only, never material
 }
@@ -291,9 +307,21 @@ KeyManifest {
 
 Each storage key records the **KEK epoch** its material is wrapped under, not
 just the KEK's identity: a KEK rotation retires a KEK epoch while leaving the
-data key's own epoch unchanged, so unwrapping needs both numbers. `live-objects`
-is the per-epoch count the GC mark pass maintains and `corium keys status`
-prints; an epoch retires only at zero.
+data key's own epoch unchanged, so unwrapping needs both numbers.
+`opened-at-t` is the log-record nonce budget above. `live-objects` is the
+per-epoch count the GC mark pass maintains and `corium keys status` prints; an
+epoch retires only at zero. The two are different meters and neither
+substitutes for the other: one counts stored objects for GC drain, the other
+counts nonces drawn.
+
+Decoding validates more than syntax, because this record bootstraps every
+storage access a process makes: epochs must be strictly ascending and ordered
+in `t`, class entries must be unique, exactly one epoch may be active in a
+populated manifest, and no content may trail the entries. A count in the record
+is a stated length, never an allocation budget — entries are read one at a time
+and decoding stops at the first absent line, so a manifest declaring
+`18446744073709551615` storage keys fails to decode instead of exhausting
+memory at open.
 
 `DbRoot` gains a `key-manifest-version` field (storage format 4) so a reader
 detects an encrypted database before it tries to parse a blob, and fails with

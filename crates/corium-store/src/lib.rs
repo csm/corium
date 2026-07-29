@@ -27,8 +27,9 @@ pub use encrypted_store::EncryptedBlobStore;
 
 mod key_manifest;
 pub use key_manifest::{
-    KEY_MANIFEST_FORMAT_VERSION, KeyManifest, ProtectionClassKey, StorageAlgorithm, StorageKey,
-    StorageKeyState, keys_root_name,
+    KEY_MANIFEST_FORMAT_VERSION, KeyManifest, LOG_RECORDS_PER_EPOCH_LIMIT,
+    LOG_RECORDS_PER_EPOCH_WARN, ProtectionClassKey, StorageAlgorithm, StorageKey, StorageKeyState,
+    keys_root_name,
 };
 
 mod snapshot;

@@ -6,8 +6,8 @@ use corium_core::{
     encoding::{decode_value, encode_value},
 };
 use corium_crypt::{
-    CryptError, SecretKey, decrypt_log_record, encrypt_log_record, is_encrypted_log_record,
-    parse_log_header,
+    CryptError, LogHeader, SecretKey, decrypt_log_record, encrypt_log_record,
+    is_encrypted_log_record, parse_log_header,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -140,8 +140,14 @@ impl LogCipher {
         )?)
     }
 
-    fn open(&self, log_version: u64, payload: &[u8]) -> Result<Vec<u8>, LogError> {
-        let header = parse_log_header(payload)?;
+    /// Opens a payload whose header the caller has already parsed, so the
+    /// decode path reads it once.
+    fn open(
+        &self,
+        log_version: u64,
+        header: LogHeader,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, LogError> {
         Ok(decrypt_log_record(
             self.key(header.epoch)?,
             &self.lineage,
@@ -183,10 +189,13 @@ impl RecordCodec {
         match (&self.cipher, is_encrypted_log_record(payload)) {
             (Some(cipher), true) => {
                 let header = parse_log_header(payload)?;
-                let record = decode_record(&cipher.open(self.log_version, payload)?)?;
+                let record = decode_record(&cipher.open(self.log_version, header, payload)?)?;
                 // The cleartext `t` drives frame indexing and recovery, so a
                 // disagreement with the authenticated payload would let the
-                // index address a record by a number it does not carry.
+                // index address a record by a number it does not carry. The
+                // AAD puts this out of an attacker's reach — the header is
+                // authenticated — so what remains is a writer that sealed one
+                // `t` under another, and that must not reach an index.
                 if record.t != header.t {
                     return Err(LogError::Corrupt);
                 }
@@ -1779,6 +1788,31 @@ fn decode_framed_payloads(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cleartext `t` a frame is indexed by must be the `t` the sealed
+    /// payload carries. The AAD authenticates the header, so no attacker can
+    /// separate them; only a writer that sealed one number under another can,
+    /// and this is the check that stops such a record reaching an index.
+    #[test]
+    fn a_header_t_disagreeing_with_its_payload_is_corrupt() {
+        let key = SecretKey::new([7; 32]);
+        let codec = RecordCodec::new(Some(Arc::new(LogCipher::with_key("db", 1, key.clone()))), 0);
+        let record = TxRecord {
+            t: 1,
+            tx_instant: 5,
+            datoms: Vec::new(),
+        };
+
+        let honest = codec.encode(&record).expect("seal");
+        assert_eq!(codec.decode(&honest).expect("decode"), record);
+
+        // Same key, same lineage, same lease version, and the header
+        // authenticates cleanly — only the two transaction numbers disagree.
+        let forged =
+            encrypt_log_record(&key, 1, b"db", 0, 2, &encode_record(&record)).expect("seal");
+        assert_eq!(parse_log_header(&forged).expect("header").t, 2);
+        assert!(matches!(codec.decode(&forged), Err(LogError::Corrupt)));
+    }
 
     #[test]
     fn versioned_log_bounds_cached_read_descriptors() {

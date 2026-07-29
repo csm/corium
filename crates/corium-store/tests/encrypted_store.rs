@@ -151,7 +151,7 @@ async fn a_manifest_bootstraps_the_decorator_across_a_rotation() {
     manifest = KeyManifest::decode(&stored).expect("decode manifest");
     assert_eq!(
         manifest
-            .rotate_storage_key(&keyring, 1)
+            .rotate_storage_key(&keyring, 1, 4_200)
             .await
             .expect("rotate"),
         2
