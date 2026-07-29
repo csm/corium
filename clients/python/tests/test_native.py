@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from corium import EntityId, Keyword, NativeExtensionError, Symbol, Tagged
+from corium import EntityId, Keyword, Symbol, Tagged
 
 _corium: Any
 try:
@@ -66,14 +66,60 @@ class NativeBoundaryTests(unittest.TestCase):
                 datetime(2026, 7, 28, 12, 34, 56, 789123, tzinfo=timezone.utc)
             )
 
-    def test_local_peer_reports_the_phase_boundary(self) -> None:
-        with self.assertRaisesRegex(NativeExtensionError, "Phase 3"):
-            _corium.connect_local(
-                ["http://127.0.0.1:4334"],
+
+@unittest.skipIf(_corium is None, "native extension is not built")
+class NativeConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_peer_connection_failures_use_the_public_error_model(
+        self,
+    ) -> None:
+        from corium import ConnectionFailedError
+
+        with self.assertRaisesRegex(
+            ConnectionFailedError, "at least one transactor endpoint"
+        ):
+            await _corium.connect_local(
+                [],
                 database="people",
                 token=None,
                 tls=False,
             )
+
+
+async def _exercise_live_peer(test: unittest.TestCase, peer: Any) -> None:
+    from corium import ClosedError
+
+    db = await peer.db()
+    query = [
+        Keyword("find"),
+        Symbol("?e"),
+        Keyword("where"),
+        [Symbol("?e"), Symbol("?a"), Symbol("?v")],
+    ]
+    test.assertIsInstance(await db.query(query), list)
+    stats = await db.stats()
+    test.assertEqual(await db.stats(), stats)
+    report = await peer.transact([])
+    test.assertGreater(report.basis_t, report.basis_before)
+    await peer.close()
+    with test.assertRaises(ClosedError):
+        await db.stats()
+
+
+@unittest.skipUnless(
+    os.environ.get("CORIUM_TEST_LOCAL_ENDPOINT"),
+    "set CORIUM_TEST_LOCAL_ENDPOINT to exercise an in-process full peer",
+)
+class NativeLocalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_peer_query_stats_transaction_and_close(self) -> None:
+        from corium import LocalPeer
+
+        peer = await LocalPeer.connect(
+            os.environ["CORIUM_TEST_LOCAL_ENDPOINT"],
+            database=os.environ.get("CORIUM_TEST_DATABASE", "people"),
+            token=os.environ.get("CORIUM_TEST_LOCAL_TOKEN"),
+            allow_insecure_token=True,
+        )
+        await _exercise_live_peer(self, peer)
 
 
 @unittest.skipUnless(
@@ -82,7 +128,7 @@ class NativeBoundaryTests(unittest.TestCase):
 )
 class NativeRemoteTests(unittest.IsolatedAsyncioTestCase):
     async def test_remote_query_stats_and_close(self) -> None:
-        from corium import ClosedError, RemotePeer
+        from corium import RemotePeer
 
         peer = await RemotePeer.connect(
             os.environ["CORIUM_TEST_REMOTE_ENDPOINT"],
@@ -90,17 +136,4 @@ class NativeRemoteTests(unittest.IsolatedAsyncioTestCase):
             token=os.environ.get("CORIUM_TEST_REMOTE_TOKEN"),
             allow_insecure_token=True,
         )
-        db = await peer.db()
-        query = [
-            Keyword("find"),
-            Symbol("?e"),
-            Keyword("where"),
-            [Symbol("?e"), Symbol("?a"), Symbol("?v")],
-        ]
-        self.assertIsInstance(await db.query(query), list)
-        self.assertGreaterEqual((await db.stats()).basis_t, 0)
-        report = await peer.transact([])
-        self.assertGreater(report.basis_t, report.basis_before)
-        await peer.close()
-        with self.assertRaises(ClosedError):
-            await db.stats()
+        await _exercise_live_peer(self, peer)
