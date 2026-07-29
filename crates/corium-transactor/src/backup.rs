@@ -568,6 +568,7 @@ fn bare_root() -> DbRoot {
         roots: None,
         next_entity_id: 0,
         last_tx_instant: i64::MIN,
+        key_manifest_version: 0,
     }
 }
 

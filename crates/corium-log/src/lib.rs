@@ -5,8 +5,12 @@ use corium_core::{
     Datom, EntityId,
     encoding::{decode_value, encode_value},
 };
+use corium_crypt::{
+    CryptError, LogHeader, SecretKey, decrypt_log_record, encrypt_log_record,
+    is_encrypted_log_record, parse_log_header,
+};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -45,6 +49,163 @@ pub enum LogError {
     /// The operation requires the asynchronous log interface.
     #[error("this transaction log requires asynchronous access")]
     AsyncOnly,
+    /// The log holds encrypted records and this process has no storage key.
+    #[error("transaction log is encrypted; no storage key is configured")]
+    Encrypted,
+    /// A storage key is configured but the log holds cleartext records.
+    /// Encryption is fixed at database creation, so this is a misconfigured
+    /// process pointed at somebody else's log, not a database to upgrade.
+    #[error("transaction log is not encrypted, but a storage key is configured")]
+    Unencrypted,
+    /// A record names a key epoch this process cannot resolve.
+    #[error("transaction log record uses storage key epoch {0}, which is unavailable")]
+    MissingKeyEpoch(u32),
+    /// Encryption or authentication of a record payload failed.
+    #[error("transaction log record encryption failed: {0}")]
+    Crypt(#[from] CryptError),
+}
+
+/// Encrypts and decrypts transaction-log record payloads for one database.
+///
+/// Frame lengths and CRC32C checksums stay cleartext, as do each record's key
+/// epoch and transaction number, so frame scanning, range reads, and recovery
+/// truncation need no key. The payload — the transaction's datoms — does not.
+///
+/// The key set is an immutable snapshot of already-unwrapped storage keys, the
+/// same shape `EncryptedBlobStore` holds: KMS access belongs on database open
+/// and key-manifest reload, not on the append path. A rotation replaces the
+/// cipher rather than mutating it.
+pub struct LogCipher {
+    lineage: Vec<u8>,
+    current_epoch: u32,
+    keys: BTreeMap<u32, SecretKey>,
+}
+
+impl LogCipher {
+    /// Creates a cipher over every readable epoch, writing under
+    /// `current_epoch`.
+    ///
+    /// `lineage` identifies the database and is authenticated into every
+    /// record, so a record cannot be moved between databases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogError::MissingKeyEpoch`] when `current_epoch` has no key.
+    pub fn new(
+        lineage: impl Into<Vec<u8>>,
+        current_epoch: u32,
+        keys: impl IntoIterator<Item = (u32, SecretKey)>,
+    ) -> Result<Self, LogError> {
+        let keys = keys.into_iter().collect::<BTreeMap<_, _>>();
+        if !keys.contains_key(&current_epoch) {
+            return Err(LogError::MissingKeyEpoch(current_epoch));
+        }
+        Ok(Self {
+            lineage: lineage.into(),
+            current_epoch,
+            keys,
+        })
+    }
+
+    /// Creates a single-epoch cipher.
+    #[must_use]
+    pub fn with_key(lineage: impl Into<Vec<u8>>, epoch: u32, key: SecretKey) -> Self {
+        Self {
+            lineage: lineage.into(),
+            current_epoch: epoch,
+            keys: BTreeMap::from([(epoch, key)]),
+        }
+    }
+
+    /// Returns the epoch new records are written under.
+    #[must_use]
+    pub fn current_epoch(&self) -> u32 {
+        self.current_epoch
+    }
+
+    fn key(&self, epoch: u32) -> Result<&SecretKey, LogError> {
+        self.keys
+            .get(&epoch)
+            .ok_or(LogError::MissingKeyEpoch(epoch))
+    }
+
+    fn seal(&self, log_version: u64, t: u64, plaintext: &[u8]) -> Result<Vec<u8>, LogError> {
+        Ok(encrypt_log_record(
+            self.key(self.current_epoch)?,
+            self.current_epoch,
+            &self.lineage,
+            log_version,
+            t,
+            plaintext,
+        )?)
+    }
+
+    /// Opens a payload whose header the caller has already parsed, so the
+    /// decode path reads it once.
+    fn open(
+        &self,
+        log_version: u64,
+        header: LogHeader,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, LogError> {
+        Ok(decrypt_log_record(
+            self.key(header.epoch)?,
+            &self.lineage,
+            log_version,
+            payload,
+        )?)
+    }
+}
+
+/// How one log file or object encodes record payloads: cleartext, or sealed
+/// under a storage key and bound to the file's lease version.
+#[derive(Clone, Default)]
+struct RecordCodec {
+    cipher: Option<Arc<LogCipher>>,
+    log_version: u64,
+}
+
+impl RecordCodec {
+    fn plaintext() -> Self {
+        Self::default()
+    }
+
+    fn new(cipher: Option<Arc<LogCipher>>, log_version: u64) -> Self {
+        Self {
+            cipher,
+            log_version,
+        }
+    }
+
+    fn encode(&self, record: &TxRecord) -> Result<Vec<u8>, LogError> {
+        let encoded = encode_record(record);
+        match &self.cipher {
+            Some(cipher) => cipher.seal(self.log_version, record.t, &encoded),
+            None => Ok(encoded),
+        }
+    }
+
+    fn decode(&self, payload: &[u8]) -> Result<TxRecord, LogError> {
+        match (&self.cipher, is_encrypted_log_record(payload)) {
+            (Some(cipher), true) => {
+                let header = parse_log_header(payload)?;
+                let record = decode_record(&cipher.open(self.log_version, header, payload)?)?;
+                // The cleartext `t` drives frame indexing and recovery, so a
+                // disagreement with the authenticated payload would let the
+                // index address a record by a number it does not carry. The
+                // AAD puts this out of an attacker's reach — the header is
+                // authenticated — so what remains is a writer that sealed one
+                // `t` under another, and that must not reach an index.
+                if record.t != header.t {
+                    return Err(LogError::Corrupt);
+                }
+                Ok(record)
+            }
+            (None, true) => Err(LogError::Encrypted),
+            (Some(_), false) => Err(LogError::Unencrypted),
+            (None, false) => decode_record(payload),
+        }
+    }
 }
 
 /// Common transaction log interface.
@@ -155,11 +316,27 @@ impl FileLog {
     /// Returns an error if the file cannot be created or a fully written
     /// record is corrupt.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LogError> {
+        Self::open_with(path, None)
+    }
+
+    /// Opens or creates a log whose record payloads are sealed under `cipher`.
+    ///
+    /// A single-file log has no lease versions, so its records bind lease
+    /// version 0 — the same number [`VersionedLog`] gives a pre-HA `{name}.log`.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be created, a fully written record
+    /// is corrupt, or a record cannot be authenticated.
+    pub fn open_sealed(path: impl AsRef<Path>, cipher: Arc<LogCipher>) -> Result<Self, LogError> {
+        Self::open_with(path, Some(cipher))
+    }
+
+    fn open_with(path: impl AsRef<Path>, cipher: Option<Arc<LogCipher>>) -> Result<Self, LogError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = IndexedFile::open(&path, true, true)?;
+        let file = IndexedFile::open(&path, true, true, RecordCodec::new(cipher, 0))?;
         file.validate_contiguous_prefix(file.frames.len())?;
         Ok(Self {
             state: RwLock::new(file),
@@ -210,6 +387,7 @@ impl TransactionLog for FileLog {
 pub struct VersionedLog {
     dir: PathBuf,
     name: String,
+    cipher: Option<Arc<LogCipher>>,
     state: RwLock<VersionedLogState>,
 }
 
@@ -233,6 +411,32 @@ impl VersionedLog {
     /// Returns an error if files cannot be read/created or a fully written
     /// record is corrupt.
     pub fn open(dir: impl AsRef<Path>, name: &str, write_version: u64) -> Result<Self, LogError> {
+        Self::open_with(dir, name, write_version, None)
+    }
+
+    /// Opens the log for writing with record payloads sealed under `cipher`.
+    ///
+    /// Every version file is read through the same cipher, and each frame is
+    /// authenticated against the version of the file holding it.
+    ///
+    /// # Errors
+    /// Returns an error if files cannot be read/created, a fully written
+    /// record is corrupt, or a record cannot be authenticated.
+    pub fn open_sealed(
+        dir: impl AsRef<Path>,
+        name: &str,
+        write_version: u64,
+        cipher: Arc<LogCipher>,
+    ) -> Result<Self, LogError> {
+        Self::open_with(dir, name, write_version, Some(cipher))
+    }
+
+    fn open_with(
+        dir: impl AsRef<Path>,
+        name: &str,
+        write_version: u64,
+        cipher: Option<Arc<LogCipher>>,
+    ) -> Result<Self, LogError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let write_path = version_path(&dir, name, write_version);
@@ -241,14 +445,24 @@ impl VersionedLog {
             let writable = version == write_version;
             files.push(VersionedFile {
                 version,
-                file: IndexedFile::open(&path, writable, writable)?,
+                file: IndexedFile::open(
+                    &path,
+                    writable,
+                    writable,
+                    RecordCodec::new(cipher.clone(), version),
+                )?,
             });
             close_cold_version_files(&mut files);
         }
         if !files.iter().any(|file| file.version == write_version) {
             files.push(VersionedFile {
                 version: write_version,
-                file: IndexedFile::open(&write_path, true, true)?,
+                file: IndexedFile::open(
+                    &write_path,
+                    true,
+                    true,
+                    RecordCodec::new(cipher.clone(), write_version),
+                )?,
             });
             files.sort_by_key(|file| file.version);
         }
@@ -258,6 +472,7 @@ impl VersionedLog {
         Ok(Self {
             dir,
             name: name.to_owned(),
+            cipher,
             state: RwLock::new(VersionedLogState {
                 files,
                 write_version: Some(write_version),
@@ -272,12 +487,34 @@ impl VersionedLog {
     /// Returns an error when the directory cannot be read or a fully
     /// written record is corrupt.
     pub fn open_read_only(dir: impl AsRef<Path>, name: &str) -> Result<Self, LogError> {
+        Self::open_read_only_with(dir, name, None)
+    }
+
+    /// Opens the log read-only, opening sealed record payloads with `cipher`.
+    ///
+    /// # Errors
+    /// Returns an error when the directory cannot be read, a fully written
+    /// record is corrupt, or a record cannot be authenticated.
+    pub fn open_read_only_sealed(
+        dir: impl AsRef<Path>,
+        name: &str,
+        cipher: Arc<LogCipher>,
+    ) -> Result<Self, LogError> {
+        Self::open_read_only_with(dir, name, Some(cipher))
+    }
+
+    fn open_read_only_with(
+        dir: impl AsRef<Path>,
+        name: &str,
+        cipher: Option<Arc<LogCipher>>,
+    ) -> Result<Self, LogError> {
         let dir = dir.as_ref().to_path_buf();
-        let mut files = open_version_files(&dir, name)?;
+        let mut files = open_version_files(&dir, name, cipher.as_ref())?;
         close_cold_version_files(&mut files);
         let cutoffs = validated_version_cutoffs(&files)?;
         Ok(Self {
             name: name.to_owned(),
+            cipher,
             state: RwLock::new(VersionedLogState {
                 next_t: merged_next_t(&files, &cutoffs)?,
                 write_version: None,
@@ -351,7 +588,12 @@ impl TransactionLog for VersionedLog {
         }
         {
             let mut state = self.state.write().expect("poisoned log lock");
-            refresh_version_files(&self.dir, &self.name, &mut state.files)?;
+            refresh_version_files(
+                &self.dir,
+                &self.name,
+                self.cipher.as_ref(),
+                &mut state.files,
+            )?;
             close_cold_version_files(&mut state.files);
             validated_version_cutoffs(&state.files)?;
         }
@@ -467,6 +709,7 @@ pub struct NativeVersionedLog<S: ?Sized> {
     name: String,
     write_version: u64,
     read_only: bool,
+    cipher: Option<Arc<LogCipher>>,
     /// Next `t` this writer will accept; also serializes concurrent appends.
     next_t: tokio::sync::Mutex<u64>,
 }
@@ -477,16 +720,40 @@ impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
     /// # Errors
     /// Returns an error when stored records cannot be read or decoded.
     pub async fn open(storage: Arc<S>, name: &str, write_version: u64) -> Result<Self, LogError> {
+        Self::open_with(storage, name, write_version, None).await
+    }
+
+    /// Opens the log for writing with record payloads sealed under `cipher`.
+    ///
+    /// # Errors
+    /// Returns an error when stored records cannot be read, decoded, or
+    /// authenticated.
+    pub async fn open_sealed(
+        storage: Arc<S>,
+        name: &str,
+        write_version: u64,
+        cipher: Arc<LogCipher>,
+    ) -> Result<Self, LogError> {
+        Self::open_with(storage, name, write_version, Some(cipher)).await
+    }
+
+    async fn open_with(
+        storage: Arc<S>,
+        name: &str,
+        write_version: u64,
+        cipher: Option<Arc<LogCipher>>,
+    ) -> Result<Self, LogError> {
         // The merged view across every version and both layouts establishes the
         // next `t` — the takeover cutoff may place it past this writer's own
         // last record.
-        let records = read_native_merged(storage.as_ref(), name).await?;
+        let records = read_native_merged(storage.as_ref(), name, cipher.as_ref()).await?;
         let next_t = records.last().map_or(1, |r| r.t + 1);
         Ok(Self {
             storage,
             name: name.to_owned(),
             write_version,
             read_only: false,
+            cipher,
             next_t: tokio::sync::Mutex::new(next_t),
         })
     }
@@ -495,11 +762,22 @@ impl<S: NativeLogStorage + ?Sized + 'static> NativeVersionedLog<S> {
     /// initialize writer state.
     #[must_use]
     pub fn open_read_only(storage: Arc<S>, name: &str) -> Self {
+        Self::open_read_only_with(storage, name, None)
+    }
+
+    /// Opens the log read-only, opening sealed record payloads with `cipher`.
+    #[must_use]
+    pub fn open_read_only_sealed(storage: Arc<S>, name: &str, cipher: Arc<LogCipher>) -> Self {
+        Self::open_read_only_with(storage, name, Some(cipher))
+    }
+
+    fn open_read_only_with(storage: Arc<S>, name: &str, cipher: Option<Arc<LogCipher>>) -> Self {
         Self {
             storage,
             name: name.to_owned(),
             write_version: 0,
             read_only: true,
+            cipher,
             next_t: tokio::sync::Mutex::new(0),
         }
     }
@@ -530,11 +808,12 @@ impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedL
                 return Err(LogError::Corrupt);
             }
         }
+        let codec = RecordCodec::new(self.cipher.clone(), self.write_version);
         let framed = records
             .iter()
             .map(|record| {
                 let mut bytes = Vec::new();
-                append_framed_record(&mut bytes, record)?;
+                append_framed_payload(&mut bytes, &codec.encode(record)?)?;
                 Ok((record.t, bytes))
             })
             .collect::<Result<Vec<_>, LogError>>()?;
@@ -566,17 +845,20 @@ impl<S: NativeLogStorage + ?Sized + 'static> TransactionLog for NativeVersionedL
         // Range/replay must merge every version (for the takeover cutoff), so
         // they read the store; the lock only serializes them with appends.
         let _guard = self.next_t.lock().await;
-        Ok(read_native_merged(self.storage.as_ref(), &self.name)
-            .await?
-            .into_iter()
-            .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
-            .collect())
+        Ok(
+            read_native_merged(self.storage.as_ref(), &self.name, self.cipher.as_ref())
+                .await?
+                .into_iter()
+                .filter(|r| r.t >= start && end.is_none_or(|e| r.t < e))
+                .collect(),
+        )
     }
 }
 
 async fn read_native_merged<S: NativeLogStorage + ?Sized>(
     storage: &S,
     name: &str,
+    cipher: Option<&Arc<LogCipher>>,
 ) -> Result<Vec<TxRecord>, LogError> {
     use std::collections::BTreeMap;
 
@@ -597,7 +879,10 @@ async fn read_native_merged<S: NativeLogStorage + ?Sized>(
         per_version
             .entry(version)
             .or_default()
-            .extend(decode_framed_records(&bytes)?);
+            .extend(decode_framed_payloads(
+                &bytes,
+                &RecordCodec::new(cipher.map(Arc::clone), version),
+            )?);
     }
 
     // Per-record objects, one framed record each.
@@ -611,7 +896,10 @@ async fn read_native_merged<S: NativeLogStorage + ?Sized>(
         per_version
             .entry(version)
             .or_default()
-            .extend(decode_framed_records(&bytes)?);
+            .extend(decode_framed_payloads(
+                &bytes,
+                &RecordCodec::new(cipher.map(Arc::clone), version),
+            )?);
     }
 
     // Order each version's records by `t` (a version is written in a single
@@ -789,12 +1077,18 @@ struct IndexedFile {
     frames: Vec<FrameIndex>,
     durable_len: u64,
     first_gap: Option<usize>,
+    codec: RecordCodec,
 }
 
 impl IndexedFile {
-    fn open(path: &Path, writable: bool, truncate_torn: bool) -> Result<Self, LogError> {
+    fn open(
+        path: &Path,
+        writable: bool,
+        truncate_torn: bool,
+        codec: RecordCodec,
+    ) -> Result<Self, LogError> {
         let file = Arc::new(open_index_file(path, writable)?);
-        let (frames, durable_len) = scan_frames(file.as_ref(), 0)?;
+        let (frames, durable_len) = scan_frames(file.as_ref(), 0, &codec)?;
         validate_sorted_frames(&frames)?;
         if truncate_torn && file.metadata()?.len() > durable_len {
             file.set_len(durable_len)?;
@@ -808,6 +1102,7 @@ impl IndexedFile {
             first_gap: first_gap_index(&frames),
             frames,
             durable_len,
+            codec,
         })
     }
 
@@ -816,14 +1111,15 @@ impl IndexedFile {
         let file_len = self.physical_len()?;
         if file_len < self.durable_len {
             let file = self.open_for_read()?;
-            let (frames, durable_len) = scan_frames(file.as_ref(), 0)?;
+            let (frames, durable_len) = scan_frames(file.as_ref(), 0, &self.codec)?;
             validate_sorted_frames(&frames)?;
             self.first_gap = first_gap_index(&frames);
             self.frames = frames;
             self.durable_len = durable_len;
         } else if file_len > self.durable_len {
             let file = self.open_for_read()?;
-            let (new_frames, durable_len) = scan_frames(file.as_ref(), self.durable_len)?;
+            let (new_frames, durable_len) =
+                scan_frames(file.as_ref(), self.durable_len, &self.codec)?;
             validate_sorted_extension(&self.frames, &new_frames)?;
             let existing_len = self.frames.len();
             if self.first_gap.is_none() {
@@ -849,7 +1145,7 @@ impl IndexedFile {
         }
 
         let mut frame = Vec::new();
-        append_framed_record(&mut frame, record)?;
+        append_framed_payload(&mut frame, &self.codec.encode(record)?)?;
         let frame_len = u64::try_from(frame.len()).map_err(|_| LogError::Corrupt)?;
         let offset = self.durable_len;
         let mut writer = file.as_ref();
@@ -913,7 +1209,7 @@ impl IndexedFile {
                 .map_err(|_| LogError::Corrupt)?;
             let mut bytes = vec![0; byte_len];
             read_exact_at(file.as_ref(), &mut bytes, offset)?;
-            let chunk_records = decode_framed_records(&bytes)?;
+            let chunk_records = decode_framed_payloads(&bytes, &self.codec)?;
             if chunk_records.len() != chunk_last - chunk_first
                 || chunk_records
                     .iter()
@@ -1061,12 +1357,21 @@ fn version_files(dir: &Path, name: &str) -> Vec<(u64, PathBuf)> {
     files
 }
 
-fn open_version_files(dir: &Path, name: &str) -> Result<Vec<VersionedFile>, LogError> {
+fn open_version_files(
+    dir: &Path,
+    name: &str,
+    cipher: Option<&Arc<LogCipher>>,
+) -> Result<Vec<VersionedFile>, LogError> {
     let mut files = Vec::new();
     for (version, path) in version_files(dir, name) {
         files.push(VersionedFile {
             version,
-            file: IndexedFile::open(&path, false, false)?,
+            file: IndexedFile::open(
+                &path,
+                false,
+                false,
+                RecordCodec::new(cipher.map(Arc::clone), version),
+            )?,
         });
         close_cold_version_files(&mut files);
     }
@@ -1076,6 +1381,7 @@ fn open_version_files(dir: &Path, name: &str) -> Result<Vec<VersionedFile>, LogE
 fn refresh_version_files(
     dir: &Path,
     name: &str,
+    cipher: Option<&Arc<LogCipher>>,
     files: &mut Vec<VersionedFile>,
 ) -> Result<(), LogError> {
     for file in &mut *files {
@@ -1086,7 +1392,12 @@ fn refresh_version_files(
         if files.iter().all(|file| file.version != version) {
             files.push(VersionedFile {
                 version,
-                file: IndexedFile::open(&path, false, false)?,
+                file: IndexedFile::open(
+                    &path,
+                    false,
+                    false,
+                    RecordCodec::new(cipher.map(Arc::clone), version),
+                )?,
             });
             close_cold_version_files(files);
         }
@@ -1312,7 +1623,11 @@ fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
 /// mismatch or invalid payload is genuine corruption and errors. Legacy
 /// length-only records remain readable, while newly written records set the
 /// high bit of the length word and carry a trailing CRC32C.
-fn scan_frames(file: &File, offset: u64) -> Result<(Vec<FrameIndex>, u64), LogError> {
+fn scan_frames(
+    file: &File,
+    offset: u64,
+    codec: &RecordCodec,
+) -> Result<(Vec<FrameIndex>, u64), LogError> {
     let file_len = file.metadata()?.len();
     let mut frames = Vec::new();
     let mut durable_len = offset;
@@ -1351,7 +1666,7 @@ fn scan_frames(file: &File, offset: u64) -> Result<(Vec<FrameIndex>, u64), LogEr
                 return Err(LogError::Corrupt);
             }
         }
-        let record = decode_record(&payload)?;
+        let record = codec.decode(&payload)?;
         frames.push(FrameIndex {
             t: record.t,
             offset: durable_len,
@@ -1364,21 +1679,73 @@ fn scan_frames(file: &File, offset: u64) -> Result<(Vec<FrameIndex>, u64), LogEr
     Ok((frames, durable_len))
 }
 
-/// Appends one checksummed, length-prefixed encoded record to `out`.
+/// Appends one checksummed, length-prefixed record payload to `out`.
 ///
 /// The high bit of the length word identifies the checksummed frame format;
 /// the remaining 63 bits are the payload length. A big-endian CRC32C over the
-/// encoded length word and payload follows the payload.
+/// encoded length word and payload follows the payload. Framing is identical
+/// for cleartext and encrypted payloads, which is what keeps scanning, range
+/// reads, and recovery truncation keyless.
+fn append_framed_payload(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), LogError> {
+    let header = frame_header(payload.len())?;
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&frame_checksum(header, payload).to_be_bytes());
+    Ok(())
+}
+
+/// Appends one checksummed, length-prefixed cleartext record to `out`.
 ///
 /// # Errors
 /// Returns an error if the record payload length is not representable.
 pub fn append_framed_record(out: &mut Vec<u8>, record: &TxRecord) -> Result<(), LogError> {
-    let payload = encode_record(record);
-    let header = frame_header(payload.len())?;
-    out.extend_from_slice(&header);
-    out.extend_from_slice(&payload);
-    out.extend_from_slice(&frame_checksum(header, &payload).to_be_bytes());
-    Ok(())
+    append_framed_payload(out, &encode_record(record))
+}
+
+/// Appends one checksummed, length-prefixed record to `out`, sealed under
+/// `cipher` when one is configured.
+///
+/// `log_version` is the lease version of the file or object the frame belongs
+/// to; it is authenticated, so a frame cannot be moved between version files.
+///
+/// # Errors
+/// Returns an error if encryption fails or the payload length is not
+/// representable.
+pub fn append_framed_record_sealed(
+    out: &mut Vec<u8>,
+    record: &TxRecord,
+    cipher: Option<&Arc<LogCipher>>,
+    log_version: u64,
+) -> Result<(), LogError> {
+    let codec = RecordCodec::new(cipher.map(Arc::clone), log_version);
+    append_framed_payload(out, &codec.encode(record)?)
+}
+
+/// Decodes all cleartext records from a framed byte slice.
+///
+/// # Errors
+/// Returns an error when any frame is truncated, has an invalid length, or
+/// checksum, or contains a corrupt encoded transaction record.
+pub fn decode_framed_records(bytes: &[u8]) -> Result<Vec<TxRecord>, LogError> {
+    decode_framed_payloads(bytes, &RecordCodec::plaintext())
+}
+
+/// Decodes all records from a framed byte slice, opening sealed payloads with
+/// `cipher`.
+///
+/// # Errors
+/// Returns an error when any frame is truncated or corrupt, when a payload
+/// cannot be authenticated, or when the frames' encryption state disagrees
+/// with the configured `cipher`.
+pub fn decode_framed_records_sealed(
+    bytes: &[u8],
+    cipher: Option<&Arc<LogCipher>>,
+    log_version: u64,
+) -> Result<Vec<TxRecord>, LogError> {
+    decode_framed_payloads(
+        bytes,
+        &RecordCodec::new(cipher.map(Arc::clone), log_version),
+    )
 }
 
 /// Decodes all records from a framed byte slice.
@@ -1386,11 +1753,10 @@ pub fn append_framed_record(out: &mut Vec<u8>, record: &TxRecord) -> Result<(), 
 /// Unlike filesystem crash recovery, native stores publish whole values
 /// atomically, so any trailing partial frame is treated as corruption.
 /// Both legacy length-only frames and checksummed frames are accepted.
-///
-/// # Errors
-/// Returns an error when any frame is truncated, has an invalid length, or
-/// checksum, or contains a corrupt encoded transaction record.
-pub fn decode_framed_records(mut bytes: &[u8]) -> Result<Vec<TxRecord>, LogError> {
+fn decode_framed_payloads(
+    mut bytes: &[u8],
+    codec: &RecordCodec,
+) -> Result<Vec<TxRecord>, LogError> {
     let mut records = Vec::new();
     while !bytes.is_empty() {
         if bytes.len() < 8 {
@@ -1414,7 +1780,7 @@ pub fn decode_framed_records(mut bytes: &[u8]) -> Result<Vec<TxRecord>, LogError
             }
             bytes = &bytes[FRAME_CHECKSUM_LEN..];
         }
-        records.push(decode_record(payload)?);
+        records.push(codec.decode(payload)?);
     }
     Ok(records)
 }
@@ -1422,6 +1788,31 @@ pub fn decode_framed_records(mut bytes: &[u8]) -> Result<Vec<TxRecord>, LogError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cleartext `t` a frame is indexed by must be the `t` the sealed
+    /// payload carries. The AAD authenticates the header, so no attacker can
+    /// separate them; only a writer that sealed one number under another can,
+    /// and this is the check that stops such a record reaching an index.
+    #[test]
+    fn a_header_t_disagreeing_with_its_payload_is_corrupt() {
+        let key = SecretKey::new([7; 32]);
+        let codec = RecordCodec::new(Some(Arc::new(LogCipher::with_key("db", 1, key.clone()))), 0);
+        let record = TxRecord {
+            t: 1,
+            tx_instant: 5,
+            datoms: Vec::new(),
+        };
+
+        let honest = codec.encode(&record).expect("seal");
+        assert_eq!(codec.decode(&honest).expect("decode"), record);
+
+        // Same key, same lineage, same lease version, and the header
+        // authenticates cleanly — only the two transaction numbers disagree.
+        let forged =
+            encrypt_log_record(&key, 1, b"db", 0, 2, &encode_record(&record)).expect("seal");
+        assert_eq!(parse_log_header(&forged).expect("header").t, 2);
+        assert!(matches!(codec.decode(&forged), Err(LogError::Corrupt)));
+    }
 
     #[test]
     fn versioned_log_bounds_cached_read_descriptors() {

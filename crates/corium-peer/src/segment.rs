@@ -315,6 +315,7 @@ mod tests {
             roots: Some([id.clone(), id.clone(), id.clone(), id]),
             next_entity_id: 1_005,
             last_tx_instant: 0,
+            key_manifest_version: 0,
         };
         RootStore::cas_root(&store, &db_root_name("music"), None, &root.encode())
             .await
@@ -371,6 +372,7 @@ mod tests {
             roots: Some([id.clone(), id.clone(), id.clone(), id]),
             next_entity_id: 1_005,
             last_tx_instant: 0,
+            key_manifest_version: 0,
         };
         RootStore::cas_root(&store, &db_root_name("music"), None, &root.encode())
             .await
