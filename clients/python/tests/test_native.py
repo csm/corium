@@ -46,6 +46,26 @@ class NativeBoundaryTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(_corium._roundtrip(value), value)
 
+    def test_reserved_tags_cannot_collide_with_native_boundary_types(self) -> None:
+        for tag, value in (
+            ("bytes", "00ff"),
+            ("eid", 42),
+            ("inst", 0),
+            ("uuid", "12345678123456781234567812345678"),
+        ):
+            tagged = object.__new__(Tagged)
+            object.__setattr__(tagged, "tag", tag)
+            object.__setattr__(tagged, "value", value)
+            with self.subTest(tag=tag):
+                with self.assertRaisesRegex(ValueError, "reserved"):
+                    _corium._roundtrip(tagged)
+
+    def test_datetime_requires_millisecond_precision(self) -> None:
+        with self.assertRaisesRegex(ValueError, "millisecond precision"):
+            _corium._roundtrip(
+                datetime(2026, 7, 28, 12, 34, 56, 789123, tzinfo=timezone.utc)
+            )
+
     def test_local_peer_reports_the_phase_boundary(self) -> None:
         with self.assertRaisesRegex(NativeExtensionError, "Phase 3"):
             _corium.connect_local(

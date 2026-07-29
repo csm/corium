@@ -12,9 +12,49 @@ use corium_protocol::codec;
 use corium_query::edn::Edn;
 use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{
     PyAny, PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyList, PySet, PyString, PyTuple,
 };
+
+const RESERVED_TAGS: [&str; 4] = ["bytes", "eid", "inst", "uuid"];
+
+struct PythonRuntime {
+    keyword: Py<PyAny>,
+    symbol: Py<PyAny>,
+    entity_id: Py<PyAny>,
+    tagged: Py<PyAny>,
+    datetime: Py<PyAny>,
+    timezone_utc: Py<PyAny>,
+    uuid: Py<PyAny>,
+    unix_millis: Py<PyAny>,
+    tx_report: Py<PyAny>,
+    datom: Py<PyAny>,
+    db_stats: Py<PyAny>,
+}
+
+static PYTHON_RUNTIME: PyOnceLock<PythonRuntime> = PyOnceLock::new();
+
+fn python_runtime(py: Python<'_>) -> PyResult<&'static PythonRuntime> {
+    PYTHON_RUNTIME.get_or_try_init(py, || {
+        let values = py.import("corium.values")?;
+        let datetime = py.import("datetime")?;
+        let api = py.import("corium._api")?;
+        Ok(PythonRuntime {
+            keyword: values.getattr("Keyword")?.unbind(),
+            symbol: values.getattr("Symbol")?.unbind(),
+            entity_id: values.getattr("EntityId")?.unbind(),
+            tagged: values.getattr("Tagged")?.unbind(),
+            datetime: datetime.getattr("datetime")?.unbind(),
+            timezone_utc: datetime.getattr("timezone")?.getattr("utc")?.unbind(),
+            uuid: py.import("uuid")?.getattr("UUID")?.unbind(),
+            unix_millis: api.getattr("_unix_millis")?.unbind(),
+            tx_report: api.getattr("_TxReportData")?.unbind(),
+            datom: api.getattr("Datom")?.unbind(),
+            db_stats: api.getattr("DbStats")?.unbind(),
+        })
+    })
+}
 
 #[pyclass(module = "corium._corium", name = "_PeerBackend")]
 struct PythonPeer {
@@ -23,6 +63,8 @@ struct PythonPeer {
 
 impl Drop for PythonPeer {
     fn drop(&mut self) {
+        // Explicit close is the deterministic API; this idempotent call is only
+        // a best-effort safety net when Python releases an unclosed peer.
         self.handle.close();
     }
 }
@@ -60,8 +102,7 @@ impl PythonPeer {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = peer.transact(forms).await.map_err(ffi_error)?;
             Python::attach(|py| {
-                let api = py.import("corium._api")?;
-                let report_type = api.getattr("_TxReportData")?;
+                let report_type = python_runtime(py)?.tx_report.bind(py);
                 let tempids = PyDict::new(py);
                 for (name, entity) in report.tempids {
                     tempids.set_item(name, entity)?;
@@ -96,6 +137,8 @@ impl PythonPeer {
 
 #[pyclass(module = "corium._corium", name = "_DbBackend")]
 struct PythonDb {
+    // DbHandle is an immutable view over Arc-backed peer state. It owns no
+    // independent connection or server resource, so dropping it needs no close.
     handle: DbHandle,
 }
 
@@ -163,7 +206,7 @@ impl PythonDb {
                 .await
                 .map_err(ffi_error)?;
             Python::attach(|py| {
-                let datom_type = py.import("corium._api")?.getattr("Datom")?;
+                let datom_type = python_runtime(py)?.datom.bind(py);
                 let result = PyList::empty(py);
                 for row in rows {
                     result.append(datom_type.call1((
@@ -184,8 +227,9 @@ impl PythonDb {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stats = db.stats().await.map_err(ffi_error)?;
             Python::attach(|py| {
-                py.import("corium._api")?
-                    .getattr("DbStats")?
+                python_runtime(py)?
+                    .db_stats
+                    .bind(py)
                     .call1((
                         stats.basis_t,
                         stats.datoms,
@@ -259,10 +303,11 @@ fn db_for_view(db: &DbHandle, view: &Bound<'_, PyAny>) -> PyResult<DbHandle> {
 }
 
 fn python_index(index: &Bound<'_, PyAny>) -> PyResult<Index> {
-    let value: String = index
-        .getattr("value")
-        .and_then(|value| value.extract())
-        .or_else(|_| index.extract())?;
+    let value: String = if index.hasattr("value")? {
+        index.getattr("value")?.extract()?
+    } else {
+        index.extract()?
+    };
     match value.as_str() {
         "eavt" => Ok(Index::Eavt),
         "aevt" => Ok(Index::Aevt),
@@ -305,37 +350,36 @@ fn python_to_edn(value: &Bound<'_, PyAny>) -> PyResult<Edn> {
         ));
     }
 
-    let values = py.import("corium.values")?;
-    if value.is_instance(&values.getattr("Keyword")?)? {
+    let runtime = python_runtime(py)?;
+    if value.is_instance(runtime.keyword.bind(py))? {
         let text: String = value.getattr("value")?.extract()?;
         return Ok(Edn::keyword(&text));
     }
-    if value.is_instance(&values.getattr("Symbol")?)? {
+    if value.is_instance(runtime.symbol.bind(py))? {
         return Ok(Edn::Symbol(value.getattr("value")?.extract()?));
     }
-    if value.is_instance(&values.getattr("EntityId")?)? {
+    if value.is_instance(runtime.entity_id.bind(py))? {
         let raw: u64 = value.getattr("value")?.extract()?;
         let raw = i64::try_from(raw)
             .map_err(|_| PyOverflowError::new_err("entity id exceeds the boundary range"))?;
         return Ok(Edn::Tagged("eid".into(), Box::new(Edn::Long(raw))));
     }
-    if value.is_instance(&values.getattr("Tagged")?)? {
+    if value.is_instance(runtime.tagged.bind(py))? {
         let tag: String = value.getattr("tag")?.extract()?;
+        if RESERVED_TAGS.contains(&tag.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "tag {tag:?} is reserved for a dedicated Corium boundary type"
+            )));
+        }
         let inner = value.getattr("value")?;
         return Ok(Edn::Tagged(tag, Box::new(python_to_edn(&inner)?)));
     }
 
-    let datetime = py.import("datetime")?;
-    if value.is_instance(&datetime.getattr("datetime")?)? {
-        let millis: i64 = py
-            .import("corium._api")?
-            .getattr("_unix_millis")?
-            .call1((value,))?
-            .extract()?;
+    if value.is_instance(runtime.datetime.bind(py))? {
+        let millis: i64 = runtime.unix_millis.bind(py).call1((value,))?.extract()?;
         return Ok(Edn::Tagged("inst".into(), Box::new(Edn::Long(millis))));
     }
-    let uuid = py.import("uuid")?;
-    if value.is_instance(&uuid.getattr("UUID")?)? {
+    if value.is_instance(runtime.uuid.bind(py))? {
         let hex: String = value.getattr("hex")?.extract()?;
         return Ok(Edn::Tagged("uuid".into(), Box::new(Edn::Str(hex))));
     }
@@ -400,14 +444,12 @@ fn edn_to_python<'py>(py: Python<'py>, value: &Edn) -> PyResult<Bound<'py, PyAny
         Edn::Long(value) => Ok(value.into_pyobject(py)?.into_any()),
         Edn::Double(value) => Ok(value.0.into_pyobject(py)?.into_any()),
         Edn::Str(value) => Ok(value.into_pyobject(py)?.into_any()),
-        Edn::Keyword(value) => py
-            .import("corium.values")?
-            .getattr("Keyword")?
-            .call1((value.to_string().trim_start_matches(':'),)),
-        Edn::Symbol(value) => py
-            .import("corium.values")?
-            .getattr("Symbol")?
-            .call1((value,)),
+        Edn::Keyword(value) => {
+            let rendered = value.to_string();
+            let name = rendered.strip_prefix(':').unwrap_or(&rendered);
+            python_runtime(py)?.keyword.bind(py).call1((name,))
+        }
+        Edn::Symbol(value) => python_runtime(py)?.symbol.bind(py).call1((value,)),
         Edn::List(values) | Edn::Vector(values) => {
             let result = PyList::empty(py);
             for value in values {
@@ -438,32 +480,30 @@ fn tagged_to_python<'py>(py: Python<'py>, tag: &str, value: &Edn) -> PyResult<Bo
         ("eid", Edn::Long(raw)) => {
             let raw = u64::try_from(*raw)
                 .map_err(|_| PyValueError::new_err("negative entity id from native boundary"))?;
-            py.import("corium.values")?
-                .getattr("EntityId")?
-                .call1((raw,))
+            python_runtime(py)?.entity_id.bind(py).call1((raw,))
         }
         ("inst", Edn::Long(millis)) => datetime_from_millis(py, *millis),
         ("uuid", Edn::Str(hex)) => {
             let kwargs = PyDict::new(py);
             kwargs.set_item("hex", hex)?;
-            py.import("uuid")?.getattr("UUID")?.call((), Some(&kwargs))
+            python_runtime(py)?.uuid.bind(py).call((), Some(&kwargs))
         }
         ("bytes", Edn::Str(hex)) => Ok(PyBytes::new(py, &hex_decode(hex)?).into_any()),
-        _ => py
-            .import("corium.values")?
-            .getattr("Tagged")?
+        _ => python_runtime(py)?
+            .tagged
+            .bind(py)
             .call1((tag, edn_to_python(py, value)?)),
     }
 }
 
 fn datetime_from_millis(py: Python<'_>, millis: i64) -> PyResult<Bound<'_, PyAny>> {
-    let datetime = py.import("datetime")?;
-    let value = datetime.getattr("datetime")?.call_method(
+    let runtime = python_runtime(py)?;
+    let value = runtime.datetime.bind(py).call_method(
         "fromtimestamp",
         (millis.div_euclid(1_000),),
         Some(&{
             let kwargs = PyDict::new(py);
-            kwargs.set_item("tz", datetime.getattr("timezone")?.getattr("utc")?)?;
+            kwargs.set_item("tz", runtime.timezone_utc.bind(py))?;
             kwargs
         }),
     )?;
@@ -536,4 +576,28 @@ fn _corium(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonPeer>()?;
     module.add_class::<PythonDb>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_value_type_errors_are_not_reinterpreted_as_string_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("value", 42).unwrap();
+            let index = py
+                .import("types")
+                .unwrap()
+                .getattr("SimpleNamespace")
+                .unwrap()
+                .call((), Some(&kwargs))
+                .unwrap();
+
+            let error = python_index(&index).unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py));
+        });
+    }
 }

@@ -251,11 +251,19 @@ class ValueAndTimeTests(unittest.IsolatedAsyncioTestCase):
             Keyword(":person/name")
         with self.assertRaises(ValueError):
             EntityId(-1)
+        for tag in ("bytes", "eid", "inst", "uuid"):
+            with self.subTest(tag=tag):
+                with self.assertRaisesRegex(ValueError, "reserved"):
+                    Tagged(tag, 1)
 
     async def test_wall_clock_views_require_aware_datetimes(self) -> None:
         database = await LocalPeer._from_backend(FakePeerBackend()).db()
         with self.assertRaises(ValueError):
             database.as_of_instant(datetime(2026, 1, 1))
+        with self.assertRaisesRegex(ValueError, "millisecond precision"):
+            database.as_of_instant(
+                datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=timezone.utc)
+            )
 
         aware = datetime(
             2026, 1, 1, 0, 0, 0, 123000, tzinfo=timezone(timedelta(hours=-8))

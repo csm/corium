@@ -98,6 +98,8 @@ def _unix_millis(instant: datetime) -> int:
         raise TypeError("instant must be a datetime")
     if instant.tzinfo is None or instant.utcoffset() is None:
         raise ValueError("instant must be timezone-aware")
+    if instant.microsecond % 1_000:
+        raise ValueError("instant must have millisecond precision")
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     delta = instant.astimezone(timezone.utc) - epoch
     return delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000

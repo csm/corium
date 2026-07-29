@@ -21,7 +21,9 @@ async with await RemotePeer.connect(
 ```
 
 Explicit `close()` (or `async with`) is required for deterministic shutdown.
-Wall-clock database views accept timezone-aware `datetime` values only.
+Wall-clock database views accept timezone-aware, millisecond-precision
+`datetime` values only. Custom `Tagged` values may use any tag except `bytes`,
+`eid`, `inst`, and `uuid`, which are reserved for dedicated boundary types.
 `https://` endpoints automatically enable platform TLS roots, and bearer
 tokens are rejected for plaintext `http://` endpoints by default. Local
 development may opt in explicitly with `allow_insecure_token=True`. Every
