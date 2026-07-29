@@ -291,6 +291,7 @@ fn db_root_round_trips_lease_fields() {
         roots: None,
         next_entity_id: 1_042,
         last_tx_instant: 123_400,
+        key_manifest_version: 4,
     };
     assert_eq!(DbRoot::decode(&root.encode()), Some(root.clone()));
     let released = DbRoot {
@@ -317,6 +318,22 @@ fn format_one_roots_decode_with_an_unowned_lease() {
     // Recovery hints absent: the sentinel forces full-log replay.
     assert_eq!(decoded.next_entity_id, 0);
     assert_eq!(decoded.last_tx_instant, i64::MIN);
+    // No key manifest, so the database is unencrypted.
+    assert_eq!(decoded.key_manifest_version, 0);
+}
+
+#[test]
+fn a_format_three_root_reads_as_unencrypted() {
+    use corium_store::DbRoot;
+    // A root written before the key manifest existed: every field through
+    // `last_tx_instant`, and nothing after it.
+    let previous =
+        b"corium-root-v3\n7\n42\n-\n-\n-\n-\ntransactor-a\n123456\n-\n1042\n123400".as_slice();
+    let decoded = DbRoot::decode(previous).expect("format 3 decodes");
+    assert_eq!(decoded.format_version, 3);
+    assert_eq!(decoded.next_entity_id, 1_042);
+    assert_eq!(decoded.last_tx_instant, 123_400);
+    assert_eq!(decoded.key_manifest_version, 0);
 }
 
 #[test]

@@ -804,6 +804,9 @@ impl EmbeddedTransactor {
             // Recovery hints for opening from this root without full replay.
             next_entity_id,
             last_tx_instant,
+            // Owned by the key manifest, not by publication;
+            // `publish_root_pinned` carries the stored value forward.
+            key_manifest_version: 0,
         };
         let outcome = publish_root_pinned(store, root_name, &root, pinned.as_ref()).await?;
         if outcome == RootPublication::Raced {
@@ -993,6 +996,10 @@ async fn publish_root_pinned(
         }
         let mut next = root.clone();
         if let Some(stored) = stored {
+            // The key manifest changes independently of the lease and of
+            // publication, so its generation always comes from the stored
+            // record rather than from the root being installed.
+            next.key_manifest_version = stored.key_manifest_version;
             if stored.lease_version > root.lease_version {
                 return Err(TransactError::Deposed {
                     published: stored.lease_version,

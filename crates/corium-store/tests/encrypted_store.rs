@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 
-use corium_crypt::{BLOB_MAGIC, SecretKey};
+use corium_crypt::{BLOB_MAGIC, KeyId, SecretKey, StaticKeyring};
 use corium_store::{
-    BlobStore, EncryptedBlobStore, MemoryStore, RootStore, StoreError, digest, mark_and_sweep,
+    BlobStore, EncryptedBlobStore, KeyManifest, MemoryStore, RootStore, StoreError, digest,
+    keys_root_name, mark_and_sweep,
 };
 
 fn key(byte: u8) -> SecretKey {
@@ -116,4 +117,102 @@ async fn root_records_remain_cleartext() {
         store.inner().get_root("db:test").await.expect("raw root"),
         Some(b"clear root".to_vec())
     );
+}
+
+#[tokio::test]
+async fn a_manifest_bootstraps_the_decorator_across_a_rotation() {
+    // The path a process actually walks at open: read `keys:<db>`, unwrap
+    // every epoch through the keyring, and hand the snapshot to the decorator.
+    // No KMS call happens after this point.
+    let kek = KeyId::new("file:/etc/corium/storage.key").expect("kek");
+    let mut keyring = StaticKeyring::default();
+    keyring.insert(kek.clone(), 1, key(3), true);
+
+    let store = MemoryStore::default();
+    let mut manifest = KeyManifest::create(&keyring, kek, 1_700_000_000_000)
+        .await
+        .expect("create manifest");
+    RootStore::cas_root(&store, &keys_root_name("people"), None, &manifest.encode())
+        .await
+        .expect("publish manifest");
+
+    let old_id = open_encrypted(&store, &manifest, &keyring)
+        .await
+        .put(b"carried-over-leaf")
+        .await
+        .expect("put under epoch 1");
+
+    // Rotating opens a new epoch. Nothing stored is rewritten, and the
+    // manifest is CAS-replaced under the same root name.
+    let stored = RootStore::get_root(&store, &keys_root_name("people"))
+        .await
+        .expect("read manifest")
+        .expect("manifest present");
+    manifest = KeyManifest::decode(&stored).expect("decode manifest");
+    assert_eq!(
+        manifest
+            .rotate_storage_key(&keyring, 1)
+            .await
+            .expect("rotate"),
+        2
+    );
+    RootStore::cas_root(
+        &store,
+        &keys_root_name("people"),
+        Some(&stored),
+        &manifest.encode(),
+    )
+    .await
+    .expect("replace manifest");
+
+    let rotated = open_encrypted(&store, &manifest, &keyring).await;
+    // A mixed-epoch tree is legal: the carried-over leaf keeps its old id and
+    // old epoch, and new writes take the new one.
+    assert_eq!(
+        rotated.get(&old_id).await.expect("read old epoch"),
+        Some(b"carried-over-leaf".to_vec())
+    );
+    let new_id = rotated.put(b"carried-over-leaf").await.expect("re-encrypt");
+    assert_ne!(new_id, old_id, "a new epoch gives a leaf a new identity");
+    assert_eq!(
+        rotated.get(&new_id).await.expect("read new epoch"),
+        Some(b"carried-over-leaf".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn a_process_without_the_kek_fails_at_open() {
+    let kek = KeyId::new("awskms:arn:aws:kms:us-west-2:1:key/2f1c").expect("kek");
+    let mut keyring = StaticKeyring::default();
+    keyring.insert(kek.clone(), 1, key(3), true);
+    let manifest = KeyManifest::create(&keyring, kek, 1).await.expect("create");
+
+    let error = manifest
+        .unwrap_storage_keys(&StaticKeyring::default())
+        .await
+        .expect_err("no KEK material");
+    assert!(
+        error
+            .to_string()
+            .contains("awskms:arn:aws:kms:us-west-2:1:key/2f1c"),
+        "the failure must name the manifest's key id: {error}"
+    );
+}
+
+async fn open_encrypted(
+    store: &MemoryStore,
+    manifest: &KeyManifest,
+    keyring: &StaticKeyring,
+) -> EncryptedBlobStore<MemoryStore> {
+    EncryptedBlobStore::new(
+        store.clone(),
+        manifest
+            .active_storage_epoch()
+            .expect("an encrypted database has an active epoch"),
+        manifest
+            .unwrap_storage_keys(keyring)
+            .await
+            .expect("unwrap storage keys"),
+    )
+    .expect("open decorator")
 }

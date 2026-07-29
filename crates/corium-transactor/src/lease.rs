@@ -140,6 +140,9 @@ pub async fn acquire(
             last_tx_instant: current
                 .as_ref()
                 .map_or(i64::MIN, |root| root.last_tx_instant),
+            // The key manifest belongs to `corium keys`, not to the fence:
+            // a lease bump must carry it forward untouched.
+            key_manifest_version: current.as_ref().map_or(0, |root| root.key_manifest_version),
         };
         match store
             .cas_root(&name, current_bytes.as_deref(), &next.encode())

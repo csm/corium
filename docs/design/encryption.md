@@ -1,8 +1,10 @@
 # Encryption at Rest and Attribute Protection
 
-Status: **implementation in progress.** The storage-encryption primitives and
-blob-store decorator are implemented; log, manifest, backup, process wiring,
-and attribute protection remain. This document specifies two independent layers
+Status: **implementation in progress.** The storage-encryption primitives, the
+blob-store decorator, log-record payload encryption, and the `keys:<db>` key
+manifest (with storage format 4) are implemented; backup format 2, process
+wiring, the `corium keys` commands, and attribute protection remain. This
+document specifies two independent layers
 — envelope encryption of every durable artifact
 ([ADR-0017](../adr/0017-encryption-at-rest.md)) and per-attribute protection
 classes keyed by separate data keys
@@ -141,8 +143,9 @@ its class keys from KMS.
 Primitives:
 
 - **AEAD:** **AES-256-GCM-SIV** for blobs, where deterministic encryption makes
-  nonce misuse resistance mandatory; AES-256-GCM for log records, whose
-  `(log-version, t)` input is unique; and AES-256-GCM-SIV (RFC 8452, zero nonce,
+  nonce misuse resistance mandatory; AES-256-GCM for log records, whose nonce is
+  random and stored (see [Transaction log](#transaction-log)); and
+  AES-256-GCM-SIV (RFC 8452, zero nonce,
   full context in the AAD) for sealed values. See
   [Fact identity](#fact-identity-and-why-sealing-is-deterministic). The
   algorithm is a stored field everywhere it is used, so a future
@@ -239,14 +242,33 @@ range scans, recovery truncation, and the existing framing machinery are
 untouched. The record **payload** is encrypted:
 
 ```
-nonce := BLAKE3_keyed(dek, "corium/log-nonce" ‖ log-version:u64 ‖ t:u64)[..12]
-AAD   := db-lineage-id ‖ log-version ‖ t ‖ epoch
+payload := header ‖ ciphertext ‖ tag
+header  := magic "CORIUML1" ‖ alg:u8 ‖ epoch:u32 ‖ t:u64 ‖ nonce:[12]
+AAD     := "corium/log-v1" ‖ len(lineage):u64 ‖ db-lineage-id
+                           ‖ log-version:u64 ‖ header
+ciphertext ‖ tag := AES-256-GCM(dek, nonce, AAD, encoded-record)
 ```
 
-Binding `(log-version, t)` means a record cannot be replayed at another basis or
-moved between the per-lease-version log files that M7 fencing relies on. The
+Binding `(log-version, t)` in the AAD means a record cannot be replayed at
+another basis or moved between the per-lease-version log files that M7 fencing
+relies on; binding the lineage means it cannot be moved between databases. The
 CRC32C still covers framing (cheap corruption detection during scans); the AEAD
 tag is the authenticity check.
+
+`t` and the key epoch stay cleartext in the header because frame indexing,
+recovery truncation, and epoch selection all happen before any key is applied —
+and a basis number is metadata the root records already publish. A decoded
+record whose `t` disagrees with its authenticated header is rejected, so the
+cleartext copy can never address a record by a number it does not carry.
+
+The nonce is **random and stored**, not derived from `(log-version, t)`. Unlike
+a blob, a log record is not content addressed and nothing requires re-encoding
+one to the same bytes, so determinism buys nothing here — while a derived nonce
+would repeat whenever a transaction number is re-issued for different tx-data,
+which is exactly what happens when an append is torn by a crash before it is
+acknowledged and truncated away on recovery. Key/nonce reuse is fatal under
+GCM; 12 stored bytes are not. Every binding property above lives in the AAD,
+so nothing is given up by making the nonce unpredictable.
 
 ### Roots and the key manifest
 
@@ -261,14 +283,27 @@ A new root record per database, `keys:<db>`, is the key manifest:
 KeyManifest {
   format-version,
   kek: KeyId,
-  storage-keys: [ { epoch, wrapped-dek, alg, created-at, state } ],   // active | retiring | retired
-  classes:      [ { class-entity-id, key-id, current-epoch } ],       // ids only, never material
+  storage-keys: [ { epoch, kek-epoch, alg, state, created-at,
+                    live-objects, wrapped-dek } ],   // active | retiring | retired
+  classes:      [ { class-entity-id, current-epoch, key-id } ],  // ids only, never material
 }
 ```
+
+Each storage key records the **KEK epoch** its material is wrapped under, not
+just the KEK's identity: a KEK rotation retires a KEK epoch while leaving the
+data key's own epoch unchanged, so unwrapping needs both numbers. `live-objects`
+is the per-epoch count the GC mark pass maintains and `corium keys status`
+prints; an epoch retires only at zero.
 
 `DbRoot` gains a `key-manifest-version` field (storage format 4) so a reader
 detects an encrypted database before it tries to parse a blob, and fails with
 "database is encrypted; no storage key configured" instead of a decode error.
+The field is a generation counter, incremented whenever the manifest changes,
+so a running process notices a rotation or re-wrap it has not loaded and
+refreshes its key snapshot without re-reading the manifest on every
+publication. It is owned by `corium keys`: lease acquisition and index
+publication carry the stored value forward untouched, exactly as publication
+already does for the live lease fields.
 
 The class table in the manifest is a **cache of what the schema already says**
 (class entities live in `:db.part/db`, below) so that a process can discover

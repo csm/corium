@@ -1,11 +1,13 @@
 //! Durable log conformance tests.
 
 use corium_core::{Datom, EntityId, Value};
+use corium_crypt::SecretKey;
 use corium_log::{
-    FileLog, LogError, MemLogRegistry, TransactionLog, TxRecord, VersionedLog,
+    FileLog, LogCipher, LogError, MemLogRegistry, TransactionLog, TxRecord, VersionedLog,
     append_framed_record, decode_framed_records,
 };
 use std::io::Write;
+use std::sync::Arc;
 
 // Frame header (8) + transaction number (8) + final byte of tx_instant (7).
 const TX_INSTANT_LOW_BYTE_OFFSET: usize = 8 + 8 + 7;
@@ -777,5 +779,202 @@ async fn native_versioned_log_uses_store_versions_and_takeover_cutoff() {
     assert_eq!(
         v2.replay_async().await.expect("replay"),
         vec![record(1), record(2), record(3)]
+    );
+}
+
+fn cipher(lineage: &str) -> Arc<LogCipher> {
+    Arc::new(LogCipher::with_key(lineage, 1, SecretKey::new([0x5a; 32])))
+}
+
+/// The sentinel a `--storage-key` deployment must never find in its data
+/// directory. `record`'s datoms carry longs, so tests that scan for plaintext
+/// use this string value instead.
+const SENTINEL: &str = "salary-is-140000";
+
+fn sentinel_record(t: u64) -> TxRecord {
+    let signed_t = i64::try_from(t).expect("test transaction fits i64");
+    TxRecord {
+        t,
+        tx_instant: 100 + signed_t,
+        datoms: vec![Datom {
+            e: EntityId::from_raw(t),
+            a: EntityId::from_raw(2),
+            v: Value::Str(SENTINEL.into()),
+            tx: EntityId::from_raw(100 + t),
+            added: true,
+        }],
+    }
+}
+
+#[test]
+fn sealed_filesystem_log_round_trips_and_stores_no_plaintext() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transactions.log");
+    let log = FileLog::open_sealed(&path, cipher("people")).expect("open");
+    log.append(&sentinel_record(1)).expect("append 1");
+    log.append(&sentinel_record(2)).expect("append 2");
+
+    let bytes = std::fs::read(&path).expect("read log");
+    assert!(
+        !bytes
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes()),
+        "sealed log must not hold plaintext datom values"
+    );
+
+    let reopened = FileLog::open_sealed(&path, cipher("people")).expect("reopen");
+    assert_eq!(
+        reopened.replay().expect("replay"),
+        vec![sentinel_record(1), sentinel_record(2)]
+    );
+    assert_eq!(
+        reopened.tx_range(2, None).expect("range"),
+        vec![sentinel_record(2)]
+    );
+    reopened.append(&sentinel_record(3)).expect("append 3");
+    assert_eq!(reopened.replay().expect("replay").len(), 3);
+}
+
+#[test]
+fn sealed_log_refuses_the_wrong_key_and_the_wrong_database() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transactions.log");
+    let log = FileLog::open_sealed(&path, cipher("people")).expect("open");
+    log.append(&record(1)).expect("append 1");
+
+    let other_key = Arc::new(LogCipher::with_key("people", 1, SecretKey::new([1; 32])));
+    assert!(matches!(
+        FileLog::open_sealed(&path, other_key),
+        Err(LogError::Crypt(_))
+    ));
+    assert!(matches!(
+        FileLog::open_sealed(&path, cipher("payroll")),
+        Err(LogError::Crypt(_))
+    ));
+    // An epoch this process cannot resolve is named, not guessed at.
+    let future_epoch =
+        Arc::new(LogCipher::new("people", 2, [(2, SecretKey::new([2; 32]))]).expect("cipher"));
+    assert!(matches!(
+        FileLog::open_sealed(&path, future_epoch),
+        Err(LogError::MissingKeyEpoch(1))
+    ));
+}
+
+#[test]
+fn encryption_state_mismatches_fail_loudly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sealed_path = dir.path().join("sealed.log");
+    FileLog::open_sealed(&sealed_path, cipher("people"))
+        .expect("open sealed")
+        .append(&record(1))
+        .expect("append");
+    assert!(matches!(
+        FileLog::open(&sealed_path),
+        Err(LogError::Encrypted)
+    ));
+
+    let plain_path = dir.path().join("plain.log");
+    FileLog::open(&plain_path)
+        .expect("open plain")
+        .append(&record(1))
+        .expect("append");
+    assert!(matches!(
+        FileLog::open_sealed(&plain_path, cipher("people")),
+        Err(LogError::Unencrypted)
+    ));
+}
+
+#[test]
+fn sealed_records_are_bound_to_their_version_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let v1 = VersionedLog::open_sealed(dir.path(), "db", 1, cipher("db")).expect("open v1");
+    v1.append(&record(1)).expect("append 1");
+    let v2 = VersionedLog::open_sealed(dir.path(), "db", 2, cipher("db")).expect("open v2");
+    v2.append(&record(2)).expect("append 2");
+    assert_eq!(
+        VersionedLog::open_read_only_sealed(dir.path(), "db", cipher("db"))
+            .expect("reader")
+            .replay()
+            .expect("replay"),
+        vec![record(1), record(2)]
+    );
+
+    // Copying a frame into another lease version's file cannot smuggle a
+    // record past the takeover cutoff: the version is authenticated.
+    let frame = std::fs::read(dir.path().join("db.v1.log")).expect("read v1");
+    let mut forged = std::fs::read(dir.path().join("db.v2.log")).expect("read v2");
+    forged.extend_from_slice(&frame);
+    std::fs::write(dir.path().join("db.v2.log"), &forged).expect("write v2");
+    assert!(matches!(
+        VersionedLog::open_read_only_sealed(dir.path(), "db", cipher("db")),
+        Err(LogError::Crypt(_))
+    ));
+}
+
+#[test]
+fn sealed_frames_keep_the_cleartext_framing_contract() {
+    let mut sealed = Vec::new();
+    corium_log::append_framed_record_sealed(&mut sealed, &record(1), Some(&cipher("db")), 0)
+        .expect("frame");
+    // Framing is unchanged: high-bit length word, payload, trailing CRC32C.
+    let encoded_len = u64::from_be_bytes(sealed[..8].try_into().expect("length"));
+    assert_ne!(encoded_len >> 63, 0);
+    let payload_len = usize::try_from(encoded_len & !(1_u64 << 63)).expect("payload length");
+    assert_eq!(sealed.len(), 8 + payload_len + 4);
+
+    assert_eq!(
+        corium_log::decode_framed_records_sealed(&sealed, Some(&cipher("db")), 0).expect("decode"),
+        vec![record(1)]
+    );
+    // A CRC32C failure is still detected without any key.
+    let last = sealed.len() - 1;
+    sealed[last] ^= 1;
+    assert!(matches!(
+        corium_log::decode_framed_records_sealed(&sealed, Some(&cipher("db")), 0),
+        Err(LogError::Corrupt)
+    ));
+}
+
+#[tokio::test]
+async fn sealed_native_log_round_trips_across_versions() {
+    use corium_log::NativeLogStorage;
+
+    let storage = Arc::new(TestNativeStorage::default());
+    let v1 =
+        corium_log::NativeVersionedLog::open_sealed(Arc::clone(&storage), "db", 1, cipher("db"))
+            .await
+            .expect("open v1");
+    v1.append_async(&sentinel_record(1))
+        .await
+        .expect("append 1");
+    v1.append_async(&sentinel_record(2))
+        .await
+        .expect("append 2");
+
+    for (_, t) in NativeLogStorage::list_records(storage.as_ref(), "db")
+        .await
+        .expect("records")
+    {
+        let bytes = NativeLogStorage::read_record(storage.as_ref(), "db", 1, t)
+            .await
+            .expect("read")
+            .expect("present");
+        assert!(
+            !bytes
+                .windows(SENTINEL.len())
+                .any(|window| window == SENTINEL.as_bytes())
+        );
+    }
+
+    let v2 =
+        corium_log::NativeVersionedLog::open_sealed(Arc::clone(&storage), "db", 2, cipher("db"))
+            .await
+            .expect("open v2");
+    v2.append_async(&sentinel_record(3))
+        .await
+        .expect("append 3");
+    assert_eq!(
+        v2.replay_async().await.expect("replay"),
+        (1..=3).map(sentinel_record).collect::<Vec<_>>()
     );
 }
