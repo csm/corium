@@ -50,7 +50,7 @@ DbRoot {
   basis-t,                 // t covered by the durable log
   index-basis-t,           // t covered by the index trees
   index-roots: {eavt, aevt, avet, vaet, eavt-hist, aevt-hist, avet-hist, vaet-hist},
-  payload-root,            // proposed: append-only set of committed payload blobs (see below)
+  payload-root,            // proposed: content id → stored object id, for every committed payload (see below)
   log-root,                // hash of the log chunk tree (see log-and-transactor.md)
   keyword-table-root,
   schema-rev,
@@ -217,19 +217,39 @@ roots and is not part of storage durability.
 ## Payload blobs
 
 *Proposed; [ADR-0020](../adr/0020-blob-value-type.md).* A `:db.type/blob` datom
-carries a 32-byte digest and a length
+carries a **content id** and a length
 ([data-model.md](data-model.md#value-model)); the bytes live in the same blob
 store as everything else, and readers fetch them lazily.
 
-The digest names a **blob manifest**, not the payload:
+The content id is BLAKE3 of the *plaintext* it names — deliberately not the
+digest of the stored object, which is what a `BlobId` is everywhere else in
+this document. The distinction exists because a payload reference lives in a
+datom, in a log that is never truncated, and so can never be rewritten. A
+stored-object digest is only stable while the object is; under
+[encryption](encryption.md) a storage re-key re-encrypts objects under a new
+epoch and every id moves. Index blobs survive that because publication rewrites
+their roots, and a blob datom has no such republish step. Plaintext addressing
+is what makes the reference outlive re-keying — and what makes blob equality
+genuine content equality rather than an accident of which epoch a payload was
+written in.
+
+The content id names a **blob manifest**, not the payload:
 
 ```
 corium-blob-manifest-v1
 <total byte length>
-<chunk id>
-<chunk id>
+<chunk content id>
+<chunk content id>
 …
 ```
+
+A manifest names its chunks by content id too, so every reference in the
+payload layer is plaintext-addressed and one resolution rule covers all of
+them. Resolution goes through the payload root, which maps content id → the
+stored object id currently holding it (see
+[below](#payload-blobs-are-permanent-and-expunge-is-the-way-out)); in a
+database without storage encryption that mapping is the identity and an
+implementation may elide it.
 
 Chunk boundaries are content-defined, which buys the same three things the
 index snapshot format gets from chunking: a large payload streams and reads by
@@ -266,11 +286,39 @@ cache as index chunks ([peer-segment-cache.md](peer-segment-cache.md)) — a blo
 is content-addressed like a segment, so it needs no invalidation and no second
 cache.
 
-Under `EncryptedBlobStore` a payload's digest is the digest of the *encrypted*
-object, exactly as it already is for index chunks. Payload confidentiality is
-that encryption ([encryption.md](encryption.md)); attribute protection classes
-seal the reference, which hides which payload a datom names rather than the
-payload itself, and so do not apply to blob values.
+**Integrity is checked end to end, and lengths have one authority.** A payload
+states its size three times — in the datom, in the manifest total, and in the
+sum of its chunks — so say who checks what. The content id is the authority.
+The store verifies each stored object against its object id as it already
+does; the hydrator checks the manifest total against the datom's length before
+it fetches a single chunk, checks the streamed byte count against that total at
+the end, and re-hashes the assembled plaintext against the content id from the
+datom. That last check is what makes the payload-root indirection safe: a wrong
+or tampered map entry cannot substitute content for a reference. Any mismatch
+is a defined `Corrupt` outcome naming the reference — a sibling of `Expunged`,
+never a silent truncation. The datom carries a length at all (rather than
+leaving it to the manifest) so a reader can budget, authorize, or refuse a
+fetch before making one.
+
+Under `EncryptedBlobStore` payload objects are encrypted like every other
+stored object, and their *object* ids are digests of ciphertext — but the
+content ids in datoms and manifests are of plaintext and do not move. A re-key
+therefore rewrites payload objects and republishes the payload root's mapping,
+which is exactly the drain step index blobs get from a rebuild. Without it, a
+storage epoch carrying payloads could never retire, since
+[encryption.md](encryption.md) retires an epoch only when no live object
+carries it.
+
+A plaintext content id is not a guessing oracle, which is the obvious worry
+and worth answering directly: under storage encryption every artifact that
+carries one — log records, index chunks, the payload root itself — is
+encrypted, so a reader who can see a content id can already decrypt the
+database. That is why the id is a plain digest rather than a keyed one, which
+would have bought nothing and cost a key that could never be rotated.
+
+Payload confidentiality is that encryption ([encryption.md](encryption.md));
+attribute protection classes seal the reference, which hides which payload a
+datom names rather than the payload itself, and so do not apply to blob values.
 
 ## Garbage collection
 
@@ -298,34 +346,62 @@ not an indexing pass — makes a committed payload collectable.
 Published snapshots hold live facts only, though, so a retracted blob datom
 has no pointer left in any index. Reachability therefore needs a record of its
 own: the **payload root**, published by the indexing pass beside the four
-index roots. It is an append-only set of every payload manifest ever
-committed, sorted and chunked like an index, so a publish costs the new
-references rather than the set. It is built by unioning the previously
-published set with the references in the log tail — which is what keeps it
-correct across a restart, where the in-memory database holds no pre-snapshot
-history to re-derive the set from.
+index roots. It maps the content id of every payload object ever committed —
+manifests and their chunks alike — to the stored object id currently holding
+it, sorted and chunked like an index, so a publish costs the new entries rather
+than the map. Entries are added by unioning the previously published map with
+the references in the log tail, which is what keeps it correct across a
+restart, where the in-memory database holds no pre-snapshot history to
+re-derive the set from.
+
+The map is what gives payload references the indirection index blobs get for
+free from being republished under new roots. Content ids are permanent;
+object ids move whenever a re-key rewrites the object underneath one, and
+rewriting the map is how that stays invisible to a datom. In a database without
+storage encryption the two are equal and an implementation may store the set
+alone.
 
 Everything downstream then works unchanged, because everything downstream
 walks roots: GC marks payloads from the payload root, and backup copies them
 from it.
 
 `DbRoot` grows one trailing field for it — the record already extends by
-appending lines older readers stop before — and the storage format goes to 4,
-so a pre-blob binary refuses the database rather than sweeping payloads it
-cannot see. A database with no blob attributes never grows a payload root.
+appending lines older readers stop before — and the storage format bumps, so a
+pre-blob binary refuses the database rather than sweeping payloads it cannot
+see. ([encryption.md](encryption.md) proposes its own trailing field and its
+own bump; both are unbuilt, and whichever lands first takes format 4.) A
+database with no blob attributes never grows a payload root.
 
 Uploads whose transaction never committed are the only ordinary garbage here:
 unreachable from any root, swept by the retention window that already exists,
-with no new machinery.
+with no new machinery. That does impose an invariant on the window, since an
+upload is unreachable until the transaction naming it commits: **the retention
+window must exceed the longest plausible upload-to-commit latency.** At the
+72-hour default this is theoretical, but a deployment that shortens the window
+toward the duration of a slow upload plus a transactor backlog can sweep chunks
+out from under a commit that was still on its way.
 
 **Expunge** is the single operation that removes payload bytes. It is
 explicit, operator-driven, irreversible, and runs as an approved job
 ([operator-service.md](operator-service.md)):
 
-- It drops the id from the payload set and sweeps what that makes unreachable
-  — a mark-and-sweep restricted to the payload root, *not* a direct delete of
-  a manifest's chunks. Payloads are deduplicated by content, so chunks a
-  surviving payload still shares must survive with it.
+- It drops the entry from the payload map and sweeps what that makes
+  unreachable — a mark-and-sweep restricted to payload roots, *not* a direct
+  delete of a manifest's chunks. Payloads are deduplicated by content, so
+  chunks a surviving payload still shares must survive with it.
+- **It marks from every database in the store, not one.** GC already works this
+  way: `gc_deleted_with_retention` unions the roots of every `db:` record in
+  the store before sweeping, because the blob store is one content-addressed
+  namespace shared by every database in it. Expunge inherits that rule, which
+  is what makes it safe in the presence of forks and clones — a fork copies the
+  log prefix and re-derives its own payload root by replay, and a restore-as-
+  clone copies the root outright, so both end up naming the same content ids in
+  the same shared store.
+- The corollary is an erasure caveat, and it belongs next to the backup one:
+  **expunging in one database erases nothing while another still names the
+  payload.** A fork or a clone keeps the bytes alive until it expunges too.
+  That is the safe behavior rather than a bug, but it means erasure is a
+  per-store obligation and not a per-database one.
 - **The datom stays.** History remains honest that the fact was asserted; only
   the bytes go. Hydrating an expunged reference yields a defined `Expunged`
   outcome rather than a corrupt-store error — the shape ADR-0018 uses for an

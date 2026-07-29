@@ -18,8 +18,8 @@ versioning where it is strong; EDN's open value set lives in one codec we
 control, rather than being contorted into protobuf messages.
 
 A proposed blob value ([ADR-0020](../adr/0020-blob-value-type.md)) adds one tag
-in the gap between bytes (`0x80`) and ref (`0x90`), carrying a 32-byte digest
-and a length. It is self-delimiting and fixed-width, so it needs no interning
+in the gap between bytes (`0x80`) and ref (`0x90`), carrying a 32-byte content
+id (a digest of the plaintext payload) and a length. It is self-delimiting and fixed-width, so it needs no interning
 table entry, and it travels in tx-data, tx-reports, datom streams, and query
 results like any other scalar — because it *is* a scalar: the payload is not on
 this wire. Adding a tag costs a thin-client protocol version; ADR-0018

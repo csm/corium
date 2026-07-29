@@ -68,10 +68,13 @@ Datomic.
 ## Blob values in results
 
 *Proposed; [ADR-0020](../adr/0020-blob-value-type.md).* A `:db.type/blob` value
-is a handle — a digest and a length — and the engine treats it as an ordinary
-scalar throughout: it binds, unifies, and compares by identity like any other
-value, and identity here is content identity, since the digest is of the
-payload. What the engine never does is dereference it. Query results, pull
+is a handle — a content id and a length — and the engine treats it as an
+ordinary scalar throughout: it binds, unifies, and compares by identity like any
+other value, and identity here is genuine content identity, because the content
+id is a digest of the plaintext payload rather than of whatever object currently
+stores it. Two datoms naming the same bytes therefore unify, whenever and under
+whichever storage-key epoch each was written.
+What the engine never does is dereference it. Query results, pull
 results, entity values, and datom streams all carry the reference; a query that
 selects a blob attribute transfers no payload bytes at all.
 

@@ -40,7 +40,7 @@ precede container contents. Multi-byte fixed scalars are big-endian.
 | `61` | keyword | interned UTF-8 name |
 | `71` | string | interned UTF-8 text |
 | `81` | bytes | length varint + bytes |
-| `88` | blob reference *(proposed)* | 32 digest bytes + payload length varint |
+| `88` | blob reference *(proposed)* | 32 content-id bytes + payload length varint |
 | `90` | entity ref | unsigned varint |
 | `a0`/`a1`/`a3` | list/vector/set | count + items |
 | `a2` | map | pair count + alternating key/value items |

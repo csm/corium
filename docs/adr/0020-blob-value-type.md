@@ -52,10 +52,22 @@ Add `:db.type/blob`: a value that carries the content hash and length of a
 payload in the blob store, whose bytes are fetched lazily and explicitly.
 
 - **The datom carries a reference, never the bytes.** `Value::Blob` holds a
-  32-byte digest and a length, fixed-width in the sortable encoding, so a blob
-  value costs the same in an index key whether it names four kilobytes or four
-  gigabytes. Nothing about the log, the segment format, the tx-report, or a
+  32-byte content id and a length, fixed-width in the sortable encoding, so a
+  blob value costs the same in an index key whether it names four kilobytes or
+  four gigabytes. Nothing about the log, the segment format, the tx-report, or a
   peer's resident set changes shape.
+- **The content id is a digest of the plaintext, not of the stored object.**
+  Everywhere else in Corium a blob id is the digest of whatever is stored, which
+  under encryption is ciphertext. That cannot work here: a payload reference
+  lives in a datom in a log that is never truncated, so it can never be
+  rewritten, while a stored-object id moves whenever a storage re-key
+  re-encrypts the object under a new epoch. Index blobs survive re-keying only
+  because publication rewrites their roots, and a blob datom has no such step.
+  Plaintext addressing keeps the reference valid across re-keys and makes blob
+  equality genuine content equality rather than an artifact of the epoch a
+  payload happened to be written in. The indirection lives in the payload root,
+  which maps content id → current stored object id, so re-keying republishes a
+  mapping instead of orphaning history.
 - **A payload is a manifest naming content-defined chunks**, the same structure
   a published index already uses, so large values stream and read by range,
   near-identical payloads share chunks, and the reachability walk that GC and
@@ -79,19 +91,23 @@ payload in the blob store, whose bytes are fetched lazily and explicitly.
   datoms could strand payloads that nothing names any more.
 - **A committed payload is live forever.** History is complete, so a retracted
   blob datom remains a valid historical value and its bytes must remain
-  fetchable. Reachability is recorded in a **payload root**: an append-only set
-  of every payload manifest ever committed, published by the indexing pass
-  beside the four index roots, chunked and shared like an index so a publish
-  costs only the new references. GC marks from it and backup copies from it,
-  both unchanged. Uploads whose transaction never committed are unreachable and
-  are swept by the retention window that already exists.
+  fetchable. Reachability is recorded in a **payload root**: a map from the
+  content id of every payload object ever committed to the stored object id
+  currently holding it, published by the indexing pass beside the four index
+  roots, chunked and shared like an index so a publish costs only the new
+  entries. GC marks from it and backup copies from it, both unchanged. Uploads
+  whose transaction never committed are unreachable and are swept by the
+  retention window that already exists — which is why that window must exceed
+  the longest plausible upload-to-commit latency.
 - **Expunge is the erasure primitive.** The one operation that removes payload
   bytes is explicit, operator-driven, and irreversible: it deletes the chunks
-  no surviving payload shares and drops the id from the payload set. The datom
-  is left exactly where it is — history stays honest that the fact was
+  no surviving payload shares and drops the entry from the payload map. The
+  datom is left exactly where it is — history stays honest that the fact was
   asserted — and a read of an expunged reference returns a defined `Expunged`
   outcome rather than a corrupt-store error, the same shape as ADR-0018's
-  missing-key policy. It runs as an approved job under
+  missing-key policy. It marks across every database in the store, as GC
+  already does, so a fork or a clone that still names a payload keeps it alive.
+  It runs as an approved job under
   [ADR-0019](0019-operator-peer-service.md) and is recorded as data.
 - **Confidentiality is storage encryption, not attribute protection.** Payload
   bytes are covered by [ADR-0017](0017-encryption-at-rest.md) like every other
@@ -112,7 +128,7 @@ payload in the blob store, whose bytes are fetched lazily and explicitly.
   This is the property `:db.type/bytes` cannot offer at any size.
 - Writes scale with peers, not with the transactor. A bulk import of large
   payloads uploads in parallel from as many peers as are running and asks the
-  single writer only to order 40-byte facts. The cost is that a peer needs
+  single writer only to order fixed-width references. The cost is that a peer needs
   storage write credentials — today it only needs read — and that the
   write path now has two failure domains, so a partial upload is possible and
   shows up as an orphaned blob rather than as a broken fact.
@@ -121,30 +137,49 @@ payload in the blob store, whose bytes are fetched lazily and explicitly.
   where an operator would reach for it. The honest answer is that they should
   reach for expunge instead, which removes the bytes deliberately and leaves an
   auditable record, rather than for a schema flag that would drop pointers
-  silently.
+  silently. The alternative considered and rejected was refcounting payloads
+  from live datoms, which would in principle let a noHistory blob attribute
+  reclaim: it buys a narrow case at the price of a second reachability regime —
+  durable, transactional refcounts that have to stay correct across retraction
+  and re-assertion, restart, fork, and clone — running beside a mark-and-sweep
+  that is already correct. Silent reclamation is also precisely what expunge
+  exists to make explicit.
 - Retracting a blob datom frees nothing. Storage grows with everything ever
   written, and the only way down is expunge. That is the same bargain
   immutability already makes for datoms, but datoms are small and payloads are
   not, so it is the first place where "never forget" has a bill an operator
   will actually notice. `corium blob` reports the size of the payload set so
   the bill is visible before it is a surprise.
-- Expunge cannot be undone and does not reach backups taken before it. A
-  restore of an older backup brings the bytes back — which is either the safety
-  net or the hole in the erasure story, depending on why the expunge happened.
-  Anyone using it to satisfy a deletion obligation has to expunge in the backup
-  set too, and the runbook says so.
+- Expunge cannot be undone, and its reach is narrower than the word suggests.
+  It does not touch backups taken before it — a restore of an older archive
+  brings the bytes back, which is either the safety net or the hole in the
+  erasure story depending on why the expunge happened — and it does not touch a
+  fork or a clone that still names the payload, because the blob store is one
+  shared namespace and the mark unions every database in it. Erasure is
+  therefore a per-store obligation: expunge everywhere the payload is named,
+  including archives, or it is not erased.
 - Deduplication is content-addressed and therefore automatic and invisible:
   transacting the same payload twice stores it once and yields the same
   reference, so two entities can share bytes and an expunge driven by one of
   them must not delete what the other still names. That is why expunge sweeps
   from the surviving set rather than deleting a manifest's chunks directly.
-  Under `EncryptedBlobStore` the digest is of the encrypted object, exactly as
-  it already is for index blobs.
-- `DbRoot` gains a field and the storage format goes to 4. Older binaries
-  reject the newer root rather than misreading it, which is what stops a
-  pre-blob transactor from running GC against a database whose payloads it
-  cannot see. Databases with no blob attributes never grow a payload root and
-  are unaffected.
+- **Dedup and per-subject erasure are in genuine tension, and this design picks
+  dedup.** Because identity is content, two subjects who upload identical bytes
+  — the same stock image, the same template PDF, the same standard form — get
+  one object, and expunging it for one subject expunges it for all of them.
+  That is exactly backwards for the case blob storage most often has to serve, a
+  deletion obligation over user-submitted content. An application that needs
+  per-subject erasure has to make its payloads per-subject distinct before
+  upload (encrypt or salt them per subject) and give up dedup deliberately,
+  which is the same shape as ADR-0018's admission that per-subject shredding
+  needs per-subject keys. Naming it here is better than discovering it during an
+  audit.
+- `DbRoot` gains a field and the storage format bumps. Older binaries reject the
+  newer root rather than misreading it, which is what stops a pre-blob
+  transactor from running GC against a database whose payloads it cannot see.
+  ADR-0017 proposes its own trailing field and its own bump for the key manifest
+  version; both are unbuilt, so whichever lands first takes format 4. Databases
+  with no blob attributes never grow a payload root and are unaffected.
 - `Value` gains a variant matched exhaustively across roughly thirty sites in a
   dozen crates — `corium-core` (value, encoding, schema), `corium-forms`
   (`schemaform.rs`, `toml_schema.rs`), `corium-protocol` (`codec.rs`),
@@ -156,10 +191,18 @@ payload in the blob store, whose bytes are fetched lazily and explicitly.
   sealed values; whichever lands first takes the number. As there, the blast
   radius is the point: every consumer is made to confront "this value is a
   handle, not the content" at compile time rather than at runtime.
-- SQL sees the reference. A blob column projects as its digest and length, and
-  a scan never fetches bytes; a hydrating function is future work. A SQL user
-  who expects `SELECT payload` to return content gets a handle instead, which
-  is the same surprise the Rust and cljrs APIs deliver, deliberately.
+- SQL sees the reference, and paying for that properly means teaching the SQL
+  stack a type shape it does not have. A blob column projects as a struct of
+  content id and length (`List<Struct>` when cardinality-many); a scan never
+  fetches bytes, and a hydrating function is future work. `corium-sql` today
+  maps every value type to an Arrow scalar or `List<scalar>` and has no struct
+  case in `catalog.rs`, `SqlType`, or `SqlValue`, and `corium-pgwire` routes an
+  unrecognized Arrow type through `SqlType::Other` to `OID_TEXT` — so shipping
+  the type without a composite OID and a binary/text codec in `types.rs` would
+  quietly show JDBC clients an opaque text column. The pgwire codec lands with
+  the type, not after it. A SQL user who expects `SELECT payload` to return
+  content gets a handle instead, which is the same surprise the Rust and cljrs
+  APIs deliver, deliberately.
 - Streaming is real on the wire and in the store but not yet in the trait:
   `BlobStore::put`/`get` are whole-buffer, so a chunk is the unit that must fit
   in memory (single-digit megabytes) while a payload need not. Range reads over

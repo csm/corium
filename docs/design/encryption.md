@@ -236,11 +236,32 @@ filesystem encryption for cached data.
 
 The proposed blob value type ([ADR-0020](../adr/0020-blob-value-type.md))
 stores user payloads as ordinary blobs — a manifest and its content-defined
-chunks — so they inherit this section wholesale: every chunk is an encrypted
-object, its id is the digest of the ciphertext, and the decorator sits above
-the cache exactly as it does for index chunks. Because encryption is
-deterministic for a given (epoch, content), payload deduplication survives it
-inside a database, and an unchanged payload re-uploads to the same id.
+chunks — so their *objects* inherit this section wholesale: every chunk is an
+encrypted object whose id is the digest of the ciphertext, and the decorator
+sits above the cache exactly as it does for index chunks.
+
+The reference in the datom is the exception, and deliberately so. A blob datom
+carries a **content id** — a digest of the plaintext — because the reference
+lives in a log that is never truncated and can never be rewritten, while a
+ciphertext id moves the moment a re-key re-encrypts the object beneath it.
+Index blobs tolerate that because publication rewrites their roots; a datom has
+no such step, so ciphertext addressing would dangle every historical reference
+at the first rotation and make blob equality mean "same content *and* same
+epoch". The payload root carries the mapping from content id to current object
+id, so **a re-key rewrites payload objects and republishes that map** — the
+drain step payloads would otherwise lack. Without it, the rule below that an
+epoch retires only when no live object carries it could never be satisfied in a
+database holding blobs.
+
+Putting a plaintext digest in a datom is not a plaintext-guessing oracle: every
+artifact carrying one — log records, index chunks, the payload root — is itself
+encrypted here, so anyone who can read a content id can already decrypt the
+database. A keyed digest would buy nothing and cost a key that could never be
+rotated without orphaning history.
+
+Payload deduplication is therefore by plaintext content and survives both
+rotation and the per-database DEK boundary, unlike the object-level dedup
+described above.
 
 This, not attribute protection, is what protects blob content. A protection
 class seals the *value in the datom*, and for a blob attribute that value is a
@@ -253,8 +274,10 @@ natural assumption.
 
 Erasure works differently too. Crypto-shredding a class key destroys sealed
 *values*; it does nothing to a payload encrypted under the storage DEK, which
-is shared by the whole database and cannot be shredded per subject. Removing
-payload bytes is expunge
+is shared by the whole database and cannot be shredded per subject — and
+content-addressed dedup means one payload object may be named by many subjects,
+so payload erasure is per payload rather than per subject in the first place.
+Removing payload bytes is expunge
 ([indexes-and-storage.md](indexes-and-storage.md#garbage-collection)) — an
 explicit, audited, irreversible deletion — or destroying the storage key,
 which takes the whole database with it.
