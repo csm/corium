@@ -8,15 +8,34 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+#[cfg(feature = "s3")]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "s3")]
+use aws_credential_types::Credentials;
+#[cfg(feature = "s3")]
+use aws_credential_types::provider::{
+    ProvideCredentials, SharedCredentialsProvider, error::CredentialsError,
+    future::ProvideCredentials as ProvideCredentialsFuture,
+};
 use corium_client::{
     ClientError, Db, LocalPeer, Peer, RemotePeer, ResultShape as ClientResultShape, TxData,
 };
-use corium_peer::{ConnectConfig, PeerError};
+use corium_peer::segment::PeerStorage;
+use corium_peer::{Admin, ConnectConfig, PeerError, SegmentCacheConfig};
 use corium_protocol::codec;
+use corium_protocol::pb;
 use corium_query::QueryError;
 use corium_query::edn::Edn;
+use corium_store::FsStore;
+#[cfg(feature = "postgres")]
+use corium_store::PostgresBlobStore;
+#[cfg(feature = "turso")]
+use corium_store::TursoBlobStore;
+#[cfg(feature = "s3")]
+use corium_store::{S3BlobStore, S3ClientConfig};
 use thiserror::Error;
 use tonic::transport::ClientTlsConfig;
 use tonic::{Code, Status};
@@ -184,6 +203,24 @@ impl ClientTlsOptions {
     }
 }
 
+/// Bounded local segment-cache settings for a direct-storage peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentCacheOptions {
+    /// Dedicated directory owned by this peer process.
+    pub directory: PathBuf,
+    /// Maximum accounted bytes in the disk tier.
+    pub capacity_bytes: u64,
+    /// Maximum accounted bytes in the in-process tier.
+    pub memory_capacity_bytes: u64,
+}
+
+/// Direct-storage bootstrap discovered from the transactor.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DirectStorageOptions {
+    /// Optional bounded disk/memory cache in front of authoritative storage.
+    pub segment_cache: Option<SegmentCacheOptions>,
+}
+
 /// Options for an in-process full peer.
 #[derive(Clone, Eq, PartialEq)]
 pub struct LocalConnectOptions {
@@ -195,6 +232,8 @@ pub struct LocalConnectOptions {
     pub token: Option<String>,
     /// TLS configuration for the endpoints, or plaintext when absent.
     pub tls: Option<ClientTlsOptions>,
+    /// Discover and open the transactor's storage backend directly.
+    pub direct_storage: Option<DirectStorageOptions>,
 }
 
 /// Options for a lightweight peer-server client.
@@ -218,6 +257,7 @@ impl fmt::Debug for LocalConnectOptions {
             .field("database_name", &self.database_name)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("tls", &self.tls.is_some())
+            .field("direct_storage", &self.direct_storage)
             .finish()
     }
 }
@@ -232,6 +272,295 @@ impl fmt::Debug for RemoteConnectOptions {
             .field("tls", &self.tls.is_some())
             .finish()
     }
+}
+
+/// Direct-storage backends compiled into this native artifact.
+#[must_use]
+pub fn compiled_storage_backends() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut backends = vec!["filesystem"];
+    #[cfg(feature = "postgres")]
+    backends.push("postgres");
+    #[cfg(feature = "turso")]
+    backends.push("turso");
+    #[cfg(feature = "s3")]
+    backends.push("s3");
+    backends
+}
+
+fn peer_error(error: PeerError) -> FfiError {
+    FfiError::from_client(ClientError::Peer(error))
+}
+
+fn storage_error(error: impl fmt::Display) -> FfiError {
+    FfiError::new(ErrorKind::Storage, error.to_string())
+}
+
+async fn discover_storage(
+    endpoints: &[String],
+    database: &str,
+    token: Option<String>,
+    tls: Option<ClientTlsOptions>,
+) -> Result<Arc<dyn PeerStorage>, FfiError> {
+    let storage = fetch_storage_connection(endpoints, database, token.clone(), tls.clone()).await?;
+    open_discovered_storage(storage, endpoints, database, token, tls).await
+}
+
+async fn fetch_storage_connection(
+    endpoints: &[String],
+    database: &str,
+    token: Option<String>,
+    tls: Option<ClientTlsOptions>,
+) -> Result<pb::StorageConnection, FfiError> {
+    let mut last_error = FfiError::new(
+        ErrorKind::Connection,
+        "no transactor endpoint accepted storage discovery",
+    );
+    for endpoint in endpoints {
+        let mut admin = match Admin::connect(
+            endpoint,
+            token.clone(),
+            tls.clone().map(ClientTlsOptions::into_config),
+        )
+        .await
+        {
+            Ok(admin) => admin,
+            Err(error) => {
+                last_error = peer_error(error);
+                continue;
+            }
+        };
+        match admin.get_storage_info(database).await {
+            Ok(info) => {
+                return info.storage.ok_or_else(|| {
+                    FfiError::new(
+                        ErrorKind::Storage,
+                        "transactor returned no direct-storage backend",
+                    )
+                });
+            }
+            Err(error) => last_error = peer_error(error),
+        }
+    }
+    Err(last_error)
+}
+
+#[allow(clippy::too_many_lines)]
+#[cfg_attr(
+    not(any(feature = "postgres", feature = "turso", feature = "s3")),
+    allow(clippy::unused_async)
+)]
+async fn open_discovered_storage(
+    storage: pb::StorageConnection,
+    endpoints: &[String],
+    database: &str,
+    token: Option<String>,
+    tls: Option<ClientTlsOptions>,
+) -> Result<Arc<dyn PeerStorage>, FfiError> {
+    use pb::storage_connection::Backend;
+
+    let backend = storage.backend.ok_or_else(|| {
+        FfiError::new(
+            ErrorKind::Storage,
+            "transactor returned no direct-storage backend",
+        )
+    })?;
+    match backend {
+        Backend::Memory(_) => Err(FfiError::new(
+            ErrorKind::Storage,
+            "memory storage is confined to the transactor process",
+        )),
+        Backend::Filesystem(storage) => {
+            let store =
+                FsStore::open(Path::new(&storage.data_dir).join("store")).map_err(storage_error)?;
+            Ok(Arc::new(store))
+        }
+        Backend::Postgres(storage) => {
+            #[cfg(feature = "postgres")]
+            {
+                let store = PostgresBlobStore::connect_existing(storage.connection_string)
+                    .await
+                    .map_err(storage_error)?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                let _ = storage;
+                Err(FfiError::new(
+                    ErrorKind::Storage,
+                    "this corium native artifact lacks PostgreSQL direct-storage support",
+                ))
+            }
+        }
+        Backend::Turso(storage) => {
+            #[cfg(feature = "turso")]
+            {
+                let store = TursoBlobStore::open_existing(storage.path)
+                    .await
+                    .map_err(storage_error)?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "turso"))]
+            {
+                let _ = storage;
+                Err(FfiError::new(
+                    ErrorKind::Storage,
+                    "this corium native artifact lacks Turso direct-storage support",
+                ))
+            }
+        }
+        Backend::S3(storage) => {
+            #[cfg(feature = "s3")]
+            {
+                let credentials = s3_credentials(&storage)?;
+                let mut client = S3ClientConfig {
+                    region: nonempty(storage.region.clone()),
+                    endpoint_url: nonempty(storage.endpoint_url.clone()),
+                    ..S3ClientConfig::default()
+                };
+                client.credentials_provider = Some(SharedCredentialsProvider::new(
+                    StorageInfoCredentialsProvider {
+                        endpoints: endpoints.to_vec(),
+                        database: database.to_owned(),
+                        token,
+                        tls,
+                        bucket: storage.bucket.clone(),
+                        prefix: storage.prefix.clone(),
+                        region: storage.region.clone(),
+                        endpoint_url: storage.endpoint_url.clone(),
+                        initial: Mutex::new(Some(credentials)),
+                    },
+                ));
+                let store = S3BlobStore::connect_existing_with_config(
+                    storage.bucket,
+                    storage.prefix,
+                    &client,
+                )
+                .await
+                .map_err(storage_error)?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = (storage, endpoints, database, token, tls);
+                Err(FfiError::new(
+                    ErrorKind::Storage,
+                    "this corium native artifact lacks S3 direct-storage support",
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+struct StorageInfoCredentialsProvider {
+    endpoints: Vec<String>,
+    database: String,
+    token: Option<String>,
+    tls: Option<ClientTlsOptions>,
+    bucket: String,
+    prefix: String,
+    region: String,
+    endpoint_url: String,
+    initial: Mutex<Option<Credentials>>,
+}
+
+#[cfg(feature = "s3")]
+impl fmt::Debug for StorageInfoCredentialsProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageInfoCredentialsProvider")
+            .field("endpoints", &self.endpoints)
+            .field("database", &self.database)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "s3")]
+impl ProvideCredentials for StorageInfoCredentialsProvider {
+    fn provide_credentials<'a>(&'a self) -> ProvideCredentialsFuture<'a>
+    where
+        Self: 'a,
+    {
+        if let Some(credentials) = self
+            .initial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return ProvideCredentialsFuture::ready(Ok(credentials));
+        }
+        ProvideCredentialsFuture::new(async move {
+            self.fetch()
+                .await
+                .map_err(|error| CredentialsError::provider_error(std::io::Error::other(error)))
+        })
+    }
+}
+
+#[cfg(feature = "s3")]
+impl StorageInfoCredentialsProvider {
+    async fn fetch(&self) -> Result<Credentials, String> {
+        let storage = fetch_storage_connection(
+            &self.endpoints,
+            &self.database,
+            self.token.clone(),
+            self.tls.clone(),
+        )
+        .await
+        .map_err(|error| format!("cannot refresh S3 storage credentials: {error}"))?
+        .backend
+        .ok_or_else(|| "credential refresh returned no storage backend".to_owned())?;
+        let pb::storage_connection::Backend::S3(storage) = storage else {
+            return Err("storage backend changed while refreshing S3 credentials".into());
+        };
+        if storage.bucket != self.bucket
+            || storage.prefix != self.prefix
+            || storage.region != self.region
+            || storage.endpoint_url != self.endpoint_url
+        {
+            return Err("S3 storage identity changed while refreshing credentials".into());
+        }
+        s3_credentials(&storage).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(feature = "s3")]
+fn s3_credentials(storage: &pb::S3Storage) -> Result<Credentials, FfiError> {
+    let access_key_id = nonempty(storage.access_key_id.clone()).ok_or_else(|| {
+        FfiError::new(
+            ErrorKind::Storage,
+            "S3 storage info omitted the read-only access key id",
+        )
+    })?;
+    let secret_access_key = nonempty(storage.secret_access_key.clone()).ok_or_else(|| {
+        FfiError::new(
+            ErrorKind::Storage,
+            "S3 storage info omitted the read-only secret access key",
+        )
+    })?;
+    Ok(Credentials::new(
+        access_key_id,
+        secret_access_key,
+        nonempty(storage.session_token.clone()),
+        unix_timestamp(storage.expires_unix_seconds),
+        "corium-storage-info-refresh",
+    ))
+}
+
+#[cfg(feature = "s3")]
+fn nonempty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(feature = "s3")]
+fn unix_timestamp(seconds: i64) -> Option<SystemTime> {
+    u64::try_from(seconds)
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
 }
 
 struct PeerState {
@@ -314,11 +643,35 @@ impl PeerHandle {
                 "at least one transactor endpoint is required",
             ));
         }
-        let tls = options.tls.map(ClientTlsOptions::into_config);
+        let endpoints = options.endpoints;
+        let tls = options.tls.clone().map(ClientTlsOptions::into_config);
         let mut config =
-            ConnectConfig::with_failover(options.endpoints, options.database_name.clone());
-        config.token = options.token;
+            ConnectConfig::with_failover(endpoints.clone(), options.database_name.clone());
+        config.token.clone_from(&options.token);
         config.tls = tls;
+        if let Some(direct) = options.direct_storage {
+            let storage = discover_storage(
+                &endpoints,
+                &options.database_name,
+                options.token,
+                options.tls,
+            )
+            .await?;
+            config = if let Some(cache) = direct.segment_cache {
+                config
+                    .with_storage_cache(
+                        storage,
+                        &SegmentCacheConfig {
+                            directory: cache.directory,
+                            capacity_bytes: cache.capacity_bytes,
+                            memory_capacity_bytes: cache.memory_capacity_bytes,
+                        },
+                    )
+                    .map_err(storage_error)?
+            } else {
+                config.with_storage(storage)
+            };
+        }
         let peer = LocalPeer::connect(config)
             .await
             .map_err(FfiError::from_client)?;
@@ -837,6 +1190,39 @@ mod tests {
         (PeerHandle::new(Arc::new(peer)), stop_tx, dir)
     }
 
+    #[tokio::test]
+    async fn local_facade_discovers_filesystem_storage_and_opens_cache() {
+        let (endpoint, stop_tx, dir) = connected_transactor("storage-test", &[]).await;
+        let cache_directory = dir.path().join("segment-cache");
+        let peer = PeerHandle::connect_local(LocalConnectOptions {
+            endpoints: vec![endpoint],
+            database_name: "storage-test".into(),
+            token: None,
+            tls: None,
+            direct_storage: Some(DirectStorageOptions {
+                segment_cache: Some(SegmentCacheOptions {
+                    directory: cache_directory.clone(),
+                    capacity_bytes: 1024 * 1024,
+                    memory_capacity_bytes: 64 * 1024,
+                }),
+            }),
+        })
+        .await
+        .expect("connect storage-aware local peer");
+
+        assert_eq!(peer.database_name(), "storage-test");
+        let _stats = peer
+            .db()
+            .await
+            .expect("database")
+            .stats()
+            .await
+            .expect("stats");
+        assert!(cache_directory.join("LOCK").is_file());
+        peer.close();
+        let _ = stop_tx.send(());
+    }
+
     #[test]
     fn composite_values_validate_and_round_trip() {
         let form = Edn::Vector(vec![
@@ -915,6 +1301,13 @@ mod tests {
                 ca_certificate: Some(b"local-private-ca".to_vec()),
                 domain_name: Some("local.test".into()),
             }),
+            direct_storage: Some(DirectStorageOptions {
+                segment_cache: Some(SegmentCacheOptions {
+                    directory: PathBuf::from("/tmp/corium-cache"),
+                    capacity_bytes: 1024,
+                    memory_capacity_bytes: 128,
+                }),
+            }),
         };
         let remote = RemoteConnectOptions {
             endpoint: "https://example.test".into(),
@@ -930,6 +1323,72 @@ mod tests {
         assert!(!rendered.contains("local-secret"));
         assert!(!rendered.contains("remote-secret"));
         assert!(!rendered.contains("private-ca"));
+    }
+
+    #[test]
+    fn base_artifact_reports_only_filesystem_direct_storage() {
+        let backends = compiled_storage_backends();
+        assert!(backends.contains(&"filesystem"));
+        assert_eq!(backends.contains(&"postgres"), cfg!(feature = "postgres"));
+        assert_eq!(backends.contains(&"turso"), cfg!(feature = "turso"));
+        assert_eq!(backends.contains(&"s3"), cfg!(feature = "s3"));
+    }
+
+    #[tokio::test]
+    async fn memory_storage_discovery_is_rejected() {
+        let error = open_discovered_storage(
+            pb::StorageConnection {
+                backend: Some(pb::storage_connection::Backend::Memory(
+                    pb::MemoryStorage {},
+                )),
+            },
+            &["http://127.0.0.1:4334".into()],
+            "people",
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("memory storage must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("confined"));
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn s3_discovery_requires_read_only_credentials_and_redacts_provider() {
+        let mut storage = pb::S3Storage {
+            bucket: "corium-data".into(),
+            prefix: "people/".into(),
+            access_key_id: "reader".into(),
+            secret_access_key: String::new(),
+            session_token: "session-secret".into(),
+            region: "us-west-2".into(),
+            endpoint_url: String::new(),
+            expires_unix_seconds: 0,
+        };
+        let error = s3_credentials(&storage).expect_err("incomplete credentials");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("read-only secret access key"));
+
+        storage.secret_access_key = "reader-secret".into();
+        let provider = StorageInfoCredentialsProvider {
+            endpoints: vec!["https://transactor.example".into()],
+            database: "people".into(),
+            token: Some("bearer-secret".into()),
+            tls: None,
+            bucket: storage.bucket.clone(),
+            prefix: storage.prefix.clone(),
+            region: storage.region.clone(),
+            endpoint_url: storage.endpoint_url.clone(),
+            initial: Mutex::new(Some(
+                s3_credentials(&storage).expect("complete credentials"),
+            )),
+        };
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains("reader-secret"));
+        assert!(!rendered.contains("session-secret"));
+        assert!(!rendered.contains("bearer-secret"));
     }
 
     fn private_ca_server_identity(server_name: &str) -> (String, String, String) {

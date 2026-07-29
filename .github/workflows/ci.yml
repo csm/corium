@@ -70,6 +70,16 @@ jobs:
       # them in their intended GC mode.
       - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
       - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
+      - name: Check Python direct-storage artifact isolation
+        run: |
+          cargo tree -p corium-python --no-default-features -e normal > /tmp/corium-python-base-tree
+          if grep -E '(^| )turso v|deadpool-postgres|aws-sdk-s3' /tmp/corium-python-base-tree; then
+            echo "base Python artifact unexpectedly includes an optional storage driver"
+            exit 1
+          fi
+          cargo check -p corium-python --no-default-features --features artifact-turso
+          cargo check -p corium-python --no-default-features --features artifact-postgres
+          cargo check -p corium-python --no-default-features --features artifact-s3
       - name: Test GC-mode cljrs crates (standalone)
         run: |
           cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings

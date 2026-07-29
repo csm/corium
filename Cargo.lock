@@ -1998,10 +1998,12 @@ name = "corium-ffi"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
  "corium-client",
  "corium-peer",
  "corium-protocol",
  "corium-query",
+ "corium-store",
  "corium-transactor",
  "rcgen",
  "rustls 0.23.42",

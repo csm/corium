@@ -45,6 +45,47 @@ peer = await RemotePeer.connect(
 )
 ```
 
+## Direct storage
+
+`LocalPeer` normally reconstructs its in-process database from the transactor's
+gapless transaction stream. For faster cold starts, `DirectStorage` asks the
+transactor for a separately usable, read-only storage connection and loads the
+latest published snapshot before subscribing to the remaining transaction tail:
+
+```python
+from corium import DirectStorage, LocalPeer, SegmentCache
+
+peer = await LocalPeer.connect(
+    "https://transactor.example.com",
+    database="people",
+    token=token,
+    storage=DirectStorage(
+        cache=SegmentCache(
+            "/var/cache/corium/people",
+            capacity_bytes=256 * 1024**3,
+        )
+    ),
+)
+```
+
+Filesystem storage is present in the base `corium` artifact. Install at most
+one of `corium-turso`, `corium-postgres`, or `corium-s3` alongside it to add
+exactly one driver. Each artifact uses a distinct extension-module name and
+depends on the common package, so it neither overwrites the base extension nor
+pulls other drivers into a remote-only installation. The package selects the
+installed artifact automatically and rejects ambiguous multi-artifact
+installations. A wheel without the advertised backend rejects it with an
+actionable `StorageError`, and
+`available_storage_backends()` reports the current artifact. See
+[`artifacts/`](artifacts/) for local builds. Publishing the platform wheel
+matrix remains Phase 5 work.
+
+PostgreSQL and S3 discovery never reuses the transactor's write credentials.
+The transactor must advertise its separately configured read-only PostgreSQL
+URL or S3 credentials. Temporary S3 credentials are refreshed through
+`GetStorageInfo`, and a refresh is rejected if the bucket, prefix, region, or
+endpoint changes.
+
 The native integration suite uses the same workload for local and remote peers:
 query result conversion, Pull, datom scans, immutable views, stable caller-error
 mapping, transactions, and deterministic close. Set
