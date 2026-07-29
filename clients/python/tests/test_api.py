@@ -195,13 +195,19 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         native = FakeNative()
         with patch.object(api, "_native_module", return_value=native):
             await LocalPeer.connect(
-                "https://local.test", database="people", token="token"
+                "https://local.test",
+                database="people",
+                token="token",
+                tls_ca=b"private CA",
+                tls_domain="local.test",
             )
             await RemotePeer.connect(
                 "https://remote.test", database="people", token="token"
             )
 
         self.assertEqual(native.calls[0][2]["tls"], True)
+        self.assertEqual(native.calls[0][2]["tls_ca"], b"private CA")
+        self.assertEqual(native.calls[0][2]["tls_domain"], "local.test")
         self.assertNotIn("storage", native.calls[0][2])
         self.assertEqual(native.calls[1][2]["tls"], True)
 
@@ -213,6 +219,24 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             await LocalPeer.connect(
                 ["https://local.test", "local.test"],
                 database="people",
+            )
+        with self.assertRaisesRegex(ValueError, "require https"):
+            await RemotePeer.connect(
+                "http://remote.test",
+                database="people",
+                tls_ca=b"private CA",
+            )
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            await RemotePeer.connect(
+                "https://remote.test",
+                database="people",
+                tls_domain="",
+            )
+        with self.assertRaisesRegex(TypeError, "PEM-encoded bytes"):
+            await RemotePeer.connect(
+                "https://remote.test",
+                database="people",
+                tls_ca="not bytes",  # type: ignore[arg-type]
             )
 
         with patch.object(api, "_native_module", return_value=native):
