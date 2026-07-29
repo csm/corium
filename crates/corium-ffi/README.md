@@ -12,3 +12,8 @@ exceptions.
 Calling `PeerHandle::close` is idempotent. It rejects new work and invalidates
 all database handles derived from that peer so connections do not remain alive
 until language-runtime garbage collection.
+
+`ClientTlsOptions` enables platform roots by default and can add a PEM
+certificate authority or override the certificate DNS name. Certificate bytes
+remain owned by the facade and connect-option debug output reveals only whether
+TLS is enabled.

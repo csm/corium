@@ -349,6 +349,8 @@ def _tls_from_endpoints(
     endpoints: Sequence[str],
     token: str | None,
     allow_insecure_token: bool,
+    tls_ca: bytes | None,
+    tls_domain: str | None,
 ) -> bool:
     if not endpoints:
         raise ValueError("at least one endpoint is required")
@@ -362,6 +364,15 @@ def _tls_from_endpoints(
     tls = schemes == {"https"}
     if token is not None and not tls and not allow_insecure_token:
         raise ValueError("bearer tokens require https:// endpoints")
+    if not tls and (tls_ca is not None or tls_domain is not None):
+        raise ValueError("custom TLS options require https:// endpoints")
+    if tls_ca is not None and not isinstance(tls_ca, bytes):
+        raise TypeError("tls_ca must be PEM-encoded bytes")
+    if tls_domain is not None:
+        if not isinstance(tls_domain, str):
+            raise TypeError("tls_domain must be a string")
+        if not tls_domain:
+            raise ValueError("tls_domain must not be empty")
     return tls
 
 
@@ -376,20 +387,31 @@ class LocalPeer(_BasePeer):
         database: str,
         token: str | None = None,
         allow_insecure_token: bool = False,
+        tls_ca: bytes | None = None,
+        tls_domain: str | None = None,
     ) -> LocalPeer:
         """Connect a full peer; ``https://`` endpoints enable platform TLS.
 
         Set ``allow_insecure_token=True`` only for deliberate local development
-        over plaintext HTTP.
+        over plaintext HTTP. ``tls_ca`` adds a PEM certificate authority and
+        ``tls_domain`` overrides the certificate DNS name for private PKI.
         """
 
         endpoint_list = [endpoints] if isinstance(endpoints, str) else list(endpoints)
-        tls = _tls_from_endpoints(endpoint_list, token, allow_insecure_token)
+        tls = _tls_from_endpoints(
+            endpoint_list,
+            token,
+            allow_insecure_token,
+            tls_ca,
+            tls_domain,
+        )
         backend = await _native_module().connect_local(
             endpoint_list,
             database=database,
             token=token,
             tls=tls,
+            tls_ca=tls_ca,
+            tls_domain=tls_domain,
         )
         return cls(backend)
 
@@ -405,18 +427,29 @@ class RemotePeer(_BasePeer):
         database: str,
         token: str | None = None,
         allow_insecure_token: bool = False,
+        tls_ca: bytes | None = None,
+        tls_domain: str | None = None,
     ) -> RemotePeer:
         """Connect to a peer server; ``https://`` enables platform TLS.
 
         Set ``allow_insecure_token=True`` only for deliberate local development
-        over plaintext HTTP.
+        over plaintext HTTP. ``tls_ca`` adds a PEM certificate authority and
+        ``tls_domain`` overrides the certificate DNS name for private PKI.
         """
 
-        tls = _tls_from_endpoints([endpoint], token, allow_insecure_token)
+        tls = _tls_from_endpoints(
+            [endpoint],
+            token,
+            allow_insecure_token,
+            tls_ca,
+            tls_domain,
+        )
         backend = await _native_module().connect_remote(
             endpoint,
             database=database,
             token=token,
             tls=tls,
+            tls_ca=tls_ca,
+            tls_domain=tls_domain,
         )
         return cls(backend)
