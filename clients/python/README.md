@@ -6,15 +6,14 @@
 - `RemotePeer` connects to `corium peer-server`.
 
 Both satisfy the same runtime-checkable `Peer` protocol and return immutable
-`Db` values. The public Python layer is present in this first implementation
-slice; the native extension that connects these types to `corium-ffi` follows
-in the next delivery phase.
+`Db` values. The native extension currently connects `RemotePeer` to
+`corium peer-server`; the in-process `LocalPeer` adapter follows in Phase 3.
 
 ```python
-from corium import LocalPeer
+from corium import RemotePeer
 
-async with await LocalPeer.connect(
-    "http://127.0.0.1:4334",
+async with await RemotePeer.connect(
+    "http://127.0.0.1:4336",
     database="people",
 ) as peer:
     db = await peer.db()
@@ -22,7 +21,9 @@ async with await LocalPeer.connect(
 ```
 
 Explicit `close()` (or `async with`) is required for deterministic shutdown.
-Wall-clock database views accept timezone-aware `datetime` values only.
+Wall-clock database views accept timezone-aware, millisecond-precision
+`datetime` values only. Custom `Tagged` values may use any tag except `bytes`,
+`eid`, `inst`, and `uuid`, which are reserved for dedicated boundary types.
 `https://` endpoints automatically enable platform TLS roots, and bearer
 tokens are rejected for plaintext `http://` endpoints by default. Local
 development may opt in explicitly with `allow_insecure_token=True`. Every

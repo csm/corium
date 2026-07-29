@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+_RESERVED_TAGS = frozenset({"bytes", "eid", "inst", "uuid"})
+
 
 def _boundary_name(value: str, kind: str) -> str:
     if not isinstance(value, str):
@@ -60,10 +62,15 @@ class EntityId:
 
 @dataclass(frozen=True, slots=True)
 class Tagged:
-    """A tagged boundary value that Corium does not otherwise interpret."""
+    """A custom tagged value whose tag is not reserved by Corium."""
 
     tag: str
     value: Any
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "tag", _boundary_name(self.tag, "tag"))
+        tag = _boundary_name(self.tag, "tag")
+        if tag in _RESERVED_TAGS:
+            raise ValueError(
+                f"tag {tag!r} is reserved for a dedicated Corium boundary type"
+            )
+        object.__setattr__(self, "tag", tag)
