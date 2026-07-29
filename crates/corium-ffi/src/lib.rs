@@ -162,6 +162,28 @@ impl CompositeValue {
     }
 }
 
+/// Runtime-neutral client TLS configuration for a language adapter.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClientTlsOptions {
+    /// Optional PEM certificate authority in addition to platform roots.
+    pub ca_certificate: Option<Vec<u8>>,
+    /// Optional certificate DNS name override.
+    pub domain_name: Option<String>,
+}
+
+impl ClientTlsOptions {
+    fn into_config(self) -> ClientTlsConfig {
+        let mut config = ClientTlsConfig::new().with_enabled_roots();
+        if let Some(certificate) = self.ca_certificate {
+            config = config.ca_certificate(tonic::transport::Certificate::from_pem(certificate));
+        }
+        if let Some(domain_name) = self.domain_name {
+            config = config.domain_name(domain_name);
+        }
+        config
+    }
+}
+
 /// Options for an in-process full peer.
 #[derive(Clone, Eq, PartialEq)]
 pub struct LocalConnectOptions {
@@ -171,8 +193,8 @@ pub struct LocalConnectOptions {
     pub database_name: String,
     /// Optional bearer token.
     pub token: Option<String>,
-    /// Use platform TLS roots for the endpoints.
-    pub tls: bool,
+    /// TLS configuration for the endpoints, or plaintext when absent.
+    pub tls: Option<ClientTlsOptions>,
 }
 
 /// Options for a lightweight peer-server client.
@@ -184,8 +206,8 @@ pub struct RemoteConnectOptions {
     pub database_name: String,
     /// Optional bearer token.
     pub token: Option<String>,
-    /// Use platform TLS roots for the endpoint.
-    pub tls: bool,
+    /// TLS configuration for the endpoint, or plaintext when absent.
+    pub tls: Option<ClientTlsOptions>,
 }
 
 impl fmt::Debug for LocalConnectOptions {
@@ -195,7 +217,7 @@ impl fmt::Debug for LocalConnectOptions {
             .field("endpoints", &self.endpoints)
             .field("database_name", &self.database_name)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
-            .field("tls", &self.tls)
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
@@ -207,7 +229,7 @@ impl fmt::Debug for RemoteConnectOptions {
             .field("endpoint", &self.endpoint)
             .field("database_name", &self.database_name)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
-            .field("tls", &self.tls)
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
@@ -292,7 +314,7 @@ impl PeerHandle {
                 "at least one transactor endpoint is required",
             ));
         }
-        let tls = options.tls.then(tls_config);
+        let tls = options.tls.map(ClientTlsOptions::into_config);
         let mut config =
             ConnectConfig::with_failover(options.endpoints, options.database_name.clone());
         config.token = options.token;
@@ -318,7 +340,7 @@ impl PeerHandle {
             options.endpoint,
             options.database_name,
             options.token,
-            options.tls.then(tls_config),
+            options.tls.map(ClientTlsOptions::into_config),
         )
         .await
         .map_err(FfiError::from_client)?;
@@ -410,10 +432,6 @@ impl PeerHandle {
             }),
         }
     }
-}
-
-fn tls_config() -> ClientTlsConfig {
-    ClientTlsConfig::new().with_enabled_roots()
 }
 
 /// Opaque immutable database handle.
@@ -724,8 +742,9 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use corium_peer::Admin;
-    use corium_protocol::authz::Guard;
+    use corium_peer::server::{PeerServerConfig, serve as serve_peer};
+    use corium_peer::{Admin, ConnectConfig, Connection};
+    use corium_protocol::authz::{AllowAll, Guard, Principal, StaticTokens};
     use corium_transactor::node::{NodeConfig, TransactorNode};
 
     use super::*;
@@ -760,11 +779,10 @@ mod tests {
             .port()
     }
 
-    async fn connected_peer() -> (
-        PeerHandle,
-        tokio::sync::oneshot::Sender<()>,
-        tempfile::TempDir,
-    ) {
+    async fn connected_transactor(
+        database: &str,
+        schema: &[Edn],
+    ) -> (String, tokio::sync::oneshot::Sender<()>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = NodeConfig::new(dir.path().join("data"));
         config.owner = "ffi-test".into();
@@ -797,9 +815,18 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         admin
-            .create_database("test", &[])
+            .create_database(database, schema)
             .await
             .expect("create database");
+        (endpoint, stop_tx, dir)
+    }
+
+    async fn connected_peer() -> (
+        PeerHandle,
+        tokio::sync::oneshot::Sender<()>,
+        tempfile::TempDir,
+    ) {
+        let (endpoint, stop_tx, dir) = connected_transactor("test", &[]).await;
         let peer = LocalPeer::connect(ConnectConfig::new(endpoint, "test"))
             .await
             .expect("connect local peer");
@@ -880,18 +907,209 @@ mod tests {
             endpoints: vec!["https://example.test".into()],
             database_name: "people".into(),
             token: Some("local-secret".into()),
-            tls: true,
+            tls: Some(ClientTlsOptions {
+                ca_certificate: Some(b"local-private-ca".to_vec()),
+                domain_name: Some("local.test".into()),
+            }),
         };
         let remote = RemoteConnectOptions {
             endpoint: "https://example.test".into(),
             database_name: "people".into(),
             token: Some("remote-secret".into()),
-            tls: true,
+            tls: Some(ClientTlsOptions {
+                ca_certificate: Some(b"remote-private-ca".to_vec()),
+                domain_name: Some("remote.test".into()),
+            }),
         };
         let rendered = format!("{local:?} {remote:?}");
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("local-secret"));
         assert!(!rendered.contains("remote-secret"));
+        assert!(!rendered.contains("private-ca"));
+    }
+
+    async fn exercise_remote_facade(peer: &PeerHandle) {
+        let fixture = corium_query::edn::read_one(r#"[{:db/id "ada" :person/name "Ada"}]"#)
+            .expect("fixture transaction");
+        let db = peer
+            .transact(CompositeValue::from_edn(&fixture))
+            .await
+            .expect("remote fixture transaction")
+            .db_after;
+        let stats = db
+            .stats()
+            .await
+            .expect("private-CA TLS request with the right token succeeds");
+
+        let relation = corium_query::edn::read_one(r#"[:find ?e :where [?e :person/name "Ada"]]"#)
+            .expect("relation query");
+        let output = db
+            .query(CompositeValue::from_edn(&relation), Vec::new(), None)
+            .await
+            .expect("remote relation query");
+        assert_eq!(output.shape, ResultShape::Relation);
+        assert!(
+            matches!(output.value.decode(), Edn::Vector(ref rows) if !rows.is_empty()),
+            "fixture query returns Ada"
+        );
+
+        let scalar = corium_query::edn::read_one(r#"[:find ?e . :where [?e :person/name "Ada"]]"#)
+            .expect("scalar query");
+        let entity = db
+            .query(CompositeValue::from_edn(&scalar), Vec::new(), None)
+            .await
+            .expect("remote scalar query");
+        assert_eq!(entity.shape, ResultShape::Scalar);
+        let pulled = db
+            .pull(
+                CompositeValue::from_edn(
+                    &corium_query::edn::read_one("[:person/name]").expect("pull pattern"),
+                ),
+                entity.value,
+            )
+            .await
+            .expect("remote pull");
+        assert!(matches!(pulled.decode(), Edn::Map(ref pairs) if !pairs.is_empty()));
+
+        let ident = CompositeValue::from_edn(&Edn::keyword("person/name"));
+        assert_eq!(
+            db.datoms(Index::Aevt, vec![ident], 1)
+                .await
+                .expect("remote datom scan")
+                .len(),
+            1
+        );
+        let missing_argument =
+            corium_query::edn::read_one("[:find ?e :in $ ?name :where [?e :person/name ?name]]")
+                .expect("argument query");
+        assert_eq!(
+            db.query(
+                CompositeValue::from_edn(&missing_argument),
+                Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("missing argument is rejected")
+            .kind(),
+            ErrorKind::Query
+        );
+
+        assert_eq!(
+            db.as_of(stats.basis_t)
+                .expect("as-of view")
+                .stats()
+                .await
+                .expect("remote as-of stats"),
+            stats
+        );
+        let report = peer
+            .transact(CompositeValue::from_edn(&Edn::Vector(Vec::new())))
+            .await
+            .expect("remote transaction");
+        assert_eq!(report.basis_before, stats.basis_t);
+        assert_eq!(
+            report
+                .db_after
+                .stats()
+                .await
+                .expect("post-transaction database")
+                .basis_t,
+            report.basis_t
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn private_ca_tls_and_bearer_tokens_cross_the_remote_facade() {
+        let schema = corium_query::edn::read_all(
+            "{:db/ident :person/name
+              :db/valueType :db.type/string
+              :db/cardinality :db.cardinality/one
+              :db/unique :db.unique/identity}",
+        )
+        .expect("schema");
+        let (transactor_endpoint, transactor_stop, dir) =
+            connected_transactor("secure", &schema).await;
+        let hosted = Arc::new(
+            Connection::connect(ConnectConfig::new(transactor_endpoint, "secure"))
+                .await
+                .expect("hosted connection"),
+        );
+        hosted.sync().await.expect("hosted peer syncs");
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("generate certificate");
+        let cert_pem = certified.cert.pem();
+        let cert_path = dir.path().join("peer-cert.pem");
+        let key_path = dir.path().join("peer-key.pem");
+        std::fs::write(&cert_path, &cert_pem).expect("write certificate");
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("write key");
+
+        let tokens = StaticTokens::new().with(
+            "secret-token",
+            Principal::new("ffi-test", "authorized-client"),
+        );
+        let guard = Guard::new(Arc::new(tokens), Arc::new(AllowAll));
+        let peer_address: std::net::SocketAddr =
+            format!("127.0.0.1:{}", free_port()).parse().expect("addr");
+        let (peer_stop_tx, peer_stop_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(serve_peer(
+            hosted,
+            peer_address,
+            guard,
+            Some(
+                corium_protocol::auth::server_tls(&cert_path, &key_path)
+                    .expect("server TLS config"),
+            ),
+            PeerServerConfig::default(),
+            async move {
+                let _ = peer_stop_rx.await;
+            },
+        ));
+
+        let endpoint = format!("https://localhost:{}", peer_address.port());
+        let options = |token: Option<&str>| RemoteConnectOptions {
+            endpoint: endpoint.clone(),
+            database_name: "secure".into(),
+            token: token.map(str::to_owned),
+            tls: Some(ClientTlsOptions {
+                ca_certificate: Some(cert_pem.as_bytes().to_vec()),
+                domain_name: Some("localhost".into()),
+            }),
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let authorized = loop {
+            if let Ok(peer) = PeerHandle::connect_remote(options(Some("secret-token"))).await
+                && let Ok(db) = peer.db().await
+                && db.stats().await.is_ok()
+            {
+                break peer;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "TLS peer server never ready"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        exercise_remote_facade(&authorized).await;
+
+        for token in [None, Some("wrong-token")] {
+            let peer = PeerHandle::connect_remote(options(token))
+                .await
+                .expect("TLS handshake succeeds before request authentication");
+            let error = peer
+                .db()
+                .await
+                .expect("remote database handle")
+                .stats()
+                .await
+                .expect_err("missing or wrong bearer token must fail");
+            assert_eq!(error.kind(), ErrorKind::Authentication);
+            assert_eq!(error.grpc_code(), Some(Code::Unauthenticated as i32));
+        }
+
+        let _ = peer_stop_tx.send(());
+        let _ = transactor_stop.send(());
     }
 
     #[tokio::test]
@@ -966,7 +1184,7 @@ mod tests {
             endpoint: " ".into(),
             database_name: "test".into(),
             token: None,
-            tls: false,
+            tls: None,
         })
         .await
         else {

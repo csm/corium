@@ -2001,6 +2001,7 @@ dependencies = [
  "corium-protocol",
  "corium-query",
  "corium-transactor",
+ "rcgen",
  "tempfile",
  "thiserror",
  "tokio",
