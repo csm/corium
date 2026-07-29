@@ -6,7 +6,8 @@
 
 use corium_core::TotalF64;
 use corium_ffi::{
-    CompositeValue, DbHandle, ErrorKind, FfiError, Index, PeerHandle, RemoteConnectOptions,
+    CompositeValue, DbHandle, ErrorKind, FfiError, Index, LocalConnectOptions, PeerHandle,
+    RemoteConnectOptions,
 };
 use corium_protocol::codec;
 use corium_query::edn::Edn;
@@ -265,20 +266,25 @@ fn connect_remote(
 }
 
 #[pyfunction]
-#[pyo3(signature = (_endpoints, *, database, token=None, tls=false))]
+#[pyo3(signature = (endpoints, *, database, token=None, tls=false))]
 fn connect_local(
     py: Python<'_>,
-    _endpoints: &Bound<'_, PyAny>,
+    endpoints: Vec<String>,
     database: String,
     token: Option<String>,
     tls: bool,
-) -> PyResult<()> {
-    let _ = (database, token, tls);
-    let error = py
-        .import("corium.errors")?
-        .getattr("NativeExtensionError")?
-        .call1(("LocalPeer native support is planned for Python client Phase 3",))?;
-    Err(PyErr::from_value(error))
+) -> PyResult<Bound<'_, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let handle = PeerHandle::connect_local(LocalConnectOptions {
+            endpoints,
+            database_name: database,
+            token,
+            tls,
+        })
+        .await
+        .map_err(ffi_error)?;
+        Python::attach(|py| Py::new(py, PythonPeer { handle }))
+    })
 }
 
 #[pyfunction]
