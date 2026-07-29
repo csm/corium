@@ -746,6 +746,10 @@ mod tests {
     use corium_peer::{Admin, ConnectConfig, Connection};
     use corium_protocol::authz::{AllowAll, Guard, Principal, StaticTokens};
     use corium_transactor::node::{NodeConfig, TransactorNode};
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
 
     use super::*;
 
@@ -928,6 +932,29 @@ mod tests {
         assert!(!rendered.contains("private-ca"));
     }
 
+    fn private_ca_server_identity(server_name: &str) -> (String, String, String) {
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("CA parameters");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        let ca_cert = ca_params.self_signed(&ca_key).expect("generate CA");
+
+        let server_key = KeyPair::generate().expect("generate server key");
+        let mut server_params =
+            CertificateParams::new(vec![server_name.into()]).expect("server parameters");
+        server_params
+            .key_usages
+            .push(KeyUsagePurpose::DigitalSignature);
+        server_params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ServerAuth);
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .expect("sign server certificate");
+
+        (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
+    }
+
     async fn exercise_remote_facade(peer: &PeerHandle) {
         let fixture = corium_query::edn::read_one(r#"[{:db/id "ada" :person/name "Ada"}]"#)
             .expect("fixture transaction");
@@ -1019,7 +1046,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn private_ca_tls_and_bearer_tokens_cross_the_remote_facade() {
+    async fn private_ca_tls_domain_and_bearer_tokens_cross_the_remote_facade() {
         // Workspace feature unification can enable both rustls crypto providers,
         // so select the provider used by tonic before starting the TLS server.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1040,13 +1067,12 @@ mod tests {
         );
         hosted.sync().await.expect("hosted peer syncs");
 
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .expect("generate certificate");
-        let cert_pem = certified.cert.pem();
+        let server_name = "corium.internal";
+        let (ca_pem, server_cert_pem, server_key_pem) = private_ca_server_identity(server_name);
         let cert_path = dir.path().join("peer-cert.pem");
         let key_path = dir.path().join("peer-key.pem");
-        std::fs::write(&cert_path, &cert_pem).expect("write certificate");
-        std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("write key");
+        std::fs::write(&cert_path, server_cert_pem).expect("write certificate");
+        std::fs::write(&key_path, server_key_pem).expect("write key");
 
         let tokens = StaticTokens::new().with(
             "secret-token",
@@ -1070,20 +1096,21 @@ mod tests {
             },
         ));
 
-        let endpoint = format!("https://localhost:{}", peer_address.port());
-        let options = |token: Option<&str>| RemoteConnectOptions {
+        let endpoint = format!("https://127.0.0.1:{}", peer_address.port());
+        let options = |token: Option<&str>, domain_name: Option<&str>| RemoteConnectOptions {
             endpoint: endpoint.clone(),
             database_name: "secure".into(),
             token: token.map(str::to_owned),
             tls: Some(ClientTlsOptions {
-                ca_certificate: Some(cert_pem.as_bytes().to_vec()),
-                domain_name: Some("localhost".into()),
+                ca_certificate: Some(ca_pem.as_bytes().to_vec()),
+                domain_name: domain_name.map(str::to_owned),
             }),
         };
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let authorized = loop {
-            if let Ok(peer) = PeerHandle::connect_remote(options(Some("secret-token"))).await
+            if let Ok(peer) =
+                PeerHandle::connect_remote(options(Some("secret-token"), Some(server_name))).await
                 && let Ok(db) = peer.db().await
                 && db.stats().await.is_ok()
             {
@@ -1097,8 +1124,14 @@ mod tests {
         };
         exercise_remote_facade(&authorized).await;
 
+        let Err(error) = PeerHandle::connect_remote(options(Some("secret-token"), None)).await
+        else {
+            panic!("TLS connection without the certificate domain override unexpectedly succeeded");
+        };
+        assert_eq!(error.kind(), ErrorKind::Connection);
+
         for token in [None, Some("wrong-token")] {
-            let peer = PeerHandle::connect_remote(options(token))
+            let peer = PeerHandle::connect_remote(options(token, Some(server_name)))
                 .await
                 .expect("TLS handshake succeeds before request authentication");
             let error = peer
