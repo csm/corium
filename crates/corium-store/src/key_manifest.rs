@@ -380,8 +380,9 @@ impl KeyManifest {
             .ok_or_else(|| invalid("missing key-encryption key"))
             .and_then(|line| KeyId::new(line).map_err(StoreError::Keyring))?;
 
+        // Neither loop below preallocates from its count; see `parse_count`.
         let storage_count = parse_count(lines.next())?;
-        let mut storage_keys = Vec::with_capacity(storage_count);
+        let mut storage_keys = Vec::new();
         for _ in 0..storage_count {
             let line = lines
                 .next()
@@ -389,7 +390,7 @@ impl KeyManifest {
             storage_keys.push(decode_storage_key(line)?);
         }
         let class_count = parse_count(lines.next())?;
-        let mut classes = Vec::with_capacity(class_count);
+        let mut classes = Vec::new();
         for _ in 0..class_count {
             let line = lines.next().ok_or_else(|| invalid("truncated class key"))?;
             classes.push(decode_class_key(line)?);
@@ -407,10 +408,16 @@ fn invalid(reason: &str) -> StoreError {
     StoreError::InvalidKeyManifest(reason.to_owned())
 }
 
+/// Reads an entry count.
+///
+/// The count is a stated length, not an allocation budget, and it must never
+/// become one. A manifest is a cleartext root record: it is restorable from any
+/// archive and writable by anything that can reach the root store, so a
+/// declared count of `usize::MAX` is a byte sequence a reader has to survive.
+/// Callers therefore grow their vectors as entries arrive and stop at the first
+/// absent line, which bounds both the allocation and the loop by the record's
+/// real length. Nothing here may `with_capacity` on the returned value.
 fn parse_count(line: Option<&str>) -> Result<usize, StoreError> {
-    // A count is a hint for the reader, not an allocation budget: entries are
-    // read one at a time, so a hostile count cannot preallocate more than the
-    // record can hold.
     line.and_then(|line| line.parse().ok())
         .ok_or_else(|| invalid("missing entry count"))
 }
@@ -645,6 +652,23 @@ mod tests {
                 supported: 1
             })
         ));
+    }
+
+    #[test]
+    fn an_overstated_entry_count_is_bounded_by_the_record() {
+        // The manifest is a cleartext root record, so its declared counts are
+        // attacker-reachable. Decoding must be bounded by the bytes actually
+        // present — never allocate or iterate to a stated length.
+        for bytes in [
+            format!("corium-keys-v1\nfile:kek\n{}\n0\n", usize::MAX),
+            format!("corium-keys-v1\nfile:kek\n0\n{}\n", usize::MAX),
+            format!("corium-keys-v1\nfile:kek\n{}\n", u64::MAX),
+        ] {
+            assert!(matches!(
+                KeyManifest::decode(bytes.as_bytes()),
+                Err(StoreError::InvalidKeyManifest(_))
+            ));
+        }
     }
 
     #[test]
