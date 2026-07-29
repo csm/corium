@@ -2001,6 +2001,8 @@ dependencies = [
  "corium-protocol",
  "corium-query",
  "corium-transactor",
+ "rcgen",
+ "rustls 0.23.42",
  "tempfile",
  "thiserror",
  "tokio",

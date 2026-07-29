@@ -6,8 +6,8 @@
 
 use corium_core::TotalF64;
 use corium_ffi::{
-    CompositeValue, DbHandle, ErrorKind, FfiError, Index, LocalConnectOptions, PeerHandle,
-    RemoteConnectOptions,
+    ClientTlsOptions, CompositeValue, DbHandle, ErrorKind, FfiError, Index, LocalConnectOptions,
+    PeerHandle, RemoteConnectOptions,
 };
 use corium_protocol::codec;
 use corium_query::edn::Edn;
@@ -244,14 +244,19 @@ impl PythonDb {
 }
 
 #[pyfunction]
-#[pyo3(signature = (endpoint, *, database, token=None, tls=false))]
+#[pyo3(signature = (
+    endpoint, *, database, token=None, tls=false, tls_ca=None, tls_domain=None
+))]
 fn connect_remote(
     py: Python<'_>,
     endpoint: String,
     database: String,
     token: Option<String>,
     tls: bool,
+    tls_ca: Option<Vec<u8>>,
+    tls_domain: Option<String>,
 ) -> PyResult<Bound<'_, PyAny>> {
+    let tls = client_tls_options(tls, tls_ca, tls_domain)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let handle = PeerHandle::connect_remote(RemoteConnectOptions {
             endpoint,
@@ -266,14 +271,19 @@ fn connect_remote(
 }
 
 #[pyfunction]
-#[pyo3(signature = (endpoints, *, database, token=None, tls=false))]
+#[pyo3(signature = (
+    endpoints, *, database, token=None, tls=false, tls_ca=None, tls_domain=None
+))]
 fn connect_local(
     py: Python<'_>,
     endpoints: Vec<String>,
     database: String,
     token: Option<String>,
     tls: bool,
+    tls_ca: Option<Vec<u8>>,
+    tls_domain: Option<String>,
 ) -> PyResult<Bound<'_, PyAny>> {
+    let tls = client_tls_options(tls, tls_ca, tls_domain)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let handle = PeerHandle::connect_local(LocalConnectOptions {
             endpoints,
@@ -285,6 +295,22 @@ fn connect_local(
         .map_err(ffi_error)?;
         Python::attach(|py| Py::new(py, PythonPeer { handle }))
     })
+}
+
+fn client_tls_options(
+    tls: bool,
+    ca_certificate: Option<Vec<u8>>,
+    domain_name: Option<String>,
+) -> PyResult<Option<ClientTlsOptions>> {
+    if !tls && (ca_certificate.is_some() || domain_name.is_some()) {
+        return Err(PyValueError::new_err(
+            "custom TLS options require an https:// endpoint",
+        ));
+    }
+    Ok(tls.then_some(ClientTlsOptions {
+        ca_certificate,
+        domain_name,
+    }))
 }
 
 #[pyfunction]
