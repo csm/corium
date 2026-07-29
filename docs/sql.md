@@ -82,6 +82,12 @@ The projection has these rules:
 - Attributes without a namespace are grouped in `corium._global`.
 - Namespace and attribute names are preserved exactly. Use SQL double quotes
   for names such as `release-group` rather than relying on normalized aliases.
+- A `:db.type/blob` column ([ADR-0020](adr/0020-blob-value-type.md), proposed)
+  projects as the payload's digest and length, not its bytes: a scan transfers
+  nothing from the blob store, and `SELECT payload` returns a handle. That is
+  the same contract the Rust and cljrs APIs offer, and it is deliberate — a
+  wide-table scan must not become a bulk download. A hydrating function, so
+  a query can opt into fetching, is future work.
 
 List functions are available through DataFusion, for example:
 

@@ -37,6 +37,16 @@ payload: [u8; payload-length]
 before the first checkpoint, with referenced children before parents. Blob
 identities are recomputed and the snapshot tree is validated during restore.
 
+Payload blobs ([ADR-0020](../adr/0020-blob-value-type.md), proposed) need no
+new frame and no new rule. The backup walks the database root's reachability
+graph, and a payload manifest and its chunks are reachable from the proposed
+payload root, so they travel as `BLOB` frames like everything else —
+children-before-parents included, since a manifest names its chunks. What
+changes is size, not structure: an archive now carries user payloads, so a
+database of large blobs backs up as large as it is. Note also that a backup
+taken before an expunge still contains the expunged bytes; restoring it brings
+them back.
+
 Every successful full or incremental run ends at a `CKPT` frame. Its payload
 has this layout:
 

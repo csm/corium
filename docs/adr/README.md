@@ -24,3 +24,4 @@ reference the old. Format: Context / Decision / Consequences.
 | [0017](0017-encryption-at-rest.md) | Envelope encryption at rest for every durable artifact | Proposed |
 | [0018](0018-attribute-protection-classes.md) | Attribute-level protection with per-class keys | Proposed |
 | [0019](0019-operator-peer-service.md) | An operator peer service for management duties | Proposed |
+| [0020](0020-blob-value-type.md) | A blob value type stored in the blob store and fetched lazily | Proposed |

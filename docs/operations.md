@@ -441,6 +441,43 @@ corium gc --data-dir /srv/corium --window 72h
 
 Use a zero window only when no stale root or in-flight reader can exist.
 
+### Blob payloads and expunge (proposed)
+
+With the proposed blob value type
+([ADR-0020](adr/0020-blob-value-type.md)), GC does not reclaim payloads: a
+committed payload is live forever, because history is complete and a retracted
+blob datom is still a valid historical fact. Ordinary GC collects only
+uploads whose transaction never committed. Watch the size of the payload set
+rather than expecting it to fall:
+
+```sh
+corium blob stat --transactor http://127.0.0.1:4334          # payload count and bytes
+```
+
+`expunge` is the only way to remove payload bytes, and it is irreversible:
+
+```sh
+corium blob expunge --transactor http://127.0.0.1:4334 <ref>
+```
+
+Operating notes for it:
+
+- **The datom stays.** Only the bytes go. Reads of the reference afterwards
+  report the payload as expunged rather than failing as a corrupt store, so
+  queries that never fetch the payload are unaffected.
+- **Shared payloads.** Identical payloads are stored once, so a reference may
+  be named by several datoms. Expunge plans against the surviving payload set
+  and never removes chunks another payload still needs — but it *does* remove
+  the bytes for every datom naming that reference, not just the one you had in
+  mind. Check first.
+- **Backups are not covered.** An archive taken before the expunge still
+  contains the payload, and restoring it brings the bytes back. Erasing for
+  real means expunging in the backup set too, or re-taking the backups and
+  retiring the old ones.
+- With an operator service configured, expunge runs as an approved job with
+  plan/apply and a recorded audit trail
+  ([design/operator-service.md](design/operator-service.md)).
+
 ## Authorization (self-hosted ReBAC)
 
 Servers authorize every request permit-all by default. `--authz-db <name>`

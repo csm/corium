@@ -82,6 +82,17 @@ pub enum Value {
 Deferred to post-v1: `:db.type/fulltext` behavior, tuple types, `:db.type/uri`,
 `:db.type/symbol` (trivial to add; kept out to hold v1 scope).
 
+A proposed variant, `Blob(BlobRef)`, is a handle rather than a value:
+`BlobRef { digest: [u8; 32], len: u64 }` names a payload in the blob store, and
+the bytes are fetched lazily and explicitly. It is fixed-width, so a blob value
+costs the same in an index key whether it names four kilobytes or four
+gigabytes, and nothing about the log, the segment format, or the tx-report
+changes shape. The reference cannot reuse `corium_store::BlobId` because
+`corium-store` sits *above* `corium-core`; the store side supplies the
+conversion. See
+[indexes-and-storage.md](indexes-and-storage.md#payload-blobs) and
+[ADR-0020](../adr/0020-blob-value-type.md).
+
 A proposed tenth variant, `Sealed`, carries a value encrypted under a
 protection class's key: opaque to the engine, hydrated only by a reader holding
 that key, and forbidden on indexed, unique, and ref attributes. See
@@ -114,6 +125,7 @@ order is defined by tag). Payloads:
 | Keyword | interned id as Long (order = intern order, stable, not lexical — AVET over keywords is grouping, not lexical sort, same as Datomic) |
 | Str | UTF-8 with `0x00` escaped as `0x00 0xFF`, terminated `0x00 0x00` |
 | Bytes | same escaping scheme as Str |
+| Blob (proposed) | 32-byte digest ‖ 8-byte big-endian length; fixed width, so no escaping (order = digest order, which is total and stable but *not* content order — grouping, like Keyword, and the reason a blob attribute cannot be AVET-indexed) |
 | Ref | EntityId big-endian |
 
 Property tests assert `encode(a) < encode(b) ⇔ a < b` for every type and
@@ -143,6 +155,25 @@ installed through ordinary transactions. v1 supports:
   `:db.type/ref`, since protected datoms cannot be indexed. Alterable, but
   forward-only like every other fact: datoms asserted before the change keep
   the form they were written in ([encryption.md](encryption.md)).
+
+A `:db.type/blob` attribute (proposed, [ADR-0020](../adr/0020-blob-value-type.md))
+carries three schema-install-time prohibitions, rejected the way `:db/protection`
+is rather than surprising anyone at runtime:
+
+- **`:db/index` and `:db/unique`** — digest order is not content order, so an
+  AVET over blob values would offer ranges that silently mean nothing.
+  Equality still works, through EAVT and AEVT, and it is content equality:
+  identical payloads share a digest.
+- **`:db/noHistory`** — history is what keeps a payload's pointer alive. An
+  attribute allowed to discard its old datoms could strand payloads that
+  nothing names any more, in a store where a committed payload is otherwise
+  live forever. Operators who want the bytes gone use expunge
+  ([indexes-and-storage.md](indexes-and-storage.md#garbage-collection)), which
+  says so out loud and leaves a record.
+
+Protection classes do not apply to blob values: sealing one would hide *which*
+payload a datom names, not the payload. Payload confidentiality is ADR-0017
+storage encryption, like every other durable artifact.
 
 The transactor materializes schema into an immutable in-memory `SchemaCache`
 (AttrId → attribute record) rebuilt per basis-t; peers build the same cache

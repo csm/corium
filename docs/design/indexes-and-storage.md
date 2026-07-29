@@ -50,6 +50,7 @@ DbRoot {
   basis-t,                 // t covered by the durable log
   index-basis-t,           // t covered by the index trees
   index-roots: {eavt, aevt, avet, vaet, eavt-hist, aevt-hist, avet-hist, vaet-hist},
+  payload-root,            // proposed: append-only set of committed payload blobs (see below)
   log-root,                // hash of the log chunk tree (see log-and-transactor.md)
   keyword-table-root,
   schema-rev,
@@ -213,6 +214,64 @@ configuration, and metrics are specified in
 [peer-segment-cache.md](peer-segment-cache.md). The cache never covers mutable
 roots and is not part of storage durability.
 
+## Payload blobs
+
+*Proposed; [ADR-0020](../adr/0020-blob-value-type.md).* A `:db.type/blob` datom
+carries a 32-byte digest and a length
+([data-model.md](data-model.md#value-model)); the bytes live in the same blob
+store as everything else, and readers fetch them lazily.
+
+The digest names a **blob manifest**, not the payload:
+
+```
+corium-blob-manifest-v1
+<total byte length>
+<chunk id>
+<chunk id>
+…
+```
+
+Chunk boundaries are content-defined, which buys the same three things the
+index snapshot format gets from chunking: a large payload streams and reads by
+range instead of being materialized whole, near-identical payloads share
+chunks, and an unchanged payload re-uploads as nothing. This needs a **new**
+boundary rule beside the one in `corium-core`'s `chunk` module: that one hashes
+a whole index key and counts entries, which does not apply to a raw byte
+stream. A rolling-window hash over the bytes (64-byte window, target 1 MiB
+chunks, clamped to 256 KiB…4 MiB) plays the same role. A payload below the
+minimum is a single chunk, but it is still wrapped in a manifest, so every blob
+has one shape and the reachability walk has one case.
+
+That walk is why the manifest exists in this form. `index_blob_children` — the
+function GC and backup share *specifically* so their reachability can never
+diverge — learns a second magic and returns a blob manifest's chunks the way it
+already returns an index manifest's. No second walk, no second place to forget.
+
+**Writes go peer-side.** A peer with storage credentials uploads the chunks,
+then the manifest, then transacts the reference: the same
+upload-before-you-name-it ordering the segment publisher obeys, for the same
+reason. Bytes never cross the transactor, which sees a fixed-width reference —
+41 encoded bytes, whatever the payload weighs — and does everything it does
+today. The upload cannot move into `corium-tx`'s `prepare`,
+which is a pure function of `(db, tx-data)` that the simulator and unit tests
+call directly — so the convenience form (transacting raw bytes against a blob
+attribute) is rewritten to a reference at the *peer boundary*, before tx-data
+is built. Thin clients hold no storage credentials and stream their bytes to a
+peer server, which uploads on their behalf ([protocol.md](protocol.md)).
+
+**Reads go through the segment cache.** Query results, pull, the entity API,
+and tx-reports carry the reference and nothing else; hydration is a separate
+call. Payload chunks are read through the same read-through, size-bounded
+cache as index chunks ([peer-segment-cache.md](peer-segment-cache.md)) — a blob
+is content-addressed like a segment, so it needs no invalidation and no second
+cache.
+
+Under `EncryptedBlobStore` a payload's digest is the digest of the *encrypted*
+object, exactly as it already is for index chunks. Payload confidentiality is
+that encryption ([encryption.md](encryption.md)); attribute protection classes
+seal the reference, which hides which payload a datom names rather than the
+payload itself, and so do not apply to blob values.
+
 ## Garbage collection
 
 Old index roots keep old segments alive only until no reader needs them.
@@ -227,6 +286,54 @@ GC is epoch-based and never urgent:
 Because deletion is the only mutation and it only touches unreachable data, a
 GC bug can strand garbage but a conservative window makes data loss a
 non-risk. `deleteDatabase` = delete root, then sweep.
+
+### Payload blobs are permanent, and expunge is the way out
+
+*Proposed; [ADR-0020](../adr/0020-blob-value-type.md).* A committed payload is
+live **forever**. The log is never truncated, so history is complete, so a
+retracted blob datom is still a valid historical fact and its bytes must still
+be fetchable at that basis. Nothing — not retraction, not an `as-of` window,
+not an indexing pass — makes a committed payload collectable.
+
+Published snapshots hold live facts only, though, so a retracted blob datom
+has no pointer left in any index. Reachability therefore needs a record of its
+own: the **payload root**, published by the indexing pass beside the four
+index roots. It is an append-only set of every payload manifest ever
+committed, sorted and chunked like an index, so a publish costs the new
+references rather than the set. It is built by unioning the previously
+published set with the references in the log tail — which is what keeps it
+correct across a restart, where the in-memory database holds no pre-snapshot
+history to re-derive the set from.
+
+Everything downstream then works unchanged, because everything downstream
+walks roots: GC marks payloads from the payload root, and backup copies them
+from it.
+
+`DbRoot` grows one trailing field for it — the record already extends by
+appending lines older readers stop before — and the storage format goes to 4,
+so a pre-blob binary refuses the database rather than sweeping payloads it
+cannot see. A database with no blob attributes never grows a payload root.
+
+Uploads whose transaction never committed are the only ordinary garbage here:
+unreachable from any root, swept by the retention window that already exists,
+with no new machinery.
+
+**Expunge** is the single operation that removes payload bytes. It is
+explicit, operator-driven, irreversible, and runs as an approved job
+([operator-service.md](operator-service.md)):
+
+- It drops the id from the payload set and sweeps what that makes unreachable
+  — a mark-and-sweep restricted to the payload root, *not* a direct delete of
+  a manifest's chunks. Payloads are deduplicated by content, so chunks a
+  surviving payload still shares must survive with it.
+- **The datom stays.** History remains honest that the fact was asserted; only
+  the bytes go. Hydrating an expunged reference yields a defined `Expunged`
+  outcome rather than a corrupt-store error — the shape ADR-0018 uses for an
+  absent key — so queries that never hydrate are unaffected and one that does
+  gets a clear answer instead of a storage fault.
+- It does not reach backups taken before it. Erasing for real means expunging
+  in the backup set too; the runbook in [operations.md](../operations.md) says
+  so.
 
 ## Consistency argument (why this is safe)
 

@@ -11,6 +11,8 @@ corium db create|delete|list <uri>
 corium db fork <src> <dst> [--as-of t]     # point-in-time fork (writable sandbox)
 corium db stats <uri>                      # datom counts, index sizes, basis
 corium gc <uri> [--window 72h]             # segment garbage collection
+corium blob put|get|stat <uri> …           # proposed: payload upload/fetch/inspect
+corium blob expunge <uri> <ref>            # proposed: destroy payload bytes (irreversible)
 corium backup <uri> <dest>                 # see below
 corium restore <src> <uri>
 corium log <uri> --from t1 --to t2         # dump tx-range as EDN
@@ -30,6 +32,15 @@ index publication, and the encryption migrations — into a process that can
 outlive a shell, checkpoint, resume, and record what it did, leaving the CLI as
 a client of them. Every command keeps working with no service configured, which
 is what keeps a development database free of a control plane.
+
+`corium blob` ([ADR-0020](../adr/0020-blob-value-type.md), proposed) is the
+same kind of command: `put` uploads a file and prints the reference to
+transact, `get` streams one back, and `stat` reports the size of a payload —
+or, with no reference, of the whole payload set, which is the number that tells
+an operator what immutability is costing them in bytes. `expunge` is the
+exception and is treated like one: it destroys payload bytes irreversibly, so
+it requires confirmation, runs as an approved job when an operator service is
+configured, and leaves the datom that named the payload untouched.
 
 ## Query console
 

@@ -232,6 +232,33 @@ digest check is unchanged. This supersedes
 [peer-segment-cache.md](peer-segment-cache.md)'s current reliance on host
 filesystem encryption for cached data.
 
+### Payload blobs
+
+The proposed blob value type ([ADR-0020](../adr/0020-blob-value-type.md))
+stores user payloads as ordinary blobs — a manifest and its content-defined
+chunks — so they inherit this section wholesale: every chunk is an encrypted
+object, its id is the digest of the ciphertext, and the decorator sits above
+the cache exactly as it does for index chunks. Because encryption is
+deterministic for a given (epoch, content), payload deduplication survives it
+inside a database, and an unchanged payload re-uploads to the same id.
+
+This, not attribute protection, is what protects blob content. A protection
+class seals the *value in the datom*, and for a blob attribute that value is a
+reference: sealing it hides which payload an entity names, and leaves the
+payload itself exactly as readable to anyone with store access as it was
+before. Blob attributes therefore do not take `:db/protection`, and an
+operator who needs blob content confidential needs the database created with
+`--storage-key`. The distinction is worth stating because the opposite is the
+natural assumption.
+
+Erasure works differently too. Crypto-shredding a class key destroys sealed
+*values*; it does nothing to a payload encrypted under the storage DEK, which
+is shared by the whole database and cannot be shredded per subject. Removing
+payload bytes is expunge
+([indexes-and-storage.md](indexes-and-storage.md#garbage-collection)) — an
+explicit, audited, irreversible deletion — or destroying the storage key,
+which takes the whole database with it.
+
 ### Transaction log
 
 The frame header (length, checksum flag) and the CRC32C stay cleartext, so
