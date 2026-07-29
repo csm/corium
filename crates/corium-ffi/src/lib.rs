@@ -1020,6 +1020,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn private_ca_tls_and_bearer_tokens_cross_the_remote_facade() {
+        // Workspace feature unification can enable both rustls crypto providers,
+        // so select the provider used by tonic before starting the TLS server.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let schema = corium_query::edn::read_all(
             "{:db/ident :person/name
               :db/valueType :db.type/string

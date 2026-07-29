@@ -19,6 +19,7 @@ tonic = { version = "0.14.5", features = ["tls-ring"] }
 async-trait = "0.1"
 corium-transactor = { workspace = true }
 rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile = "3"
 tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
