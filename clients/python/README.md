@@ -6,15 +6,14 @@
 - `RemotePeer` connects to `corium peer-server`.
 
 Both satisfy the same runtime-checkable `Peer` protocol and return immutable
-`Db` values. The public Python layer is present in this first implementation
-slice; the native extension that connects these types to `corium-ffi` follows
-in the next delivery phase.
+`Db` values. The native extension currently connects `RemotePeer` to
+`corium peer-server`; the in-process `LocalPeer` adapter follows in Phase 3.
 
 ```python
-from corium import LocalPeer
+from corium import RemotePeer
 
-async with await LocalPeer.connect(
-    "http://127.0.0.1:4334",
+async with await RemotePeer.connect(
+    "http://127.0.0.1:4336",
     database="people",
 ) as peer:
     db = await peer.db()
