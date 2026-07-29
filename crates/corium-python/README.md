@@ -6,8 +6,8 @@ facade.
 
 It owns no database semantics. The crate converts Python boundary values to
 Corium's composite encoding, adapts facade futures to `asyncio`, maps facade
-errors to the public Python exception hierarchy, and exposes opaque remote
-peer/database backends to the pure-Python API.
+errors to the public Python exception hierarchy, and exposes opaque local or
+remote peer/database backends to the pure-Python API.
 
 Build the mixed Python/Rust package from `clients/python`:
 
