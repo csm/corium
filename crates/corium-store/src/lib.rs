@@ -22,6 +22,9 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 mod segment_cache;
 pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheMetrics, SegmentReader};
 
+mod discovery;
+pub use discovery::{DiscoveredStore, DiscoveredStoreSpec, StorageConnectionError};
+
 mod encrypted_store;
 pub use encrypted_store::EncryptedBlobStore;
 
@@ -136,6 +139,10 @@ pub enum StoreError {
     /// A blocking store worker failed before returning its result.
     #[error("store blocking task failed: {0}")]
     BlockingTask(String),
+    /// A local path advertised by a transactor is not reachable from this
+    /// process. Direct-storage peers must be co-located with local backends.
+    #[error("the transactor's local storage at {0} is not reachable from this process")]
+    UnreachableLocalStorage(PathBuf),
     /// `PostgreSQL` database failure.
     #[cfg(feature = "postgres")]
     #[error("PostgreSQL store failed: {0}")]

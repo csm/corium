@@ -80,6 +80,11 @@ actionable `StorageError`, and
 [`artifacts/`](artifacts/) for local builds. Publishing the platform wheel
 matrix remains Phase 5 work.
 
+Filesystem and Turso advertise local paths, so their direct-storage peers must
+run on a host that can reach the same path as the transactor. Corium rejects a
+missing store with `StorageError`; it does not create an empty store or silently
+fall back to replaying the full transaction stream.
+
 PostgreSQL and S3 discovery never reuses the transactor's write credentials.
 The transactor must advertise its separately configured read-only PostgreSQL
 URL or S3 credentials. Temporary S3 credentials are refreshed through

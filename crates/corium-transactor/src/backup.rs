@@ -18,11 +18,12 @@ use corium_log::{
 };
 use corium_protocol::pb;
 use corium_store::{
-    BlobId, BlobStore, DbRoot, FORMAT_VERSION, FsStore, RootStore, StoreError, db_root_name,
+    BlobId, BlobStore, DbRoot, DiscoveredStoreSpec, FORMAT_VERSION, FsStore, RootStore,
+    StorageConnectionError, StoreError, db_root_name,
 };
 use thiserror::Error;
 
-use crate::{LogBackend, NodeStore, StorageConnectionError, StoreSpec};
+use crate::{LogBackend, StoreSpec};
 
 /// Binary backup container version written by this release.
 pub const BACKUP_FORMAT_VERSION: u32 = 1;
@@ -121,8 +122,7 @@ pub enum BackupError {
 /// fixed by the running transactor.
 #[derive(Clone, Debug)]
 pub struct BackupSource {
-    store: StoreSpec,
-    data_dir: PathBuf,
+    store: DiscoveredStoreSpec,
     basis_t: u64,
 }
 
@@ -136,18 +136,20 @@ impl BackupSource {
         let storage = info
             .storage
             .ok_or_else(|| BackupError::Invalid("transactor returned no storage backend".into()))?;
-        let (store, data_dir) =
-            StoreSpec::from_connection(storage).map_err(|error| match error {
-                StorageConnectionError::Missing => {
-                    BackupError::Invalid("transactor returned no storage backend".into())
-                }
-                StorageConnectionError::Unsupported(detail) => {
-                    BackupError::UnsupportedSource(detail)
-                }
-            })?;
+        let store = DiscoveredStoreSpec::from_connection(storage).map_err(|error| match error {
+            StorageConnectionError::Missing => {
+                BackupError::Invalid("transactor returned no storage backend".into())
+            }
+            StorageConnectionError::Unsupported(detail) => BackupError::UnsupportedSource(detail),
+        })?;
+        StoreSpec::from_discovered(&store).map_err(|error| match error {
+            StorageConnectionError::Missing => {
+                BackupError::Invalid("transactor returned no storage backend".into())
+            }
+            StorageConnectionError::Unsupported(detail) => BackupError::UnsupportedSource(detail),
+        })?;
         Ok(Self {
             store,
-            data_dir,
             basis_t: info.basis_t,
         })
     }
@@ -681,9 +683,8 @@ pub async fn backup(
         return Err(BackupError::MissingDatabase(db.to_owned()));
     }
     let destination = destination.as_ref();
-    let source_store = Arc::new(NodeStore::open_existing(&source.store, &source.data_dir).await?);
-    let source_logs =
-        LogBackend::for_spec(&source.store, &source.data_dir, Arc::clone(&source_store));
+    let source_store = Arc::new(source.store.clone().open_existing().await?);
+    let source_logs = LogBackend::for_discovered(&source.store, Arc::clone(&source_store));
     let db_name = db_root_name(db);
     let meta_name = meta_root_name(db);
     let source_db_bytes = source_store

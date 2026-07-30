@@ -118,6 +118,12 @@ class FakeNative:
 
 
 class PeerApiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        api._native_module.cache_clear()
+
+    def tearDown(self) -> None:
+        api._native_module.cache_clear()
+
     async def test_local_and_remote_satisfy_the_same_protocol(self) -> None:
         for peer_type in (LocalPeer, RemotePeer):
             backend = FakePeerBackend()
@@ -285,7 +291,7 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options["direct_storage"], True)
         self.assertEqual(options["segment_cache_directory"], "/tmp/corium-python-cache")
         self.assertEqual(options["segment_cache_capacity_bytes"], 128 * 1024 * 1024)
-        self.assertEqual(options["segment_cache_memory_bytes"], 64 * 1024 * 1024)
+        self.assertIsNone(options["segment_cache_memory_bytes"])
 
     async def test_direct_storage_configuration_is_validated(self) -> None:
         with self.assertRaisesRegex(ValueError, "must be positive"):
@@ -300,10 +306,15 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             )
 
     def test_missing_native_extension_has_a_dedicated_error(self) -> None:
-        with patch.object(
-            api.importlib, "import_module", side_effect=ImportError("missing")
-        ):
-            with self.assertRaises(NativeExtensionError):
+        def import_missing(module_name: str) -> object:
+            if module_name == "corium._corium":
+                raise ImportError("missing base extension")
+            raise ModuleNotFoundError(name=module_name)
+
+        with patch.object(api.importlib, "import_module", side_effect=import_missing):
+            with self.assertRaisesRegex(
+                NativeExtensionError, "native extension is not installed"
+            ):
                 api._native_module()
 
     def test_optional_native_artifact_is_preferred_and_must_be_unique(self) -> None:
@@ -314,8 +325,14 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 return turso
             raise ModuleNotFoundError(name=module_name)
 
-        with patch.object(api.importlib, "import_module", side_effect=import_one):
+        with patch.object(
+            api.importlib, "import_module", side_effect=import_one
+        ) as import_module:
             self.assertIs(api._native_module(), turso)
+            self.assertIs(api._native_module(), turso)
+            self.assertEqual(import_module.call_count, 3)
+
+        api._native_module.cache_clear()
 
         def import_two(module_name: str) -> object:
             if module_name in ("corium._corium_turso", "corium._corium_s3"):

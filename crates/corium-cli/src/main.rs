@@ -37,7 +37,7 @@ use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
 #[cfg(feature = "s3")]
 use corium_store::S3ClientConfig;
-use corium_store::{DbRoot, FsStore, RootStore};
+use corium_store::{DbRoot, DiscoveredStoreSpec, FsStore, RootStore};
 use corium_transactor::node::{NodeConfig, TransactorNode};
 #[cfg(feature = "s3")]
 use corium_transactor::{S3ReadOnlyConfig, S3ReadOnlyCredentials};
@@ -199,22 +199,32 @@ impl ClientFlags {
         let storage = info
             .storage
             .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
-        let (spec, data_dir) = StoreSpec::from_connection(storage)
+        let spec = DiscoveredStoreSpec::from_connection(storage)
             .map_err(|error| format!("cannot use transactor storage backend: {error}"))?;
         #[cfg(feature = "s3")]
         let mut spec = spec;
         #[cfg(feature = "s3")]
-        if let StoreSpec::S3 { client, .. } = &mut spec {
+        if let DiscoveredStoreSpec::S3 {
+            bucket,
+            prefix,
+            client,
+        } = &mut spec
+        {
             let initial = sdk_credentials(client)?;
             client.credentials_provider = Some(SharedCredentialsProvider::new(
                 StorageInfoCredentialsProvider {
                     client: self.clone(),
                     db: db.clone(),
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
+                    region: client.region.clone(),
+                    endpoint_url: client.endpoint_url.clone(),
                     initial: std::sync::Mutex::new(Some(initial)),
                 },
             ));
         }
-        let store = corium_transactor::NodeStore::open_existing(&spec, &data_dir)
+        let store = spec
+            .open_existing()
             .await
             .map_err(|error| format!("cannot open peer storage: {error}"))?;
         let storage = Arc::new(store);
@@ -232,6 +242,10 @@ impl ClientFlags {
 struct StorageInfoCredentialsProvider {
     client: ClientFlags,
     db: String,
+    bucket: String,
+    prefix: String,
+    region: Option<String>,
+    endpoint_url: Option<String>,
     initial: std::sync::Mutex<Option<Credentials>>,
 }
 
@@ -242,6 +256,8 @@ impl std::fmt::Debug for StorageInfoCredentialsProvider {
             .debug_struct("StorageInfoCredentialsProvider")
             .field("transactor", &self.client.primary())
             .field("db", &self.db)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
             .finish_non_exhaustive()
     }
 }
@@ -284,13 +300,27 @@ impl StorageInfoCredentialsProvider {
             .map_err(|error| format!("cannot refresh storage info: {error}"))?
             .storage
             .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
-        let (spec, _) = StoreSpec::from_connection(storage)
+        let spec = DiscoveredStoreSpec::from_connection(storage)
             .map_err(|error| format!("cannot use refreshed storage info: {error}"))?;
-        let StoreSpec::S3 { client, .. } = spec else {
+        let DiscoveredStoreSpec::S3 {
+            bucket,
+            prefix,
+            client,
+        } = spec
+        else {
             return Err(
                 "transactor storage backend changed while refreshing S3 credentials".into(),
             );
         };
+        if bucket != self.bucket
+            || prefix != self.prefix
+            || client.region != self.region
+            || client.endpoint_url != self.endpoint_url
+        {
+            return Err(
+                "transactor S3 storage identity changed while refreshing credentials".into(),
+            );
+        }
         sdk_credentials(&client)
     }
 }
@@ -1091,7 +1121,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             let cache = segment_cache_dir.map(|directory| SegmentCacheConfig {
                 directory,
                 capacity_bytes: segment_cache_capacity.expect("required with cache directory"),
-                memory_capacity_bytes: segment_cache_memory.unwrap_or(64 * 1024 * 1024),
+                memory_capacity_bytes: segment_cache_memory
+                    .unwrap_or(SegmentCacheConfig::DEFAULT_MEMORY_CAPACITY_BYTES),
             });
             if cache.is_some() && !client.peer_bootstrap {
                 return Err("segment cache requires --peer-bootstrap".into());

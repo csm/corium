@@ -8,10 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
-#[cfg(feature = "s3")]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "s3")]
 use aws_credential_types::Credentials;
@@ -29,13 +27,9 @@ use corium_protocol::codec;
 use corium_protocol::pb;
 use corium_query::QueryError;
 use corium_query::edn::Edn;
-use corium_store::FsStore;
-#[cfg(feature = "postgres")]
-use corium_store::PostgresBlobStore;
-#[cfg(feature = "turso")]
-use corium_store::TursoBlobStore;
 #[cfg(feature = "s3")]
-use corium_store::{S3BlobStore, S3ClientConfig};
+use corium_store::S3ClientConfig;
+use corium_store::{DiscoveredStoreSpec, StorageConnectionError};
 use thiserror::Error;
 use tonic::transport::ClientTlsConfig;
 use tonic::{Code, Status};
@@ -214,6 +208,12 @@ pub struct SegmentCacheOptions {
     pub memory_capacity_bytes: u64,
 }
 
+impl SegmentCacheOptions {
+    /// Default size of the in-process cache tier.
+    pub const DEFAULT_MEMORY_CAPACITY_BYTES: u64 =
+        SegmentCacheConfig::DEFAULT_MEMORY_CAPACITY_BYTES;
+}
+
 /// Direct-storage bootstrap discovered from the transactor.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DirectStorageOptions {
@@ -296,14 +296,33 @@ fn storage_error(error: impl fmt::Display) -> FfiError {
     FfiError::new(ErrorKind::Storage, error.to_string())
 }
 
+struct StorageDiscovery {
+    endpoints: Vec<String>,
+    database: String,
+    token: Option<String>,
+    tls: Option<ClientTlsOptions>,
+}
+
 async fn discover_storage(
     endpoints: &[String],
     database: &str,
     token: Option<String>,
     tls: Option<ClientTlsOptions>,
 ) -> Result<Arc<dyn PeerStorage>, FfiError> {
-    let storage = fetch_storage_connection(endpoints, database, token.clone(), tls.clone()).await?;
-    open_discovered_storage(storage, endpoints, database, token, tls).await
+    let discovery = StorageDiscovery {
+        endpoints: endpoints.to_vec(),
+        database: database.to_owned(),
+        token,
+        tls,
+    };
+    let storage = fetch_storage_connection(
+        &discovery.endpoints,
+        &discovery.database,
+        discovery.token.clone(),
+        discovery.tls.clone(),
+    )
+    .await?;
+    open_discovered_storage(storage, discovery).await
 }
 
 async fn fetch_storage_connection(
@@ -345,111 +364,43 @@ async fn fetch_storage_connection(
     Err(last_error)
 }
 
-#[allow(clippy::too_many_lines)]
-#[cfg_attr(
-    not(any(feature = "postgres", feature = "turso", feature = "s3")),
-    allow(clippy::unused_async)
-)]
 async fn open_discovered_storage(
     storage: pb::StorageConnection,
-    endpoints: &[String],
-    database: &str,
-    token: Option<String>,
-    tls: Option<ClientTlsOptions>,
+    #[cfg_attr(not(feature = "s3"), allow(unused_variables))] discovery: StorageDiscovery,
 ) -> Result<Arc<dyn PeerStorage>, FfiError> {
-    use pb::storage_connection::Backend;
-
-    let backend = storage.backend.ok_or_else(|| {
-        FfiError::new(
+    let spec = DiscoveredStoreSpec::from_connection(storage).map_err(|error| match error {
+        StorageConnectionError::Missing => FfiError::new(
             ErrorKind::Storage,
             "transactor returned no direct-storage backend",
-        )
+        ),
+        StorageConnectionError::Unsupported(detail) => FfiError::new(ErrorKind::Storage, detail),
     })?;
-    match backend {
-        Backend::Memory(_) => Err(FfiError::new(
-            ErrorKind::Storage,
-            "memory storage is confined to the transactor process",
-        )),
-        Backend::Filesystem(storage) => {
-            let store =
-                FsStore::open(Path::new(&storage.data_dir).join("store")).map_err(storage_error)?;
-            Ok(Arc::new(store))
-        }
-        Backend::Postgres(storage) => {
-            #[cfg(feature = "postgres")]
-            {
-                let store = PostgresBlobStore::connect_existing(storage.connection_string)
-                    .await
-                    .map_err(storage_error)?;
-                Ok(Arc::new(store))
-            }
-            #[cfg(not(feature = "postgres"))]
-            {
-                let _ = storage;
-                Err(FfiError::new(
-                    ErrorKind::Storage,
-                    "this corium native artifact lacks PostgreSQL direct-storage support",
-                ))
-            }
-        }
-        Backend::Turso(storage) => {
-            #[cfg(feature = "turso")]
-            {
-                let store = TursoBlobStore::open_existing(storage.path)
-                    .await
-                    .map_err(storage_error)?;
-                Ok(Arc::new(store))
-            }
-            #[cfg(not(feature = "turso"))]
-            {
-                let _ = storage;
-                Err(FfiError::new(
-                    ErrorKind::Storage,
-                    "this corium native artifact lacks Turso direct-storage support",
-                ))
-            }
-        }
-        Backend::S3(storage) => {
-            #[cfg(feature = "s3")]
-            {
-                let credentials = s3_credentials(&storage)?;
-                let mut client = S3ClientConfig {
-                    region: nonempty(storage.region.clone()),
-                    endpoint_url: nonempty(storage.endpoint_url.clone()),
-                    ..S3ClientConfig::default()
-                };
-                client.credentials_provider = Some(SharedCredentialsProvider::new(
-                    StorageInfoCredentialsProvider {
-                        endpoints: endpoints.to_vec(),
-                        database: database.to_owned(),
-                        token,
-                        tls,
-                        bucket: storage.bucket.clone(),
-                        prefix: storage.prefix.clone(),
-                        region: storage.region.clone(),
-                        endpoint_url: storage.endpoint_url.clone(),
-                        initial: Mutex::new(Some(credentials)),
-                    },
-                ));
-                let store = S3BlobStore::connect_existing_with_config(
-                    storage.bucket,
-                    storage.prefix,
-                    &client,
-                )
-                .await
-                .map_err(storage_error)?;
-                Ok(Arc::new(store))
-            }
-            #[cfg(not(feature = "s3"))]
-            {
-                let _ = (storage, endpoints, database, token, tls);
-                Err(FfiError::new(
-                    ErrorKind::Storage,
-                    "this corium native artifact lacks S3 direct-storage support",
-                ))
-            }
-        }
+    #[cfg(feature = "s3")]
+    let mut spec = spec;
+    #[cfg(feature = "s3")]
+    if let DiscoveredStoreSpec::S3 {
+        bucket,
+        prefix,
+        client,
+    } = &mut spec
+    {
+        let initial = s3_credentials(client)?;
+        client.credentials_provider = Some(SharedCredentialsProvider::new(
+            StorageInfoCredentialsProvider {
+                endpoints: discovery.endpoints,
+                database: discovery.database,
+                token: discovery.token,
+                tls: discovery.tls,
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                region: client.region.clone(),
+                endpoint_url: client.endpoint_url.clone(),
+                initial: Mutex::new(Some(initial)),
+            },
+        ));
     }
+    let store = spec.open_existing().await.map_err(storage_error)?;
+    Ok(Arc::new(store))
 }
 
 #[cfg(feature = "s3")]
@@ -460,8 +411,8 @@ struct StorageInfoCredentialsProvider {
     tls: Option<ClientTlsOptions>,
     bucket: String,
     prefix: String,
-    region: String,
-    endpoint_url: String,
+    region: Option<String>,
+    endpoint_url: Option<String>,
     initial: Mutex<Option<Credentials>>,
 }
 
@@ -510,32 +461,37 @@ impl StorageInfoCredentialsProvider {
             self.tls.clone(),
         )
         .await
-        .map_err(|error| format!("cannot refresh S3 storage credentials: {error}"))?
-        .backend
-        .ok_or_else(|| "credential refresh returned no storage backend".to_owned())?;
-        let pb::storage_connection::Backend::S3(storage) = storage else {
+        .map_err(|error| format!("cannot refresh S3 storage credentials: {error}"))?;
+        let spec = DiscoveredStoreSpec::from_connection(storage)
+            .map_err(|error| format!("cannot use refreshed storage info: {error}"))?;
+        let DiscoveredStoreSpec::S3 {
+            bucket,
+            prefix,
+            client,
+        } = spec
+        else {
             return Err("storage backend changed while refreshing S3 credentials".into());
         };
-        if storage.bucket != self.bucket
-            || storage.prefix != self.prefix
-            || storage.region != self.region
-            || storage.endpoint_url != self.endpoint_url
+        if bucket != self.bucket
+            || prefix != self.prefix
+            || client.region != self.region
+            || client.endpoint_url != self.endpoint_url
         {
             return Err("S3 storage identity changed while refreshing credentials".into());
         }
-        s3_credentials(&storage).map_err(|error| error.to_string())
+        s3_credentials(&client).map_err(|error| error.to_string())
     }
 }
 
 #[cfg(feature = "s3")]
-fn s3_credentials(storage: &pb::S3Storage) -> Result<Credentials, FfiError> {
-    let access_key_id = nonempty(storage.access_key_id.clone()).ok_or_else(|| {
+fn s3_credentials(client: &S3ClientConfig) -> Result<Credentials, FfiError> {
+    let access_key_id = client.access_key_id.clone().ok_or_else(|| {
         FfiError::new(
             ErrorKind::Storage,
             "S3 storage info omitted the read-only access key id",
         )
     })?;
-    let secret_access_key = nonempty(storage.secret_access_key.clone()).ok_or_else(|| {
+    let secret_access_key = client.secret_access_key.clone().ok_or_else(|| {
         FfiError::new(
             ErrorKind::Storage,
             "S3 storage info omitted the read-only secret access key",
@@ -544,23 +500,10 @@ fn s3_credentials(storage: &pb::S3Storage) -> Result<Credentials, FfiError> {
     Ok(Credentials::new(
         access_key_id,
         secret_access_key,
-        nonempty(storage.session_token.clone()),
-        unix_timestamp(storage.expires_unix_seconds),
+        client.session_token.clone(),
+        client.expires_after,
         "corium-storage-info-refresh",
     ))
-}
-
-#[cfg(feature = "s3")]
-fn nonempty(value: String) -> Option<String> {
-    (!value.is_empty()).then_some(value)
-}
-
-#[cfg(feature = "s3")]
-fn unix_timestamp(seconds: i64) -> Option<SystemTime> {
-    u64::try_from(seconds)
-        .ok()
-        .filter(|seconds| *seconds > 0)
-        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
 }
 
 struct PeerState {
@@ -1136,6 +1079,15 @@ mod tests {
             .port()
     }
 
+    fn storage_discovery() -> StorageDiscovery {
+        StorageDiscovery {
+            endpoints: vec!["http://127.0.0.1:4334".into()],
+            database: "people".into(),
+            token: None,
+            tls: None,
+        }
+    }
+
     async fn connected_transactor(
         database: &str,
         schema: &[Edn],
@@ -1326,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn base_artifact_reports_only_filesystem_direct_storage() {
+    fn compiled_backends_match_enabled_features() {
         let backends = compiled_storage_backends();
         assert!(backends.contains(&"filesystem"));
         assert_eq!(backends.contains(&"postgres"), cfg!(feature = "postgres"));
@@ -1342,16 +1294,137 @@ mod tests {
                     pb::MemoryStorage {},
                 )),
             },
-            &["http://127.0.0.1:4334".into()],
-            "people",
-            None,
-            None,
+            storage_discovery(),
         )
         .await
         .err()
         .expect("memory storage must be rejected");
         assert_eq!(error.kind(), ErrorKind::Storage);
         assert!(error.message().contains("confined"));
+    }
+
+    #[tokio::test]
+    async fn filesystem_discovery_rejects_an_unreachable_store_without_creating_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("store");
+        let error = open_discovered_storage(
+            pb::StorageConnection {
+                backend: Some(pb::storage_connection::Backend::Filesystem(
+                    pb::FilesystemStorage {
+                        data_dir: directory.path().to_string_lossy().into_owned(),
+                    },
+                )),
+            },
+            storage_discovery(),
+        )
+        .await
+        .err()
+        .expect("unreachable filesystem storage must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("not reachable"));
+        assert!(!root.exists());
+    }
+
+    #[cfg(feature = "turso")]
+    #[tokio::test]
+    async fn turso_discovery_rejects_an_unreachable_database_without_creating_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("missing.db");
+        let error = open_discovered_storage(
+            pb::StorageConnection {
+                backend: Some(pb::storage_connection::Backend::Turso(pb::TursoStorage {
+                    path: path.to_string_lossy().into_owned(),
+                })),
+            },
+            storage_discovery(),
+        )
+        .await
+        .err()
+        .expect("unreachable Turso storage must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("not reachable"));
+        assert!(!path.exists());
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    #[tokio::test]
+    async fn postgres_discovery_is_rejected_when_backend_is_disabled() {
+        let error = open_discovered_storage(
+            pb::StorageConnection {
+                backend: Some(pb::storage_connection::Backend::Postgres(
+                    pb::PostgreSqlStorage {
+                        connection_string: "postgresql://reader:secret@example.test/db".into(),
+                    },
+                )),
+            },
+            storage_discovery(),
+        )
+        .await
+        .err()
+        .expect("disabled PostgreSQL backend must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("lacks PostgreSQL"));
+        assert!(!error.message().contains("secret"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_open_errors_do_not_expose_the_connection_password() {
+        let error = open_discovered_storage(
+            pb::StorageConnection {
+                backend: Some(pb::storage_connection::Backend::Postgres(
+                    pb::PostgreSqlStorage {
+                        connection_string:
+                            "postgresql://reader:postgres-secret@127.0.0.1:1/corium?connect_timeout=1"
+                                .into(),
+                    },
+                )),
+            },
+            storage_discovery(),
+        )
+        .await
+        .err()
+        .expect("unreachable PostgreSQL storage must fail");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(!error.message().contains("postgres-secret"));
+    }
+
+    #[cfg(not(feature = "turso"))]
+    #[tokio::test]
+    async fn turso_discovery_is_rejected_when_backend_is_disabled() {
+        let error = open_discovered_storage(
+            pb::StorageConnection {
+                backend: Some(pb::storage_connection::Backend::Turso(pb::TursoStorage {
+                    path: "/private/turso.db".into(),
+                })),
+            },
+            storage_discovery(),
+        )
+        .await
+        .err()
+        .expect("disabled Turso backend must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("lacks Turso"));
+    }
+
+    #[cfg(not(feature = "s3"))]
+    #[tokio::test]
+    async fn s3_discovery_is_rejected_when_backend_is_disabled() {
+        let error = open_discovered_storage(
+            pb::StorageConnection {
+                backend: Some(pb::storage_connection::Backend::S3(pb::S3Storage {
+                    bucket: "corium-data".into(),
+                    prefix: "people/".into(),
+                    ..Default::default()
+                })),
+            },
+            storage_discovery(),
+        )
+        .await
+        .err()
+        .expect("disabled S3 backend must be rejected");
+        assert_eq!(error.kind(), ErrorKind::Storage);
+        assert!(error.message().contains("lacks S3"));
     }
 
     #[cfg(feature = "s3")]
@@ -1367,23 +1440,34 @@ mod tests {
             endpoint_url: String::new(),
             expires_unix_seconds: 0,
         };
-        let error = s3_credentials(&storage).expect_err("incomplete credentials");
-        assert_eq!(error.kind(), ErrorKind::Storage);
-        assert!(error.message().contains("read-only secret access key"));
+        let error = DiscoveredStoreSpec::from_connection(pb::StorageConnection {
+            backend: Some(pb::storage_connection::Backend::S3(storage.clone())),
+        })
+        .expect_err("incomplete credentials");
+        assert!(error.to_string().contains("read-only secret access key"));
 
         storage.secret_access_key = "reader-secret".into();
+        let DiscoveredStoreSpec::S3 {
+            bucket,
+            prefix,
+            client,
+        } = DiscoveredStoreSpec::from_connection(pb::StorageConnection {
+            backend: Some(pb::storage_connection::Backend::S3(storage)),
+        })
+        .expect("complete S3 storage spec")
+        else {
+            panic!("S3 storage spec");
+        };
         let provider = StorageInfoCredentialsProvider {
             endpoints: vec!["https://transactor.example".into()],
             database: "people".into(),
             token: Some("bearer-secret".into()),
             tls: None,
-            bucket: storage.bucket.clone(),
-            prefix: storage.prefix.clone(),
-            region: storage.region.clone(),
-            endpoint_url: storage.endpoint_url.clone(),
-            initial: Mutex::new(Some(
-                s3_credentials(&storage).expect("complete credentials"),
-            )),
+            bucket,
+            prefix,
+            region: client.region.clone(),
+            endpoint_url: client.endpoint_url.clone(),
+            initial: Mutex::new(Some(s3_credentials(&client).expect("complete credentials"))),
         };
         let rendered = format!("{provider:?}");
         assert!(!rendered.contains("reader-secret"));

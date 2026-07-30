@@ -22,6 +22,8 @@ TLS is enabled.
 storage connection and optionally places a bounded segment cache in front of
 it. Filesystem support is built in. The `postgres`, `turso`, and `s3` features
 are independent so a base/remote artifact does not pull their driver graphs.
+Filesystem and Turso connections require the advertised local path to exist;
+the facade never creates a missing store during discovery.
 The S3 feature refreshes temporary credentials through `GetStorageInfo` and
 pins refreshes to the originally discovered bucket, prefix, region, and
 endpoint.

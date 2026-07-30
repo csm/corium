@@ -22,11 +22,11 @@ use pyo3::types::{
 const RESERVED_TAGS: [&str; 4] = ["bytes", "eid", "inst", "uuid"];
 
 #[cfg(any(
-    all(feature = "artifact-turso", feature = "artifact-postgres"),
-    all(feature = "artifact-turso", feature = "artifact-s3"),
-    all(feature = "artifact-postgres", feature = "artifact-s3"),
+    all(feature = "artifact-turso", any(feature = "postgres", feature = "s3")),
+    all(feature = "artifact-postgres", any(feature = "turso", feature = "s3")),
+    all(feature = "artifact-s3", any(feature = "turso", feature = "postgres")),
 ))]
-compile_error!("select at most one corium-python artifact feature");
+compile_error!("a corium-python artifact must enable exactly one storage backend");
 
 struct PythonRuntime {
     keyword: Py<PyAny>,
@@ -309,7 +309,8 @@ fn connect_local(
             Some(SegmentCacheOptions {
                 directory: directory.into(),
                 capacity_bytes,
-                memory_capacity_bytes: memory_capacity_bytes.unwrap_or(64 * 1024 * 1024),
+                memory_capacity_bytes: memory_capacity_bytes
+                    .unwrap_or(SegmentCacheOptions::DEFAULT_MEMORY_CAPACITY_BYTES),
             })
         }
         _ => {

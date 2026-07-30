@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib
 import os
 from collections.abc import Sequence
@@ -51,7 +52,7 @@ class SegmentCache:
 
     directory: str | os.PathLike[str]
     capacity_bytes: int
-    memory_capacity_bytes: int = 64 * 1024 * 1024
+    memory_capacity_bytes: int | None = None
 
     def __post_init__(self) -> None:
         directory = os.fspath(self.directory)
@@ -63,9 +64,12 @@ class SegmentCache:
         capacity = _nonnegative_int(self.capacity_bytes, "capacity_bytes")
         if capacity == 0:
             raise ValueError("capacity_bytes must be positive")
-        memory = _nonnegative_int(self.memory_capacity_bytes, "memory_capacity_bytes")
-        if memory > capacity:
-            raise ValueError("memory_capacity_bytes must not exceed capacity_bytes")
+        if self.memory_capacity_bytes is not None:
+            memory = _nonnegative_int(
+                self.memory_capacity_bytes, "memory_capacity_bytes"
+            )
+            if memory > capacity:
+                raise ValueError("memory_capacity_bytes must not exceed capacity_bytes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +375,7 @@ class _BasePeer(Peer):
         await self.close()
 
 
+@functools.cache
 def _native_module() -> Any:
     optional_modules = (
         "corium._corium_turso",
