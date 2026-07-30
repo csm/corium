@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
@@ -10,6 +12,7 @@ from corium import (
     ClosedError,
     Datom,
     DbStats,
+    DirectStorage,
     EntityId,
     Index,
     Keyword,
@@ -17,8 +20,10 @@ from corium import (
     NativeExtensionError,
     Peer,
     RemotePeer,
+    SegmentCache,
     Symbol,
     Tagged,
+    available_storage_backends,
 )
 from corium._api import _TxReportData, _View
 
@@ -109,8 +114,17 @@ class FakeNative:
         self.calls.append(("remote", endpoint, options))
         return FakePeerBackend()
 
+    def _storage_backends(self) -> list[str]:
+        return ["filesystem", "turso"]
+
 
 class PeerApiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        api._native_module.cache_clear()
+
+    def tearDown(self) -> None:
+        api._native_module.cache_clear()
+
     async def test_local_and_remote_satisfy_the_same_protocol(self) -> None:
         for peer_type in (LocalPeer, RemotePeer):
             backend = FakePeerBackend()
@@ -208,7 +222,7 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(native.calls[0][2]["tls"], True)
         self.assertEqual(native.calls[0][2]["tls_ca"], b"private CA")
         self.assertEqual(native.calls[0][2]["tls_domain"], "local.test")
-        self.assertNotIn("storage", native.calls[0][2])
+        self.assertEqual(native.calls[0][2]["direct_storage"], False)
         self.assertEqual(native.calls[1][2]["tls"], True)
 
         with self.assertRaisesRegex(ValueError, "require https"):
@@ -256,11 +270,78 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("allow_insecure_token", native.calls[-2][2])
         self.assertEqual(native.calls[-1][2]["tls"], False)
 
+    async def test_direct_storage_and_segment_cache_are_forwarded(self) -> None:
+        native = FakeNative()
+        storage = DirectStorage(
+            cache=SegmentCache(
+                Path("/tmp/corium-python-cache"),
+                capacity_bytes=128 * 1024 * 1024,
+            )
+        )
+        with patch.object(api, "_native_module", return_value=native):
+            await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                storage=storage,
+            )
+            self.assertEqual(
+                available_storage_backends(), frozenset({"filesystem", "turso"})
+            )
+
+        options = native.calls[0][2]
+        self.assertEqual(options["direct_storage"], True)
+        self.assertEqual(options["segment_cache_directory"], "/tmp/corium-python-cache")
+        self.assertEqual(options["segment_cache_capacity_bytes"], 128 * 1024 * 1024)
+        self.assertIsNone(options["segment_cache_memory_bytes"])
+
+    async def test_direct_storage_configuration_is_validated(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            SegmentCache("/tmp/cache", 0)
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            SegmentCache("/tmp/cache", 1024, 2048)
+        with self.assertRaisesRegex(TypeError, "storage must"):
+            await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                storage=object(),  # type: ignore[arg-type]
+            )
+
     def test_missing_native_extension_has_a_dedicated_error(self) -> None:
+        def import_missing(module_name: str) -> object:
+            if module_name == "corium._corium":
+                raise ImportError("missing base extension")
+            raise ModuleNotFoundError(name=module_name)
+
+        with patch.object(importlib, "import_module", side_effect=import_missing):
+            with self.assertRaisesRegex(
+                NativeExtensionError, "native extension is not installed"
+            ):
+                api._native_module()
+
+    def test_optional_native_artifact_is_preferred_and_must_be_unique(self) -> None:
+        turso = object()
+
+        def import_one(module_name: str) -> object:
+            if module_name == "corium._corium_turso":
+                return turso
+            raise ModuleNotFoundError(name=module_name)
+
         with patch.object(
-            api.importlib, "import_module", side_effect=ImportError("missing")
-        ):
-            with self.assertRaises(NativeExtensionError):
+            importlib, "import_module", side_effect=import_one
+        ) as import_module:
+            self.assertIs(api._native_module(), turso)
+            self.assertIs(api._native_module(), turso)
+            self.assertEqual(import_module.call_count, 3)
+
+        api._native_module.cache_clear()
+
+        def import_two(module_name: str) -> object:
+            if module_name in ("corium._corium_turso", "corium._corium_s3"):
+                return object()
+            raise ModuleNotFoundError(name=module_name)
+
+        with patch.object(importlib, "import_module", side_effect=import_two):
+            with self.assertRaisesRegex(NativeExtensionError, "multiple"):
                 api._native_module()
 
 

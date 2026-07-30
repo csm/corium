@@ -19,6 +19,11 @@ except ImportError:
 
 @unittest.skipIf(_corium is None, "native extension is not built")
 class NativeBoundaryTests(unittest.TestCase):
+    def test_native_artifact_reports_compiled_storage_backends(self) -> None:
+        backends = set(_corium._storage_backends())
+        self.assertIn("filesystem", backends)
+        self.assertTrue(backends.issubset({"filesystem", "postgres", "turso", "s3"}))
+
     def test_every_boundary_value_round_trips_losslessly(self) -> None:
         instant = datetime(2026, 7, 28, 12, 34, 56, 789000, tzinfo=timezone.utc)
         before_epoch = datetime(1960, 1, 2, 3, 4, 5, 678000, tzinfo=timezone.utc)

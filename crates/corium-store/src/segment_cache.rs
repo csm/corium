@@ -41,6 +41,9 @@ pub struct SegmentCacheConfig {
 }
 
 impl SegmentCacheConfig {
+    /// Default size of the in-process cache tier.
+    pub const DEFAULT_MEMORY_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+
     /// Validates the configured capacities.
     ///
     /// # Errors
@@ -161,7 +164,7 @@ pub struct SegmentCache {
 
 impl Default for SegmentCache {
     fn default() -> Self {
-        Self::memory_only(64 * 1024 * 1024)
+        Self::memory_only(SegmentCacheConfig::DEFAULT_MEMORY_CAPACITY_BYTES)
     }
 }
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,6 +44,43 @@ class Datom:
     value: Any
     tx: int
     added: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentCache:
+    """Bounded local cache for immutable direct-storage segments."""
+
+    directory: str | os.PathLike[str]
+    capacity_bytes: int
+    memory_capacity_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        directory = os.fspath(self.directory)
+        if not isinstance(directory, str):
+            raise TypeError("segment cache directory must be a string path")
+        if not directory:
+            raise ValueError("segment cache directory must not be empty")
+        object.__setattr__(self, "directory", directory)
+        capacity = _nonnegative_int(self.capacity_bytes, "capacity_bytes")
+        if capacity == 0:
+            raise ValueError("capacity_bytes must be positive")
+        if self.memory_capacity_bytes is not None:
+            memory = _nonnegative_int(
+                self.memory_capacity_bytes, "memory_capacity_bytes"
+            )
+            if memory > capacity:
+                raise ValueError("memory_capacity_bytes must not exceed capacity_bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectStorage:
+    """Discover the transactor's read-only storage connection."""
+
+    cache: SegmentCache | None = None
+
+    def __post_init__(self) -> None:
+        if self.cache is not None and not isinstance(self.cache, SegmentCache):
+            raise TypeError("cache must be a SegmentCache")
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,13 +375,44 @@ class _BasePeer(Peer):
         await self.close()
 
 
+@functools.cache
 def _native_module() -> Any:
+    optional_modules = (
+        "corium._corium_turso",
+        "corium._corium_postgres",
+        "corium._corium_s3",
+    )
+    found: list[Any] = []
+    for module_name in optional_modules:
+        try:
+            found.append(importlib.import_module(module_name))
+        except ModuleNotFoundError as error:
+            if error.name != module_name:
+                raise NativeExtensionError(
+                    f"the optional native extension {module_name} failed to load"
+                ) from error
+        except ImportError as error:
+            raise NativeExtensionError(
+                f"the optional native extension {module_name} failed to load"
+            ) from error
+    if len(found) > 1:
+        raise NativeExtensionError(
+            "multiple Corium direct-storage artifacts are installed; install only one"
+        )
+    if found:
+        return found[0]
     try:
         return importlib.import_module("corium._corium")
     except ImportError as error:
         raise NativeExtensionError(
             "the Corium native extension is not installed for this platform"
         ) from error
+
+
+def available_storage_backends() -> frozenset[str]:
+    """Return direct-storage backends compiled into the native artifact."""
+
+    return frozenset(_native_module()._storage_backends())
 
 
 def _tls_from_endpoints(
@@ -389,14 +459,19 @@ class LocalPeer(_BasePeer):
         allow_insecure_token: bool = False,
         tls_ca: bytes | None = None,
         tls_domain: str | None = None,
+        storage: DirectStorage | None = None,
     ) -> LocalPeer:
         """Connect a full peer; ``https://`` endpoints enable platform TLS.
 
         Set ``allow_insecure_token=True`` only for deliberate local development
         over plaintext HTTP. ``tls_ca`` adds a PEM certificate authority and
         ``tls_domain`` overrides the certificate DNS name for private PKI.
+        ``storage=DirectStorage()`` discovers a read-only storage connection
+        from the transactor so the peer can bootstrap from published segments.
         """
 
+        if storage is not None and not isinstance(storage, DirectStorage):
+            raise TypeError("storage must be DirectStorage or None")
         endpoint_list = [endpoints] if isinstance(endpoints, str) else list(endpoints)
         tls = _tls_from_endpoints(
             endpoint_list,
@@ -412,6 +487,22 @@ class LocalPeer(_BasePeer):
             tls=tls,
             tls_ca=tls_ca,
             tls_domain=tls_domain,
+            direct_storage=storage is not None,
+            segment_cache_directory=(
+                storage.cache.directory
+                if storage is not None and storage.cache is not None
+                else None
+            ),
+            segment_cache_capacity_bytes=(
+                storage.cache.capacity_bytes
+                if storage is not None and storage.cache is not None
+                else None
+            ),
+            segment_cache_memory_bytes=(
+                storage.cache.memory_capacity_bytes
+                if storage is not None and storage.cache is not None
+                else None
+            ),
         )
         return cls(backend)
 

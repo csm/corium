@@ -12,9 +12,9 @@ use corium_core::{Datom, IndexOrder, encoding::DecodeError};
 use corium_db::Db;
 use corium_protocol::codec::{self, CodecError};
 use corium_store::{
-    BlobId, BlobStore, DbRoot, FORMAT_VERSION, RootStore, SegmentCache, SegmentCacheConfig,
-    SegmentCacheMetrics, SegmentReader, StoreError, db_root_name, decode_index_manifest,
-    decode_segment_keys, is_index_manifest, meta_root_name,
+    BlobId, BlobStore, DbRoot, DiscoveredStore, FORMAT_VERSION, RootStore, SegmentCache,
+    SegmentCacheConfig, SegmentCacheMetrics, SegmentReader, StoreError, db_root_name,
+    decode_index_manifest, decode_segment_keys, is_index_manifest, meta_root_name,
 };
 use thiserror::Error;
 
@@ -91,6 +91,28 @@ where
 
     async fn get_peer_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
         RootStore::get_root(self, name).await
+    }
+}
+
+/// Read-only peer adapter for storage discovered through a transactor.
+pub struct DiscoveredPeerStorage(DiscoveredStore);
+
+impl DiscoveredPeerStorage {
+    /// Wraps a discovered store for peer snapshot reads.
+    #[must_use]
+    pub const fn new(store: DiscoveredStore) -> Self {
+        Self(store)
+    }
+}
+
+#[async_trait]
+impl PeerStorage for DiscoveredPeerStorage {
+    async fn get_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.0.get(id).await
+    }
+
+    async fn get_peer_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.0.get_root(name).await
     }
 }
 

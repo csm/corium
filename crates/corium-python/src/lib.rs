@@ -6,8 +6,9 @@
 
 use corium_core::TotalF64;
 use corium_ffi::{
-    ClientTlsOptions, CompositeValue, DbHandle, ErrorKind, FfiError, Index, LocalConnectOptions,
-    PeerHandle, RemoteConnectOptions,
+    ClientTlsOptions, CompositeValue, DbHandle, DirectStorageOptions, ErrorKind, FfiError, Index,
+    LocalConnectOptions, PeerHandle, RemoteConnectOptions, SegmentCacheOptions,
+    compiled_storage_backends,
 };
 use corium_protocol::codec;
 use corium_query::edn::Edn;
@@ -19,6 +20,13 @@ use pyo3::types::{
 };
 
 const RESERVED_TAGS: [&str; 4] = ["bytes", "eid", "inst", "uuid"];
+
+#[cfg(any(
+    all(feature = "artifact-turso", any(feature = "postgres", feature = "s3")),
+    all(feature = "artifact-postgres", any(feature = "turso", feature = "s3")),
+    all(feature = "artifact-s3", any(feature = "turso", feature = "postgres")),
+))]
+compile_error!("a corium-python artifact must enable exactly one storage backend");
 
 struct PythonRuntime {
     keyword: Py<PyAny>,
@@ -272,8 +280,11 @@ fn connect_remote(
 
 #[pyfunction]
 #[pyo3(signature = (
-    endpoints, *, database, token=None, tls=false, tls_ca=None, tls_domain=None
+    endpoints, *, database, token=None, tls=false, tls_ca=None, tls_domain=None,
+    direct_storage=false, segment_cache_directory=None,
+    segment_cache_capacity_bytes=None, segment_cache_memory_bytes=None
 ))]
+#[allow(clippy::too_many_arguments)]
 fn connect_local(
     py: Python<'_>,
     endpoints: Vec<String>,
@@ -282,19 +293,55 @@ fn connect_local(
     tls: bool,
     tls_ca: Option<Vec<u8>>,
     tls_domain: Option<String>,
+    direct_storage: bool,
+    segment_cache_directory: Option<String>,
+    segment_cache_capacity_bytes: Option<u64>,
+    segment_cache_memory_bytes: Option<u64>,
 ) -> PyResult<Bound<'_, PyAny>> {
     let tls = client_tls_options(tls, tls_ca, tls_domain)?;
+    let segment_cache = match (
+        segment_cache_directory,
+        segment_cache_capacity_bytes,
+        segment_cache_memory_bytes,
+    ) {
+        (None, None, None) => None,
+        (Some(directory), Some(capacity_bytes), memory_capacity_bytes) => {
+            Some(SegmentCacheOptions {
+                directory: directory.into(),
+                capacity_bytes,
+                memory_capacity_bytes: memory_capacity_bytes.unwrap_or_else(|| {
+                    SegmentCacheOptions::DEFAULT_MEMORY_CAPACITY_BYTES.min(capacity_bytes)
+                }),
+            })
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "segment cache requires both a directory and capacity",
+            ));
+        }
+    };
+    if segment_cache.is_some() && !direct_storage {
+        return Err(PyValueError::new_err(
+            "segment cache requires direct_storage=True",
+        ));
+    }
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let handle = PeerHandle::connect_local(LocalConnectOptions {
             endpoints,
             database_name: database,
             token,
             tls,
+            direct_storage: direct_storage.then_some(DirectStorageOptions { segment_cache }),
         })
         .await
         .map_err(ffi_error)?;
         Python::attach(|py| Py::new(py, PythonPeer { handle }))
     })
+}
+
+#[pyfunction]
+fn _storage_backends() -> Vec<&'static str> {
+    compiled_storage_backends()
 }
 
 fn client_tls_options(
@@ -600,14 +647,42 @@ fn ffi_error(error: FfiError) -> PyErr {
     })
 }
 
-#[pymodule]
-fn _corium(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(connect_remote, module)?)?;
     module.add_function(wrap_pyfunction!(connect_local, module)?)?;
     module.add_function(wrap_pyfunction!(_roundtrip, module)?)?;
+    module.add_function(wrap_pyfunction!(_storage_backends, module)?)?;
     module.add_class::<PythonPeer>()?;
     module.add_class::<PythonDb>()?;
     Ok(())
+}
+
+#[cfg(not(any(
+    feature = "artifact-turso",
+    feature = "artifact-postgres",
+    feature = "artifact-s3"
+)))]
+#[pymodule]
+fn _corium(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_module(module)
+}
+
+#[cfg(feature = "artifact-turso")]
+#[pymodule]
+fn _corium_turso(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_module(module)
+}
+
+#[cfg(feature = "artifact-postgres")]
+#[pymodule]
+fn _corium_postgres(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_module(module)
+}
+
+#[cfg(feature = "artifact-s3")]
+#[pymodule]
+fn _corium_s3(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_module(module)
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ jobs:
       - run: python -m pip install -e './clients/python[dev]'
       - run: ruff check clients/python
       - run: ruff format --check clients/python
-      - run: mypy clients/python/src clients/python/tests
+      - run: mypy --config-file clients/python/pyproject.toml clients/python/src clients/python/tests clients/python/artifacts
       - run: python -m unittest discover -s clients/python/tests -v
 
   rust:
@@ -70,6 +70,20 @@ jobs:
       # them in their intended GC mode.
       - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
       - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
+      - name: Lint optional Python storage backends
+        run: cargo clippy -p corium-ffi -p corium-python --features all-storage --all-targets -- -D warnings
+      - name: Test optional Python storage backends
+        run: cargo test -p corium-ffi --features all-storage
+      - name: Check Python direct-storage artifact isolation
+        run: |
+          cargo tree -p corium-python --no-default-features -e normal > /tmp/corium-python-base-tree
+          if grep -E '(^| )turso v|deadpool-postgres|aws-sdk-s3' /tmp/corium-python-base-tree; then
+            echo "base Python artifact unexpectedly includes an optional storage driver"
+            exit 1
+          fi
+          cargo check -p corium-python --no-default-features --features artifact-turso
+          cargo check -p corium-python --no-default-features --features artifact-postgres
+          cargo check -p corium-python --no-default-features --features artifact-s3
       - name: Test GC-mode cljrs crates (standalone)
         run: |
           cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
