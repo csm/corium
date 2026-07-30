@@ -174,12 +174,14 @@ payload in the blob store, whose bytes are fetched lazily and explicitly.
   which is the same shape as ADR-0018's admission that per-subject shredding
   needs per-subject keys. Naming it here is better than discovering it during an
   audit.
-- `DbRoot` gains a field and the storage format bumps. Older binaries reject the
-  newer root rather than misreading it, which is what stops a pre-blob
-  transactor from running GC against a database whose payloads it cannot see.
-  ADR-0017 proposes its own trailing field and its own bump for the key manifest
-  version; both are unbuilt, so whichever lands first takes format 4. Databases
-  with no blob attributes never grow a payload root and are unaffected.
+- `DbRoot` gains a trailing field at storage format 5, after
+  [ADR-0017](0017-encryption-at-rest.md)'s `key-manifest-version` at format 4.
+  Older binaries reject the newer root rather than misreading it, which is what
+  stops a pre-blob transactor from running GC against a database whose payloads
+  it cannot see. Both proposals extend the same line-ordered record by
+  appending, so the landing order fixes the layout: a format-5 root carries the
+  key-manifest line and then the payload-root line. Databases with no blob
+  attributes never grow a payload root and are unaffected.
 - `Value` gains a variant matched exhaustively across roughly thirty sites in a
   dozen crates — `corium-core` (value, encoding, schema), `corium-forms`
   (`schemaform.rs`, `toml_schema.rs`), `corium-protocol` (`codec.rs`),

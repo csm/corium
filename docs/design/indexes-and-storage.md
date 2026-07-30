@@ -366,11 +366,14 @@ walks roots: GC marks payloads from the payload root, and backup copies them
 from it.
 
 `DbRoot` grows one trailing field for it — the record already extends by
-appending lines older readers stop before — and the storage format bumps, so a
+appending lines older readers stop before — at **storage format 5**, so a
 pre-blob binary refuses the database rather than sweeping payloads it cannot
-see. ([encryption.md](encryption.md) proposes its own trailing field and its
-own bump; both are unbuilt, and whichever lands first takes format 4.) A
-database with no blob attributes never grows a payload root.
+see. Format 4 is [encryption.md](encryption.md)'s `key-manifest-version`, which
+lands first and appends a trailing line of its own; a format-5 root therefore
+carries that line and then `payload-root`. The order matters precisely because
+both are trailing extensions, and only the second one to land can discover that
+it is not the last line. A database with no blob attributes never grows a
+payload root.
 
 Uploads whose transaction never committed are the only ordinary garbage here:
 unreachable from any root, swept by the retention window that already exists,
