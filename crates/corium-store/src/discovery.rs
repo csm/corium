@@ -6,7 +6,6 @@ use std::time::SystemTime;
 #[cfg(feature = "s3")]
 use std::time::{Duration, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use corium_protocol::pb;
 
 #[cfg(feature = "postgres")]
@@ -221,7 +220,7 @@ impl DiscoveredStoreSpec {
     }
 }
 
-/// An opened store discovered through the transactor.
+/// An opened, read-only store discovered through the transactor.
 pub enum DiscoveredStore {
     /// Existing filesystem store.
     Filesystem(FsStore),
@@ -236,21 +235,12 @@ pub enum DiscoveredStore {
     S3(S3BlobStore),
 }
 
-#[async_trait]
-impl BlobStore for DiscoveredStore {
-    async fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
-        match self {
-            Self::Filesystem(store) => store.put(bytes).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.put(bytes).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.put(bytes).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.put(bytes).await,
-        }
-    }
-
-    async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+impl DiscoveredStore {
+    /// Loads one immutable blob.
+    ///
+    /// # Errors
+    /// Returns an error when the discovered backend cannot read the blob.
+    pub async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
             Self::Filesystem(store) => store.get(id).await,
             #[cfg(feature = "postgres")]
@@ -262,31 +252,11 @@ impl BlobStore for DiscoveredStore {
         }
     }
 
-    async fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
-        match self {
-            Self::Filesystem(store) => store.contains(id).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.contains(id).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.contains(id).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.contains(id).await,
-        }
-    }
-
-    async fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
-        match self {
-            Self::Filesystem(store) => store.delete(id).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.delete(id).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.delete(id).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.delete(id).await,
-        }
-    }
-
-    async fn list(&self) -> Result<BlobIdStream, StoreError> {
+    /// Lists every immutable blob in the discovered backend.
+    ///
+    /// # Errors
+    /// Returns an error when the discovered backend cannot enumerate blobs.
+    pub async fn list(&self) -> Result<BlobIdStream, StoreError> {
         match self {
             Self::Filesystem(store) => store.list().await,
             #[cfg(feature = "postgres")]
@@ -298,7 +268,11 @@ impl BlobStore for DiscoveredStore {
         }
     }
 
-    async fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
+    /// Returns the blob's backend modification time, when available.
+    ///
+    /// # Errors
+    /// Returns an error when the discovered backend cannot inspect the blob.
+    pub async fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
         match self {
             Self::Filesystem(store) => store.modified_at(id).await,
             #[cfg(feature = "postgres")]
@@ -309,11 +283,12 @@ impl BlobStore for DiscoveredStore {
             Self::S3(store) => store.modified_at(id).await,
         }
     }
-}
 
-#[async_trait]
-impl RootStore for DiscoveredStore {
-    async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    /// Loads one named root record.
+    ///
+    /// # Errors
+    /// Returns an error when the discovered backend cannot read the root.
+    pub async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
             Self::Filesystem(store) => store.get_root(name).await,
             #[cfg(feature = "postgres")]
@@ -325,36 +300,11 @@ impl RootStore for DiscoveredStore {
         }
     }
 
-    async fn cas_root(
-        &self,
-        name: &str,
-        expected: Option<&[u8]>,
-        new: &[u8],
-    ) -> Result<(), StoreError> {
-        match self {
-            Self::Filesystem(store) => store.cas_root(name, expected, new).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.cas_root(name, expected, new).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.cas_root(name, expected, new).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.cas_root(name, expected, new).await,
-        }
-    }
-
-    async fn delete_root(&self, name: &str) -> Result<(), StoreError> {
-        match self {
-            Self::Filesystem(store) => store.delete_root(name).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.delete_root(name).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.delete_root(name).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.delete_root(name).await,
-        }
-    }
-
-    async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+    /// Lists root names with `prefix`.
+    ///
+    /// # Errors
+    /// Returns an error when the discovered backend cannot enumerate roots.
+    pub async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         match self {
             Self::Filesystem(store) => store.list_roots(prefix).await,
             #[cfg(feature = "postgres")]

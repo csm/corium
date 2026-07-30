@@ -309,8 +309,9 @@ fn connect_local(
             Some(SegmentCacheOptions {
                 directory: directory.into(),
                 capacity_bytes,
-                memory_capacity_bytes: memory_capacity_bytes
-                    .unwrap_or(SegmentCacheOptions::DEFAULT_MEMORY_CAPACITY_BYTES),
+                memory_capacity_bytes: memory_capacity_bytes.unwrap_or_else(|| {
+                    SegmentCacheOptions::DEFAULT_MEMORY_CAPACITY_BYTES.min(capacity_bytes)
+                }),
             })
         }
         _ => {

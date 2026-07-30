@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -311,7 +312,7 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 raise ImportError("missing base extension")
             raise ModuleNotFoundError(name=module_name)
 
-        with patch.object(api.importlib, "import_module", side_effect=import_missing):
+        with patch.object(importlib, "import_module", side_effect=import_missing):
             with self.assertRaisesRegex(
                 NativeExtensionError, "native extension is not installed"
             ):
@@ -326,7 +327,7 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             raise ModuleNotFoundError(name=module_name)
 
         with patch.object(
-            api.importlib, "import_module", side_effect=import_one
+            importlib, "import_module", side_effect=import_one
         ) as import_module:
             self.assertIs(api._native_module(), turso)
             self.assertIs(api._native_module(), turso)
@@ -339,7 +340,7 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 return object()
             raise ModuleNotFoundError(name=module_name)
 
-        with patch.object(api.importlib, "import_module", side_effect=import_two):
+        with patch.object(importlib, "import_module", side_effect=import_two):
             with self.assertRaisesRegex(NativeExtensionError, "multiple"):
                 api._native_module()
 

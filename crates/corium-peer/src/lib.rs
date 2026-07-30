@@ -31,7 +31,7 @@ use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
-pub use crate::segment::CachedPeerStorage;
+pub use crate::segment::{CachedPeerStorage, DiscoveredPeerStorage};
 use crate::segment::{PeerStorage, SnapshotError, load_current_snapshot};
 pub use corium_store::{SegmentCacheConfig, SegmentCacheMetrics};
 

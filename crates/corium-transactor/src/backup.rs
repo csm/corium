@@ -18,8 +18,8 @@ use corium_log::{
 };
 use corium_protocol::pb;
 use corium_store::{
-    BlobId, BlobStore, DbRoot, DiscoveredStoreSpec, FORMAT_VERSION, FsStore, RootStore,
-    StorageConnectionError, StoreError, db_root_name,
+    BlobId, BlobStore, DbRoot, DiscoveredStore, DiscoveredStoreSpec, FORMAT_VERSION, FsStore,
+    RootStore, StorageConnectionError, StoreError, db_root_name,
 };
 use thiserror::Error;
 
@@ -136,18 +136,9 @@ impl BackupSource {
         let storage = info
             .storage
             .ok_or_else(|| BackupError::Invalid("transactor returned no storage backend".into()))?;
-        let store = DiscoveredStoreSpec::from_connection(storage).map_err(|error| match error {
-            StorageConnectionError::Missing => {
-                BackupError::Invalid("transactor returned no storage backend".into())
-            }
-            StorageConnectionError::Unsupported(detail) => BackupError::UnsupportedSource(detail),
-        })?;
-        StoreSpec::from_discovered(&store).map_err(|error| match error {
-            StorageConnectionError::Missing => {
-                BackupError::Invalid("transactor returned no storage backend".into())
-            }
-            StorageConnectionError::Unsupported(detail) => BackupError::UnsupportedSource(detail),
-        })?;
+        let store =
+            DiscoveredStoreSpec::from_connection(storage).map_err(storage_connection_error)?;
+        StoreSpec::from_discovered(&store).map_err(storage_connection_error)?;
         Ok(Self {
             store,
             basis_t: info.basis_t,
@@ -158,6 +149,15 @@ impl BackupSource {
     #[must_use]
     pub const fn basis_t(&self) -> u64 {
         self.basis_t
+    }
+}
+
+fn storage_connection_error(error: StorageConnectionError) -> BackupError {
+    match error {
+        StorageConnectionError::Missing => {
+            BackupError::Invalid("transactor returned no storage backend".into())
+        }
+        StorageConnectionError::Unsupported(detail) => BackupError::UnsupportedSource(detail),
     }
 }
 
@@ -498,7 +498,7 @@ fn read_archive(path: &Path, include_records: bool) -> Result<Archive, BackupErr
 /// Writes one blob and everything it references into the binary archive,
 /// children first.
 fn write_blob_tree<'a>(
-    source: &'a dyn BlobStore,
+    source: &'a DiscoveredStore,
     id: &'a BlobId,
     seen: &'a mut std::collections::HashSet<BlobId>,
     writer: &'a mut File,
@@ -624,7 +624,7 @@ async fn create_archive(
     destination: &Path,
     db: &str,
     root: &DbRoot,
-    source_store: &dyn BlobStore,
+    source_store: &DiscoveredStore,
     checkpoint: &[u8],
 ) -> Result<usize, BackupError> {
     if let Some(parent) = destination.parent()
@@ -684,7 +684,8 @@ pub async fn backup(
     }
     let destination = destination.as_ref();
     let source_store = Arc::new(source.store.clone().open_existing().await?);
-    let source_logs = LogBackend::for_discovered(&source.store, Arc::clone(&source_store));
+    let source_logs = LogBackend::for_discovered(&source.store, Arc::clone(&source_store))
+        .map_err(storage_connection_error)?;
     let db_name = db_root_name(db);
     let meta_name = meta_root_name(db);
     let source_db_bytes = source_store

@@ -27,7 +27,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
 use corium_peer::server::PeerServerConfig;
-use corium_peer::{Admin, ConnectConfig, Connection, IndexPolicySettings, SegmentCacheConfig};
+use corium_peer::{
+    Admin, ConnectConfig, Connection, DiscoveredPeerStorage, IndexPolicySettings,
+    SegmentCacheConfig,
+};
 use corium_protocol::auth::{DEFAULT_DEV_TOKEN, client_tls, server_tls};
 use corium_protocol::authz::{
     ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, Principal,
@@ -227,7 +230,7 @@ impl ClientFlags {
             .open_existing()
             .await
             .map_err(|error| format!("cannot open peer storage: {error}"))?;
-        let storage = Arc::new(store);
+        let storage = Arc::new(DiscoveredPeerStorage::new(store));
         if let Some(cache) = cache {
             config
                 .with_storage_cache(storage, &cache)
@@ -1118,11 +1121,15 @@ async fn run(cli: Cli) -> Result<(), String> {
             serve,
         } => {
             let tls = serve.tls()?;
-            let cache = segment_cache_dir.map(|directory| SegmentCacheConfig {
-                directory,
-                capacity_bytes: segment_cache_capacity.expect("required with cache directory"),
-                memory_capacity_bytes: segment_cache_memory
-                    .unwrap_or(SegmentCacheConfig::DEFAULT_MEMORY_CAPACITY_BYTES),
+            let cache = segment_cache_dir.map(|directory| {
+                let capacity_bytes = segment_cache_capacity.expect("required with cache directory");
+                SegmentCacheConfig {
+                    directory,
+                    capacity_bytes,
+                    memory_capacity_bytes: segment_cache_memory.unwrap_or_else(|| {
+                        SegmentCacheConfig::DEFAULT_MEMORY_CAPACITY_BYTES.min(capacity_bytes)
+                    }),
+                }
             });
             if cache.is_some() && !client.peer_bootstrap {
                 return Err("segment cache requires --peer-bootstrap".into());

@@ -22,7 +22,7 @@ use corium_client::{
     ClientError, Db, LocalPeer, Peer, RemotePeer, ResultShape as ClientResultShape, TxData,
 };
 use corium_peer::segment::PeerStorage;
-use corium_peer::{Admin, ConnectConfig, PeerError, SegmentCacheConfig};
+use corium_peer::{Admin, ConnectConfig, DiscoveredPeerStorage, PeerError, SegmentCacheConfig};
 use corium_protocol::codec;
 use corium_protocol::pb;
 use corium_query::QueryError;
@@ -400,7 +400,7 @@ async fn open_discovered_storage(
         ));
     }
     let store = spec.open_existing().await.map_err(storage_error)?;
-    Ok(Arc::new(store))
+    Ok(Arc::new(DiscoveredPeerStorage::new(store)))
 }
 
 #[cfg(feature = "s3")]

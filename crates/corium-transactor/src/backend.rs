@@ -227,25 +227,11 @@ impl fmt::Debug for StorageInfoConfig {
 }
 
 impl StoreSpec {
-    /// Reconstructs a spec (and the filesystem data directory, empty for
-    /// backends that carry their own location) from the connection info a
-    /// transactor advertises through `GetStorageInfo`. The inverse of
-    /// [`Self::connection_info`], letting a client open the transactor's
-    /// storage service directly from just the transactor address.
-    ///
-    /// # Errors
-    /// Returns an error for a missing backend, an in-memory backend (confined
-    /// to the transactor process), or a backend omitted from this build.
-    pub fn from_connection(
-        connection: corium_protocol::pb::StorageConnection,
-    ) -> Result<(Self, PathBuf), StorageConnectionError> {
-        let discovered = DiscoveredStoreSpec::from_connection(connection)?;
-        Self::from_discovered(&discovered)
-    }
-
     pub(crate) fn from_discovered(
         discovered: &DiscoveredStoreSpec,
     ) -> Result<(Self, PathBuf), StorageConnectionError> {
+        // `corium-store` features may be unified by another dependency
+        // without enabling the matching `corium-transactor` feature.
         #[allow(unreachable_patterns)]
         let resolved = match discovered {
             DiscoveredStoreSpec::Filesystem { root } => {
@@ -851,36 +837,43 @@ impl LogBackend {
         }
     }
 
-    /// The read-only log backend paired with a discovered storage service.
-    #[must_use]
+    /// Returns the read-only log backend paired with a discovered storage service.
+    ///
+    /// # Errors
+    /// Returns an error when this transactor build lacks the advertised
+    /// backend, even if Cargo feature unification enabled it in `corium-store`.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn for_discovered(
+    pub(crate) fn for_discovered(
         spec: &DiscoveredStoreSpec,
         #[cfg_attr(
             not(any(feature = "postgres", feature = "turso", feature = "s3")),
             allow(unused_variables)
         )]
         store: Arc<DiscoveredStore>,
-    ) -> Self {
+    ) -> Result<Self, StorageConnectionError> {
+        // `corium-store` features may be unified by another dependency
+        // without enabling the matching `corium-transactor` feature.
         #[allow(unreachable_patterns)]
         match spec {
-            DiscoveredStoreSpec::Filesystem { root } => Self::Fs(
+            DiscoveredStoreSpec::Filesystem { root } => Ok(Self::Fs(
                 root.parent()
                     .map_or_else(|| PathBuf::from("logs"), |data_dir| data_dir.join("logs")),
-            ),
+            )),
             #[cfg(feature = "postgres")]
-            DiscoveredStoreSpec::Postgres { .. } => {
-                Self::Native(Arc::new(NativeRootLogStore::new(store)))
-            }
+            DiscoveredStoreSpec::Postgres { .. } => Ok(Self::Native(Arc::new(
+                NativeRootLogStore::new_discovered(store),
+            ))),
             #[cfg(feature = "turso")]
-            DiscoveredStoreSpec::Turso { .. } => {
-                Self::Native(Arc::new(NativeRootLogStore::new(store)))
-            }
+            DiscoveredStoreSpec::Turso { .. } => Ok(Self::Native(Arc::new(
+                NativeRootLogStore::new_discovered(store),
+            ))),
             #[cfg(feature = "s3")]
-            DiscoveredStoreSpec::S3 { .. } => {
-                Self::Native(Arc::new(NativeRootLogStore::new(store)))
-            }
-            _ => unreachable!("backup source storage was validated for this build"),
+            DiscoveredStoreSpec::S3 { .. } => Ok(Self::Native(Arc::new(
+                NativeRootLogStore::new_discovered(store),
+            ))),
+            _ => Err(StorageConnectionError::Unsupported(
+                "this corium-transactor build lacks the advertised storage backend".into(),
+            )),
         }
     }
 
@@ -994,7 +987,13 @@ impl LogBackend {
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 struct NativeRootLogStore {
-    store: Arc<dyn RootStore>,
+    store: NativeLogRootStore,
+}
+
+#[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
+enum NativeLogRootStore {
+    ReadWrite(Arc<dyn RootStore>),
+    Discovered(Arc<DiscoveredStore>),
 }
 
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
@@ -1003,7 +1002,31 @@ impl NativeRootLogStore {
     where
         S: RootStore + 'static,
     {
-        Self { store }
+        Self {
+            store: NativeLogRootStore::ReadWrite(store),
+        }
+    }
+
+    fn new_discovered(store: Arc<DiscoveredStore>) -> Self {
+        Self {
+            store: NativeLogRootStore::Discovered(store),
+        }
+    }
+
+    async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, LogError> {
+        match &self.store {
+            NativeLogRootStore::ReadWrite(store) => store.get_root(name).await,
+            NativeLogRootStore::Discovered(store) => store.get_root(name).await,
+        }
+        .map_err(|error| LogError::Native(error.to_string()))
+    }
+
+    async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, LogError> {
+        match &self.store {
+            NativeLogRootStore::ReadWrite(store) => store.list_roots(prefix).await,
+            NativeLogRootStore::Discovered(store) => store.list_roots(prefix).await,
+        }
+        .map_err(|error| LogError::Native(error.to_string()))
     }
 }
 
@@ -1078,8 +1101,12 @@ impl NativeLogStorage for NativeRootLogStore {
         for (_, framed) in records {
             bytes.extend_from_slice(framed);
         }
-        match self
-            .store
+        let NativeLogRootStore::ReadWrite(store) = &self.store else {
+            return Err(LogError::Native(
+                "transaction log storage is read-only".into(),
+            ));
+        };
+        match store
             .cas_root(&Self::record_key(name, version, *last_t), None, &bytes)
             .await
         {
@@ -1095,19 +1122,12 @@ impl NativeLogStorage for NativeRootLogStore {
         version: u64,
         t: u64,
     ) -> Result<Option<Vec<u8>>, LogError> {
-        self.store
-            .get_root(&Self::record_key(name, version, t))
-            .await
-            .map_err(|error| LogError::Native(error.to_string()))
+        self.get_root(&Self::record_key(name, version, t)).await
     }
 
     async fn list_records(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError> {
         let prefix = Self::prefix(name);
-        let names = self
-            .store
-            .list_roots(&prefix)
-            .await
-            .map_err(|error| LogError::Native(error.to_string()))?;
+        let names = self.list_roots(&prefix).await?;
         names
             .into_iter()
             .filter_map(|key| match Self::parse_key(&prefix, &key) {
@@ -1124,19 +1144,12 @@ impl NativeLogStorage for NativeRootLogStore {
         version: u64,
         chunk: u64,
     ) -> Result<Option<Vec<u8>>, LogError> {
-        self.store
-            .get_root(&Self::legacy_key(name, version, chunk))
-            .await
-            .map_err(|error| LogError::Native(error.to_string()))
+        self.get_root(&Self::legacy_key(name, version, chunk)).await
     }
 
     async fn list_legacy_chunks(&self, name: &str) -> Result<Vec<(u64, u64)>, LogError> {
         let prefix = Self::prefix(name);
-        let names = self
-            .store
-            .list_roots(&prefix)
-            .await
-            .map_err(|error| LogError::Native(error.to_string()))?;
+        let names = self.list_roots(&prefix).await?;
         names
             .into_iter()
             .filter_map(|key| match Self::parse_key(&prefix, &key) {
@@ -1149,13 +1162,17 @@ impl NativeLogStorage for NativeRootLogStore {
 
     async fn delete_all(&self, name: &str) -> Result<(), LogError> {
         let prefix = Self::prefix(name);
-        let names = self
-            .store
+        let NativeLogRootStore::ReadWrite(store) = &self.store else {
+            return Err(LogError::Native(
+                "transaction log storage is read-only".into(),
+            ));
+        };
+        let names = store
             .list_roots(&prefix)
             .await
             .map_err(|error| LogError::Native(error.to_string()))?;
         for key in names {
-            self.store
+            store
                 .delete_root(&key)
                 .await
                 .map_err(|error| LogError::Native(error.to_string()))?;
@@ -1206,16 +1223,17 @@ mod tests {
     #[cfg(feature = "s3")]
     #[tokio::test]
     async fn s3_storage_info_carries_static_read_only_credentials() {
-        let missing = StoreSpec::from_connection(corium_protocol::pb::StorageConnection {
-            backend: Some(corium_protocol::pb::storage_connection::Backend::S3(
-                corium_protocol::pb::S3Storage {
-                    bucket: "bucket".into(),
-                    prefix: String::new(),
-                    ..Default::default()
-                },
-            )),
-        })
-        .expect_err("S3 clients must not fall back to ambient credentials");
+        let missing =
+            DiscoveredStoreSpec::from_connection(corium_protocol::pb::StorageConnection {
+                backend: Some(corium_protocol::pb::storage_connection::Backend::S3(
+                    corium_protocol::pb::S3Storage {
+                        bucket: "bucket".into(),
+                        prefix: String::new(),
+                        ..Default::default()
+                    },
+                )),
+            })
+            .expect_err("S3 clients must not fall back to ambient credentials");
         assert!(missing.to_string().contains("read-only access key"));
 
         let spec = StoreSpec::S3 {
@@ -1260,8 +1278,8 @@ mod tests {
         assert_ne!(s3.access_key_id, "PRIMARY");
 
         s3.expires_unix_seconds = 1_900_000_000;
-        let (StoreSpec::S3 { client, .. }, _) =
-            StoreSpec::from_connection(corium_protocol::pb::StorageConnection {
+        let DiscoveredStoreSpec::S3 { client, .. } =
+            DiscoveredStoreSpec::from_connection(corium_protocol::pb::StorageConnection {
                 backend: Some(corium_protocol::pb::storage_connection::Backend::S3(s3)),
             })
             .expect("parse S3 storage info")
