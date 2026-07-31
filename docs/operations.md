@@ -441,6 +441,68 @@ corium gc --data-dir /srv/corium --window 72h
 
 Use a zero window only when no stale root or in-flight reader can exist.
 
+## Encryption at rest
+
+Every durable artifact of an encrypted database — index blobs, transaction-log
+record payloads, and cached segments — is sealed under a per-database data key
+that is itself wrapped by a key-encryption key (KEK) Corium never stores. See
+[docs/design/encryption.md](design/encryption.md) for the model and
+[ADR-0017](adr/0017-encryption-at-rest.md) for the decision.
+
+Encryption is fixed at creation. A database created without a storage key stays
+unencrypted forever; migrating one is a backup and restore into a new database.
+
+A key identity is a URI. `file:/etc/corium/storage.key` and `env:CORIUM_KEK`
+resolve locally and hold 32 raw bytes or 64 hexadecimal characters (surrounding
+whitespace is ignored). KMS identities (`awskms:`, `gcpkms:`, `vault:`) are
+recognized but not yet resolvable.
+
+```sh
+# A KEK. Keep it off the machine holding the data if you can.
+head -c 32 /dev/urandom > /etc/corium/storage.key && chmod 400 /etc/corium/storage.key
+
+# Every process that reads storage directly needs it. Repeat the flag when a
+# node hosts databases under different KEKs; CORIUM_STORAGE_KEY works too.
+corium transactor  --data-dir /srv/corium --storage-key file:/etc/corium/storage.key
+corium peer-server --db people --peer-bootstrap --storage-key file:/etc/corium/storage.key
+
+# The transactor resolves the key, so no material leaves this host.
+corium db create people --schema schema.toml --storage-key file:/etc/corium/storage.key
+```
+
+Thin clients and peer-server callers need no key: they receive plaintext over
+TLS. A process that *should* hold a key and does not fails at open, naming the
+key, rather than at its first read.
+
+Inspect and rotate keys one database at a time:
+
+```sh
+corium keys status people                       # epochs, states, nonce budget
+corium keys rotate people                       # open a new epoch; rewrites nothing
+corium keys rewrap people --kek file:/etc/corium/storage-2026.key
+```
+
+`rotate` opens a new storage-key epoch that new writes use immediately. Older
+epochs stay readable and drain as ordinary re-indexing rewrites their objects;
+an epoch retires only when no live object carries it. Rotate when `corium keys
+status` reports `:rotation-due true`, which fires at half the log-record nonce
+budget — log records use a random 96-bit nonce, so an epoch must seal well under
+2³² records, and that count is simply the span of `t` the epoch covers.
+
+`rewrap` re-encrypts the data keys under a new KEK and touches no stored object.
+The transactor must be able to resolve both KEKs at once, so start it with both
+`--storage-key` flags, re-wrap, then drop the old one.
+
+Two operational consequences worth planning for:
+
+- **Offline commands need the key.** `corium log --data-dir` and
+  `corium gc --data-dir` read blob and log content, so pass `--storage-key`.
+  Offline GC refuses to run without it rather than sweep every index chunk it
+  cannot follow.
+- **Backup does not support encrypted databases yet.** `corium backup` refuses
+  one, because copying its ciphertext without the key manifest (backup format 2)
+  would produce an archive no restore could open.
+
 ## Authorization (self-hosted ReBAC)
 
 Servers authorize every request permit-all by default. `--authz-db <name>`

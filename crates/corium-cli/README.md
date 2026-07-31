@@ -27,6 +27,10 @@ Ships the `corium` command. Subcommands:
 - **`sql`** — read-only SQL shell over the peer-local database.
 - **`backup` / `restore`** — one versioned binary archive with online,
   storage-native full/incremental log backup and guarded offline restore.
+- **`keys status` / `rotate` / `rewrap`** — a database's storage-encryption
+  keys: their epochs, the log-record nonce budget, opening a new epoch, and
+  re-wrapping the data keys under another key-encryption key. Processes that
+  read storage directly declare the keys they hold with `--storage-key`.
 - **`gc`** — retention-aware garbage collection (online or offline).
 - **`log`** — inspect the transaction log.
 
@@ -34,7 +38,7 @@ Ships the `corium` command. Subcommands:
 
 - Every Corium library crate (`corium-core`, `corium-db`, `corium-peer`,
   `corium-pgwire`, `corium-protocol`, `corium-query`, `corium-sql`,
-  `corium-store`, `corium-transactor`, `corium-log`).
+  `corium-store`, `corium-transactor`, `corium-log`, `corium-crypt`).
 - `clap` (arg parsing), `tokio` + `tonic` + `rustls` (networking/TLS),
   `ratatui` + `rustyline` (TUI/console line editing), `tracing`-subscriber
   (human/JSON logs).
