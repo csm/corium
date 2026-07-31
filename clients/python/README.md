@@ -10,14 +10,14 @@ Both satisfy the same runtime-checkable `Peer` protocol and return immutable
 peer library and `RemotePeer` to `corium peer-server`.
 
 ```python
-from corium import LocalPeer
+from corium import LocalPeer, Query
 
 async with await LocalPeer.connect(
     "http://127.0.0.1:4334",
     database="people",
 ) as peer:
     db = await peer.db()
-    rows = await db.query(raw_query_form)
+    rows = await db.query(Query.find("?name").where("?entity", ":person/name", "?name"))
 ```
 
 Explicit `close()` (or `async with`) is required for deterministic shutdown.
@@ -29,6 +29,65 @@ tokens are rejected for plaintext `http://` endpoints by default. Local
 development may opt in explicitly with `allow_insecure_token=True`. Every
 endpoint must include an `http://` or `https://` scheme. Datom scans use
 `limit=None` for an explicitly unbounded scan.
+
+## Query, Pull, and transaction builders
+
+All builders are immutable: every fluent method returns a new value, and
+`Db.query`, `Db.pull`, and `Peer.transact` accept either builders or the
+existing raw data-form escape hatches.
+
+```python
+from corium import (
+    EntityMap,
+    Pull,
+    Query,
+    TxBuilder,
+    data,
+    gte,
+    lookup,
+    tempid,
+)
+
+tx = (
+    TxBuilder()
+    .entity(
+        EntityMap.with_id(tempid("ada")).set("person/name", "Ada").set("person/age", 36)
+    )
+    .build()
+)
+report = await peer.transact(tx)
+
+adults = (
+    Query.find_collection("?name")
+    .in_scalar("?minimum")
+    .where(data("?entity", ":person/name", "?name"))
+    .where("?entity", ":person/age", "?age")
+    .where(gte("?age", "?minimum"))
+)
+names = await report.db_after.query(adults, 18)
+
+person = await report.db_after.pull(
+    Pull().db_id().attr("person/name").attr("person/age"),
+    lookup("person/name", "Ada"),
+)
+```
+
+Query builders cover relation, collection, tuple, and scalar results; scalar,
+tuple, collection, relation, database, and rule inputs; data patterns;
+predicates and functions; `not`, `not-join`, `or`, and `or-join`; rules; Pull
+find expressions; and aggregates. Strings beginning with `?` are variables,
+strings beginning with `:` are keywords, and `_` is the blank term. Use
+`lit(...)` when one of those spellings must remain a string literal.
+
+Pull builders cover wildcard and entity-id selections, reverse references,
+nested patterns, bounded and unbounded recursion, aliases, defaults, and
+limits. Transaction builders cover entity maps, temporary IDs, lookup
+references, explicit `EntityId` values, add/retract/CAS/retract-entity
+operations, and arbitrary raw forms.
+
+See [`examples/people.py`](examples/people.py) for a complete topology-neutral
+example. The package includes `py.typed`, so these APIs are visible to static
+type checkers without a separate stub distribution.
 
 Private PKI deployments can add a PEM certificate authority and override the
 certificate DNS name without replacing the platform trust store:
@@ -77,8 +136,13 @@ installed artifact automatically and rejects ambiguous multi-artifact
 installations. A wheel without the advertised backend rejects it with an
 actionable `StorageError`, and
 `available_storage_backends()` reports the current artifact. See
-[`artifacts/`](artifacts/) for local builds. Publishing the platform wheel
-matrix remains Phase 5 work.
+[`artifacts/`](artifacts/) for local builds.
+
+Release automation builds and smoke-tests CPython 3.10+ ABI3 wheels for Linux
+x86-64 and ARM64, macOS ARM64 and x86-64, and Windows x86-64. A tagged release
+publishes the base package and each optional artifact using PyPI trusted
+publishing. Unsupported platforms fail installation without falling back to an
+unverified source build.
 
 Filesystem and Turso advertise local paths, so their direct-storage peers must
 run on a host that can reach the same path as the transactor. Corium rejects a

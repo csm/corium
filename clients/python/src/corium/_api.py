@@ -13,6 +13,7 @@ from enum import Enum
 from types import TracebackType
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
+from ._forms import lower_form
 from .errors import ClosedError, NativeExtensionError
 
 
@@ -208,18 +209,25 @@ class Db:
         )
 
     async def query(self, query: Any, *args: Any, fuel: int | None = None) -> Any:
-        """Execute a raw query form with positional inputs."""
+        """Execute a raw form or typed query builder with positional inputs."""
 
         self._ensure_open()
         if fuel is not None:
             fuel = _nonnegative_int(fuel, "fuel")
-        return await self._backend.query(self._view, query, args, fuel)
+        return await self._backend.query(
+            self._view,
+            lower_form(query),
+            tuple(lower_form(arg) for arg in args),
+            fuel,
+        )
 
     async def pull(self, pattern: Any, entity: Any) -> Any:
-        """Execute a raw Pull pattern for one entity."""
+        """Execute a raw form or typed Pull pattern for one entity."""
 
         self._ensure_open()
-        return await self._backend.pull(self._view, pattern, entity)
+        return await self._backend.pull(
+            self._view, lower_form(pattern), lower_form(entity)
+        )
 
     async def datoms(
         self,
@@ -303,6 +311,15 @@ class Peer(Protocol):
 
     async def close(self) -> None: ...
 
+    async def __aenter__(self) -> Peer: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
 
 _PeerT = TypeVar("_PeerT", bound="_BasePeer")
 
@@ -337,7 +354,9 @@ class _BasePeer(Peer):
         return Db(await self._require_backend().sync(), self._state)
 
     async def transact(self, tx_data: Any) -> TxReport:
-        report = await self._require_backend().transact(tx_data)
+        """Submit raw forms or typed transaction data."""
+
+        report = await self._require_backend().transact(lower_form(tx_data))
         return TxReport(
             basis_before=report.basis_before,
             basis_t=report.basis_t,

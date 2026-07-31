@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from corium import EntityId, Keyword, Symbol, Tagged
+from corium import EdnList, EntityId, Keyword, Symbol, Tagged
 
 _corium: Any
 try:
@@ -44,6 +44,7 @@ class NativeBoundaryTests(unittest.TestCase):
             before_epoch,
             identifier,
             [Keyword("find"), Symbol("?name")],
+            EdnList((Symbol("count"), Symbol("?name"))),
             frozenset({Keyword("person/name"), "Ada"}),
             {Keyword("person/name"): "Ada"},
             Tagged("custom/tag", [1, "two"]),
