@@ -2016,8 +2016,13 @@ async fn run_keys(command: KeysCommand) -> Result<(), String> {
                 return Ok(());
             }
             println!(
-                "{{:db {db:?} :encrypted true :kek {:?} :basis-t {} :rotation-due {}",
-                status.kek, status.basis_t, status.rotation_due
+                "{{:db {db:?} :encrypted true :kek {:?} :basis-t {} :rotation-due {} \
+                 :keys-unavailable {} :keys-fenced {}",
+                status.kek,
+                status.basis_t,
+                status.rotation_due,
+                status.keys_unavailable,
+                status.keys_fenced
             );
             println!(" :storage-keys [");
             for key in &status.storage_keys {
@@ -2038,6 +2043,21 @@ async fn run_keys(command: KeysCommand) -> Result<(), String> {
                 );
             }
             println!(" ]}}");
+            if status.keys_fenced {
+                eprintln!(
+                    "corium: the serving transactor cannot load the epoch this manifest \
+                     opened, so it is refusing writes; give it a --storage-key that \
+                     resolves {}",
+                    status.kek
+                );
+            } else if status.keys_unavailable {
+                eprintln!(
+                    "corium: the serving transactor could not load the latest manifest \
+                     change and is still using the keys it already held; give it a \
+                     --storage-key that resolves {}",
+                    status.kek
+                );
+            }
             if status.rotation_due {
                 eprintln!(
                     "corium: the active storage-key epoch has spent half its log-record \

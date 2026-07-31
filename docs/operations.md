@@ -493,6 +493,28 @@ budget — log records use a random 96-bit nonce, so an epoch must seal well und
 The transactor must be able to resolve both KEKs at once, so start it with both
 `--storage-key` flags, re-wrap, then drop the old one.
 
+### When a node cannot load a key change
+
+A key change made elsewhere — by an operator against another process, or by the
+other half of an HA pair — is picked up within a lease-renewal tick. When that
+load fails, what happens next depends on *which* change it was, and
+`corium keys status` reports both states:
+
+| Field | Meaning | Effect |
+|---|---|---|
+| `:keys-unavailable true` | The manifest changed but this node could not load it; its existing keys still open the database and still write under the active epoch. Typically a re-wrap to a KEK it cannot resolve, or an unreachable KMS. | Warning only. Reads and writes continue; the `corium_keys_unavailable` gauge rises. |
+| `:keys-fenced true` | The manifest opened a storage-key epoch this node cannot load, so it would keep sealing records under one the manifest has closed. | **Writes refuse** with `FAILED_PRECONDITION` naming both epochs. Reads, index publication, and the lease continue. |
+
+The distinction is deliberate. A re-wrap leaves the data keys themselves
+unchanged, so refusing writes would turn a KMS outage into a write outage for no
+confidentiality gain. A rotation is different in kind: the log-record nonce
+budget is measured as the span of `t` between epochs, so records sealed under a
+closed epoch are drawn against a budget that has stopped counting them.
+
+Both clear as soon as a load succeeds. The fix is the same either way — give the
+process a `--storage-key` that resolves the KEK the manifest now names, and
+restart it — but only the fenced state stops writes while you do.
+
 Two operational consequences worth planning for:
 
 - **Offline commands need the key.** `corium log --data-dir` and

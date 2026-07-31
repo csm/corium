@@ -30,7 +30,8 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::UnsupportedFormat { .. }
         // A missing or unresolvable key is an operator misconfiguration, not
         // a transient fault: the caller must fix the deployment, not retry.
-        | NodeError::Keys(_) => Status::failed_precondition(error.to_string()),
+        | NodeError::Keys(_)
+        | NodeError::KeysFenced { .. } => Status::failed_precondition(error.to_string()),
         NodeError::Transact(inner) => match inner {
             crate::TransactError::Tx(_) => Status::invalid_argument(inner.to_string()),
             crate::TransactError::Deposed { .. } => Status::failed_precondition(inner.to_string()),
@@ -445,12 +446,16 @@ impl Catalog for CatalogSvc {
             Access::on(Action::ManageKeys, &request.db),
         )
         .await?;
-        let (manifest, basis_t) = self
+        let status = self
             .0
             .key_status(&request.db)
             .await
             .map_err(|error| to_status(&error))?;
-        let Some(manifest) = manifest.filter(|manifest| !manifest.storage_keys.is_empty()) else {
+        let basis_t = status.basis_t;
+        let Some(manifest) = status
+            .manifest
+            .filter(|manifest| !manifest.storage_keys.is_empty())
+        else {
             return Ok(Response::new(pb::KeyStatusResponse {
                 encrypted: false,
                 basis_t,
@@ -480,6 +485,8 @@ impl Catalog for CatalogSvc {
             basis_t,
             records_per_epoch_limit: corium_store::LOG_RECORDS_PER_EPOCH_LIMIT,
             rotation_due: manifest.storage_rotation_due(basis_t),
+            keys_unavailable: status.keys_unavailable,
+            keys_fenced: status.keys_fenced,
         }))
     }
 

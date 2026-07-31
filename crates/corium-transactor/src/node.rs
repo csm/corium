@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -197,6 +197,25 @@ pub struct IndexPolicy {
     pub tail_deadline: Duration,
 }
 
+/// What `corium keys status` reports for one database.
+///
+/// The two alarm flags are about *this node*, not the stored manifest: they
+/// answer "is the process doing the encrypting actually using the keys the
+/// manifest names?", which the manifest alone cannot say.
+#[derive(Debug)]
+pub struct KeyStatus {
+    /// The stored manifest; `None` for an unencrypted database.
+    pub manifest: Option<KeyManifest>,
+    /// Current transaction basis, which closes the active epoch's nonce span.
+    pub basis_t: u64,
+    /// A manifest change could not be loaded, but the keys in hand still
+    /// serve and still write under the active epoch.
+    pub keys_unavailable: bool,
+    /// This node writes under an epoch the manifest has closed, so writes are
+    /// refused until a reload succeeds.
+    pub keys_fenced: bool,
+}
+
 /// Partial [`IndexPolicy`] override; `None` fields are left unchanged.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IndexPolicyUpdate {
@@ -310,6 +329,19 @@ pub enum NodeError {
     /// Storage-encryption keys could not be resolved.
     #[error(transparent)]
     Keys(#[from] KeyWiringError),
+    /// The key manifest opened a storage-key epoch this node cannot load, so
+    /// it would otherwise keep sealing records under a closed one.
+    #[error(
+        "database {db:?} writes under storage-key epoch {writing}, but the key manifest          has opened epoch {active} and this node cannot load it;          fix --storage-key so the new epoch resolves"
+    )]
+    KeysFenced {
+        /// Database refusing writes.
+        db: String,
+        /// Epoch the manifest says new writes belong to.
+        active: u32,
+        /// Epoch this node still holds.
+        writing: u32,
+    },
     /// Malformed request.
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -356,6 +388,22 @@ pub struct DbState {
     /// `DbRoot::key_manifest_version`. A root carrying a different one means
     /// another process rotated or re-wrapped, and these keys are stale.
     key_manifest_version: AtomicU64,
+    /// A manifest change could not be loaded: the keyring cannot resolve the
+    /// KEK it now names, or the KMS holding it is unreachable. The already
+    /// unwrapped snapshot keeps serving, because a re-wrap leaves the data
+    /// keys themselves unchanged and a KMS outage should not take the write
+    /// path down. Observable rather than fatal.
+    keys_unavailable: AtomicBool,
+    /// The manifest's active epoch is *not* the one this node writes under,
+    /// and the keys to adopt it could not be loaded. Unlike the above this is
+    /// unsafe to continue through: every record sealed from here is drawn
+    /// under a key the manifest considers closed, and the log-record nonce
+    /// budget — which is measured as the span of `t` between epochs — stops
+    /// counting them. Writes refuse until a reload succeeds.
+    keys_fenced: AtomicBool,
+    /// The epoch the manifest opened when [`Self::keys_fenced`] was raised, so
+    /// the refusal names both sides of the mismatch.
+    fenced_active_epoch: AtomicU32,
     naming: Mutex<Naming>,
     /// Held by the batch leader while it flushes the pending queue; also taken
     /// by lease renewal so a renewal never interleaves with a commit's
@@ -391,6 +439,32 @@ impl DbState {
         )
     }
 
+    /// Clears both key alarms after a successful reload, reporting whether
+    /// this database had been raising one.
+    fn clear_key_alarms(&self) -> bool {
+        // Both swaps must run, so this is a bitwise `|`, not a short-circuit.
+        self.keys_unavailable.swap(false, Ordering::AcqRel)
+            | self.keys_fenced.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether either key alarm is currently raised.
+    fn key_alarm_raised(&self) -> bool {
+        self.keys_unavailable.load(Ordering::Acquire) || self.keys_fenced.load(Ordering::Acquire)
+    }
+
+    /// The error writes refuse with while the keys are fenced, if they are.
+    fn keys_fenced_error(&self) -> Option<NodeError> {
+        if !self.keys_fenced.load(Ordering::Acquire) {
+            return None;
+        }
+        let crypto = self.crypto();
+        Some(NodeError::KeysFenced {
+            db: self.name.clone(),
+            active: self.fenced_active_epoch.load(Ordering::Acquire),
+            writing: crypto.store.storage_epoch().unwrap_or_default(),
+        })
+    }
+
     fn crypto(&self) -> Arc<DbCrypto> {
         Arc::clone(
             &self
@@ -404,6 +478,20 @@ impl DbState {
     #[must_use]
     pub fn is_encrypted(&self) -> bool {
         self.store().storage_epoch().is_some()
+    }
+
+    /// Whether a key-manifest change could not be loaded. The keys in hand
+    /// still serve; see [`Self::keys_fenced`] for the case that does not.
+    #[must_use]
+    pub fn keys_unavailable(&self) -> bool {
+        self.keys_unavailable.load(Ordering::Acquire)
+    }
+
+    /// Whether this node is writing under a storage-key epoch the manifest has
+    /// closed. Writes refuse while this holds.
+    #[must_use]
+    pub fn keys_fenced(&self) -> bool {
+        self.keys_fenced.load(Ordering::Acquire)
     }
 
     /// Current database value.
@@ -768,6 +856,9 @@ impl TransactorNode {
             log,
             crypto: std::sync::RwLock::new(Arc::new(crypto)),
             key_manifest_version: AtomicU64::new(key_manifest_version),
+            keys_unavailable: AtomicBool::new(false),
+            keys_fenced: AtomicBool::new(false),
+            fenced_active_epoch: AtomicU32::new(0),
             naming: Mutex::new(Naming {
                 schema,
                 idents,
@@ -1483,16 +1574,20 @@ impl TransactorNode {
         })
     }
 
-    /// Reads a database's key manifest and current basis, for `corium keys
-    /// status`.
+    /// Reads a database's key manifest, current basis, and whether this node
+    /// is actually operating on the keys the manifest names.
     ///
     /// # Errors
     /// Returns [`NodeError`] when the database is unknown or the manifest
     /// cannot be read.
-    pub async fn key_status(&self, name: &str) -> Result<(Option<KeyManifest>, u64), NodeError> {
+    pub async fn key_status(&self, name: &str) -> Result<KeyStatus, NodeError> {
         let state = self.db_state(name).await?;
-        let manifest = load_key_manifest(self.store.as_ref(), name).await?;
-        Ok((manifest, state.db().basis_t()))
+        Ok(KeyStatus {
+            manifest: load_key_manifest(self.store.as_ref(), name).await?,
+            basis_t: state.db().basis_t(),
+            keys_unavailable: state.keys_unavailable(),
+            keys_fenced: state.keys_fenced(),
+        })
     }
 
     /// Opens a new storage-key epoch that new writes use immediately.
@@ -1578,6 +1673,11 @@ impl TransactorNode {
             cipher: crypto.cipher.clone(),
         });
         state.key_manifest_version.store(version, Ordering::Release);
+        // A rotation performed here supersedes whatever alarm an earlier
+        // failed reload raised: these keys came from this manifest.
+        if state.clear_key_alarms() {
+            self.metrics.record_keys_available();
+        }
         Ok(())
     }
 
@@ -1617,6 +1717,16 @@ impl TransactorNode {
     /// Called from the maintenance loop, so a rotation or re-wrap performed
     /// elsewhere — by an operator against a standby, or by the other half of
     /// an HA pair — is picked up without a restart.
+    ///
+    /// A failure here is not automatically fatal, and which failure it is
+    /// decides that. Re-wrapping leaves the data keys themselves untouched, so
+    /// a node that cannot resolve the new KEK still holds correct material and
+    /// still writes under the epoch the manifest calls active; refusing its
+    /// writes would turn a KMS outage into an outage. A *rotation* it cannot
+    /// load is different in kind: every record it seals from then on is drawn
+    /// under a key the manifest has closed, and the nonce budget — measured as
+    /// the span of `t` between epochs — silently stops counting them. The
+    /// epoch comparison that separates the two needs no key at all.
     async fn refresh_keys_if_stale(&self, state: &Arc<DbState>) -> Result<(), NodeError> {
         let Some(root) = self
             .store
@@ -1634,29 +1744,84 @@ impl TransactorNode {
             return Ok(());
         };
         let crypto = state.crypto();
-        let store = reload_db_crypto(
+        match reload_db_crypto(
             &state.name,
             &crypto,
             &manifest,
             self.config.keyring.as_ref(),
         )
-        .await?;
-        *state
-            .crypto
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(DbCrypto {
-            store,
-            cipher: crypto.cipher.clone(),
-        });
-        state
-            .key_manifest_version
-            .store(root.key_manifest_version, Ordering::Release);
-        tracing::info!(
-            db = %state.name,
-            key_manifest_version = root.key_manifest_version,
-            "reloaded storage keys after a manifest change"
-        );
-        Ok(())
+        .await
+        {
+            Ok(store) => {
+                *state
+                    .crypto
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(DbCrypto {
+                    store,
+                    cipher: crypto.cipher.clone(),
+                });
+                state
+                    .key_manifest_version
+                    .store(root.key_manifest_version, Ordering::Release);
+                if state.clear_key_alarms() {
+                    self.metrics.record_keys_available();
+                }
+                tracing::info!(
+                    db = %state.name,
+                    key_manifest_version = root.key_manifest_version,
+                    "reloaded storage keys after a manifest change"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.raise_key_alarm(state, &crypto, &manifest, &error);
+                Ok(())
+            }
+        }
+    }
+
+    /// Records a failed key reload, escalating only when this node would
+    /// otherwise keep writing under an epoch the manifest has closed.
+    ///
+    /// The maintenance loop calls this every renewal tick while the condition
+    /// lasts, so both the log lines and the metric are edge-triggered: an
+    /// operator sees one line naming the problem, not one per tick.
+    fn raise_key_alarm(
+        &self,
+        state: &Arc<DbState>,
+        crypto: &DbCrypto,
+        manifest: &KeyManifest,
+        error: &KeyWiringError,
+    ) {
+        let writing = crypto.store.storage_epoch();
+        let active = manifest.active_storage_epoch();
+        let was_alarmed = state.key_alarm_raised();
+        let fenced =
+            matches!((active, writing), (Some(active), Some(writing)) if active != writing);
+        if fenced {
+            let active = active.unwrap_or_default();
+            state.fenced_active_epoch.store(active, Ordering::Release);
+            if !state.keys_fenced.swap(true, Ordering::AcqRel) {
+                tracing::error!(
+                    db = %state.name,
+                    active_epoch = active,
+                    writing_epoch = writing.unwrap_or_default(),
+                    %error,
+                    "storage keys are fenced: the manifest opened an epoch this node cannot \
+                     load, so writes are refused until --storage-key resolves it"
+                );
+            }
+        } else if !state.keys_unavailable.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                db = %state.name,
+                %error,
+                "cannot load the changed key manifest; continuing on the keys already held \
+                 (they still open this database, and the epoch new writes use is unchanged)"
+            );
+        }
+        if !was_alarmed {
+            self.metrics.record_keys_unavailable();
+        }
     }
 
     /// Sweeps blobs unreachable from any live database root (including
@@ -1842,6 +2007,18 @@ impl TransactorNode {
             std::mem::take(&mut *pending)
         };
         if batch.is_empty() {
+            return;
+        }
+        // Refuse before preparing anything when this node's storage keys are
+        // fenced. Unlike the ownership fence below, this is a local flag with
+        // no round trip, and it has to come first: a record sealed under a
+        // closed epoch is durable and uncounted the moment it is appended.
+        if let Some(error) = state.keys_fenced_error() {
+            for request in batch {
+                let _ = request
+                    .resp
+                    .send(Err(batch_abort_error(&state.name, &error)));
+            }
             return;
         }
         // No pre-append ownership check on the common path: the post-append

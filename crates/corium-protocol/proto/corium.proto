@@ -305,6 +305,14 @@ message KeyStatusResponse {
   uint64 records_per_epoch_limit = 5;
   // Whether the active epoch has drawn enough nonces to want a rotation.
   bool rotation_due = 6;
+  // True when the serving transactor could not load a manifest change: it is
+  // still operating on the keys it already held. Those keys still open the
+  // database and still write under the active epoch, so this is a warning.
+  bool keys_unavailable = 7;
+  // True when the serving transactor writes under an epoch this manifest has
+  // closed, because it could not load the new one. Writes are refused until
+  // its --storage-key resolves the new epoch.
+  bool keys_fenced = 8;
 }
 
 message RotateStorageKeyRequest {
