@@ -44,7 +44,11 @@ async fn fork_duplicates_the_source_at_a_past_basis_and_diverges() {
     config.index_interval = Duration::from_millis(10);
     config.gc_interval = None;
     let node = TransactorNode::open(config).await.expect("node");
-    assert!(node.create_db("main", &schema()).await.expect("create"));
+    assert!(
+        node.create_db("main", &schema(), None)
+            .await
+            .expect("create")
+    );
     node.transact("main", &encoded("[{:db/id \"item\" :item/value 1}]"))
         .await
         .expect("tx one");
@@ -92,7 +96,11 @@ async fn fork_validates_inputs_and_existing_targets() {
     let mut config = NodeConfig::new(dir.path().to_path_buf());
     config.gc_interval = None;
     let node = TransactorNode::open(config).await.expect("node");
-    assert!(node.create_db("main", &schema()).await.expect("create"));
+    assert!(
+        node.create_db("main", &schema(), None)
+            .await
+            .expect("create")
+    );
     node.transact("main", &encoded("[{:db/id \"item\" :item/value 1}]"))
         .await
         .expect("tx one");
@@ -137,7 +145,11 @@ async fn forked_database_survives_restart() {
         let mut config = NodeConfig::new(dir.path().to_path_buf());
         config.gc_interval = None;
         let node = TransactorNode::open(config).await.expect("node");
-        assert!(node.create_db("main", &schema()).await.expect("create"));
+        assert!(
+            node.create_db("main", &schema(), None)
+                .await
+                .expect("create")
+        );
         node.transact("main", &encoded("[{:db/id \"item\" :item/value 1}]"))
             .await
             .expect("tx one");

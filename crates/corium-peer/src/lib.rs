@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use corium_core::{Datom, EntityId, KeywordInterner, Schema};
+use corium_crypt::Keyring;
 use corium_db::{Db, Idents, bootstrap};
 use corium_log::TxRecord;
 use corium_protocol::auth::TokenInterceptor;
@@ -31,8 +32,8 @@ use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
-pub use crate::segment::{CachedPeerStorage, DiscoveredPeerStorage};
-use crate::segment::{PeerStorage, SnapshotError, load_current_snapshot};
+pub use crate::segment::{CachedPeerStorage, DiscoveredPeerStorage, EncryptedPeerStorage};
+use crate::segment::{PeerStorage, SnapshotError, load_current_snapshot, open_encrypted_storage};
 pub use corium_store::{SegmentCacheConfig, SegmentCacheMetrics};
 
 type Client = TransactorClient<InterceptedService<Channel, TokenInterceptor>>;
@@ -92,6 +93,10 @@ pub struct ConnectConfig {
     /// Optional direct blob/root storage used to bootstrap from the newest
     /// published index before subscribing to the transaction-log tail.
     storage: Option<Arc<dyn PeerStorage>>,
+    /// Keys this peer can resolve. Needed only for a storage-aware peer
+    /// reading an encrypted database: everything arriving over the wire is
+    /// already plaintext.
+    keyring: Option<Arc<dyn Keyring>>,
     segment_cache_metrics: Option<SegmentCacheMetricsHandle>,
 }
 
@@ -115,6 +120,7 @@ impl std::fmt::Debug for ConnectConfig {
             .field("failover_timeout", &self.failover_timeout)
             .field("heartbeat_timeout", &self.heartbeat_timeout)
             .field("storage", &self.storage.is_some())
+            .field("keyring", &self.keyring.is_some())
             .field("segment_cache", &self.segment_cache_metrics.is_some())
             .finish()
     }
@@ -140,6 +146,7 @@ impl ConnectConfig {
             failover_timeout: Duration::from_secs(30),
             heartbeat_timeout: None,
             storage: None,
+            keyring: None,
             segment_cache_metrics: None,
         }
     }
@@ -173,6 +180,17 @@ impl ConnectConfig {
         });
         self.storage = Some(Arc::new(cached));
         Ok(self)
+    }
+
+    /// Supplies the keys this peer can resolve.
+    ///
+    /// Only a storage-aware peer needs them, and only for a database that is
+    /// encrypted at rest: without direct storage every datom arrives over the
+    /// wire already decrypted by the transactor's peers.
+    #[must_use]
+    pub fn with_keyring(mut self, keyring: Arc<dyn Keyring>) -> Self {
+        self.keyring = Some(keyring);
+        self
     }
 
     /// Whether direct peer storage has been configured.
@@ -289,7 +307,17 @@ impl Connection {
         if config.endpoints.is_empty() {
             return Err(PeerError::Protocol("no endpoints configured".into()));
         }
-        let snapshot = match &config.storage {
+        // Decryption wraps whatever storage was configured, so it sits above
+        // the segment cache and the SSD tier keeps holding ciphertext.
+        let storage = match &config.storage {
+            Some(storage) => Some(
+                open_encrypted_storage(Arc::clone(storage), &config.db, config.keyring.as_ref())
+                    .await
+                    .map_err(SnapshotError::Store)?,
+            ),
+            None => None,
+        };
+        let snapshot = match &storage {
             Some(storage) => load_current_snapshot(storage.as_ref(), &config.db).await?,
             None => None,
         };
@@ -850,14 +878,75 @@ impl Admin {
     /// # Errors
     /// Returns [`PeerError`] for invalid schema or transport failure.
     pub async fn create_database(&mut self, db: &str, schema: &[Edn]) -> Result<bool, PeerError> {
+        self.create_database_with_key(db, schema, None).await
+    }
+
+    /// Creates a database, optionally encrypted at rest under `storage_key`.
+    ///
+    /// `storage_key` is a key-encryption key URI the *transactor* resolves —
+    /// it is where the database's data keys are wrapped, and no key material
+    /// crosses this connection. It is fixed at creation: a database made
+    /// without one can only become encrypted through a backup and restore.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for invalid schema, a key the transactor cannot
+    /// resolve, or transport failure.
+    pub async fn create_database_with_key(
+        &mut self,
+        db: &str,
+        schema: &[Edn],
+        storage_key: Option<&str>,
+    ) -> Result<bool, PeerError> {
         let response = self
             .client
             .create_database(pb::CreateDatabaseRequest {
                 db: db.to_owned(),
                 schema: codec::encode_edn(&Edn::Vector(schema.to_vec())),
+                storage_key: storage_key.unwrap_or_default().to_owned(),
             })
             .await?;
         Ok(response.into_inner().created)
+    }
+
+    /// Reports a database's storage-encryption keys and their epochs.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure or an unknown database.
+    pub async fn key_status(&mut self, db: &str) -> Result<pb::KeyStatusResponse, PeerError> {
+        Ok(self
+            .client
+            .key_status(pb::KeyStatusRequest { db: db.to_owned() })
+            .await?
+            .into_inner())
+    }
+
+    /// Opens a new storage-key epoch that new writes use, rewriting nothing.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure, an unknown or unencrypted
+    /// database, or a key the transactor cannot wrap under.
+    pub async fn rotate_storage_key(&mut self, db: &str) -> Result<u32, PeerError> {
+        Ok(self
+            .client
+            .rotate_storage_key(pb::RotateStorageKeyRequest { db: db.to_owned() })
+            .await?
+            .into_inner()
+            .epoch)
+    }
+
+    /// Re-wraps every data key under `kek`. No stored data is touched.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] on transport failure, an unknown or unencrypted
+    /// database, or a KEK the transactor cannot resolve.
+    pub async fn rewrap_keys(&mut self, db: &str, kek: &str) -> Result<(), PeerError> {
+        self.client
+            .rewrap_keys(pb::RewrapKeysRequest {
+                db: db.to_owned(),
+                kek: kek.to_owned(),
+            })
+            .await?;
+        Ok(())
     }
 
     /// Forks `db` into a new database `target` duplicating it at

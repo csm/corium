@@ -19,13 +19,16 @@ Corium's write side. Two layers:
 
 Also provides online, storage-native **backup** into one versioned binary
 archive plus offline restore, Prometheus **metrics**, storage
-`backend`/`StoreSpec` selection, and `--ha` standby mode (lease polling,
-takeover-as-crash-recovery, depose-to-standby).
+`backend`/`StoreSpec` selection, `--ha` standby mode (lease polling,
+takeover-as-crash-recovery, depose-to-standby), and **encryption at rest**: the
+`keys` module resolves a database's `keys:<db>` manifest into the blob-store
+decorator and log cipher it operates through, and the node owns creating,
+rotating, and re-wrapping that manifest (ADR-0017).
 
 ## Dependencies
 
-- Engine: `corium-core`, `corium-db`, `corium-index`, `corium-log`,
-  `corium-query`, `corium-store`, `corium-tx`.
+- Engine: `corium-core`, `corium-crypt`, `corium-db`, `corium-index`,
+  `corium-log`, `corium-query`, `corium-store`, `corium-tx`.
 - Network: `corium-protocol`, `tonic`, `tokio`/`tokio-stream`, `async-trait`.
 - `tracing` for observability; `thiserror` for errors.
 - Feature-gated storage backends: `postgres`, `turso`, `s3` (forwarded to

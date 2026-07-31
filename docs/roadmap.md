@@ -211,9 +211,12 @@ Security and multi-tenancy:
   digest of the stored encrypted object, so idempotent `put`, structural
   sharing, keyless integrity verification, GC, and backup are all preserved.
   Storage format 4, backup format 2. Done: the primitives, the blob-store
-  decorator, log-record payload encryption, and the `keys:<db>` manifest with
-  storage format 4. Remaining: backup format 2, `--storage-key` wiring through
-  every process, and `corium keys init|status|rotate|rewrap`. See
+  decorator, log-record payload encryption, the `keys:<db>` manifest with
+  storage format 4, `--storage-key` on the transactor, peer server, `corium
+  log`, and offline `corium gc`, `corium db create --storage-key`, and
+  `corium keys status|rotate|rewrap`. Remaining: backup format 2 (backup
+  refuses an encrypted database until then) and KMS-backed keyrings; today a
+  key identity resolves through `file:` or `env:`. See
   [encryption.md](design/encryption.md) and
   [ADR-0017](adr/0017-encryption-at-rest.md).
 - **Attribute protection classes.** *(Specified.)* Per-attribute confidentiality

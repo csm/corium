@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use corium_log::{LogError, MemLogRegistry, TransactionLog, TxRecord, VersionedLog};
+use corium_log::{LogCipher, LogError, MemLogRegistry, TransactionLog, TxRecord, VersionedLog};
 #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
 use corium_log::{NativeLogStorage, NativeVersionedLog};
 pub use corium_store::StorageConnectionError;
@@ -885,23 +885,37 @@ impl LogBackend {
         &self,
         name: &str,
         write_version: u64,
+        cipher: Option<Arc<LogCipher>>,
     ) -> Result<Arc<dyn TransactionLog>, LogError> {
         match self {
             Self::Fs(dir) => {
                 let dir = dir.clone();
                 let name = name.to_owned();
-                let log = tokio::task::spawn_blocking(move || {
-                    VersionedLog::open(dir, &name, write_version)
+                let log = tokio::task::spawn_blocking(move || match cipher {
+                    Some(cipher) => VersionedLog::open_sealed(dir, &name, write_version, cipher),
+                    None => VersionedLog::open(dir, &name, write_version),
                 })
                 .await
                 .map_err(|error| LogError::Native(format!("log task failed: {error}")))??;
                 Ok(Arc::new(BlockingTransactionLog(Arc::new(log))))
             }
+            // In-memory logs hold decoded records in this process's heap and
+            // never reach a durable medium, which is the only thing storage
+            // encryption protects. Sealing them would encrypt nothing.
             Self::Mem(registry) => Ok(Arc::new(registry.open(name, write_version))),
             #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-            Self::Native(storage) => Ok(Arc::new(
-                NativeVersionedLog::open(Arc::clone(storage), name, write_version).await?,
-            )),
+            Self::Native(storage) => Ok(Arc::new(match cipher {
+                Some(cipher) => {
+                    NativeVersionedLog::open_sealed(
+                        Arc::clone(storage),
+                        name,
+                        write_version,
+                        cipher,
+                    )
+                    .await?
+                }
+                None => NativeVersionedLog::open(Arc::clone(storage), name, write_version).await?,
+            })),
         }
     }
 
@@ -913,15 +927,21 @@ impl LogBackend {
     ///
     /// # Errors
     /// Returns an error when a transaction log cannot be opened.
-    pub async fn open_read_only(&self, name: &str) -> Result<Arc<dyn TransactionLog>, LogError> {
+    pub async fn open_read_only(
+        &self,
+        name: &str,
+        cipher: Option<Arc<LogCipher>>,
+    ) -> Result<Arc<dyn TransactionLog>, LogError> {
         match self {
             Self::Fs(dir) => {
                 let dir = dir.clone();
                 let name = name.to_owned();
-                let log =
-                    tokio::task::spawn_blocking(move || VersionedLog::open_read_only(dir, &name))
-                        .await
-                        .map_err(|error| LogError::Native(format!("log task failed: {error}")))??;
+                let log = tokio::task::spawn_blocking(move || match cipher {
+                    Some(cipher) => VersionedLog::open_read_only_sealed(dir, &name, cipher),
+                    None => VersionedLog::open_read_only(dir, &name),
+                })
+                .await
+                .map_err(|error| LogError::Native(format!("log task failed: {error}")))??;
                 Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
                     BlockingTransactionLog(Arc::new(log)),
                 ))))
@@ -930,9 +950,12 @@ impl LogBackend {
                 registry.open(name, 0),
             )))),
             #[cfg(any(feature = "postgres", feature = "turso", feature = "s3"))]
-            Self::Native(storage) => Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
-                NativeVersionedLog::open_read_only(Arc::clone(storage), name),
-            )))),
+            Self::Native(storage) => Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(match cipher {
+                Some(cipher) => {
+                    NativeVersionedLog::open_read_only_sealed(Arc::clone(storage), name, cipher)
+                }
+                None => NativeVersionedLog::open_read_only(Arc::clone(storage), name),
+            })))),
         }
     }
 

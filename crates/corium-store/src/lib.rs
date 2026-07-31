@@ -32,7 +32,7 @@ mod key_manifest;
 pub use key_manifest::{
     KEY_MANIFEST_FORMAT_VERSION, KeyManifest, LOG_RECORDS_PER_EPOCH_LIMIT,
     LOG_RECORDS_PER_EPOCH_WARN, ProtectionClassKey, StorageAlgorithm, StorageKey, StorageKeyState,
-    keys_root_name,
+    keys_root_name, load_key_manifest, publish_key_manifest,
 };
 
 mod snapshot;
@@ -116,6 +116,14 @@ pub enum StoreError {
     /// A key could not be resolved, wrapped, or unwrapped.
     #[error("storage key unavailable: {0}")]
     Keyring(corium_crypt::KeyError),
+    /// The database is encrypted and this process holds no keyring.
+    #[error("database {db:?} is encrypted under key {kek}; no storage key is configured")]
+    EncryptedWithoutKey {
+        /// Database whose key manifest was found.
+        db: String,
+        /// Key-encryption key the manifest names.
+        kek: String,
+    },
     /// The key manifest is malformed.
     #[error("invalid key manifest: {0}")]
     InvalidKeyManifest(String),
@@ -277,6 +285,40 @@ pub trait BlobStore: Send + Sync {
     }
 }
 
+/// A shared store is a store. Decorators such as [`EncryptedBlobStore`] own
+/// what they wrap, so this is what lets one backend be wrapped per database
+/// while the node keeps its own handle.
+#[async_trait]
+impl<S: BlobStore + ?Sized> BlobStore for Arc<S> {
+    async fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
+        self.as_ref().put(bytes).await
+    }
+
+    async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.as_ref().get(id).await
+    }
+
+    async fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
+        self.as_ref().contains(id).await
+    }
+
+    async fn put_if_absent(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
+        self.as_ref().put_if_absent(bytes).await
+    }
+
+    async fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
+        self.as_ref().delete(id).await
+    }
+
+    async fn list(&self) -> Result<BlobIdStream, StoreError> {
+        self.as_ref().list().await
+    }
+
+    async fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
+        self.as_ref().modified_at(id).await
+    }
+}
+
 /// Named root pointer storage with compare-and-swap fencing.
 #[async_trait]
 pub trait RootStore: Send + Sync {
@@ -309,6 +351,30 @@ pub trait RootStore: Send + Sync {
     ///
     /// Returns an error if the backend cannot enumerate roots.
     async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
+}
+
+#[async_trait]
+impl<S: RootStore + ?Sized> RootStore for Arc<S> {
+    async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.as_ref().get_root(name).await
+    }
+
+    async fn cas_root(
+        &self,
+        name: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<(), StoreError> {
+        self.as_ref().cas_root(name, expected, new).await
+    }
+
+    async fn delete_root(&self, name: &str) -> Result<(), StoreError> {
+        self.as_ref().delete_root(name).await
+    }
+
+    async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.as_ref().list_roots(prefix).await
+    }
 }
 
 /// In-memory blob and root store for tests and embedded use.
@@ -911,6 +977,27 @@ pub async fn mark_and_sweep_retained(
     now: SystemTime,
 ) -> Result<GcReport, StoreError> {
     let mut marked = HashSet::new();
+    mark_reachable(store, live_roots, &mut children, &mut marked).await?;
+    sweep_unmarked(store, &marked, retention, now).await
+}
+
+/// Adds every blob reachable from `live_roots` to `marked`.
+///
+/// The mark walk reads blob *content* to find references, so it must run
+/// through the same reader the blobs were written through — for an encrypted
+/// database, that database's decrypting store. Sweeping does not: it lists,
+/// stats, and deletes by id, which is why [`sweep_unmarked`] takes the raw
+/// store and one marked set can be accumulated across several databases with
+/// different keys.
+///
+/// # Errors
+/// Returns an error if a blob read or child-reference decode fails.
+pub async fn mark_reachable<S: std::hash::BuildHasher>(
+    store: &dyn BlobStore,
+    live_roots: impl IntoIterator<Item = BlobId>,
+    mut children: impl FnMut(&BlobId, &[u8]) -> Result<Vec<BlobId>, StoreError>,
+    marked: &mut HashSet<BlobId, S>,
+) -> Result<(), StoreError> {
     let mut pending = live_roots.into_iter().collect::<Vec<_>>();
     while let Some(id) = pending.pop() {
         if !marked.insert(id.clone()) {
@@ -922,7 +1009,19 @@ pub async fn mark_and_sweep_retained(
             .ok_or_else(|| StoreError::MissingBlob(id.clone()))?;
         pending.extend(children(&id, &bytes)?);
     }
+    Ok(())
+}
 
+/// Deletes every blob absent from `marked` and older than `retention`.
+///
+/// # Errors
+/// Returns an error if a blob cannot be listed, inspected, or deleted.
+pub async fn sweep_unmarked<S: std::hash::BuildHasher>(
+    store: &dyn BlobStore,
+    marked: &HashSet<BlobId, S>,
+    retention: Duration,
+    now: SystemTime,
+) -> Result<GcReport, StoreError> {
     let mut swept = 0;
     let mut retained = 0;
     let mut ids = store.list().await?;

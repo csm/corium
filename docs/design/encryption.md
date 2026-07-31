@@ -1,9 +1,15 @@
 # Encryption at Rest and Attribute Protection
 
-Status: **implementation in progress.** The storage-encryption primitives, the
-blob-store decorator, log-record payload encryption, and the `keys:<db>` key
-manifest (with storage format 4) are implemented; backup format 2, process
-wiring, the `corium keys` commands, and attribute protection remain. This
+Status: **layer 1 implemented, layer 2 not started.** The storage-encryption
+primitives, the blob-store decorator, log-record payload encryption, the
+`keys:<db>` key manifest (with storage format 4), and the process wiring —
+`--storage-key` on the transactor, peer server, and offline commands;
+`corium db create --storage-key`; `corium keys status|rotate|rewrap` — are
+implemented. Remaining in layer 1: backup format 2 (until then `corium backup`
+refuses an encrypted database rather than writing an archive no restore could
+open) and KMS-backed keyrings (a key identity resolves through `file:` or
+`env:` today; `awskms:`, `gcpkms:`, and `vault:` are recognized as key sources
+and rejected as unresolvable). Attribute protection is unimplemented. This
 document specifies two independent layers
 — envelope encryption of every durable artifact
 ([ADR-0017](../adr/0017-encryption-at-rest.md)) and per-attribute protection
@@ -886,6 +892,8 @@ Failure modes, all of which must be distinguishable in logs and metrics:
 | Class key missing | reads follow `on-missing-key`; writes to that class refuse |
 | Class key wrong (unwrap succeeds, AEAD fails) | `QueryError::Protected` with the class and epoch, never a decode error |
 | KMS unreachable | cached material keeps serving; new epochs fail; `corium_keys_unavailable` gauge set |
+| Manifest re-wrapped under a KEK this process cannot resolve | cached material keeps serving (a re-wrap does not change the data keys); `corium_keys_unavailable` gauge set, reported by `corium keys status` |
+| Manifest opened an epoch this process cannot load | writes refuse, naming both epochs; reads, publication, and the lease continue. Sealing on would draw nonces under an epoch whose budget has stopped counting them |
 | Assertion in the wrong form for the attribute's current state | transaction rejected at validation |
 | Retraction naming a form the attribute never had | transaction rejected at validation |
 | Protection altered without the acknowledgement | transaction rejected, with the remedy in the message |

@@ -36,7 +36,7 @@ async fn reopening_recovers_current_value_from_the_index_root() {
         let node = TransactorNode::open(config(dir.path()))
             .await
             .expect("node1");
-        assert!(node.create_db("main", &schema).await.expect("create"));
+        assert!(node.create_db("main", &schema, None).await.expect("create"));
         node.transact("main", &encoded("[{:db/id \"a\" :item/value 1}]"))
             .await
             .expect("tx a");

@@ -75,7 +75,7 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
            :db/cardinality :db.cardinality/one
            :db/index true}]",
     );
-    assert!(node.create_db("main", &schema).await.expect("create"));
+    assert!(node.create_db("main", &schema, None).await.expect("create"));
     node.transact("main", &encoded("[{:db/id \"item\" :item/value 1}]"))
         .await
         .expect("tx one");
@@ -184,7 +184,7 @@ async fn empty_database_round_trips_through_a_binary_checkpoint() {
     config.gc_interval = None;
     let node = TransactorNode::open(config).await.expect("node");
     assert!(
-        node.create_db("empty", &encoded("[]"))
+        node.create_db("empty", &encoded("[]"), None)
             .await
             .expect("create")
     );
@@ -246,7 +246,7 @@ async fn process_local_memory_source_is_rejected_explicitly() {
     config.gc_interval = None;
     let node = TransactorNode::open(config).await.expect("node");
     assert!(
-        node.create_db("memory", &encoded("[]"))
+        node.create_db("memory", &encoded("[]"), None)
             .await
             .expect("create")
     );
@@ -274,7 +274,11 @@ async fn native_turso_log_is_backed_up_through_the_same_replay_path() {
            :db/valueType :db.type/long
            :db/cardinality :db.cardinality/one}]",
     );
-    assert!(node.create_db("native", &schema).await.expect("create"));
+    assert!(
+        node.create_db("native", &schema, None)
+            .await
+            .expect("create")
+    );
     node.transact("native", &encoded("[[:db/add 1000 :item/value 1]]"))
         .await
         .expect("transaction");

@@ -369,6 +369,8 @@ pub enum Action {
     GarbageCollect,
     /// Request or reconfigure indexing.
     ManageIndex,
+    /// Inspect or rotate a database's storage-encryption keys.
+    ManageKeys,
 }
 
 impl Action {
@@ -388,6 +390,7 @@ impl Action {
                 | Self::ForkDatabase
                 | Self::GarbageCollect
                 | Self::ManageIndex
+                | Self::ManageKeys
         )
     }
 }

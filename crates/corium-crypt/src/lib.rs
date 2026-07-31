@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use aes_gcm::Aes256Gcm;
 use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
@@ -97,6 +98,16 @@ impl KeyId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Splits the identity into its scheme and the rest.
+    ///
+    /// An identity with no `:` has no scheme, which every resolver rejects —
+    /// the URI form is what lets one keyring serve files, environment
+    /// variables, and a KMS at once.
+    #[must_use]
+    pub fn scheme(&self) -> Option<(&str, &str)> {
+        self.0.split_once(':')
+    }
 }
 
 impl fmt::Display for KeyId {
@@ -175,6 +186,25 @@ pub enum KeyError {
     /// Wrapped key material decrypted to an invalid length.
     #[error("wrapped key did not contain a 256-bit key")]
     InvalidWrappedKey,
+    /// The identity names a scheme this build cannot resolve.
+    #[error(
+        "key {0} names a key source this build cannot resolve; \
+         file: and env: are always available"
+    )]
+    UnsupportedScheme(KeyId),
+    /// The identity's source could not be read.
+    ///
+    /// The reason never quotes the material, only where it was looked for.
+    #[error("key {id} could not be read: {reason}")]
+    Unreadable {
+        /// Key identity that failed to resolve.
+        id: KeyId,
+        /// Why the source was unusable.
+        reason: String,
+    },
+    /// The source resolved but did not hold a 256-bit key.
+    #[error("key {0} does not hold 32 bytes of key material (raw or 64 hex characters)")]
+    InvalidMaterial(KeyId),
     /// Wrapped key metadata named a different key epoch.
     #[error("wrapped key uses epoch {actual}, expected {expected}")]
     WrappedEpochMismatch {
@@ -216,7 +246,34 @@ pub struct StaticKeyring {
     key_ids: Vec<KeyId>,
 }
 
+/// Epoch a locally held key resolves at.
+///
+/// A file or environment variable holds one piece of material and has no
+/// notion of versions, so it is always epoch 1. Rotating such a key means
+/// naming a different identity — which is what `corium keys rewrap --kek`
+/// takes — rather than bumping an epoch the source cannot represent.
+pub const STATIC_KEY_EPOCH: u32 = 1;
+
 impl StaticKeyring {
+    /// Resolves each identity from its own source and returns the keyring.
+    ///
+    /// Resolution happens once, here, so a misconfigured process fails at
+    /// startup naming the key it could not read, rather than at its first
+    /// blob read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyError`] when any identity names an unsupported scheme,
+    /// cannot be read, or does not hold 256 bits of material.
+    pub fn resolve(ids: impl IntoIterator<Item = KeyId>) -> Result<Self, KeyError> {
+        let mut keyring = Self::default();
+        for id in ids {
+            let key = load_key(&id)?;
+            keyring.insert(id, STATIC_KEY_EPOCH, key, true);
+        }
+        Ok(keyring)
+    }
+
     /// Inserts material and optionally makes its epoch current for writes.
     pub fn insert(&mut self, id: KeyId, epoch: u32, key: SecretKey, current: bool) {
         if current {
@@ -275,6 +332,63 @@ impl Keyring for StaticKeyring {
     fn key_ids(&self) -> &[KeyId] {
         &self.key_ids
     }
+}
+
+/// Reads the material one locally resolvable key identity names.
+///
+/// `file:<path>` reads the file; `env:<NAME>` reads an environment variable.
+/// Both accept 32 raw bytes or 64 hexadecimal characters, with surrounding
+/// whitespace ignored so a key file written by `printf` or by an editor that
+/// appends a newline both work.
+///
+/// KMS schemes (`awskms:`, `gcpkms:`, `vault:`) are resolved by their own
+/// keyring implementations, not here, and are reported as unsupported rather
+/// than silently treated as a path.
+///
+/// # Errors
+///
+/// Returns [`KeyError`] when the scheme is not locally resolvable, the source
+/// cannot be read, or it does not hold 256 bits.
+pub fn load_key(id: &KeyId) -> Result<SecretKey, KeyError> {
+    let Some((scheme, rest)) = id.scheme() else {
+        return Err(KeyError::UnsupportedScheme(id.clone()));
+    };
+    let material = match scheme {
+        "file" => Zeroizing::new(std::fs::read(Path::new(rest)).map_err(|error| {
+            KeyError::Unreadable {
+                id: id.clone(),
+                reason: format!("cannot read {rest}: {error}"),
+            }
+        })?),
+        "env" => Zeroizing::new(
+            std::env::var(rest)
+                .map_err(|_| KeyError::Unreadable {
+                    id: id.clone(),
+                    reason: format!("environment variable {rest} is not set"),
+                })?
+                .into_bytes(),
+        ),
+        _ => return Err(KeyError::UnsupportedScheme(id.clone())),
+    };
+    decode_key_material(&material).ok_or_else(|| KeyError::InvalidMaterial(id.clone()))
+}
+
+/// Accepts 32 raw bytes, or 64 hexadecimal characters with surrounding
+/// whitespace.
+fn decode_key_material(material: &[u8]) -> Option<SecretKey> {
+    if let Ok(key) = SecretKey::from_slice(material) {
+        return Some(key);
+    }
+    let trimmed = std::str::from_utf8(material).ok()?.trim();
+    if trimmed.len() != 64 {
+        return None;
+    }
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    for (slot, pair) in bytes.iter_mut().zip(trimmed.as_bytes().chunks(2)) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(SecretKey::new(*bytes))
 }
 
 /// Derives a separate 256-bit key for a domain-specific context.
@@ -674,6 +788,58 @@ mod tests {
         let rendered = format!("{:?}", key(0xA5));
         assert_eq!(rendered, "SecretKey([REDACTED])");
         assert!(!rendered.contains("165"));
+    }
+
+    #[tokio::test]
+    async fn local_key_sources_accept_raw_and_hex_material() {
+        let dir = std::env::temp_dir().join(format!("corium-crypt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let raw_path = dir.join("raw.key");
+        std::fs::write(&raw_path, [7_u8; 32]).expect("write raw");
+        let hex_path = dir.join("hex.key");
+        // Trailing newline: what every editor and `echo` produces.
+        std::fs::write(&hex_path, format!("{}\n", "07".repeat(32))).expect("write hex");
+
+        let raw = KeyId::new(format!("file:{}", raw_path.display())).expect("id");
+        let hex = KeyId::new(format!("file:{}", hex_path.display())).expect("id");
+        assert_eq!(load_key(&raw).expect("raw"), key(7));
+        assert_eq!(load_key(&hex).expect("hex"), key(7));
+        assert!(matches!(
+            load_key(&KeyId::new("env:CORIUM_KEY_THAT_IS_NOT_SET").expect("id")),
+            Err(KeyError::Unreadable { .. })
+        ));
+
+        let keyring = StaticKeyring::resolve([raw.clone(), hex]).expect("resolve");
+        assert_eq!(keyring.key_ids().len(), 2);
+        assert_eq!(
+            keyring.current_epoch(&raw).await.expect("epoch"),
+            STATIC_KEY_EPOCH
+        );
+
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn unresolvable_key_identities_name_what_failed() {
+        let missing = KeyId::new("file:/nonexistent/corium/storage.key").expect("id");
+        assert!(matches!(
+            load_key(&missing),
+            Err(KeyError::Unreadable { .. })
+        ));
+        // A KMS identity is a real key source, just not one this function
+        // resolves; it must not be mistaken for a relative path.
+        let kms = KeyId::new("awskms:arn:aws:kms:us-west-2:1:key/2f1c").expect("id");
+        assert!(matches!(
+            load_key(&kms),
+            Err(KeyError::UnsupportedScheme(_))
+        ));
+        assert!(matches!(
+            load_key(&KeyId::new("storage.key").expect("id")),
+            Err(KeyError::UnsupportedScheme(_))
+        ));
+        assert!(decode_key_material(b"too short").is_none());
+        assert!(decode_key_material(&[0; 31]).is_none());
+        assert!(decode_key_material("zz".repeat(32).as_bytes()).is_none());
     }
 
     #[tokio::test]

@@ -5,16 +5,19 @@
 //! read-through cache (see `docs/design/protocol.md`). Blobs are immutable
 //! and content-addressed, so cache entries never invalidate.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use corium_core::{Datom, IndexOrder, encoding::DecodeError};
+use corium_crypt::{Keyring, SecretKey, decrypt_blob, parse_blob_header};
 use corium_db::Db;
 use corium_protocol::codec::{self, CodecError};
 use corium_store::{
-    BlobId, BlobStore, DbRoot, DiscoveredStore, FORMAT_VERSION, RootStore, SegmentCache,
-    SegmentCacheConfig, SegmentCacheMetrics, SegmentReader, StoreError, db_root_name,
-    decode_index_manifest, decode_segment_keys, is_index_manifest, meta_root_name,
+    BlobId, BlobStore, DbRoot, DiscoveredStore, FORMAT_VERSION, KeyManifest, RootStore,
+    SegmentCache, SegmentCacheConfig, SegmentCacheMetrics, SegmentReader, StoreError, db_root_name,
+    decode_index_manifest, decode_segment_keys, digest, is_index_manifest, keys_root_name,
+    meta_root_name,
 };
 use thiserror::Error;
 
@@ -92,6 +95,83 @@ where
     async fn get_peer_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
         RootStore::get_root(self, name).await
     }
+}
+
+/// Storage decorator that decrypts blobs for a peer reading an encrypted
+/// database directly.
+///
+/// It sits *above* the segment cache, so the SSD tier holds ciphertext and its
+/// existing digest check is unchanged — a cache directory on a shared host is
+/// then no more revealing than the object store it mirrors. Root records pass
+/// through: they are cleartext everywhere.
+pub struct EncryptedPeerStorage {
+    storage: Arc<dyn PeerStorage>,
+    keys: BTreeMap<u32, SecretKey>,
+}
+
+impl EncryptedPeerStorage {
+    /// Wraps peer storage with an unwrapped storage-key snapshot.
+    ///
+    /// The snapshot covers every epoch the manifest carries, because a
+    /// published index may still name leaves written under an epoch that has
+    /// since been retired.
+    #[must_use]
+    pub fn new(storage: Arc<dyn PeerStorage>, keys: BTreeMap<u32, SecretKey>) -> Self {
+        Self { storage, keys }
+    }
+}
+
+#[async_trait]
+impl PeerStorage for EncryptedPeerStorage {
+    async fn get_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(object) = self.storage.get_blob(id).await? else {
+            return Ok(None);
+        };
+        if digest(&object) != *id {
+            return Err(StoreError::CorruptBlob(id.clone()));
+        }
+        let header = parse_blob_header(&object)?;
+        let key = self
+            .keys
+            .get(&header.epoch)
+            .ok_or(StoreError::MissingEncryptionKey(header.epoch))?;
+        Ok(Some(decrypt_blob(key, &object)?))
+    }
+
+    async fn get_peer_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.storage.get_peer_root(name).await
+    }
+}
+
+/// Resolves the storage keys `db` needs and wraps `storage` when it is
+/// encrypted.
+///
+/// Returns `storage` unchanged for an unencrypted database, so a peer that
+/// holds no keyring keeps working exactly as before against one.
+///
+/// # Errors
+/// Returns [`StoreError`] when the manifest cannot be read, when the database
+/// is encrypted and `keyring` is absent, or when an epoch cannot be unwrapped.
+pub async fn open_encrypted_storage(
+    storage: Arc<dyn PeerStorage>,
+    db: &str,
+    keyring: Option<&Arc<dyn Keyring>>,
+) -> Result<Arc<dyn PeerStorage>, StoreError> {
+    let Some(bytes) = storage.get_peer_root(&keys_root_name(db)).await? else {
+        return Ok(storage);
+    };
+    let manifest = KeyManifest::decode(&bytes)?;
+    if manifest.storage_keys.is_empty() {
+        return Ok(storage);
+    }
+    let Some(keyring) = keyring else {
+        return Err(StoreError::EncryptedWithoutKey {
+            db: db.to_owned(),
+            kek: manifest.kek.to_string(),
+        });
+    };
+    let keys = manifest.unwrap_storage_keys(keyring.as_ref()).await?;
+    Ok(Arc::new(EncryptedPeerStorage::new(storage, keys)))
 }
 
 /// Read-only peer adapter for storage discovered through a transactor.

@@ -68,7 +68,9 @@ async fn mem_node_with_batch(max_commit_batch: Option<usize>) -> Arc<TransactorN
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_transactions_all_commit_with_contiguous_basis() {
     let node = mem_node().await;
-    node.create_db("items", &schema()).await.expect("create");
+    node.create_db("items", &schema(), None)
+        .await
+        .expect("create");
 
     // Fire many transactions at once; whichever caller leads a flush batches
     // whatever is queued, so these share durable writes while each still
@@ -103,7 +105,9 @@ async fn concurrent_transactions_all_commit_with_contiguous_basis() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_transaction_does_not_abort_its_batchmates() {
     let node = mem_node().await;
-    node.create_db("items", &schema()).await.expect("create");
+    node.create_db("items", &schema(), None)
+        .await
+        .expect("create");
 
     // A rejected transaction (type mismatch) and a valid one, fired together so
     // they may share a batch: the bad one fails alone, the good one commits.
@@ -128,7 +132,9 @@ async fn a_batch_cap_of_one_disables_batching_but_stays_correct() {
     // batching is off; concurrent transactions must still each commit with a
     // contiguous, gapless basis.
     let node = mem_node_with_batch(Some(1)).await;
-    node.create_db("items", &schema()).await.expect("create");
+    node.create_db("items", &schema(), None)
+        .await
+        .expect("create");
 
     let count: u64 = 50;
     let mut handles = Vec::new();

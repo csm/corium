@@ -26,6 +26,7 @@ use aws_credential_types::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
+use corium_crypt::{KeyId, Keyring, StaticKeyring};
 use corium_peer::server::PeerServerConfig;
 use corium_peer::{
     Admin, ConnectConfig, Connection, DiscoveredPeerStorage, IndexPolicySettings,
@@ -347,6 +348,41 @@ fn sdk_credentials(config: &S3ClientConfig) -> Result<Credentials, String> {
     ))
 }
 
+/// Keys a process can resolve, for databases encrypted at rest.
+///
+/// Each value is a key identity URI — `file:/etc/corium/storage.key`,
+/// `env:CORIUM_KEK`, or a KMS URI a KMS-backed keyring resolves. The flag is
+/// repeatable because one transactor hosts many databases, and per-tenant key
+/// isolation means each may name its own key-encryption key.
+#[derive(Args, Clone, Default)]
+struct KeyFlags {
+    /// Key-encryption key this process can resolve (repeatable).
+    #[arg(
+        long = "storage-key",
+        env = "CORIUM_STORAGE_KEY",
+        value_delimiter = ','
+    )]
+    storage_keys: Vec<String>,
+}
+
+impl KeyFlags {
+    /// Resolves every named key now, so a misconfigured process fails at
+    /// startup naming the key rather than at its first read.
+    fn keyring(&self) -> Result<Option<Arc<dyn Keyring>>, String> {
+        if self.storage_keys.is_empty() {
+            return Ok(None);
+        }
+        let ids = self
+            .storage_keys
+            .iter()
+            .map(|id| KeyId::new(id.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let keyring = StaticKeyring::resolve(ids).map_err(|error| error.to_string())?;
+        Ok(Some(Arc::new(keyring)))
+    }
+}
+
 /// Server-side TLS/auth flags.
 ///
 /// Authentication is a permissive default so a local server is usable with no
@@ -663,6 +699,8 @@ enum Command {
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         db_fn_memory_bytes: usize,
         #[command(flatten)]
+        keys: KeyFlags,
+        #[command(flatten)]
         serve: ServeFlags,
     },
     /// Run a peer server hosting one database for thin clients.
@@ -688,6 +726,8 @@ enum Command {
         /// Bounded memory front tier (defaults to 64MiB when SSD cache is enabled).
         #[arg(long, value_parser = parse_byte_size, requires = "segment_cache_dir")]
         segment_cache_memory: Option<u64>,
+        #[command(flatten)]
+        keys: KeyFlags,
         #[command(flatten)]
         client: ClientFlags,
         #[command(flatten)]
@@ -721,6 +761,10 @@ enum Command {
     /// relationships, and ask what the policy decides.
     #[command(subcommand)]
     Authz(authz::AuthzCommand),
+    /// Storage-encryption keys: inspect them, open a new epoch, or re-wrap
+    /// them under another key-encryption key.
+    #[command(subcommand)]
+    Keys(KeysCommand),
     /// Sweep blobs unreachable from any live database root.
     Gc {
         /// Operate offline over a data directory (transactor must be stopped).
@@ -742,6 +786,8 @@ enum Command {
         /// Retain unreachable blobs newer than this window (offline and online).
         #[arg(long, default_value = "72h")]
         window: String,
+        #[command(flatten)]
+        keys: KeyFlags,
     },
     /// Create or incrementally refresh a database backup from a live transactor.
     Backup {
@@ -819,6 +865,8 @@ enum Command {
         /// Last transaction to print (exclusive; 0 = open-ended).
         #[arg(long, default_value_t = 0)]
         to: u64,
+        #[command(flatten)]
+        keys: KeyFlags,
     },
 }
 
@@ -831,6 +879,13 @@ enum DbCommand {
         /// Schema file: `.toml` for hierarchical TOML, otherwise EDN.
         #[arg(long)]
         schema: Option<PathBuf>,
+        /// Encrypt every durable artifact under this key-encryption key, for
+        /// example `file:/etc/corium/storage.key` or `awskms:arn:…`. The
+        /// *transactor* resolves it, so no key material leaves this host.
+        /// Encryption is fixed here: an unencrypted database can only become
+        /// encrypted through a backup and restore.
+        #[arg(long)]
+        storage_key: Option<String>,
         #[command(flatten)]
         client: ClientFlags,
     },
@@ -899,6 +954,44 @@ enum DbCommand {
     },
 }
 
+/// Storage-encryption key administration for one database.
+///
+/// Every command here talks to the transactor, which is the process that holds
+/// the keys and owns the manifest. Rotation and re-wrapping are cheap: neither
+/// rewrites a single stored object.
+#[derive(Subcommand)]
+enum KeysCommand {
+    /// Print a database's key-encryption key, its storage-key epochs, and how
+    /// much of the active epoch's log-record nonce budget is spent.
+    Status {
+        /// Database name.
+        db: String,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
+    /// Open a new storage-key epoch. New writes use it immediately; existing
+    /// objects stay readable under their own epoch and drain through ordinary
+    /// re-indexing.
+    Rotate {
+        /// Database name.
+        db: String,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
+    /// Re-wrap every data key under another key-encryption key. No stored data
+    /// is read, rewritten, or re-encrypted.
+    Rewrap {
+        /// Database name.
+        db: String,
+        /// The key-encryption key to wrap under. The transactor must be able
+        /// to resolve both this one and the outgoing one.
+        #[arg(long)]
+        kek: String,
+        #[command(flatten)]
+        client: ClientFlags,
+    },
+}
+
 #[tokio::main]
 #[allow(clippy::large_futures)]
 async fn main() -> ExitCode {
@@ -958,6 +1051,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             gc_window,
             db_fn_fuel,
             db_fn_memory_bytes,
+            keys,
             serve,
         } => {
             let file = TransactorFileConfig::load(config_file.as_deref())?;
@@ -1027,6 +1121,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 Some(parse_duration(&gc_interval)?)
             };
             config.gc_retention = parse_duration(&gc_window)?;
+            config.keyring = keys.keyring()?;
             // The built-in `cljrs-tx` runtime is wired by `NodeConfig::new`
             // when the `cljrs` feature is on; apply the flag budgets here.
             #[cfg(feature = "cljrs")]
@@ -1117,6 +1212,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             segment_cache_dir,
             segment_cache_capacity,
             segment_cache_memory,
+            keys,
             client,
             serve,
         } => {
@@ -1134,7 +1230,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             if cache.is_some() && !client.peer_bootstrap {
                 return Err("segment cache requires --peer-bootstrap".into());
             }
-            let config = client.connect_config_cache(db, cache).await?;
+            let mut config = client.connect_config_cache(db, cache).await?;
+            if let Some(keyring) = keys.keyring()? {
+                config = config.with_keyring(keyring);
+            }
             let connection = Arc::new(
                 Connection::connect(config)
                     .await
@@ -1229,6 +1328,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Db(command) => run_db(command).await,
         Command::Authz(command) => authz::run(command).await,
+        Command::Keys(command) => run_keys(command).await,
         Command::Gc {
             data_dir,
             transactor,
@@ -1236,35 +1336,14 @@ async fn run(cli: Cli) -> Result<(), String> {
             ca,
             tls_domain,
             window,
+            keys,
         } => match (data_dir, transactor) {
             (Some(data_dir), None) => {
-                let store = FsStore::open(data_dir.join("store"))
-                    .map_err(|error| format!("cannot open store: {error}"))?;
-                let mut live = Vec::new();
-                for root_name in store
-                    .list_roots("db:")
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    if let Some(root) = store
-                        .get_root(&root_name)
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .as_deref()
-                        .and_then(DbRoot::decode)
-                    {
-                        live.extend(root.roots.into_iter().flatten());
-                    }
-                }
-                let report = corium_store::mark_and_sweep_retained(
-                    &store,
-                    live,
-                    |_, bytes| corium_store::index_blob_children(bytes),
-                    parse_duration(&window)?,
-                    std::time::SystemTime::now(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                let store = Arc::new(
+                    FsStore::open(data_dir.join("store"))
+                        .map_err(|error| format!("cannot open store: {error}"))?,
+                );
+                let report = offline_gc(&store, &keys, parse_duration(&window)?).await?;
                 println!(
                     "{{:marked {} :swept {} :retained {}}}",
                     report.marked, report.swept, report.retained
@@ -1391,7 +1470,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             db,
             from,
             to,
-        } => run_log(&data_dir, &db, from, to).await,
+            keys,
+        } => run_log(&data_dir, &db, from, to, &keys).await,
     }
 }
 
@@ -1804,11 +1884,229 @@ fn resolve_client_token(token: Option<&str>) -> Option<String> {
     }
 }
 
+/// Builds the cipher `db`'s log records were sealed with, or `None` when the
+/// database is unencrypted.
+async fn log_cipher(
+    store: &FsStore,
+    db: &str,
+    keys: &KeyFlags,
+) -> Result<Option<Arc<corium_log::LogCipher>>, String> {
+    let Some(manifest) = corium_store::load_key_manifest(store, db)
+        .await
+        .map_err(|error| format!("cannot read the key manifest: {error}"))?
+        .filter(|manifest| !manifest.storage_keys.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(keyring) = keys.keyring()? else {
+        return Err(format!(
+            "database {db:?} is encrypted under key {}; pass --storage-key naming it",
+            manifest.kek
+        ));
+    };
+    let epoch = manifest
+        .active_storage_epoch()
+        .ok_or_else(|| format!("database {db:?} has no active storage-key epoch"))?;
+    let material = manifest
+        .unwrap_storage_keys(keyring.as_ref())
+        .await
+        .map_err(|error| format!("cannot unwrap the storage keys: {error}"))?;
+    let cipher =
+        corium_log::LogCipher::new(corium_transactor::keys::log_lineage(db), epoch, material)
+            .map_err(|error| format!("cannot open the sealed log: {error}"))?;
+    Ok(Some(Arc::new(cipher)))
+}
+
+/// The blob reader `db`'s references must be followed through: decrypting when
+/// the database has a key manifest, the bare store otherwise.
+async fn offline_reader(
+    store: &Arc<FsStore>,
+    db: &str,
+    keyring: Option<&Arc<dyn Keyring>>,
+) -> Result<Box<dyn corium_store::BlobStore>, String> {
+    let Some(manifest) = corium_store::load_key_manifest(store.as_ref(), db)
+        .await
+        .map_err(|error| format!("cannot read {db:?}'s key manifest: {error}"))?
+        .filter(|manifest| !manifest.storage_keys.is_empty())
+    else {
+        return Ok(Box::new(Arc::clone(store)));
+    };
+    let Some(keyring) = keyring else {
+        return Err(format!(
+            "database {db:?} is encrypted under key {}; pass --storage-key naming it, \
+             or collection would sweep every index it cannot follow",
+            manifest.kek
+        ));
+    };
+    let epoch = manifest
+        .active_storage_epoch()
+        .ok_or_else(|| format!("database {db:?} has no active storage-key epoch"))?;
+    let keys = manifest
+        .unwrap_storage_keys(keyring.as_ref())
+        .await
+        .map_err(|error| format!("cannot unwrap {db:?}'s storage keys: {error}"))?;
+    Ok(Box::new(
+        corium_store::EncryptedBlobStore::new(Arc::clone(store), epoch, keys)
+            .map_err(|error| error.to_string())?,
+    ))
+}
+
+/// Marks and sweeps a stopped transactor's blob store.
+///
+/// Marking follows references *inside* blobs, so an encrypted database's index
+/// manifests have to be decrypted to be walked — a keyless mark would find no
+/// chunks and sweep the whole published index. This therefore refuses to run
+/// rather than proceed without a key it needs.
+async fn offline_gc(
+    store: &Arc<FsStore>,
+    keys: &KeyFlags,
+    retention: Duration,
+) -> Result<corium_store::GcReport, String> {
+    let keyring = keys.keyring()?;
+    let mut marked = std::collections::HashSet::new();
+    for root_name in store
+        .list_roots("db:")
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let Some(root) = store
+            .get_root(&root_name)
+            .await
+            .map_err(|error| error.to_string())?
+            .as_deref()
+            .and_then(DbRoot::decode)
+        else {
+            continue;
+        };
+        let Some(roots) = root.roots else {
+            continue;
+        };
+        let db = root_name.strip_prefix("db:").unwrap_or(&root_name);
+        let reader = offline_reader(store, db, keyring.as_ref()).await?;
+        corium_store::mark_reachable(
+            reader.as_ref(),
+            roots,
+            |_, bytes| corium_store::index_blob_children(bytes),
+            &mut marked,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    corium_store::sweep_unmarked(
+        store.as_ref(),
+        &marked,
+        retention,
+        std::time::SystemTime::now(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Runs a `corium keys` subcommand against a transactor.
+async fn run_keys(command: KeysCommand) -> Result<(), String> {
+    match command {
+        KeysCommand::Status { db, client } => {
+            let mut admin = admin_client(&client).await?;
+            let status = admin
+                .key_status(&db)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !status.encrypted {
+                println!("{{:db {db:?} :encrypted false}}");
+                return Ok(());
+            }
+            println!(
+                "{{:db {db:?} :encrypted true :kek {:?} :basis-t {} :rotation-due {} \
+                 :keys-unavailable {} :keys-fenced {}",
+                status.kek,
+                status.basis_t,
+                status.rotation_due,
+                status.keys_unavailable,
+                status.keys_fenced
+            );
+            println!(" :storage-keys [");
+            for key in &status.storage_keys {
+                // The nonce budget is the point of this line: log records seal
+                // one per transaction under a random 96-bit nonce, so an epoch
+                // must retire well before the birthday bound.
+                let used = percent_of(key.records_sealed, status.records_per_epoch_limit);
+                println!(
+                    "  {{:epoch {} :state {:?} :alg {:?} :kek-epoch {} :opened-at-t {} \
+                     :records-sealed {} :nonce-budget-used {used} :live-objects {}}}",
+                    key.epoch,
+                    key.state,
+                    key.algorithm,
+                    key.kek_epoch,
+                    key.opened_at_t,
+                    key.records_sealed,
+                    key.live_objects,
+                );
+            }
+            println!(" ]}}");
+            if status.keys_fenced {
+                eprintln!(
+                    "corium: the serving transactor cannot load the epoch this manifest \
+                     opened, so it is refusing writes; give it a --storage-key that \
+                     resolves {}",
+                    status.kek
+                );
+            } else if status.keys_unavailable {
+                eprintln!(
+                    "corium: the serving transactor could not load the latest manifest \
+                     change and is still using the keys it already held; give it a \
+                     --storage-key that resolves {}",
+                    status.kek
+                );
+            }
+            if status.rotation_due {
+                eprintln!(
+                    "corium: the active storage-key epoch has spent half its log-record \
+                     nonce budget; run `corium keys rotate {db}`"
+                );
+            }
+            Ok(())
+        }
+        KeysCommand::Rotate { db, client } => {
+            let mut admin = admin_client(&client).await?;
+            let epoch = admin
+                .rotate_storage_key(&db)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("{{:db {db:?} :storage-key-epoch {epoch} :rotated true}}");
+            eprintln!(
+                "corium: new writes use epoch {epoch}; older epochs stay readable until \
+                 re-indexing drains them (see `corium keys status {db}`)"
+            );
+            Ok(())
+        }
+        KeysCommand::Rewrap { db, kek, client } => {
+            let mut admin = admin_client(&client).await?;
+            admin
+                .rewrap_keys(&db, &kek)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("{{:db {db:?} :kek {kek:?} :rewrapped true}}");
+            Ok(())
+        }
+    }
+}
+
+/// Renders `used` as a percentage of `limit`, for the nonce-budget report.
+fn percent_of(used: u64, limit: u64) -> String {
+    if limit == 0 {
+        return "\"n/a\"".to_owned();
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let share = (used as f64 / limit as f64) * 100.0;
+    format!("{share:.3}")
+}
+
 async fn run_db(command: DbCommand) -> Result<(), String> {
     match command {
         DbCommand::Create {
             name,
             schema,
+            storage_key,
             client,
         } => {
             let forms = match schema {
@@ -1817,7 +2115,7 @@ async fn run_db(command: DbCommand) -> Result<(), String> {
             };
             let mut admin = admin_client(&client).await?;
             let created = admin
-                .create_database(&name, &forms)
+                .create_database_with_key(&name, &forms, storage_key.as_deref())
                 .await
                 .map_err(|error| error.to_string())?;
             println!("{{:db {name:?} :created {created}}}");
@@ -1963,20 +2261,37 @@ async fn run_db_index_policy(
     Ok(())
 }
 
-async fn run_log(data_dir: &std::path::Path, db: &str, from: u64, to: u64) -> Result<(), String> {
+async fn run_log(
+    data_dir: &std::path::Path,
+    db: &str,
+    from: u64,
+    to: u64,
+    keys: &KeyFlags,
+) -> Result<(), String> {
     use corium_log::TransactionLog;
-    let log = corium_log::VersionedLog::open_read_only(data_dir.join("logs"), db)
-        .map_err(|error| format!("cannot open log: {error}"))?;
+    let store = FsStore::open(data_dir.join("store")).ok();
+    // An encrypted log's record payloads need the database's data keys, which
+    // its manifest holds wrapped under a key this process must resolve.
+    let cipher = match &store {
+        Some(store) => log_cipher(store, db, keys).await?,
+        None => None,
+    };
+    let log_dir = data_dir.join("logs");
+    let log = match cipher {
+        Some(cipher) => corium_log::VersionedLog::open_read_only_sealed(log_dir, db, cipher),
+        None => corium_log::VersionedLog::open_read_only(log_dir, db),
+    }
+    .map_err(|error| format!("cannot open log: {error}"))?;
     // Naming from the meta root makes keyword values readable.
-    let interner = match FsStore::open(data_dir.join("store")) {
-        Ok(store) => store
+    let interner = match &store {
+        Some(store) => store
             .get_root(&format!("meta:{db}"))
             .await
             .ok()
             .flatten()
             .and_then(|meta| decode_meta_interner(&meta))
             .unwrap_or_default(),
-        Err(_) => KeywordInterner::default(),
+        None => KeywordInterner::default(),
     };
     let end = if to == 0 { None } else { Some(to) };
     for record in log

@@ -77,8 +77,35 @@ pub enum LogError {
 /// cipher rather than mutating it.
 pub struct LogCipher {
     lineage: Vec<u8>,
+    keys: RwLock<Arc<KeySnapshot>>,
+}
+
+/// One immutable set of unwrapped storage keys and the epoch writes use.
+struct KeySnapshot {
     current_epoch: u32,
     keys: BTreeMap<u32, SecretKey>,
+}
+
+impl KeySnapshot {
+    fn new(
+        current_epoch: u32,
+        keys: impl IntoIterator<Item = (u32, SecretKey)>,
+    ) -> Result<Self, LogError> {
+        let keys = keys.into_iter().collect::<BTreeMap<_, _>>();
+        if !keys.contains_key(&current_epoch) {
+            return Err(LogError::MissingKeyEpoch(current_epoch));
+        }
+        Ok(Self {
+            current_epoch,
+            keys,
+        })
+    }
+
+    fn key(&self, epoch: u32) -> Result<&SecretKey, LogError> {
+        self.keys
+            .get(&epoch)
+            .ok_or(LogError::MissingKeyEpoch(epoch))
+    }
 }
 
 impl LogCipher {
@@ -96,14 +123,9 @@ impl LogCipher {
         current_epoch: u32,
         keys: impl IntoIterator<Item = (u32, SecretKey)>,
     ) -> Result<Self, LogError> {
-        let keys = keys.into_iter().collect::<BTreeMap<_, _>>();
-        if !keys.contains_key(&current_epoch) {
-            return Err(LogError::MissingKeyEpoch(current_epoch));
-        }
         Ok(Self {
             lineage: lineage.into(),
-            current_epoch,
-            keys,
+            keys: RwLock::new(Arc::new(KeySnapshot::new(current_epoch, keys)?)),
         })
     }
 
@@ -112,27 +134,60 @@ impl LogCipher {
     pub fn with_key(lineage: impl Into<Vec<u8>>, epoch: u32, key: SecretKey) -> Self {
         Self {
             lineage: lineage.into(),
-            current_epoch: epoch,
-            keys: BTreeMap::from([(epoch, key)]),
+            keys: RwLock::new(Arc::new(KeySnapshot {
+                current_epoch: epoch,
+                keys: BTreeMap::from([(epoch, key)]),
+            })),
         }
+    }
+
+    /// Installs a new key snapshot, so new records seal under `current_epoch`.
+    ///
+    /// A storage-key rotation opens an epoch that new writes must use
+    /// immediately — that is the whole point of the log-record nonce budget it
+    /// resets. The append path holds this cipher through the open log, so the
+    /// snapshot is replaced here rather than the cipher being rebuilt: a
+    /// rotation needs no restart and no log reopen. The swap is atomic and
+    /// every record is self-describing about its epoch, so a record sealed on
+    /// either side of it opens under the snapshot that follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogError::MissingKeyEpoch`] when `current_epoch` has no key,
+    /// leaving the installed snapshot untouched.
+    pub fn install(
+        &self,
+        current_epoch: u32,
+        keys: impl IntoIterator<Item = (u32, SecretKey)>,
+    ) -> Result<(), LogError> {
+        let snapshot = Arc::new(KeySnapshot::new(current_epoch, keys)?);
+        *self
+            .keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Arc<KeySnapshot> {
+        Arc::clone(
+            &self
+                .keys
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Returns the epoch new records are written under.
     #[must_use]
     pub fn current_epoch(&self) -> u32 {
-        self.current_epoch
-    }
-
-    fn key(&self, epoch: u32) -> Result<&SecretKey, LogError> {
-        self.keys
-            .get(&epoch)
-            .ok_or(LogError::MissingKeyEpoch(epoch))
+        self.snapshot().current_epoch
     }
 
     fn seal(&self, log_version: u64, t: u64, plaintext: &[u8]) -> Result<Vec<u8>, LogError> {
+        let snapshot = self.snapshot();
         Ok(encrypt_log_record(
-            self.key(self.current_epoch)?,
-            self.current_epoch,
+            snapshot.key(snapshot.current_epoch)?,
+            snapshot.current_epoch,
             &self.lineage,
             log_version,
             t,
@@ -149,7 +204,7 @@ impl LogCipher {
         payload: &[u8],
     ) -> Result<Vec<u8>, LogError> {
         Ok(decrypt_log_record(
-            self.key(header.epoch)?,
+            self.snapshot().key(header.epoch)?,
             &self.lineage,
             log_version,
             payload,
