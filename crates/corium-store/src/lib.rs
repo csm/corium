@@ -22,8 +22,18 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 mod segment_cache;
 pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheMetrics, SegmentReader};
 
+mod discovery;
+pub use discovery::{DiscoveredStore, DiscoveredStoreSpec, StorageConnectionError};
+
 mod encrypted_store;
 pub use encrypted_store::EncryptedBlobStore;
+
+mod key_manifest;
+pub use key_manifest::{
+    KEY_MANIFEST_FORMAT_VERSION, KeyManifest, LOG_RECORDS_PER_EPOCH_LIMIT,
+    LOG_RECORDS_PER_EPOCH_WARN, ProtectionClassKey, StorageAlgorithm, StorageKey, StorageKeyState,
+    keys_root_name,
+};
 
 mod snapshot;
 pub use snapshot::{
@@ -103,12 +113,36 @@ pub enum StoreError {
     /// Encryption, authentication, or encrypted-format failure.
     #[error("encrypted blob failed: {0}")]
     Encryption(#[from] corium_crypt::CryptError),
+    /// A key could not be resolved, wrapped, or unwrapped.
+    #[error("storage key unavailable: {0}")]
+    Keyring(corium_crypt::KeyError),
+    /// The key manifest is malformed.
+    #[error("invalid key manifest: {0}")]
+    InvalidKeyManifest(String),
+    /// The key manifest was written by a newer release.
+    #[error("key manifest format {found} is newer than supported format {supported}")]
+    UnsupportedKeyManifest {
+        /// Format version found in the stored manifest.
+        found: u32,
+        /// Newest format version this release understands.
+        supported: u32,
+    },
+    /// The key manifest names an AEAD suite this release does not implement.
+    #[error("unsupported storage encryption algorithm {0:?}")]
+    UnsupportedKeyAlgorithm(String),
+    /// Storage-key epochs are exhausted.
+    #[error("storage key epochs are exhausted")]
+    StorageEpochExhausted,
     /// Root name cannot be safely represented on the filesystem.
     #[error("invalid root name {0:?}")]
     InvalidRootName(String),
     /// A blocking store worker failed before returning its result.
     #[error("store blocking task failed: {0}")]
     BlockingTask(String),
+    /// A local path advertised by a transactor is not reachable from this
+    /// process. Direct-storage peers must be co-located with local backends.
+    #[error("the transactor's local storage at {0} is not reachable from this process")]
+    UnreachableLocalStorage(PathBuf),
     /// `PostgreSQL` database failure.
     #[cfg(feature = "postgres")]
     #[error("PostgreSQL store failed: {0}")]
@@ -653,7 +687,13 @@ pub fn meta_root_name(db: &str) -> String {
 /// items such as [`chunk_segment_keys`]), so consecutive publications share
 /// unchanged chunks instead of rewriting the whole index; format-2 flat
 /// single-blob snapshots remain readable.
-pub const FORMAT_VERSION: u32 = 3;
+///
+/// Format 4 adds `key_manifest_version`, so a reader learns a database is
+/// encrypted from its root record and can refuse to open it without a storage
+/// key, instead of failing later with a decode error on a blob it cannot
+/// parse. Roots from formats 1-3 decode with version `0` — no manifest, no
+/// encryption.
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Published durable index-root metadata carrying the write lease
 /// (see `docs/design/log-and-transactor.md`).
@@ -699,6 +739,16 @@ pub struct DbRoot {
     /// instant). `i64::MIN` when absent, which is dominated by any real
     /// instant and so is a safe floor.
     pub last_tx_instant: i64,
+    /// Generation of this database's `keys:<db>` manifest, or `0` when the
+    /// database is unencrypted.
+    ///
+    /// Non-zero says "encrypted" before any blob is fetched, so a process
+    /// without a storage key fails at open naming the manifest, rather than on
+    /// a decode error deep inside a segment. The number increments whenever
+    /// the manifest changes — a DEK rotation or a KEK re-wrap — so a running
+    /// process notices a manifest it has not loaded and refreshes its key
+    /// snapshot, instead of re-reading the manifest on every publication.
+    pub key_manifest_version: u64,
 }
 
 /// Encodes a possibly empty single-line field.
@@ -746,6 +796,8 @@ impl DbRoot {
         out.push_str(&self.next_entity_id.to_string());
         out.push('\n');
         out.push_str(&self.last_tx_instant.to_string());
+        out.push('\n');
+        out.push_str(&self.key_manifest_version.to_string());
         out.into_bytes()
     }
 
@@ -794,6 +846,9 @@ impl DbRoot {
             .next()
             .and_then(|l| l.parse().ok())
             .unwrap_or(i64::MIN);
+        // Absent in formats 1-3, which had no key manifest and so no
+        // encryption: `0` is exactly what those roots mean.
+        let key_manifest_version = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
         Some(Self {
             format_version,
             lease_version,
@@ -804,6 +859,7 @@ impl DbRoot {
             roots,
             next_entity_id,
             last_tx_instant,
+            key_manifest_version,
         })
     }
 }

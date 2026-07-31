@@ -1,6 +1,18 @@
 """Async Python client for local and remote Corium peers."""
 
-from ._api import Datom, Db, DbStats, Index, LocalPeer, Peer, RemotePeer, TxReport
+from ._api import (
+    Datom,
+    Db,
+    DbStats,
+    DirectStorage,
+    Index,
+    LocalPeer,
+    Peer,
+    RemotePeer,
+    SegmentCache,
+    TxReport,
+    available_storage_backends,
+)
 from .errors import (
     AuthenticationError,
     ClosedError,
@@ -26,6 +38,7 @@ __all__ = [
     "Db",
     "DbStats",
     "DecodeError",
+    "DirectStorage",
     "EntityId",
     "FuelExhaustedError",
     "Index",
@@ -37,9 +50,11 @@ __all__ = [
     "ProtocolError",
     "QueryError",
     "RemotePeer",
+    "SegmentCache",
     "StorageError",
     "Symbol",
     "Tagged",
     "TransactionError",
     "TxReport",
+    "available_storage_backends",
 ]

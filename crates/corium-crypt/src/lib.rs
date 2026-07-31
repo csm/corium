@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use aes_gcm::Aes256Gcm;
 use aes_gcm_siv::aead::{Aead, KeyInit, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use async_trait::async_trait;
@@ -16,8 +17,14 @@ use zeroize::Zeroizing;
 /// Magic prefix for an encrypted content-addressed blob.
 pub const BLOB_MAGIC: &[u8; 8] = b"CORIUMB1";
 
+/// Magic prefix for an encrypted transaction-log record payload.
+pub const LOG_MAGIC: &[u8; 8] = b"CORIUML1";
+
 const ALGORITHM_AES_256_GCM_SIV: u8 = 1;
+const ALGORITHM_AES_256_GCM: u8 = 2;
 const BLOB_HEADER_LEN: usize = BLOB_MAGIC.len() + 1 + size_of::<u32>() + size_of::<u64>();
+/// Magic, algorithm, key epoch, transaction number, nonce.
+const LOG_HEADER_LEN: usize = LOG_MAGIC.len() + 1 + size_of::<u32>() + size_of::<u64>() + NONCE_LEN;
 const AEAD_TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
@@ -30,6 +37,20 @@ impl SecretKey {
     #[must_use]
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(Zeroizing::new(bytes))
+    }
+
+    /// Draws fresh 256-bit key material from the operating system's
+    /// cryptographic random source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptError::RandomnessUnavailable`] when the OS entropy
+    /// source cannot be read. Callers must fail rather than fall back: a
+    /// predictable data key is indistinguishable from no encryption.
+    pub fn generate() -> Result<Self, CryptError> {
+        let mut bytes = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(bytes.as_mut_slice()).map_err(|_| CryptError::RandomnessUnavailable)?;
+        Ok(Self(bytes))
     }
 
     /// Copies a byte slice into zeroized storage.
@@ -93,15 +114,30 @@ pub struct BlobHeader {
     pub plaintext_len: u64,
 }
 
+/// Parsed metadata from an encrypted log-record payload header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogHeader {
+    /// Key epoch used to encrypt the payload.
+    pub epoch: u32,
+    /// Transaction number the payload was written at.
+    pub t: u64,
+}
+
 /// Failures while encrypting or decrypting stored data.
 #[derive(Debug, Error)]
 pub enum CryptError {
     /// A secret key was not exactly 256 bits.
     #[error("secret key must be exactly 32 bytes")]
     InvalidKeyLength,
+    /// The operating system's random source was unavailable.
+    #[error("cryptographic randomness is unavailable")]
+    RandomnessUnavailable,
     /// The encrypted object does not contain a complete, supported header.
     #[error("invalid encrypted blob header")]
     InvalidBlobHeader,
+    /// The log payload does not contain a complete, supported header.
+    #[error("invalid encrypted log record header")]
+    InvalidLogHeader,
     /// The encrypted object names an unsupported algorithm.
     #[error("unsupported encrypted blob algorithm {0}")]
     UnsupportedAlgorithm(u8),
@@ -109,10 +145,10 @@ pub enum CryptError {
     #[error("encrypted blob length does not match its header")]
     InvalidBlobLength,
     /// Encryption failed after inputs were validated.
-    #[error("encrypted blob encryption failed")]
+    #[error("encryption failed")]
     EncryptionFailed,
     /// Authentication failed, including when the wrong key was supplied.
-    #[error("encrypted blob authentication failed")]
+    #[error("authentication failed")]
     AuthenticationFailed,
     /// The plaintext is too large for the stored length field.
     #[error("plaintext is too large to encrypt")]
@@ -357,6 +393,158 @@ pub fn decrypt_blob(key: &SecretKey, object: &[u8]) -> Result<Vec<u8>, CryptErro
         .map_err(|_| CryptError::AuthenticationFailed)
 }
 
+/// Reports whether a log-record payload carries the encrypted-record header.
+///
+/// The plaintext record encoding starts with its transaction number as a
+/// big-endian `u64`, so [`LOG_MAGIC`] is only ambiguous with a `t` above
+/// 4.8 quintillion. A log that reached that many transactions would have
+/// exhausted every other counter in the system first.
+#[must_use]
+pub fn is_encrypted_log_record(payload: &[u8]) -> bool {
+    payload.len() >= LOG_MAGIC.len() && &payload[..LOG_MAGIC.len()] == LOG_MAGIC
+}
+
+/// Parses and validates an encrypted log record's cleartext header.
+///
+/// The epoch and transaction number stay cleartext so frame scanning,
+/// recovery truncation, and range reads keep working — and so a reader can
+/// pick the right key epoch — without holding any key.
+///
+/// # Errors
+///
+/// Returns a [`CryptError`] when the header is truncated, is not a log
+/// record, or names an unsupported algorithm.
+pub fn parse_log_header(payload: &[u8]) -> Result<LogHeader, CryptError> {
+    if !is_encrypted_log_record(payload) || payload.len() < LOG_HEADER_LEN + AEAD_TAG_LEN {
+        return Err(CryptError::InvalidLogHeader);
+    }
+    let algorithm = payload[LOG_MAGIC.len()];
+    if algorithm != ALGORITHM_AES_256_GCM {
+        return Err(CryptError::UnsupportedAlgorithm(algorithm));
+    }
+    let epoch_offset = LOG_MAGIC.len() + 1;
+    let t_offset = epoch_offset + size_of::<u32>();
+    let nonce_offset = t_offset + size_of::<u64>();
+    let epoch = u32::from_be_bytes(
+        payload[epoch_offset..t_offset]
+            .try_into()
+            .map_err(|_| CryptError::InvalidLogHeader)?,
+    );
+    let t = u64::from_be_bytes(
+        payload[t_offset..nonce_offset]
+            .try_into()
+            .map_err(|_| CryptError::InvalidLogHeader)?,
+    );
+    Ok(LogHeader { epoch, t })
+}
+
+/// Builds the authenticated header and additional data for one log record.
+fn log_header_and_aad(
+    epoch: u32,
+    lineage: &[u8],
+    log_version: u64,
+    t: u64,
+    nonce: &[u8; NONCE_LEN],
+) -> (Vec<u8>, Vec<u8>) {
+    let mut header = Vec::with_capacity(LOG_HEADER_LEN);
+    header.extend_from_slice(LOG_MAGIC);
+    header.push(ALGORITHM_AES_256_GCM);
+    header.extend_from_slice(&epoch.to_be_bytes());
+    header.extend_from_slice(&t.to_be_bytes());
+    header.extend_from_slice(nonce);
+
+    // The lineage is variable length, so its length is bound too: without it
+    // a lineage/version pair could be re-split to authenticate under another
+    // database.
+    let mut aad = Vec::with_capacity(b"corium/log-v1".len() + 16 + lineage.len() + header.len());
+    aad.extend_from_slice(b"corium/log-v1");
+    aad.extend_from_slice(&(lineage.len() as u64).to_be_bytes());
+    aad.extend_from_slice(lineage);
+    aad.extend_from_slice(&log_version.to_be_bytes());
+    aad.extend_from_slice(&header);
+    (header, aad)
+}
+
+/// Encrypts one transaction-log record payload.
+///
+/// The AAD binds the database lineage, the log's lease version, the
+/// transaction number, and the key epoch, so a record can neither be replayed
+/// at another basis nor moved between the per-lease-version log files that
+/// takeover fencing relies on.
+///
+/// Unlike blobs, log records are not content addressed and nothing requires
+/// re-encoding a record to the same bytes, so this uses one-pass AES-256-GCM
+/// with a fresh random nonce rather than a nonce derived from
+/// `(log_version, t)`. A derived nonce would be reused whenever a transaction
+/// number is re-issued with different content — which happens whenever an
+/// append is torn by a crash before it is acknowledged, and truncated away on
+/// recovery. Key/nonce reuse is fatal under GCM; storing 12 bytes is not.
+///
+/// # Errors
+///
+/// Returns a [`CryptError`] when randomness is unavailable or encryption
+/// fails.
+pub fn encrypt_log_record(
+    key: &SecretKey,
+    epoch: u32,
+    lineage: &[u8],
+    log_version: u64,
+    t: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptError> {
+    let mut nonce_bytes = [0_u8; NONCE_LEN];
+    getrandom::fill(&mut nonce_bytes).map_err(|_| CryptError::RandomnessUnavailable)?;
+    let (mut header, aad) = log_header_and_aad(epoch, lineage, log_version, t, &nonce_bytes);
+    let cipher =
+        Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptError::EncryptionFailed)?;
+    header.extend_from_slice(&ciphertext);
+    Ok(header)
+}
+
+/// Authenticates and decrypts one transaction-log record payload.
+///
+/// `log_version` is the lease version of the file or object the payload was
+/// read from; supplying another one fails authentication rather than
+/// returning a record from the wrong version file.
+///
+/// # Errors
+///
+/// Returns a [`CryptError`] for a malformed payload, the wrong key, a
+/// mismatched lineage or log version, or tampering.
+pub fn decrypt_log_record(
+    key: &SecretKey,
+    lineage: &[u8],
+    log_version: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, CryptError> {
+    let LogHeader { epoch, t } = parse_log_header(payload)?;
+    let header = &payload[..LOG_HEADER_LEN];
+    let nonce_offset = LOG_HEADER_LEN - NONCE_LEN;
+    let nonce_bytes = <[u8; NONCE_LEN]>::try_from(&header[nonce_offset..])
+        .map_err(|_| CryptError::InvalidLogHeader)?;
+    let (_, aad) = log_header_and_aad(epoch, lineage, log_version, t, &nonce_bytes);
+    let cipher =
+        Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &payload[LOG_HEADER_LEN..],
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptError::AuthenticationFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +590,83 @@ mod tests {
         let mut tampered_nonce = encrypt_blob(&key(1), 9, b"sentinel").expect("encrypt");
         tampered_nonce[BLOB_HEADER_LEN] ^= 1;
         assert!(decrypt_blob(&key(1), &tampered_nonce).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn log_records_round_trip(payload in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let encrypted = encrypt_log_record(&key(5), 2, b"people", 7, 42, &payload)
+                .expect("encrypt");
+            prop_assert_eq!(
+                parse_log_header(&encrypted).expect("header"),
+                LogHeader { epoch: 2, t: 42 }
+            );
+            prop_assert_eq!(
+                decrypt_log_record(&key(5), b"people", 7, &encrypted).expect("decrypt"),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn log_records_are_bound_to_their_position() {
+        let plaintext = b"sentinel payload".as_slice();
+        let encrypted = encrypt_log_record(&key(5), 2, b"people", 7, 42, plaintext).expect("seal");
+        assert!(is_encrypted_log_record(&encrypted));
+        assert!(
+            !encrypted
+                .windows(plaintext.len())
+                .any(|window| window == plaintext)
+        );
+
+        // Lineage, lease version, transaction number, and epoch are all
+        // authenticated: none of them can be restated without detection.
+        assert!(decrypt_log_record(&key(5), b"other", 7, &encrypted).is_err());
+        assert!(decrypt_log_record(&key(5), b"people", 8, &encrypted).is_err());
+        assert!(decrypt_log_record(&key(6), b"people", 7, &encrypted).is_err());
+
+        let mut moved = encrypted.clone();
+        let t_offset = LOG_MAGIC.len() + 1 + size_of::<u32>();
+        moved[t_offset..t_offset + size_of::<u64>()].copy_from_slice(&43_u64.to_be_bytes());
+        assert_eq!(parse_log_header(&moved).expect("header").t, 43);
+        assert!(decrypt_log_record(&key(5), b"people", 7, &moved).is_err());
+
+        let mut retagged = encrypted;
+        retagged[LOG_MAGIC.len() + 1] ^= 1;
+        assert!(decrypt_log_record(&key(5), b"people", 7, &retagged).is_err());
+    }
+
+    #[test]
+    fn log_records_do_not_reuse_a_nonce() {
+        // A torn append is truncated on recovery and the same `t` is re-issued,
+        // possibly for different tx-data. Encryption must not repeat itself.
+        let first = encrypt_log_record(&key(5), 2, b"people", 7, 42, b"first").expect("first");
+        let second = encrypt_log_record(&key(5), 2, b"people", 7, 42, b"first").expect("second");
+        assert_ne!(first, second);
+        assert_eq!(
+            decrypt_log_record(&key(5), b"people", 7, &second).expect("decrypt"),
+            b"first"
+        );
+    }
+
+    #[test]
+    fn plaintext_records_are_not_mistaken_for_encrypted_ones() {
+        let mut plaintext = 42_u64.to_be_bytes().to_vec();
+        plaintext.extend_from_slice(&[0; 32]);
+        assert!(!is_encrypted_log_record(&plaintext));
+        assert!(matches!(
+            parse_log_header(&plaintext),
+            Err(CryptError::InvalidLogHeader)
+        ));
+        assert!(!is_encrypted_log_record(&[]));
+        assert!(!is_encrypted_log_record(LOG_MAGIC.as_slice().split_at(4).0));
+    }
+
+    #[test]
+    fn generated_keys_are_distinct() {
+        let first = SecretKey::generate().expect("generate");
+        assert_ne!(first, SecretKey::generate().expect("generate"));
+        assert_ne!(first, SecretKey::new([0; 32]));
     }
 
     #[test]

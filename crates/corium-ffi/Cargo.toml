@@ -7,11 +7,20 @@ rust-version.workspace = true
 homepage.workspace = true
 description = "Owned facade for Corium language bindings"
 
+[features]
+default = []
+postgres = ["corium-store/postgres"]
+turso = ["corium-store/turso"]
+s3 = ["corium-store/s3", "dep:aws-credential-types"]
+all-storage = ["postgres", "turso", "s3"]
+
 [dependencies]
+aws-credential-types = { version = "1", optional = true }
 corium-client = { workspace = true }
 corium-peer = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
+corium-store = { workspace = true }
 thiserror = "2"
 tonic = { version = "0.14.5", features = ["tls-ring"] }
 
