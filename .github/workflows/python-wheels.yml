@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       release_ref:
-        description: Version tag to build and publish
+        description: Version tag to build
         required: true
         type: string
   pull_request:
@@ -141,22 +141,3 @@ jobs:
         run: >-
           python clients/python/scripts/smoke_wheels.py dist
           ${{ github.event_name == 'pull_request' && '--base-only' || '' }}
-
-  publish:
-    if: inputs.release_ref != ''
-    needs: smoke
-    runs-on: ubuntu-24.04
-    environment:
-      name: pypi
-      url: https://pypi.org/project/corium/
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
