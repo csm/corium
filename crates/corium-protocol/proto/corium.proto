@@ -144,6 +144,10 @@ message CreateDatabaseRequest {
   string db = 1;
   // Composite-encoded EDN vector of Datomic-style attribute maps.
   bytes schema = 2;
+  // Key-encryption key URI (for example "file:/etc/corium/storage.key" or
+  // "awskms:arn:...") enabling encryption at rest. Empty leaves the database
+  // unencrypted, permanently: encryption is fixed at creation.
+  string storage_key = 3;
 }
 
 message CreateDatabaseResponse {
@@ -266,6 +270,68 @@ message S3Storage {
   int64 expires_unix_seconds = 8;
 }
 
+// One storage-key epoch as the manifest records it. No key material is ever
+// carried: the wrapped data key stays in the manifest.
+message StorageKeyEpoch {
+  uint32 epoch = 1;
+  uint32 kek_epoch = 2;
+  string algorithm = 3;
+  // "active", "retiring", or "retired".
+  string state = 4;
+  int64 created_at_unix_ms = 5;
+  // Transaction the epoch opened at; with the next epoch's (or the current
+  // basis) it bounds the log-record nonce budget drawn under this key.
+  uint64 opened_at_t = 6;
+  // Live objects carrying this epoch as of the last mark pass; an epoch
+  // retires only at zero.
+  uint64 live_objects = 7;
+  // Log records sealed under this epoch so far.
+  uint64 records_sealed = 8;
+}
+
+message KeyStatusRequest {
+  string db = 1;
+}
+
+message KeyStatusResponse {
+  // False for an unencrypted database; every field below is then unset.
+  bool encrypted = 1;
+  // Key-encryption key the data keys are wrapped under.
+  string kek = 2;
+  repeated StorageKeyEpoch storage_keys = 3;
+  // Current transaction basis, the end of the active epoch's nonce span.
+  uint64 basis_t = 4;
+  // Records sealed under the active epoch before rotation is advisable.
+  uint64 records_per_epoch_limit = 5;
+  // Whether the active epoch has drawn enough nonces to want a rotation.
+  bool rotation_due = 6;
+  // True when the serving transactor could not load a manifest change: it is
+  // still operating on the keys it already held. Those keys still open the
+  // database and still write under the active epoch, so this is a warning.
+  bool keys_unavailable = 7;
+  // True when the serving transactor writes under an epoch this manifest has
+  // closed, because it could not load the new one. Writes are refused until
+  // its --storage-key resolves the new epoch.
+  bool keys_fenced = 8;
+}
+
+message RotateStorageKeyRequest {
+  string db = 1;
+}
+
+message RotateStorageKeyResponse {
+  // The epoch new writes now use.
+  uint32 epoch = 1;
+}
+
+message RewrapKeysRequest {
+  string db = 1;
+  // Key-encryption key to wrap every data key under.
+  string kek = 2;
+}
+
+message RewrapKeysResponse {}
+
 message GetStorageInfoRequest {
   string db = 1;
 }
@@ -291,6 +357,12 @@ service Catalog {
   rpc SetIndexPolicy(SetIndexPolicyRequest) returns (SetIndexPolicyResponse);
   // Fetch storage connection info along with the current basis t.
   rpc GetStorageInfo(GetStorageInfoRequest) returns (GetStorageInfoResponse);
+  // Report a database's storage-encryption keys and their epochs.
+  rpc KeyStatus(KeyStatusRequest) returns (KeyStatusResponse);
+  // Open a new storage-key epoch that new writes use. Nothing is rewritten.
+  rpc RotateStorageKey(RotateStorageKeyRequest) returns (RotateStorageKeyResponse);
+  // Re-wrap every data key under another key-encryption key.
+  rpc RewrapKeys(RewrapKeysRequest) returns (RewrapKeysResponse);
 }
 
 // ---------------------------------------------------------------------------

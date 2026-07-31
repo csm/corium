@@ -35,7 +35,7 @@ async fn request_index_publishes_now_and_policy_updates_apply_at_runtime() {
            :db/valueType :db.type/long
            :db/cardinality :db.cardinality/one}]",
     );
-    assert!(node.create_db("main", &schema).await.expect("create"));
+    assert!(node.create_db("main", &schema, None).await.expect("create"));
     node.transact("main", &encoded("[{:db/id \"item\" :item/value 1}]"))
         .await
         .expect("tx one");

@@ -116,6 +116,13 @@ pub enum BackupError {
     /// The advertised backend cannot be opened independently.
     #[error("storage backend cannot be backed up independently: {0}")]
     UnsupportedSource(String),
+    /// The database is encrypted at rest, which this archive format cannot
+    /// carry.
+    #[error(
+        "database {0:?} is encrypted at rest; backup format 1 cannot carry its key manifest \
+         or its ciphertext"
+    )]
+    EncryptedDatabase(String),
 }
 
 /// An independently accessible storage service plus the transaction basis
@@ -684,6 +691,16 @@ pub async fn backup(
     }
     let destination = destination.as_ref();
     let source_store = Arc::new(source.store.clone().open_existing().await?);
+    // Encrypted databases need backup format 2 — the header carries the key
+    // manifest and blob frames are copied verbatim. Until it exists, refuse
+    // rather than write an archive whose blobs no restore could open.
+    if source_store
+        .get_root(&corium_store::keys_root_name(db))
+        .await?
+        .is_some()
+    {
+        return Err(BackupError::EncryptedDatabase(db.to_owned()));
+    }
     let source_logs = LogBackend::for_discovered(&source.store, Arc::clone(&source_store))
         .map_err(storage_connection_error)?;
     let db_name = db_root_name(db);
@@ -729,7 +746,7 @@ pub async fn backup(
             .basis_t
             .checked_add(1)
             .ok_or_else(|| BackupError::Invalid("source basis is too large".into()))?;
-        let log = source_logs.open_read_only(db).await?;
+        let log = source_logs.open_read_only(db, None).await?;
         log.tx_range_async(start, Some(end)).await?
     } else {
         Vec::new()

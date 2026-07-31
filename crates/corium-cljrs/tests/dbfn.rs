@@ -277,7 +277,7 @@ async fn node_expands_db_functions() {
 
     let encode =
         |text: &str| corium_protocol::codec::encode_edn(&read_one(text).expect("edn vector"));
-    node.create_db("accounts", &encode(SCHEMA))
+    node.create_db("accounts", &encode(SCHEMA), None)
         .await
         .expect("create db");
     node.transact(

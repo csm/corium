@@ -15,6 +15,7 @@ pub struct Metrics {
     gc_runs: AtomicU64,
     gc_swept: AtomicU64,
     gc_retained: AtomicU64,
+    keys_unavailable: AtomicU64,
 }
 
 /// Decrements the transaction queue gauge even if a waiting future is cancelled.
@@ -43,6 +44,9 @@ pub struct Snapshot {
     pub gc_runs: u64,
     /// Blobs deleted by GC.
     pub gc_swept: u64,
+    /// Databases whose key manifest changed in a way this node could not
+    /// load. Non-zero means an operator's key change is not in effect here.
+    pub keys_unavailable: u64,
 }
 
 impl Metrics {
@@ -56,6 +60,7 @@ impl Metrics {
             index_runs: self.index_runs.load(Ordering::Relaxed),
             gc_runs: self.gc_runs.load(Ordering::Relaxed),
             gc_swept: self.gc_swept.load(Ordering::Relaxed),
+            keys_unavailable: self.keys_unavailable.load(Ordering::Relaxed),
         }
     }
 
@@ -85,6 +90,22 @@ impl Metrics {
         );
     }
 
+    /// Counts one database entering the "keys could not be reloaded" state.
+    pub(crate) fn record_keys_unavailable(&self) {
+        self.keys_unavailable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one database leaving it.
+    pub(crate) fn record_keys_available(&self) {
+        // Saturating, so a bookkeeping slip cannot wrap the gauge to u64::MAX
+        // and make a healthy node look catastrophic.
+        let _ = self
+            .keys_unavailable
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            });
+    }
+
     pub(crate) fn record_gc(&self, swept: u64, retained: u64) {
         self.gc_runs.fetch_add(1, Ordering::Relaxed);
         self.gc_swept.fetch_add(swept, Ordering::Relaxed);
@@ -103,6 +124,7 @@ impl Metrics {
         let gc_runs = self.gc_runs.load(Ordering::Relaxed);
         let gc_swept = self.gc_swept.load(Ordering::Relaxed);
         let gc_retained = self.gc_retained.load(Ordering::Relaxed);
+        let keys_unavailable = self.keys_unavailable.load(Ordering::Relaxed);
         let (tx_seconds, tx_subseconds) = (tx_micros / 1_000_000, tx_micros % 1_000_000);
         let (index_seconds, index_subseconds) =
             (index_micros / 1_000_000, index_micros % 1_000_000);
@@ -122,7 +144,9 @@ corium_transactor_index_duration_seconds_sum {index_seconds}.{index_subseconds:0
 # TYPE corium_transactor_gc_runs_total counter\n\
 corium_transactor_gc_runs_total {gc_runs}\n\
 corium_transactor_gc_swept_blobs_total {gc_swept}\n\
-corium_transactor_gc_retained_blobs_total {gc_retained}\n",
+corium_transactor_gc_retained_blobs_total {gc_retained}\n\
+# TYPE corium_keys_unavailable gauge\n\
+corium_keys_unavailable {keys_unavailable}\n",
         )
     }
 }

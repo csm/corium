@@ -47,7 +47,11 @@ async fn mem_backend_runs_the_full_create_transact_read_path() {
     // A mem node touches no filesystem, so a bogus data_dir is harmless.
     let node = TransactorNode::open(config).await.expect("open mem node");
 
-    assert!(node.create_db("mbrainz", &schema()).await.expect("create"));
+    assert!(
+        node.create_db("mbrainz", &schema(), None)
+            .await
+            .expect("create")
+    );
     let response = node.transact("mbrainz", &tx()).await.expect("transact");
     assert!(response.basis_t > response.basis_before);
 
@@ -76,7 +80,11 @@ async fn expected_basis_rejects_a_stale_transaction_before_commit() {
     let mut config = NodeConfig::new(std::path::PathBuf::from("/nonexistent-mem-node"));
     config.store = StoreSpec::Memory;
     let node = TransactorNode::open(config).await.expect("open mem node");
-    assert!(node.create_db("mbrainz", &schema()).await.expect("create"));
+    assert!(
+        node.create_db("mbrainz", &schema(), None)
+            .await
+            .expect("create")
+    );
 
     let first = node
         .transact_at("mbrainz", &tx(), Some(0))

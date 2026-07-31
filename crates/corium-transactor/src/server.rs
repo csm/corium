@@ -25,9 +25,13 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::TxForm(_)
         | NodeError::SchemaForm(_) => Status::invalid_argument(error.to_string()),
         NodeError::BasisMismatch { .. } => Status::aborted(error.to_string()),
-        NodeError::Deposed(_) | NodeError::Standby { .. } | NodeError::UnsupportedFormat { .. } => {
-            Status::failed_precondition(error.to_string())
-        }
+        NodeError::Deposed(_)
+        | NodeError::Standby { .. }
+        | NodeError::UnsupportedFormat { .. }
+        // A missing or unresolvable key is an operator misconfiguration, not
+        // a transient fault: the caller must fix the deployment, not retry.
+        | NodeError::Keys(_)
+        | NodeError::KeysFenced { .. } => Status::failed_precondition(error.to_string()),
         NodeError::Transact(inner) => match inner {
             crate::TransactError::Tx(_) => Status::invalid_argument(inner.to_string()),
             crate::TransactError::Deposed { .. } => Status::failed_precondition(inner.to_string()),
@@ -277,9 +281,10 @@ impl Catalog for CatalogSvc {
             Access::on(Action::CreateDatabase, &request.db),
         )
         .await?;
+        let storage_key = parse_key_id(&request.storage_key)?;
         let created = self
             .0
-            .create_db(&request.db, &request.schema)
+            .create_db(&request.db, &request.schema, storage_key)
             .await
             .map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::CreateDatabaseResponse { created }))
@@ -428,6 +433,113 @@ impl Catalog for CatalogSvc {
             .map(Response::new)
             .map_err(|error| to_status(&error))
     }
+
+    async fn key_status(
+        &self,
+        request: Request<pb::KeyStatusRequest>,
+    ) -> Result<Response<pb::KeyStatusResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::ManageKeys, &request.db),
+        )
+        .await?;
+        let status = self
+            .0
+            .key_status(&request.db)
+            .await
+            .map_err(|error| to_status(&error))?;
+        let basis_t = status.basis_t;
+        let Some(manifest) = status
+            .manifest
+            .filter(|manifest| !manifest.storage_keys.is_empty())
+        else {
+            return Ok(Response::new(pb::KeyStatusResponse {
+                encrypted: false,
+                basis_t,
+                ..pb::KeyStatusResponse::default()
+            }));
+        };
+        let storage_keys = manifest
+            .storage_keys
+            .iter()
+            .map(|key| pb::StorageKeyEpoch {
+                epoch: key.epoch,
+                kek_epoch: key.kek_epoch,
+                algorithm: key.algorithm.to_string(),
+                state: key.state.to_string(),
+                created_at_unix_ms: key.created_at_unix_ms,
+                opened_at_t: key.opened_at_t,
+                live_objects: key.live_objects,
+                records_sealed: manifest
+                    .log_records_sealed(key.epoch, basis_t)
+                    .unwrap_or_default(),
+            })
+            .collect();
+        Ok(Response::new(pb::KeyStatusResponse {
+            encrypted: true,
+            kek: manifest.kek.to_string(),
+            storage_keys,
+            basis_t,
+            records_per_epoch_limit: corium_store::LOG_RECORDS_PER_EPOCH_LIMIT,
+            rotation_due: manifest.storage_rotation_due(basis_t),
+            keys_unavailable: status.keys_unavailable,
+            keys_fenced: status.keys_fenced,
+        }))
+    }
+
+    async fn rotate_storage_key(
+        &self,
+        request: Request<pb::RotateStorageKeyRequest>,
+    ) -> Result<Response<pb::RotateStorageKeyResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::ManageKeys, &request.db),
+        )
+        .await?;
+        let epoch = self
+            .0
+            .rotate_storage_key(&request.db)
+            .await
+            .map_err(|error| to_status(&error))?;
+        Ok(Response::new(pb::RotateStorageKeyResponse { epoch }))
+    }
+
+    async fn rewrap_keys(
+        &self,
+        request: Request<pb::RewrapKeysRequest>,
+    ) -> Result<Response<pb::RewrapKeysResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::ManageKeys, &request.db),
+        )
+        .await?;
+        let kek = parse_key_id(&request.kek)?
+            .ok_or_else(|| Status::invalid_argument("a key-encryption key is required"))?;
+        self.0
+            .rewrap_keys(&request.db, kek)
+            .await
+            .map_err(|error| to_status(&error))?;
+        Ok(Response::new(pb::RewrapKeysResponse {}))
+    }
+}
+
+/// Parses an optional key identity, where empty means "unset".
+fn parse_key_id(value: &str) -> Result<Option<corium_crypt::KeyId>, Status> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    corium_crypt::KeyId::new(value)
+        .map(Some)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 fn requested_gc_retention(request: pb::GcDeletedDatabasesRequest) -> Option<std::time::Duration> {
