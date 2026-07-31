@@ -4,11 +4,12 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corium_core::{Datom, IndexOrder, KeywordInterner, Schema};
+use corium_crypt::{KeyId, Keyring};
 use corium_db::{Db, Idents};
 use corium_log::{LogError, TransactionLog, TxRecord};
 use corium_protocol::codec::{self, CodecError};
@@ -17,14 +18,16 @@ use corium_protocol::schemaform::{SchemaFormError, schema_from_edn};
 use corium_protocol::txforms::{TxFormError, tx_items_from_edn};
 use corium_query::edn::Edn;
 use corium_store::{
-    BlobId, BlobStore, RootStore, StoreError, decode_index_manifest, decode_segment_keys,
-    is_index_manifest, mark_and_sweep_retained, meta_root_name,
+    BlobId, BlobStore, KeyManifest, RootStore, StoreError, decode_index_manifest,
+    decode_segment_keys, is_index_manifest, keys_root_name, load_key_manifest, mark_reachable,
+    meta_root_name, publish_key_manifest, sweep_unmarked,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::Instrument;
 
 use crate::backend::{LogBackend, NodeStore, StorageInfoConfig, StoreSpec};
+use crate::keys::{DbCrypto, DbStore, KeyWiringError, reload_db_crypto, resolve_db_crypto};
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
 use crate::{DbRoot, EmbeddedTransactor, Prepared, TransactError, db_root_name};
@@ -100,6 +103,11 @@ pub struct NodeConfig {
     pub max_commit_batch_bytes: usize,
     /// Optional database-function expander (`:db/fn` support).
     pub tx_fn_expander: Option<Arc<dyn TxFnExpander>>,
+    /// Keys this process can resolve, for databases encrypted at rest.
+    ///
+    /// A node without one serves unencrypted databases exactly as before and
+    /// refuses to open an encrypted one, naming the key its manifest wants.
+    pub keyring: Option<Arc<dyn Keyring>>,
 }
 
 impl std::fmt::Debug for NodeConfig {
@@ -123,6 +131,7 @@ impl std::fmt::Debug for NodeConfig {
             .field("max_commit_batch", &self.max_commit_batch)
             .field("max_commit_batch_bytes", &self.max_commit_batch_bytes)
             .field("tx_fn_expander", &self.tx_fn_expander.is_some())
+            .field("keyring", &self.keyring.is_some())
             .finish()
     }
 }
@@ -156,6 +165,7 @@ impl NodeConfig {
             tx_fn_expander: Some(Arc::new(crate::txfn::DbFnExpander::default())),
             #[cfg(not(feature = "cljrs"))]
             tx_fn_expander: None,
+            keyring: None,
         }
     }
 }
@@ -185,6 +195,25 @@ pub struct IndexPolicy {
     /// Longest a below-threshold tail may defer publication
     /// ([`NodeConfig::index_tail_deadline`]).
     pub tail_deadline: Duration,
+}
+
+/// What `corium keys status` reports for one database.
+///
+/// The two alarm flags are about *this node*, not the stored manifest: they
+/// answer "is the process doing the encrypting actually using the keys the
+/// manifest names?", which the manifest alone cannot say.
+#[derive(Debug)]
+pub struct KeyStatus {
+    /// The stored manifest; `None` for an unencrypted database.
+    pub manifest: Option<KeyManifest>,
+    /// Current transaction basis, which closes the active epoch's nonce span.
+    pub basis_t: u64,
+    /// A manifest change could not be loaded, but the keys in hand still
+    /// serve and still write under the active epoch.
+    pub keys_unavailable: bool,
+    /// This node writes under an epoch the manifest has closed, so writes are
+    /// refused until a reload succeeds.
+    pub keys_fenced: bool,
 }
 
 /// Partial [`IndexPolicy`] override; `None` fields are left unchanged.
@@ -297,6 +326,22 @@ pub enum NodeError {
     /// Lease failure.
     #[error(transparent)]
     Lease(#[from] LeaseError),
+    /// Storage-encryption keys could not be resolved.
+    #[error(transparent)]
+    Keys(#[from] KeyWiringError),
+    /// The key manifest opened a storage-key epoch this node cannot load, so
+    /// it would otherwise keep sealing records under a closed one.
+    #[error(
+        "database {db:?} writes under storage-key epoch {writing}, but the key manifest          has opened epoch {active} and this node cannot load it;          fix --storage-key so the new epoch resolves"
+    )]
+    KeysFenced {
+        /// Database refusing writes.
+        db: String,
+        /// Epoch the manifest says new writes belong to.
+        active: u32,
+        /// Epoch this node still holds.
+        writing: u32,
+    },
     /// Malformed request.
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -335,6 +380,30 @@ pub struct DbState {
     name: String,
     transactor: EmbeddedTransactor,
     log: Arc<dyn TransactionLog>,
+    /// This database's view of the node's storage service, plus its log
+    /// cipher. A storage-key rotation swaps the blob decorator here and
+    /// installs the new snapshot into the (shared) cipher the open log holds.
+    crypto: std::sync::RwLock<Arc<DbCrypto>>,
+    /// Generation of the key manifest this state was resolved from, mirroring
+    /// `DbRoot::key_manifest_version`. A root carrying a different one means
+    /// another process rotated or re-wrapped, and these keys are stale.
+    key_manifest_version: AtomicU64,
+    /// A manifest change could not be loaded: the keyring cannot resolve the
+    /// KEK it now names, or the KMS holding it is unreachable. The already
+    /// unwrapped snapshot keeps serving, because a re-wrap leaves the data
+    /// keys themselves unchanged and a KMS outage should not take the write
+    /// path down. Observable rather than fatal.
+    keys_unavailable: AtomicBool,
+    /// The manifest's active epoch is *not* the one this node writes under,
+    /// and the keys to adopt it could not be loaded. Unlike the above this is
+    /// unsafe to continue through: every record sealed from here is drawn
+    /// under a key the manifest considers closed, and the log-record nonce
+    /// budget — which is measured as the span of `t` between epochs — stops
+    /// counting them. Writes refuse until a reload succeeds.
+    keys_fenced: AtomicBool,
+    /// The epoch the manifest opened when [`Self::keys_fenced`] was raised, so
+    /// the refusal names both sides of the mismatch.
+    fenced_active_epoch: AtomicU32,
     naming: Mutex<Naming>,
     /// Held by the batch leader while it flushes the pending queue; also taken
     /// by lease renewal so a renewal never interleaves with a commit's
@@ -355,6 +424,74 @@ impl DbState {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The store this database's blobs are read and written through:
+    /// encrypting for an encrypted database, the bare backend otherwise.
+    #[must_use]
+    pub fn store(&self) -> Arc<DbStore> {
+        Arc::clone(
+            &self
+                .crypto
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .store,
+        )
+    }
+
+    /// Clears both key alarms after a successful reload, reporting whether
+    /// this database had been raising one.
+    fn clear_key_alarms(&self) -> bool {
+        // Both swaps must run, so this is a bitwise `|`, not a short-circuit.
+        self.keys_unavailable.swap(false, Ordering::AcqRel)
+            | self.keys_fenced.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether either key alarm is currently raised.
+    fn key_alarm_raised(&self) -> bool {
+        self.keys_unavailable.load(Ordering::Acquire) || self.keys_fenced.load(Ordering::Acquire)
+    }
+
+    /// The error writes refuse with while the keys are fenced, if they are.
+    fn keys_fenced_error(&self) -> Option<NodeError> {
+        if !self.keys_fenced.load(Ordering::Acquire) {
+            return None;
+        }
+        let crypto = self.crypto();
+        Some(NodeError::KeysFenced {
+            db: self.name.clone(),
+            active: self.fenced_active_epoch.load(Ordering::Acquire),
+            writing: crypto.store.storage_epoch().unwrap_or_default(),
+        })
+    }
+
+    fn crypto(&self) -> Arc<DbCrypto> {
+        Arc::clone(
+            &self
+                .crypto
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Whether this database's durable artifacts are encrypted.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        self.store().storage_epoch().is_some()
+    }
+
+    /// Whether a key-manifest change could not be loaded. The keys in hand
+    /// still serve; see [`Self::keys_fenced`] for the case that does not.
+    #[must_use]
+    pub fn keys_unavailable(&self) -> bool {
+        self.keys_unavailable.load(Ordering::Acquire)
+    }
+
+    /// Whether this node is writing under a storage-key epoch the manifest has
+    /// closed. Writes refuse while this holds.
+    #[must_use]
+    pub fn keys_fenced(&self) -> bool {
+        self.keys_fenced.load(Ordering::Acquire)
     }
 
     /// Current database value.
@@ -668,6 +805,17 @@ impl TransactorNode {
                 supported: corium_store::FORMAT_VERSION,
             });
         }
+        // Keys are resolved before the lease is taken: an encrypted database
+        // this process cannot open should fail loudly without first fencing
+        // out whoever can.
+        let manifest = load_key_manifest(self.store.as_ref(), name).await?;
+        let crypto = resolve_db_crypto(
+            name,
+            &self.store,
+            manifest.as_ref(),
+            self.config.keyring.as_ref(),
+        )
+        .await?;
         // Acquisition rewrites the root record under our lease version, so
         // it doubles as the fence bump: a deposed writer's pending root CAS
         // now has stale expected bytes and must fail. It also preserves the
@@ -676,7 +824,10 @@ impl TransactorNode {
         let held = self.acquire_lease(name).await?;
         // The log tail replay below happens strictly after the fence, so it
         // observes every record a previous owner could ever have acked.
-        let log = self.log_backend.open(name, held.version).await?;
+        let log = self
+            .log_backend
+            .open(name, held.version, crypto.cipher.clone())
+            .await?;
         let post_fence = self
             .store
             .get_root(&root_name)
@@ -684,14 +835,30 @@ impl TransactorNode {
             .as_deref()
             .and_then(DbRoot::decode);
         let transactor = self
-            .recover_transactor(name, &schema, &idents, &interner, post_fence.as_ref(), &log)
+            .recover_transactor(
+                name,
+                &schema,
+                &idents,
+                &interner,
+                post_fence.as_ref(),
+                &log,
+                crypto.store.as_ref(),
+            )
             .await?;
         let basis_t = transactor.db().basis_t();
+        let key_manifest_version = post_fence
+            .as_ref()
+            .map_or(0, |root| root.key_manifest_version);
         let index_basis = post_fence.map_or(0, |root| root.index_basis_t);
         let state = Arc::new(DbState {
             name: name.to_owned(),
             transactor,
             log,
+            crypto: std::sync::RwLock::new(Arc::new(crypto)),
+            key_manifest_version: AtomicU64::new(key_manifest_version),
+            keys_unavailable: AtomicBool::new(false),
+            keys_fenced: AtomicBool::new(false),
+            fenced_active_epoch: AtomicU32::new(0),
             naming: Mutex::new(Naming {
                 schema,
                 idents,
@@ -718,6 +885,7 @@ impl TransactorNode {
     /// (a pre-recovery root, or a bare fence bump with no snapshot) or a
     /// failure materializing the snapshot falls back to full-log replay,
     /// which is always correct because the log is the source of truth.
+    #[allow(clippy::too_many_arguments)]
     async fn recover_transactor(
         &self,
         name: &str,
@@ -726,6 +894,7 @@ impl TransactorNode {
         interner: &KeywordInterner,
         root: Option<&DbRoot>,
         log: &Arc<dyn TransactionLog>,
+        store: &DbStore,
     ) -> Result<EmbeddedTransactor, NodeError> {
         // `next_entity_id == 0` is the "no hint" sentinel (see DbRoot); it and
         // an absent snapshot both rule out the tail-only path.
@@ -733,15 +902,15 @@ impl TransactorNode {
             && let Some(roots) = &root.roots
             && root.next_entity_id != 0
         {
-            match self
-                .load_current_snapshot(
-                    root,
-                    &roots[IndexOrder::Eavt as usize],
-                    schema,
-                    idents,
-                    interner,
-                )
-                .await
+            match Self::load_current_snapshot(
+                store,
+                root,
+                &roots[IndexOrder::Eavt as usize],
+                schema,
+                idents,
+                interner,
+            )
+            .await
             {
                 Ok(snapshot) => {
                     return Ok(EmbeddedTransactor::recover_from_snapshot_async(
@@ -770,15 +939,14 @@ impl TransactorNode {
     /// bootstrap (`corium-peer`'s `load_current_snapshot`). Only current
     /// facts are reconstructed; the log tail carries everything since.
     async fn load_current_snapshot(
-        &self,
+        store: &DbStore,
         root: &DbRoot,
         eavt: &BlobId,
         schema: &Schema,
         idents: &Idents,
         interner: &KeywordInterner,
     ) -> Result<Db, StoreError> {
-        let datoms = self
-            .load_index_keys(eavt)
+        let datoms = Self::load_index_keys(store, eavt)
             .await?
             .into_iter()
             .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
@@ -795,9 +963,8 @@ impl TransactorNode {
 
     /// Reads one covering index's sorted key stream from the blob store: a
     /// format-3 manifest's chunks in order, or a pre-format-3 flat blob.
-    async fn load_index_keys(&self, id: &BlobId) -> Result<Vec<Vec<u8>>, StoreError> {
-        let blob = self
-            .store
+    async fn load_index_keys(store: &DbStore, id: &BlobId) -> Result<Vec<Vec<u8>>, StoreError> {
+        let blob = store
             .get(id)
             .await?
             .ok_or_else(|| StoreError::MissingBlob(id.clone()))?;
@@ -806,8 +973,7 @@ impl TransactorNode {
         }
         let mut keys = Vec::new();
         for child in decode_index_manifest(&blob)? {
-            let chunk = self
-                .store
+            let chunk = store
                 .get(&child)
                 .await?
                 .ok_or_else(|| StoreError::MissingBlob(child.clone()))?;
@@ -929,6 +1095,11 @@ impl TransactorNode {
                     }
                     Err(_) => {}
                 }
+                // The renewal already re-read the root, so this is where a
+                // manifest change made elsewhere is cheapest to notice.
+                if let Err(error) = node.refresh_keys_if_stale(&db).await {
+                    tracing::warn!(db = %name, %error, "cannot reload storage keys");
+                }
             }
         });
         self.spawn_indexing(state);
@@ -1008,7 +1179,7 @@ impl TransactorNode {
         let started = Instant::now();
         let published = db
             .transactor
-            .publish_indexes(self.store.as_ref(), &root_name, version)
+            .publish_indexes(db.store().as_ref(), &root_name, version)
             .await;
         let duration = started.elapsed();
         self.metrics.record_index(duration);
@@ -1120,12 +1291,19 @@ impl TransactorNode {
     /// Creates a database with the supplied EDN schema forms; returns
     /// `false` when it already exists.
     ///
+    /// `storage_key` names the key-encryption key the database's data keys are
+    /// wrapped under, enabling encryption at rest. It is fixed here and
+    /// forever: a database created without one stays unencrypted, and turning
+    /// encryption on later is a backup and restore into a new database.
+    ///
     /// # Errors
-    /// Returns an error for invalid names/schema or store failures.
+    /// Returns an error for invalid names/schema, an unresolvable storage key,
+    /// or store failures.
     pub async fn create_db(
         self: &Arc<Self>,
         name: &str,
         schema_edn: &[u8],
+        storage_key: Option<KeyId>,
     ) -> Result<bool, NodeError> {
         if !valid_db_name(name) {
             return Err(NodeError::InvalidName(name.to_owned()));
@@ -1149,13 +1327,28 @@ impl TransactorNode {
         };
         let (schema, idents) = schema_from_edn(&forms)?;
         let meta = codec::encode_metadata(&schema, &idents, &KeywordInterner::default());
+        // The manifest is written before the catalog entry: a crash between
+        // them leaves an unreferenced key record, whereas the other order
+        // would leave a catalogued database whose first write went out in the
+        // clear.
+        let encrypted = storage_key.is_some();
+        if let Some(kek) = storage_key {
+            self.create_key_manifest(name, kek).await?;
+        }
         match self
             .store
             .cas_root(&meta_root_name(name), None, &meta)
             .await
         {
             Ok(()) => {}
-            Err(StoreError::CasFailed { .. }) => return Ok(false),
+            Err(StoreError::CasFailed { .. }) => {
+                // Another node catalogued the name first; take our keys back
+                // out so its manifest is the only one.
+                if encrypted {
+                    self.store.delete_root(&keys_root_name(name)).await?;
+                }
+                return Ok(false);
+            }
             Err(error) => return Err(error.into()),
         }
         let state = self.open_db(name).await?;
@@ -1228,7 +1421,37 @@ impl TransactorNode {
         // lease-versioned file the target's first open creates, and publish
         // meta last — it is the catalog entry, so a crash mid-fork never
         // catalogs a target without its log.
-        let log = self.log_backend.open(target, 0).await?;
+        // A fork of an encrypted database is encrypted too, under its own
+        // fresh data key: the log records below are re-sealed on the way in,
+        // so the target shares no key material and no ciphertext with its
+        // source, and its own KEK grant can be revoked independently.
+        let target_crypto = match load_key_manifest(self.store.as_ref(), source).await? {
+            Some(source_manifest) => {
+                let manifest = self
+                    .create_key_manifest(target, source_manifest.kek)
+                    .await?;
+                Some(
+                    resolve_db_crypto(
+                        target,
+                        &self.store,
+                        Some(&manifest),
+                        self.config.keyring.as_ref(),
+                    )
+                    .await?,
+                )
+            }
+            None => None,
+        };
+        let log = self
+            .log_backend
+            .open(
+                target,
+                0,
+                target_crypto
+                    .as_ref()
+                    .and_then(|crypto| crypto.cipher.clone()),
+            )
+            .await?;
         for record in &records {
             log.append_async(record).await?;
         }
@@ -1240,8 +1463,12 @@ impl TransactorNode {
         {
             Ok(()) => {}
             Err(StoreError::CasFailed { .. }) => {
-                // Another node claimed the name first; discard our log copy.
+                // Another node claimed the name first; discard our log copy
+                // and the keys we minted for it.
                 self.log_backend.delete_all(target).await?;
+                if target_crypto.is_some() {
+                    self.store.delete_root(&keys_root_name(target)).await?;
+                }
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -1275,6 +1502,10 @@ impl TransactorNode {
             .remove(name);
         self.store.delete_root(&db_root_name(name)).await?;
         self.store.delete_root(&meta_root_name(name)).await?;
+        // The manifest goes with the database: leaving it would block
+        // recreating the name, and its wrapped keys protect nothing once the
+        // objects they encrypted are swept.
+        self.store.delete_root(&keys_root_name(name)).await?;
         self.log_backend.delete_all(name).await?;
         Ok(true)
     }
@@ -1293,6 +1524,306 @@ impl TransactorNode {
         names
     }
 
+    /// The store this node marks `db`'s reachable blobs through.
+    ///
+    /// A hosted database already holds one; a database this node only stands
+    /// by for is resolved from its manifest, because garbage collection is a
+    /// node-wide duty that must not skip a database merely because another
+    /// process holds its lease.
+    async fn gc_store(&self, db: &str) -> Result<Arc<DbStore>, NodeError> {
+        if let Some(state) = self
+            .dbs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(db)
+            .cloned()
+        {
+            return Ok(state.store());
+        }
+        let manifest = load_key_manifest(self.store.as_ref(), db).await?;
+        Ok(resolve_db_crypto(
+            db,
+            &self.store,
+            manifest.as_ref(),
+            self.config.keyring.as_ref(),
+        )
+        .await?
+        .store)
+    }
+
+    /// Mints a database's first storage key and publishes its manifest.
+    async fn create_key_manifest(&self, db: &str, kek: KeyId) -> Result<KeyManifest, NodeError> {
+        let keyring = self.keyring()?;
+        let manifest = KeyManifest::create(keyring.as_ref(), kek, now_unix_ms()).await?;
+        match publish_key_manifest(self.store.as_ref(), db, None, &manifest).await {
+            Ok(()) => Ok(manifest),
+            Err(StoreError::CasFailed { .. }) => Err(NodeError::BadRequest(format!(
+                "database {db:?} already has a key manifest; \
+                 remove the stale {} root before recreating it",
+                keys_root_name(db)
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn keyring(&self) -> Result<&Arc<dyn Keyring>, NodeError> {
+        self.config.keyring.as_ref().ok_or_else(|| {
+            NodeError::BadRequest(
+                "this transactor holds no storage keys; start it with --storage-key".into(),
+            )
+        })
+    }
+
+    /// Reads a database's key manifest, current basis, and whether this node
+    /// is actually operating on the keys the manifest names.
+    ///
+    /// # Errors
+    /// Returns [`NodeError`] when the database is unknown or the manifest
+    /// cannot be read.
+    pub async fn key_status(&self, name: &str) -> Result<KeyStatus, NodeError> {
+        let state = self.db_state(name).await?;
+        Ok(KeyStatus {
+            manifest: load_key_manifest(self.store.as_ref(), name).await?,
+            basis_t: state.db().basis_t(),
+            keys_unavailable: state.keys_unavailable(),
+            keys_fenced: state.keys_fenced(),
+        })
+    }
+
+    /// Opens a new storage-key epoch that new writes use immediately.
+    ///
+    /// Nothing already stored is rewritten: old epochs stay readable and drain
+    /// through ordinary re-indexing. The rotation runs under the database's
+    /// commit lock, so the basis it records as the new epoch's opening is one
+    /// no concurrent transaction can move, and no record is sealed between the
+    /// manifest write and the cipher swap.
+    ///
+    /// # Errors
+    /// Returns [`NodeError`] when the database is unknown or unencrypted, when
+    /// the manifest changed under the rotation, or when the new key cannot be
+    /// wrapped.
+    pub async fn rotate_storage_key(&self, name: &str) -> Result<u32, NodeError> {
+        let state = self.db_state(name).await?;
+        let keyring = Arc::clone(self.keyring()?);
+        let _commit = state.commit.lock().await;
+        let previous = self.require_key_manifest(name).await?;
+        let mut manifest = previous.clone();
+        let epoch = manifest
+            .rotate_storage_key(keyring.as_ref(), now_unix_ms(), state.db().basis_t())
+            .await?;
+        self.install_key_manifest(&state, Some(&previous), &manifest)
+            .await?;
+        tracing::info!(db = %name, epoch, "opened a new storage-key epoch");
+        Ok(epoch)
+    }
+
+    /// Re-wraps every storage key under `kek`, rewriting no data.
+    ///
+    /// # Errors
+    /// Returns [`NodeError`] when the database is unknown or unencrypted, when
+    /// either KEK cannot be resolved, or when the manifest changed underneath.
+    pub async fn rewrap_keys(&self, name: &str, kek: KeyId) -> Result<(), NodeError> {
+        let state = self.db_state(name).await?;
+        let keyring = Arc::clone(self.keyring()?);
+        let _commit = state.commit.lock().await;
+        let previous = self.require_key_manifest(name).await?;
+        let mut manifest = previous.clone();
+        manifest.rewrap(keyring.as_ref(), kek.clone()).await?;
+        self.install_key_manifest(&state, Some(&previous), &manifest)
+            .await?;
+        tracing::info!(db = %name, %kek, "re-wrapped storage keys under a new KEK");
+        Ok(())
+    }
+
+    async fn require_key_manifest(&self, name: &str) -> Result<KeyManifest, NodeError> {
+        load_key_manifest(self.store.as_ref(), name)
+            .await?
+            .filter(|manifest| !manifest.storage_keys.is_empty())
+            .ok_or_else(|| {
+                NodeError::BadRequest(format!(
+                    "database {name:?} is not encrypted; encryption is fixed at creation \
+                     (corium db create --storage-key)"
+                ))
+            })
+    }
+
+    /// Publishes a changed manifest, bumps the root's generation counter so
+    /// other processes notice, and adopts the new keys here.
+    ///
+    /// The manifest is the durable record and goes first; the generation bump
+    /// and the local swap follow. A crash between them leaves a manifest whose
+    /// generation no root announces, which the next open resolves correctly
+    /// because open reads the manifest itself.
+    async fn install_key_manifest(
+        &self,
+        state: &Arc<DbState>,
+        previous: Option<&KeyManifest>,
+        manifest: &KeyManifest,
+    ) -> Result<(), NodeError> {
+        publish_key_manifest(self.store.as_ref(), &state.name, previous, manifest).await?;
+        let version = self.bump_key_manifest_version(&state.name).await?;
+        let crypto = state.crypto();
+        let store =
+            reload_db_crypto(&state.name, &crypto, manifest, self.config.keyring.as_ref()).await?;
+        *state
+            .crypto
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(DbCrypto {
+            store,
+            cipher: crypto.cipher.clone(),
+        });
+        state.key_manifest_version.store(version, Ordering::Release);
+        // A rotation performed here supersedes whatever alarm an earlier
+        // failed reload raised: these keys came from this manifest.
+        if state.clear_key_alarms() {
+            self.metrics.record_keys_available();
+        }
+        Ok(())
+    }
+
+    /// Increments `DbRoot::key_manifest_version`, the generation counter a
+    /// running process watches to learn its key snapshot is stale.
+    ///
+    /// An index publication may install a new root between the read and the
+    /// write, so the compare-and-set is retried against the newer root rather
+    /// than failing the rotation whose manifest is already durable. The bump
+    /// is a pure increment on whatever root is current, so re-reading loses
+    /// nothing.
+    async fn bump_key_manifest_version(&self, name: &str) -> Result<u64, NodeError> {
+        const ATTEMPTS: usize = 5;
+        let root_name = db_root_name(name);
+        for attempt in 1..=ATTEMPTS {
+            let stored = self.store.get_root(&root_name).await?;
+            let mut root = stored
+                .as_deref()
+                .and_then(DbRoot::decode)
+                .ok_or_else(|| NodeError::UnknownDb(name.to_owned()))?;
+            root.key_manifest_version = root.key_manifest_version.saturating_add(1);
+            match self
+                .store
+                .cas_root(&root_name, stored.as_deref(), &root.encode())
+                .await
+            {
+                Ok(()) => return Ok(root.key_manifest_version),
+                Err(StoreError::CasFailed { .. }) if attempt < ATTEMPTS => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("the final attempt returns its result")
+    }
+
+    /// Reloads `db`'s keys when another process changed the manifest.
+    ///
+    /// Called from the maintenance loop, so a rotation or re-wrap performed
+    /// elsewhere — by an operator against a standby, or by the other half of
+    /// an HA pair — is picked up without a restart.
+    ///
+    /// A failure here is not automatically fatal, and which failure it is
+    /// decides that. Re-wrapping leaves the data keys themselves untouched, so
+    /// a node that cannot resolve the new KEK still holds correct material and
+    /// still writes under the epoch the manifest calls active; refusing its
+    /// writes would turn a KMS outage into an outage. A *rotation* it cannot
+    /// load is different in kind: every record it seals from then on is drawn
+    /// under a key the manifest has closed, and the nonce budget — measured as
+    /// the span of `t` between epochs — silently stops counting them. The
+    /// epoch comparison that separates the two needs no key at all.
+    async fn refresh_keys_if_stale(&self, state: &Arc<DbState>) -> Result<(), NodeError> {
+        let Some(root) = self
+            .store
+            .get_root(&db_root_name(&state.name))
+            .await?
+            .as_deref()
+            .and_then(DbRoot::decode)
+        else {
+            return Ok(());
+        };
+        if root.key_manifest_version == state.key_manifest_version.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(manifest) = load_key_manifest(self.store.as_ref(), &state.name).await? else {
+            return Ok(());
+        };
+        let crypto = state.crypto();
+        match reload_db_crypto(
+            &state.name,
+            &crypto,
+            &manifest,
+            self.config.keyring.as_ref(),
+        )
+        .await
+        {
+            Ok(store) => {
+                *state
+                    .crypto
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(DbCrypto {
+                    store,
+                    cipher: crypto.cipher.clone(),
+                });
+                state
+                    .key_manifest_version
+                    .store(root.key_manifest_version, Ordering::Release);
+                if state.clear_key_alarms() {
+                    self.metrics.record_keys_available();
+                }
+                tracing::info!(
+                    db = %state.name,
+                    key_manifest_version = root.key_manifest_version,
+                    "reloaded storage keys after a manifest change"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.raise_key_alarm(state, &crypto, &manifest, &error);
+                Ok(())
+            }
+        }
+    }
+
+    /// Records a failed key reload, escalating only when this node would
+    /// otherwise keep writing under an epoch the manifest has closed.
+    ///
+    /// The maintenance loop calls this every renewal tick while the condition
+    /// lasts, so both the log lines and the metric are edge-triggered: an
+    /// operator sees one line naming the problem, not one per tick.
+    fn raise_key_alarm(
+        &self,
+        state: &Arc<DbState>,
+        crypto: &DbCrypto,
+        manifest: &KeyManifest,
+        error: &KeyWiringError,
+    ) {
+        let writing = crypto.store.storage_epoch();
+        let active = manifest.active_storage_epoch();
+        let was_alarmed = state.key_alarm_raised();
+        let fenced =
+            matches!((active, writing), (Some(active), Some(writing)) if active != writing);
+        if fenced {
+            let active = active.unwrap_or_default();
+            state.fenced_active_epoch.store(active, Ordering::Release);
+            if !state.keys_fenced.swap(true, Ordering::AcqRel) {
+                tracing::error!(
+                    db = %state.name,
+                    active_epoch = active,
+                    writing_epoch = writing.unwrap_or_default(),
+                    %error,
+                    "storage keys are fenced: the manifest opened an epoch this node cannot \
+                     load, so writes are refused until --storage-key resolves it"
+                );
+            }
+        } else if !state.keys_unavailable.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                db = %state.name,
+                %error,
+                "cannot load the changed key manifest; continuing on the keys already held \
+                 (they still open this database, and the epoch new writes use is unchanged)"
+            );
+        }
+        if !was_alarmed {
+            self.metrics.record_keys_unavailable();
+        }
+    }
+
     /// Sweeps blobs unreachable from any live database root (including
     /// everything left behind by deleted databases and superseded indexes).
     ///
@@ -1309,27 +1840,37 @@ impl TransactorNode {
     /// Returns an error when the store cannot be enumerated or swept.
     pub async fn gc_deleted_with_retention(&self, retention: Duration) -> Result<u64, NodeError> {
         let _gc = self.gc_lock.lock().await;
-        let mut live = Vec::new();
+        // Marking reads blob *content* to find references, so each database's
+        // roots are walked through that database's own store — an encrypted
+        // one's manifests are ciphertext to everyone else. Sweeping is keyless:
+        // it lists, stats, and deletes by id, so one marked set covers the
+        // whole shared backend.
+        let mut marked = std::collections::HashSet::new();
         for root_name in self.store.list_roots("db:").await? {
-            if let Some(root) = self
+            let Some(root) = self
                 .store
                 .get_root(&root_name)
                 .await?
                 .as_deref()
                 .and_then(DbRoot::decode)
-                && let Some(roots) = root.roots
-            {
-                live.extend(roots);
-            }
+            else {
+                continue;
+            };
+            let Some(roots) = root.roots else {
+                continue;
+            };
+            let db = root_name.strip_prefix("db:").unwrap_or(&root_name);
+            let store = self.gc_store(db).await?;
+            mark_reachable(
+                store.as_ref(),
+                roots,
+                |_, bytes| corium_store::index_blob_children(bytes),
+                &mut marked,
+            )
+            .await?;
         }
-        let report = mark_and_sweep_retained(
-            self.store.as_ref(),
-            live,
-            |_, bytes| corium_store::index_blob_children(bytes),
-            retention,
-            SystemTime::now(),
-        )
-        .await?;
+        let report =
+            sweep_unmarked(self.store.as_ref(), &marked, retention, SystemTime::now()).await?;
         self.metrics
             .record_gc(report.swept as u64, report.retained as u64);
         tracing::info!(
@@ -1466,6 +2007,18 @@ impl TransactorNode {
             std::mem::take(&mut *pending)
         };
         if batch.is_empty() {
+            return;
+        }
+        // Refuse before preparing anything when this node's storage keys are
+        // fenced. Unlike the ownership fence below, this is a local flag with
+        // no round trip, and it has to come first: a record sealed under a
+        // closed epoch is durable and uncounted the moment it is appended.
+        if let Some(error) = state.keys_fenced_error() {
+            for request in batch {
+                let _ = request
+                    .resp
+                    .send(Err(batch_abort_error(&state.name, &error)));
+            }
             return;
         }
         // No pre-append ownership check on the common path: the post-append

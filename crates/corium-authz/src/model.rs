@@ -238,6 +238,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ListDatabases => "list-databases",
         Action::GarbageCollect => "garbage-collect",
         Action::ManageIndex => "manage-index",
+        Action::ManageKeys => "manage-keys",
     }
 }
 
@@ -245,7 +246,7 @@ pub fn action_name(action: Action) -> &'static str {
 /// `corium authz check`, which takes the action to test on the command line.
 #[must_use]
 pub fn action_from_name(name: &str) -> Option<Action> {
-    const ACTIONS: [Action; 13] = [
+    const ACTIONS: [Action; 14] = [
         Action::Query,
         Action::Pull,
         Action::Datoms,
@@ -259,6 +260,7 @@ pub fn action_from_name(name: &str) -> Option<Action> {
         Action::ListDatabases,
         Action::GarbageCollect,
         Action::ManageIndex,
+        Action::ManageKeys,
     ];
     ACTIONS
         .into_iter()
@@ -282,6 +284,7 @@ pub fn action_names() -> Vec<&'static str> {
         Action::ListDatabases,
         Action::GarbageCollect,
         Action::ManageIndex,
+        Action::ManageKeys,
     ]
     .into_iter()
     .map(action_name)
@@ -343,7 +346,7 @@ mod tests {
             let action = action_from_name(name).expect("every listed name parses");
             assert_eq!(action_name(action), name);
         }
-        assert_eq!(action_names().len(), 13);
+        assert_eq!(action_names().len(), 14);
         assert!(action_from_name("nonsense").is_none());
     }
 }

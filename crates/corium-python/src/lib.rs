@@ -32,6 +32,7 @@ struct PythonRuntime {
     keyword: Py<PyAny>,
     symbol: Py<PyAny>,
     entity_id: Py<PyAny>,
+    edn_list: Py<PyAny>,
     tagged: Py<PyAny>,
     datetime: Py<PyAny>,
     timezone_utc: Py<PyAny>,
@@ -53,6 +54,7 @@ fn python_runtime(py: Python<'_>) -> PyResult<&'static PythonRuntime> {
             keyword: values.getattr("Keyword")?.unbind(),
             symbol: values.getattr("Symbol")?.unbind(),
             entity_id: values.getattr("EntityId")?.unbind(),
+            edn_list: values.getattr("EdnList")?.unbind(),
             tagged: values.getattr("Tagged")?.unbind(),
             datetime: datetime.getattr("datetime")?.unbind(),
             timezone_utc: datetime.getattr("timezone")?.getattr("utc")?.unbind(),
@@ -443,6 +445,14 @@ fn python_to_edn(value: &Bound<'_, PyAny>) -> PyResult<Edn> {
             .map_err(|_| PyOverflowError::new_err("entity id exceeds the boundary range"))?;
         return Ok(Edn::Tagged("eid".into(), Box::new(Edn::Long(raw))));
     }
+    if value.is_instance(runtime.edn_list.bind(py))? {
+        return value
+            .getattr("items")?
+            .try_iter()?
+            .map(|item| python_to_edn(&item?))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Edn::List);
+    }
     if value.is_instance(runtime.tagged.bind(py))? {
         let tag: String = value.getattr("tag")?.extract()?;
         if RESERVED_TAGS.contains(&tag.as_str()) {
@@ -529,7 +539,14 @@ fn edn_to_python<'py>(py: Python<'py>, value: &Edn) -> PyResult<Bound<'py, PyAny
             python_runtime(py)?.keyword.bind(py).call1((name,))
         }
         Edn::Symbol(value) => python_runtime(py)?.symbol.bind(py).call1((value,)),
-        Edn::List(values) | Edn::Vector(values) => {
+        Edn::List(values) => {
+            let result = PyList::empty(py);
+            for value in values {
+                result.append(edn_to_python(py, value)?)?;
+            }
+            python_runtime(py)?.edn_list.bind(py).call1((result,))
+        }
+        Edn::Vector(values) => {
             let result = PyList::empty(py);
             for value in values {
                 result.append(edn_to_python(py, value)?)?;

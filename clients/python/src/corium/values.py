@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +59,22 @@ class EntityId:
 
     def __int__(self) -> int:
         return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class EdnList:
+    """An EDN list, distinct from a Python list (which represents a vector)."""
+
+    items: tuple[Any, ...]
+
+    def __init__(self, items: Iterable[Any] = ()) -> None:
+        object.__setattr__(self, "items", tuple(items))
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
 
 
 @dataclass(frozen=True, slots=True)

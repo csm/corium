@@ -684,3 +684,177 @@ async fn cli_admin_commands_round_trip() {
     assert!(swept.contains(":swept"), "{swept}");
     assert!(!store.contains(&orphan).await.expect("orphan swept"));
 }
+
+/// A storage-aware peer reads the published index straight from the store, so
+/// it needs the key; without one it must refuse rather than mis-parse
+/// ciphertext as a segment.
+async fn assert_storage_peer_needs_the_key(data: &Path, endpoint: &str, key_uri: &str) {
+    let storage: Arc<dyn corium_peer::segment::PeerStorage> =
+        Arc::new(FsStore::open(data.join("store")).expect("open store"));
+    assert!(
+        Connection::connect(
+            ConnectConfig::new(endpoint.to_owned(), "vault").with_storage(Arc::clone(&storage))
+        )
+        .await
+        .is_err(),
+        "a keyless storage peer must not read an encrypted database"
+    );
+    let keyring = Arc::new(
+        corium_crypt::StaticKeyring::resolve([
+            corium_crypt::KeyId::new(key_uri.to_owned()).expect("key id")
+        ])
+        .expect("resolve"),
+    );
+    let storage_peer = Connection::connect(
+        ConnectConfig::new(endpoint.to_owned(), "vault")
+            .with_storage(storage)
+            .with_keyring(keyring),
+    )
+    .await
+    .expect("storage-aware peer with the key connects");
+    assert_eq!(long_values(&storage_peer.db()), vec![11]);
+}
+
+/// The `--storage-key` surface end to end: a transactor holding a key file,
+/// a database created encrypted through the CLI, `corium keys status` and
+/// `rotate`, a storage-aware peer reading ciphertext directly, and offline
+/// commands that refuse to run without the key.
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_database_round_trips_through_the_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = dir.path().join("data");
+    let key_path = dir.path().join("storage.key");
+    std::fs::write(&key_path, [0x5a_u8; 32]).expect("write key");
+    let key_uri = format!("file:{}", key_path.display());
+    let port = free_port();
+    let proc = TransactorProc::spawn(&data, port, &["--storage-key", &key_uri]);
+    let _admin = proc.wait_ready().await;
+    let endpoint = proc.endpoint();
+    let schema_path = dir.path().join("schema.edn");
+    std::fs::write(&schema_path, SCHEMA).expect("write schema");
+
+    let corium = env!("CARGO_BIN_EXE_corium");
+    let run = |args: Vec<String>| {
+        let output = Command::new(corium)
+            .args(&args)
+            .output()
+            .expect("run corium");
+        assert!(
+            output.status.success(),
+            "corium {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let created = run(vec![
+        "db".into(),
+        "create".into(),
+        "vault".into(),
+        "--schema".into(),
+        schema_path.display().to_string(),
+        "--storage-key".into(),
+        key_uri.clone(),
+        "--transactor".into(),
+        endpoint.clone(),
+    ]);
+    assert!(created.contains(":created true"), "{created}");
+
+    let peer = Connection::connect(ConnectConfig::new(endpoint.clone(), "vault"))
+        .await
+        .expect("connect");
+    peer.transact(add_value(11)).await.expect("transact");
+    run(vec![
+        "db".into(),
+        "request-index".into(),
+        "vault".into(),
+        "--transactor".into(),
+        endpoint.clone(),
+    ]);
+
+    let status = run(vec![
+        "keys".into(),
+        "status".into(),
+        "vault".into(),
+        "--transactor".into(),
+        endpoint.clone(),
+    ]);
+    assert!(status.contains(":encrypted true"), "{status}");
+    assert!(status.contains(":epoch 1"), "{status}");
+    assert!(status.contains(":state \"active\""), "{status}");
+    assert!(status.contains(":rotation-due false"), "{status}");
+
+    assert_storage_peer_needs_the_key(&data, &endpoint, &key_uri).await;
+
+    // Rotation opens an epoch new writes use; earlier ones stay readable.
+    let rotated = run(vec![
+        "keys".into(),
+        "rotate".into(),
+        "vault".into(),
+        "--transactor".into(),
+        endpoint.clone(),
+    ]);
+    assert!(rotated.contains(":storage-key-epoch 2"), "{rotated}");
+    peer.transact(add_value(12)).await.expect("post-rotation");
+    let synced = peer.sync().await.expect("sync");
+    let mut values = long_values(&synced);
+    values.sort_unstable();
+    assert_eq!(values, vec![11, 12]);
+
+    let status = run(vec![
+        "keys".into(),
+        "status".into(),
+        "vault".into(),
+        "--transactor".into(),
+        endpoint.clone(),
+    ]);
+    assert!(status.contains(":state \"retiring\""), "{status}");
+
+    assert_offline_commands_need_the_key(&data, &key_uri);
+}
+
+/// Offline commands read blob and log *content*, so an encrypted database
+/// needs its key here too — and each says so rather than failing obscurely.
+fn assert_offline_commands_need_the_key(data: &Path, key_uri: &str) {
+    let corium = env!("CARGO_BIN_EXE_corium");
+    let output = |args: Vec<String>| {
+        Command::new(corium)
+            .args(&args)
+            .output()
+            .expect("run corium")
+    };
+    let log_args = |extra: Vec<String>| {
+        let mut args = vec![
+            "log".to_owned(),
+            "--data-dir".to_owned(),
+            data.display().to_string(),
+            "--db".to_owned(),
+            "vault".to_owned(),
+        ];
+        args.extend(extra);
+        args
+    };
+
+    let refused = output(log_args(Vec::new()));
+    assert!(!refused.status.success(), "keyless log must fail");
+    let message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(message.contains("--storage-key"), "{message}");
+
+    let logged = output(log_args(vec![
+        "--storage-key".to_owned(),
+        key_uri.to_owned(),
+    ]));
+    assert!(logged.status.success(), "log with the key must succeed");
+    let printed = String::from_utf8_lossy(&logged.stdout);
+    assert!(printed.contains(":t 1"), "{printed}");
+
+    // A keyless offline GC would sweep every index chunk it cannot follow.
+    let refused = output(vec![
+        "gc".to_owned(),
+        "--data-dir".to_owned(),
+        data.display().to_string(),
+    ]);
+    assert!(!refused.status.success(), "keyless offline GC must fail");
+    let message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(message.contains("--storage-key"), "{message}");
+}

@@ -11,7 +11,7 @@ use std::fmt;
 
 use corium_crypt::{KeyId, Keyring, SecretKey};
 
-use crate::StoreError;
+use crate::{RootStore, StoreError};
 
 /// Manifest format written by this release.
 pub const KEY_MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -540,6 +540,53 @@ impl KeyManifest {
         }
         Ok(())
     }
+}
+
+/// Reads and validates a database's key manifest.
+///
+/// `None` means the database is unencrypted, which is a permanent property
+/// fixed at creation: there is no manifest to grow one later, and a reader
+/// that finds none may go on reading plaintext blobs.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the root store cannot be read or the stored
+/// manifest is malformed or from a newer release.
+pub async fn load_key_manifest(
+    store: &dyn RootStore,
+    db: &str,
+) -> Result<Option<KeyManifest>, StoreError> {
+    match store.get_root(&keys_root_name(db)).await? {
+        Some(bytes) => KeyManifest::decode(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Publishes a key manifest, fenced on the bytes it was read from.
+///
+/// `previous` is the manifest this update was computed from — `None` to
+/// create one. The compare-and-set means two concurrent rotations cannot
+/// both open an epoch: the loser sees [`StoreError::CasFailed`] and must
+/// re-read before retrying, rather than overwriting an epoch whose objects
+/// are already stored.
+///
+/// # Errors
+///
+/// Returns [`StoreError::CasFailed`] when the stored manifest changed, and
+/// [`StoreError::InvalidKeyManifest`] when `manifest` is structurally
+/// impossible — validation happens before the write so a bad manifest can
+/// never be the record every process bootstraps from.
+pub async fn publish_key_manifest(
+    store: &dyn RootStore,
+    db: &str,
+    previous: Option<&KeyManifest>,
+    manifest: &KeyManifest,
+) -> Result<(), StoreError> {
+    manifest.validate()?;
+    let expected = previous.map(KeyManifest::encode);
+    store
+        .cas_root(&keys_root_name(db), expected.as_deref(), &manifest.encode())
+        .await
 }
 
 fn invalid(reason: &str) -> StoreError {

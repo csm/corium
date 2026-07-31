@@ -1,0 +1,143 @@
+name: Python wheels
+
+on:
+  workflow_call:
+    inputs:
+      release_ref:
+        description: Version tag to build
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - ".github/workflows/python-wheels.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "clients/python/**"
+      - "crates/corium-client/**"
+      - "crates/corium-ffi/**"
+      - "crates/corium-python/**"
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - if: inputs.release_ref != ''
+        run: >-
+          python clients/python/scripts/release.py check
+          --expected "${{ inputs.release_ref }}"
+      - if: inputs.release_ref == ''
+        run: python clients/python/scripts/release.py check
+
+  build:
+    needs: release-check
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2_28"
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2_28"
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: "off"
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+        distribution:
+          - name: corium
+            directory: clients/python
+            out: ../../dist
+          - name: corium-turso
+            directory: clients/python/artifacts/turso
+            out: ../../../../dist
+          - name: corium-postgres
+            directory: clients/python/artifacts/postgres
+            out: ../../../../dist
+          - name: corium-s3
+            directory: clients/python/artifacts/s3
+            out: ../../../../dist
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        if: >-
+          github.event_name != 'pull_request' ||
+          matrix.distribution.name == 'corium'
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
+      - uses: actions/setup-python@v5
+        if: >-
+          github.event_name != 'pull_request' ||
+          matrix.distribution.name == 'corium'
+        with:
+          python-version: "3.10"
+      - name: Build ${{ matrix.distribution.name }}
+        if: >-
+          github.event_name != 'pull_request' ||
+          matrix.distribution.name == 'corium'
+        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
+        with:
+          maturin-version: v1.11.5
+          command: build
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          working-directory: ${{ matrix.distribution.directory }}
+          args: >-
+            --release --locked --compatibility pypi -i python3.10
+            --out ${{ matrix.distribution.out }}
+      - uses: actions/upload-artifact@v4
+        if: >-
+          github.event_name != 'pull_request' ||
+          matrix.distribution.name == 'corium'
+        with:
+          name: wheels-${{ matrix.platform.target }}-${{ matrix.distribution.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-${{ matrix.platform.target }}-*
+          path: dist
+          merge-multiple: true
+      - name: Install and import wheel combinations
+        run: >-
+          python clients/python/scripts/smoke_wheels.py dist
+          ${{ github.event_name == 'pull_request' && '--base-only' || '' }}

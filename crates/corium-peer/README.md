@@ -15,15 +15,17 @@ locally without round-tripping the transactor:
   the server backfills the gap from the durable log; with an HA pair it fails
   over across an endpoint preference list.
 - **Segment cache** (`segment`) — reads immutable index segments directly from
-  storage through a local cache for snapshot bootstrap and large scans.
+  storage through a local cache for snapshot bootstrap and large scans. For a
+  database encrypted at rest, `ConnectConfig::with_keyring` puts a decrypting
+  decorator *above* that cache, so the SSD tier keeps holding ciphertext.
 - **`sync`**, tx-report queue, `Admin` operations, and index-policy settings.
 - **`server`** — the peer server that hosts a peer as a standalone gRPC
   endpoint for thin clients.
 
 ## Dependencies
 
-- Engine: `corium-core`, `corium-db`, `corium-log`, `corium-query`,
-  `corium-store`.
+- Engine: `corium-core`, `corium-crypt`, `corium-db`, `corium-log`,
+  `corium-query`, `corium-store`.
 - Network: `corium-protocol`, `tonic`, `tokio`/`tokio-stream`, `async-trait`.
 - `tracing`, `thiserror`.
 

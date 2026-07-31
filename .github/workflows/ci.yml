@@ -18,8 +18,9 @@ jobs:
       - run: python -m pip install -e './clients/python[dev]'
       - run: ruff check clients/python
       - run: ruff format --check clients/python
-      - run: mypy --config-file clients/python/pyproject.toml clients/python/src clients/python/tests clients/python/artifacts
+      - run: mypy --config-file clients/python/pyproject.toml clients/python/src clients/python/tests clients/python/examples clients/python/artifacts
       - run: python -m unittest discover -s clients/python/tests -v
+      - run: python clients/python/scripts/release.py check
 
   rust:
     runs-on: ubuntu-latest

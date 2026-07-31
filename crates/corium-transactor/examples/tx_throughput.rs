@@ -478,7 +478,7 @@ async fn run(args: Args) -> Result<(), String> {
 
     let db = "bench";
     let filler = args.datoms_per_tx.saturating_sub(1);
-    node.create_db(db, &schema_edn(filler))
+    node.create_db(db, &schema_edn(filler), None)
         .await
         .map_err(|e| format!("create db: {e}"))?;
 

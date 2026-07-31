@@ -23,4 +23,6 @@ maturin build
 
 The common package automatically selects an installed artifact and rejects
 ambiguous installations. `corium.available_storage_backends()` verifies which
-driver is active. Publishing the platform wheel matrix remains Phase 5 work.
+driver is active. Tagged releases build and smoke-test each artifact on the
+same Linux, macOS, and Windows matrix as the common package before publishing
+through PyPI trusted publishing.

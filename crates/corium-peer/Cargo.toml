@@ -11,6 +11,7 @@ description = "Corium peer library"
 async-trait = "0.1"
 corium-authz = { workspace = true }
 corium-core = { workspace = true }
+corium-crypt = { workspace = true }
 corium-db = { workspace = true }
 corium-log = { workspace = true }
 corium-protocol = { workspace = true }

@@ -4,6 +4,7 @@
 pub mod authz;
 pub mod backend;
 pub mod backup;
+pub mod keys;
 pub mod lease;
 pub mod metrics;
 pub mod node;
