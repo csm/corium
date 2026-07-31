@@ -17,6 +17,12 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
+keywords = ["database", "datalog", "asyncio"]
+
+[project.urls]
+Documentation = "https://github.com/csm/corium/tree/main/clients/python"
+Issues = "https://github.com/csm/corium/issues"
+Repository = "https://github.com/csm/corium"
 
 [project.optional-dependencies]
 dev = [
