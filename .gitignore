@@ -1,4 +1,5 @@
 /target/
+docs/manual/book/
 examples/postgres-jdbc/target/
 /.idea/
 examples/musicbrainz/data/logs/

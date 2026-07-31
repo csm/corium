@@ -1,0 +1,22 @@
+[book]
+title = "Corium Operator Manual"
+authors = ["The Corium authors"]
+description = "How to configure, run, secure, and recover a Corium deployment."
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/csm/corium"
+edit-url-template = "https://github.com/csm/corium/edit/main/docs/manual/{path}"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
