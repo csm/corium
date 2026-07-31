@@ -256,6 +256,18 @@ Security and multi-tenancy:
 
 Engine and API:
 
+- **Schema migration planning and execution.** *(Specified.)* Add
+  `corium schema update` as a plan-first declarative diff against the installed
+  schema, with exact impact counts and additive, validate/reindex, rewrite, and
+  destructive classes. Before apply is enabled, close the implementation gap
+  between the data model and creation-only schema metadata: schema vocabulary
+  becomes basis-versioned datoms, peers apply schema generations from tx
+  reports, index/unique activation waits for a verified backfill, and old
+  databases receive a deterministic compatibility transaction preserving
+  attribute ids. Removal means retirement; in-place type change and hard
+  deletion remain rejected. See
+  [schema-migrations.md](design/schema-migrations.md) and
+  [ADR-0020](adr/0020-planned-schema-migrations.md).
 - Fulltext (`tantivy`) and tuple value types; excision (design reserved in
   [time-model.md](design/time-model.md)); query fn clauses in user cljrs
   code; leapfrog join; HTTP/JSON gateway; adaptive index statistics; disk

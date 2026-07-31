@@ -149,7 +149,10 @@ The transactor materializes schema into an immutable in-memory `SchemaCache`
 from the same datoms, so validation logic is shared code in `corium-core`.
 
 Schema alteration follows Datomic's rules (additive changes free; a defined
-set of legal alterations like adding `:db/index`; no value-type changes).
+set of legal alterations like adding `:db/index`; no value-type changes). The
+plan/apply workflow, impact classes, retirement semantics, and implementation
+work needed to make those changes basis-versioned are specified in
+[schema-migrations.md](schema-migrations.md).
 
 ## Transaction data (input model)
 

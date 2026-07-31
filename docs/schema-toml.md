@@ -4,6 +4,12 @@ Corium accepts hierarchical TOML schema files when `corium db create
 --schema` receives a path ending in `.toml`. The format is a concise authoring
 layer over Corium's flat attribute model; EDN schema files remain supported.
 
+The same format is the desired input to the proposed `corium schema update`
+plan/apply workflow. An update file may be partial: installed attributes absent
+from it remain unmanaged unless `--prune` explicitly requests retirement.
+`schema-version` versions this file format; it is not a migration sequence.
+See [the schema migration design](design/schema-migrations.md).
+
 ## Grouped attributes
 
 The common form groups attributes under a familiar entity-shaped declaration:
