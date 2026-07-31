@@ -17,6 +17,15 @@ Rationale (ADR-0006): protobuf handles framing, streaming, auth, and
 versioning where it is strong; EDN's open value set lives in one codec we
 control, rather than being contorted into protobuf messages.
 
+A proposed blob value ([ADR-0020](../adr/0020-blob-value-type.md)) adds one tag
+in the gap between bytes (`0x80`) and ref (`0x90`), carrying a 32-byte content
+id (a digest of the plaintext payload) and a length. It is self-delimiting and fixed-width, so it needs no interning
+table entry, and it travels in tx-data, tx-reports, datom streams, and query
+results like any other scalar — because it *is* a scalar: the payload is not on
+this wire. Adding a tag costs a thin-client protocol version; ADR-0018
+anticipates the same bump for sealed values, and whichever lands first takes
+the number.
+
 ## Services
 
 ### TransactorService (peers → transactor)
@@ -109,8 +118,20 @@ service PeerServer {
   rpc TxRange(TxRangeRequest) returns (stream TxChunk);
   rpc DbStats(DbStatsRequest) returns (DbStatsResponse);
   rpc Subscribe(SubscribeRequest) returns (stream TxReport);     // relayed
+  rpc PutBlob(stream BlobChunk) returns (BlobRefResponse);       // proposed: client uploads, peer stores
+  rpc GetBlob(BlobRefRequest) returns (stream BlobChunk);        // proposed: ranged, resumable
 }
 ```
+
+`PutBlob`/`GetBlob` exist only for clients with no storage credentials
+([ADR-0020](../adr/0020-blob-value-type.md)). A Rust peer holding credentials
+never calls them: it uploads payload chunks to the blob store itself and reads
+them back through its segment cache, exactly as it already does for index
+segments. For a thin client the peer server is the storage proxy — it uploads
+on the client's behalf and returns the reference, which the client then
+transacts as an ordinary value. Both directions are streamed and chunked so a
+payload never has to be one message, and `GetBlob` takes a byte range so a
+client can resume rather than restart.
 
 Requests name a db view as
 `{db-name, as-of?, since?, history?, as-of-instant?, since-instant?}` so thin

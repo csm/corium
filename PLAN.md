@@ -176,6 +176,20 @@ locally, with protected values redacted — and protected datoms are excluded
 from AVET and VAET, which the schema enforces by rejecting `:db/protection`
 alongside `:db/index`, `:db/unique`, and `:db.type/ref`.
 
+Large values are specified but not yet built
+([ADR-0020](docs/adr/0020-blob-value-type.md)). `:db.type/blob` puts a 32-byte
+digest and a length in the datom and the payload in the blob store the rest of
+the system already runs on — chunked into a manifest like a published index, so
+it streams and shares chunks; uploaded by the writing peer so bytes never cross
+the transactor; and fetched lazily through the existing segment cache, so a
+query that selects a blob attribute transfers nothing until someone asks for
+the bytes. Blob attributes take neither `:db/index`/`:db/unique` (digest order
+is not content order) nor `:db/noHistory` (history is what keeps a payload's
+pointer alive). A committed payload is live forever, tracked by an append-only
+payload root that GC and backup walk like any other root; `corium blob expunge`
+is the deliberate, audited, irreversible way to take bytes back out, and it
+leaves the datom in place.
+
 Operator-level management is specified as its own surface
 ([docs/design/operator-service.md](docs/design/operator-service.md),
 [ADR-0019](docs/adr/0019-operator-peer-service.md)): a peer whose workload is

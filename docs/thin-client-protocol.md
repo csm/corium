@@ -9,7 +9,16 @@ served by `PeerServerService` over gRPC/HTTP2.
 
 Every transact/subscribe request sends `protocol_version = 1`. A mismatch is
 `FAILED_PRECONDITION`, never silent downgrade. Deployments use TLS and may
-require `authorization: Bearer <token>` metadata. Standard gRPC status codes
+require `authorization: Bearer <token>` metadata.
+
+The proposed blob value ([ADR-0020](adr/0020-blob-value-type.md)) adds tag
+`88` below and a version, since a v1 client cannot decode it: a server that may
+return blob values requires clients to negotiate the newer version, and a
+client that never touches a blob attribute is unaffected. ADR-0018 anticipates
+the same bump for sealed values; whichever lands first takes the number. A blob
+value is a *handle* — the payload is fetched separately, over `PutBlob`/
+`GetBlob` for clients without storage credentials — so decoding the tag never
+implies transferring the bytes. Standard gRPC status codes
 are used: malformed EDN/query input is `INVALID_ARGUMENT`, an unknown
 database/entity is `NOT_FOUND`, budget exhaustion is `INVALID_ARGUMENT`, and
 upstream loss is `UNAVAILABLE`.
@@ -31,6 +40,7 @@ precede container contents. Multi-byte fixed scalars are big-endian.
 | `61` | keyword | interned UTF-8 name |
 | `71` | string | interned UTF-8 text |
 | `81` | bytes | length varint + bytes |
+| `88` | blob reference *(proposed)* | 32 content-id bytes + payload length varint |
 | `90` | entity ref | unsigned varint |
 | `a0`/`a1`/`a3` | list/vector/set | count + items |
 | `a2` | map | pair count + alternating key/value items |

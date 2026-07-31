@@ -83,6 +83,12 @@ not granted.
 - Index publication requests and pacing policy.
 - Encryption jobs: the protection sweep, storage re-key and epoch drain,
   key rewrap, and the pre-flight audits that precede a shred.
+- Blob expunge ([ADR-0020](../adr/0020-blob-value-type.md), proposed) — the one
+  operation that destroys payload bytes. It belongs here for the same reasons a
+  shred does: it is irreversible, it wants plan/apply (which payloads, how many
+  bytes, which datoms still name them) and two-person approval, and the record
+  of who expunged what is the point rather than a side effect. It does not
+  reach backups taken before it, which the plan says out loud.
 - Database deletion and its blob sweep.
 
 **Stays in the CLI** (interactive, local, or a process launcher):

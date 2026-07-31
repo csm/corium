@@ -441,6 +441,58 @@ corium gc --data-dir /srv/corium --window 72h
 
 Use a zero window only when no stale root or in-flight reader can exist.
 
+### Blob payloads and expunge (proposed)
+
+With the proposed blob value type
+([ADR-0020](adr/0020-blob-value-type.md)), GC does not reclaim payloads: a
+committed payload is live forever, because history is complete and a retracted
+blob datom is still a valid historical fact. Ordinary GC collects only
+uploads whose transaction never committed — which puts a floor under the
+retention window: **it must exceed the longest plausible upload-to-commit
+latency**, or a slow upload followed by a transactor backlog can have its chunks
+swept before the transaction naming them commits. The 72-hour default leaves
+enormous headroom; a deployment that shortens the window should keep that
+distance in mind.
+
+Watch the size of the payload set rather than expecting it to fall:
+
+```sh
+corium blob stat --transactor http://127.0.0.1:4334          # payload count and bytes
+```
+
+`expunge` is the only way to remove payload bytes, and it is irreversible:
+
+```sh
+corium blob expunge --transactor http://127.0.0.1:4334 <ref>
+```
+
+Operating notes for it:
+
+- **The datom stays.** Only the bytes go. Reads of the reference afterwards
+  report the payload as expunged rather than failing as a corrupt store, so
+  queries that never fetch the payload are unaffected.
+- **Expunge is per payload, not per subject.** Identical bytes are stored once
+  no matter who uploaded them, so a reference is routinely named by many datoms
+  and many entities — the same attached form, the same stock image, the same
+  template. Expunging removes the bytes for *every* datom naming that content,
+  not the one you had in mind. If you are satisfying a deletion obligation for
+  one subject, confirm who else names the payload first; an application that
+  needs per-subject erasure has to make its payloads per-subject distinct
+  (encrypted or salted per subject) at upload time and give up deduplication.
+- **Other databases keep it alive.** The blob store is one shared namespace,
+  and the expunge mark unions every database in it, so a fork or a
+  restored clone that still names the payload keeps the bytes — expunge there
+  too, or nothing is erased.
+- **Backups are not covered.** An archive taken before the expunge still
+  contains the payload, and restoring it brings the bytes back. Erasing for
+  real means expunging in the backup set too, or re-taking the backups and
+  retiring the old ones.
+- **Chunks shared with a surviving payload survive.** Expunge plans against the
+  remaining payload set and never removes a chunk another payload still needs.
+- With an operator service configured, expunge runs as an approved job with
+  plan/apply and a recorded audit trail
+  ([design/operator-service.md](design/operator-service.md)).
+
 ## Encryption at rest
 
 Every durable artifact of an encrypted database — index blobs, transaction-log

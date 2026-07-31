@@ -65,6 +65,27 @@ change which tree + filter a scan uses — see time-model.md). `history` scans
 bind an extra `?added` pattern position (5-element patterns), exactly as in
 Datomic.
 
+## Blob values in results
+
+*Proposed; [ADR-0020](../adr/0020-blob-value-type.md).* A `:db.type/blob` value
+is a handle — a content id and a length — and the engine treats it as an
+ordinary scalar throughout: it binds, unifies, and compares by identity like any
+other value, and identity here is genuine content identity, because the content
+id is a digest of the plaintext payload rather than of whatever object currently
+stores it. Two datoms naming the same bytes therefore unify, whenever and under
+whichever storage-key epoch each was written.
+What the engine never does is dereference it. Query results, pull
+results, entity values, and datom streams all carry the reference; a query that
+selects a blob attribute transfers no payload bytes at all.
+
+Hydration is a separate call on the connection, deliberately outside the
+engine, which keeps `corium-query` free of the I/O it does not otherwise do and
+keeps the cost visible at the call site rather than hidden inside a scan that
+looked cheap. Because a blob attribute can be neither indexed nor unique
+([data-model.md](data-model.md#schema)), the planner sees blob positions the
+way it sees any unindexed attribute: equality is a scan, and there are no
+ranges to offer.
+
 ## cljrs interop in queries
 
 Predicate/function clauses resolve in this order: (1) built-in native set

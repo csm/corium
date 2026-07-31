@@ -65,6 +65,10 @@ same canonical attribute through grouped and flat syntax is an error.
 
 Every detailed declaration requires `type`. Supported values are `boolean`,
 `long`, `double`, `instant`, `uuid`, `keyword`, `string`, `bytes`, and `ref`.
+A proposed `blob` type ([ADR-0020](adr/0020-blob-value-type.md)) stores the
+payload in the blob store and the reference in the datom; it rejects `index`,
+`unique`, and `no-history` at schema-install time, so those options are errors
+rather than silent no-ops on a `blob` attribute.
 
 The remaining options are:
 

@@ -82,6 +82,25 @@ The projection has these rules:
 - Attributes without a namespace are grouped in `corium._global`.
 - Namespace and attribute names are preserved exactly. Use SQL double quotes
   for names such as `release-group` rather than relying on normalized aliases.
+- A `:db.type/blob` column ([ADR-0020](adr/0020-blob-value-type.md), proposed)
+  projects as a struct of the payload's content id and length, not its bytes:
+  a scan transfers nothing from the blob store, and `SELECT payload` returns a
+  handle. That is the same contract the Rust and cljrs APIs offer, and it is
+  deliberate — a wide-table scan must not become a bulk download. A hydrating
+  function, so a query can opt into fetching, is future work.
+
+  ```text
+  corium.message(e BIGINT, subject TEXT, attachment STRUCT<content_id BYTEA, len BIGINT>)
+  ```
+
+  A cardinality-many blob attribute is `LIST<STRUCT<…>>`, following the same
+  rule as every other many-valued column. This is the first composite type in
+  the projection: the catalog maps every other value type to an Arrow scalar or
+  a list of one, and the PostgreSQL wire server has no composite encoding, so a
+  blob column needs a struct case in the catalog's type mapping and a composite
+  OID plus binary/text codec in `corium-pgwire` before it can be served. Until
+  both exist a wire client would see the column as opaque text, so they ship
+  together.
 
 List functions are available through DataFusion, for example:
 
