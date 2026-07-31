@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from corium import EdnList, EntityId, Keyword, Symbol, Tagged
+from corium import EdnList, EntityId, Keyword, Pull, Symbol, Tagged, pull_attr
 
 _corium: Any
 try:
@@ -52,6 +52,21 @@ class NativeBoundaryTests(unittest.TestCase):
         for value in values:
             with self.subTest(value=value):
                 self.assertEqual(_corium._roundtrip(value), value)
+
+    def test_pull_attribute_options_round_trip_as_a_vector(self) -> None:
+        pattern = (
+            Pull()
+            .attr(
+                pull_attr("person/nick")
+                .as_(Keyword("nickname"))
+                .limit(2)
+                .default("n/a")
+            )
+            .to_form()
+        )
+
+        self.assertIsInstance(pattern[0], list)
+        self.assertEqual(_corium._roundtrip(pattern), pattern)
 
     def test_reserved_tags_cannot_collide_with_native_boundary_types(self) -> None:
         for tag, value in (

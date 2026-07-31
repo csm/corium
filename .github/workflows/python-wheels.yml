@@ -1,6 +1,12 @@
 name: Python wheels
 
 on:
+  workflow_call:
+    inputs:
+      release_ref:
+        description: Version tag to build and publish
+        required: true
+        type: string
   pull_request:
     paths:
       - ".github/workflows/python-wheels.yml"
@@ -10,10 +16,6 @@ on:
       - "crates/corium-client/**"
       - "crates/corium-ffi/**"
       - "crates/corium-python/**"
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,14 +25,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - if: startsWith(github.ref, 'refs/tags/v')
+      - if: inputs.release_ref != ''
         run: >-
           python clients/python/scripts/release.py check
-          --expected "${{ github.ref_name }}"
-      - if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          --expected "${{ inputs.release_ref }}"
+      - if: inputs.release_ref == ''
         run: python clients/python/scripts/release.py check
 
   build:
@@ -73,6 +77,8 @@ jobs:
         if: >-
           github.event_name != 'pull_request' ||
           matrix.distribution.name == 'corium'
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: actions/setup-python@v5
         if: >-
           github.event_name != 'pull_request' ||
@@ -121,6 +127,8 @@ jobs:
     runs-on: ${{ matrix.platform.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -135,7 +143,7 @@ jobs:
           ${{ github.event_name == 'pull_request' && '--base-only' || '' }}
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release_ref != ''
     needs: smoke
     runs-on: ubuntu-24.04
     environment:
