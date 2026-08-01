@@ -16,7 +16,8 @@ jobs:
           java-version: '17'
           cache: maven
           cache-dependency-path: clients/java/pom.xml
-      - run: mvn -f clients/java/pom.xml --batch-mode verify
+      - run: mvn -f clients/java/pom.xml --batch-mode --activate-profiles release -Dgpg.skip=true verify
+      - run: python3 clients/java/scripts/release.py check
 
   python:
     runs-on: ubuntu-latest

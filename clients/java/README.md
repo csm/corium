@@ -59,3 +59,20 @@ mvn verify
 
 The build generates Java and gRPC sources from the canonical protocol schema.
 The schema is at `crates/corium-protocol/proto/corium.proto`.
+
+## Publishing
+
+The release workflow publishes `dev.corium:corium-client` to Maven Central.
+The `release` Maven profile creates source and Javadoc JARs. It signs each
+artifact and sends the deployment to the Central Publisher Portal. The workflow
+waits until the deployment is public.
+
+Add these secrets to the `maven-central` GitHub environment:
+
+- `MAVEN_CENTRAL_USERNAME`: username from a Central Portal user token
+- `MAVEN_CENTRAL_TOKEN`: password from the same user token
+- `MAVEN_GPG_PRIVATE_KEY`: ASCII-armored private signing key
+- `MAVEN_GPG_PASSPHRASE`: passphrase for the signing key
+
+Publish the public signing key to a public key server. Make sure that the
+Central Portal account can publish the verified `dev.corium` namespace.
