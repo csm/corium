@@ -1,16 +1,44 @@
 # Encryption at Rest and Attribute Protection
 
-Status: **layer 1 implemented, layer 2 not started.** The storage-encryption
-primitives, the blob-store decorator, log-record payload encryption, the
-`keys:<db>` key manifest (with storage format 4), and the process wiring —
-`--storage-key` on the transactor, peer server, and offline commands;
-`corium db create --storage-key`; `corium keys status|rotate|rewrap` — are
-implemented. Remaining in layer 1: backup format 2 (until then `corium backup`
-refuses an encrypted database rather than writing an archive no restore could
-open) and KMS-backed keyrings (a key identity resolves through `file:` or
-`env:` today; `awskms:`, `gcpkms:`, and `vault:` are recognized as key sources
-and rejected as unresolvable). Attribute protection is unimplemented. This
-document specifies two independent layers
+Status: **layer 1 implemented; layer 2 implemented for protection declared at
+database creation.** The storage-encryption primitives, the blob-store
+decorator, log-record payload encryption, the `keys:<db>` key manifest (with
+storage format 4), and the process wiring — `--storage-key` on the transactor,
+peer server, and offline commands; `corium db create --storage-key`;
+`corium keys status|rotate|rewrap` — are implemented. Remaining in layer 1:
+backup format 2 (until then `corium backup` refuses an encrypted database
+rather than writing an archive no restore could open) and KMS-backed keyrings
+(a key identity resolves through `file:` or `env:` today; `awskms:`,
+`gcpkms:`, and `vault:` are recognized as key sources and rejected as
+unresolvable).
+
+Layer 2 is implemented end to end for the shape of protection Corium's schema
+can express today. A class declared in the create-time schema
+(`:db.protect/ident` in EDN, `[protect.<name>]` in TOML) protects an attribute
+from `t = 0`; the writing peer seals, the transactor validates the cleartext
+header and commits with no key, and a reader hydrates exactly the classes its
+keyring resolves. What is **not** implemented, and why:
+
+- **Protection changes** — protecting, unprotecting, or re-classifying a
+  populated attribute, the acknowledgement datom, the sweep, and
+  `corium keys protect|unprotect|audit`. Corium's schema is create-time and
+  immutable: attributes are not entities, and there is no alteration path to
+  hang a forward-only change on. That mechanism is the prerequisite, and the
+  single largest remaining piece. Everything downstream of it is already
+  written against a per-attribute protection *timeline* rather than a single
+  class, so alterations append to it rather than reshaping anything.
+- **Entity scope.** Classes parse and store `:db.protect.scope/entity`, and
+  sealing under it refuses rather than silently binding the wrong subject. It
+  needs `ReserveEntityIds`, local upsert pre-resolution, and the
+  `expected_basis_t` retry loop described below.
+- **Surfaces**: per-principal `KeyPolicy` on the peer server (it hydrates with
+  one server-wide key set today), `--seal-through`, SQL predicate *rewriting*
+  (SQL gets the safe defaults instead: `NULL` for an unhydrated value, and no
+  pushdown on a protected column), and the thin-client v3 contract document.
+- **Operations**: class rotation and shred commands, metrics, and audit
+  events.
+
+This document specifies two independent layers
 — envelope encryption of every durable artifact
 ([ADR-0017](../adr/0017-encryption-at-rest.md)) and per-attribute protection
 classes keyed by separate data keys
@@ -445,9 +473,18 @@ pub struct Sealed {
 pub enum Value { /* … */ Sealed(Sealed) }
 ```
 
-Encoded as `0xA0 ‖ class ‖ epoch ‖ vtype ‖ len ‖ body`, self-delimiting like
-every other value encoding, so `Datom::key`, `key_components`, and
-`Datom::from_key` need no structural change.
+Encoded as `0xA0 ‖ class ‖ epoch ‖ vtype ‖ body`, self-delimiting like every
+other value encoding — the body uses the same zero-escaped framing as `Str`
+and `Bytes` — so `Datom::key`, `key_components`, and `Datom::from_key` need no
+structural change. The wire codec carries the same fields under tag `0xA6`,
+because `0xA0` is `LIST` in its tag space; sending one needs protocol v3.
+
+A **keyword** value seals its text under the string tag. Reading one back
+therefore needs a keyword id the transactor never assigned, so the interner
+keeps a reader-local overlay above `FIRST_LOCAL_KW_ID`: local ids never reach
+storage or the wire (keywords travel by name in both), and a keyword the
+reader already knows durably keeps its durable id, so a hydrated value and a
+query literal still compare equal.
 
 Sealing:
 
@@ -746,6 +783,9 @@ from the same `Db`.
 - The **query cache** keys on a fingerprint of the hydration key set alongside
   the query and basis, for the same reason the deferred `ViewFilter` work must:
   a result computed with a key must never be served to a caller without it.
+  Corium's query cache is parse-only — it holds parsed queries, not results —
+  so there is nothing to key yet. The requirement lands with the first result
+  cache.
 
 When a value cannot be hydrated, the class's `:db.protect/on-missing-key`
 decides, and a request may narrow (never widen) it:
@@ -948,6 +988,10 @@ records key grants, rotations, and shreds.
   unreadable" stops being forgettable.
 
 ## Implementation plan
+
+Steps 1–4 are done; 5–8 remain, in that order. Step 5 gates the rest of the
+protection story, because everything it covers presumes a schema that can be
+altered.
 
 1. **`corium-crypt`.** Primitives, `KeyId`/`SecretKey`/`Keyring`,
    `StaticKeyring`, deterministic sealing, derivation, zeroization. Pure

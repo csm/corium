@@ -50,11 +50,25 @@ service Transactor {
 - Protocol v2 adds `TransactRequest.expected_basis_t`. When present, the
   transactor rejects a stale request before transaction preparation or durable
   append; peer-local read/modify/write adapters use this fence.
+- Protocol v3 adds the sealed value tag `0xA6` — `class:8 ‖ epoch:4 ‖
+  vtype:1 ‖ body` — and the versioned schema payload that carries protection
+  classes and per-attribute protection timelines. The tag is `0xA6` rather
+  than the `0xA0` the sortable encoding uses, because `0xA0` is `LIST` in the
+  composite tag space. A pre-v3 client never receives one: values reach a thin
+  client through the boundary EDN, which renders an unhydrated value as
+  `#corium/redacted {:class … :type …}`, a tagged element any EDN reader
+  parses. Sending sealed values on the wire arrives with the peer server's
+  deferred `--seal-through` mode.
+- The schema payload opens with a version marker. Version 1 opened with an
+  attribute count, which no schema comes near, so a reader tells the two apart
+  by inspection: a current build still reads a database written by an older
+  one, and a payload from a newer build reports an upgrade rather than
+  mis-parsing.
 - Version checks use a supported range to permit server-first rolling
-  upgrades. A v2 server accepts v1 clients (which cannot request the new
-  fence); a v2 client still sends version 2 and is rejected by a v1 server
-  before that older server can ignore the fence. Upgrade transactors first,
-  then peers and clients.
+  upgrades. A v3 server accepts v1 and v2 clients (which cannot request the
+  basis fence, or receive a sealed value); a v3 client still sends version 3
+  and is rejected by an older server before that server can ignore what it
+  does not understand. Upgrade transactors first, then peers and clients.
 
 #### Future fleet routing
 
@@ -135,12 +149,13 @@ vectors ship with it so third parties can write clients.
   credentials to it, as in Datomic). Encryption at rest
   ([encryption.md](encryption.md)) is proposed to remove that assumption for
   blobs, log records, backups, and cached segments.
-- Attribute protection classes (proposed) seal values under per-class keys
-  before they leave the writing peer, so tx-data, tx-reports, datom streams,
-  and query results may carry sealed values that only a key-holding reader can
-  hydrate. This adds a value tag to the codec and a thin-client protocol
-  version; a peer server either hydrates per request or forwards sealed values
-  (`--seal-through`) for end-to-end protection.
+- Attribute protection classes seal values under per-class keys before they
+  leave the writing peer, so tx-data, tx-reports, and datom streams may carry
+  sealed values that only a key-holding reader can hydrate. Tx-data carries
+  one as the EDN tagged form `#corium/sealed {:class :epoch :vtype :body}`,
+  which the transactor validates against its schema without holding any key. A
+  peer server hydrates per request with its own key set; forwarding sealed
+  values to the thin client (`--seal-through`) is deferred.
 
 ## Embedded transport
 
