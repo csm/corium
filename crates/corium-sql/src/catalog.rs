@@ -694,6 +694,11 @@ fn value_scalar(db: &Db, value: &Value) -> ScalarValue {
         Value::Str(value) => ScalarValue::Utf8(Some(value.to_string())),
         Value::Bytes(value) => ScalarValue::Binary(Some(value.to_vec())),
         Value::Ref(value) => ScalarValue::UInt64(Some(value.raw())),
+        // Unhydrated sealed values report NULL; the column keeps its declared
+        // Arrow type (docs/design/encryption.md).
+        Value::Sealed(sealed) => {
+            ScalarValue::try_new_null(&arrow_type(sealed.vtype)).unwrap_or(ScalarValue::Null)
+        }
     }
 }
 
@@ -722,5 +727,6 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Str(_) => "string",
         Value::Bytes(_) => "bytes",
         Value::Ref(_) => "ref",
+        Value::Sealed(sealed) => schema_type_name(sealed.vtype),
     }
 }

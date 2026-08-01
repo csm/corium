@@ -507,6 +507,76 @@ pub fn decrypt_blob(key: &SecretKey, object: &[u8]) -> Result<Vec<u8>, CryptErro
         .map_err(|_| CryptError::AuthenticationFailed)
 }
 
+/// Seals a value deterministically: the same key, AAD, and plaintext always
+/// produce the same bytes.
+///
+/// The nonce is all zero by design. Fact identity depends on determinism —
+/// the index key *is* the datom, and a retraction cancels an assertion by
+/// sharing its `(e, a, v)` byte prefix — so a keyless transactor must be able
+/// to pair a retraction with an assertion bytewise, without holding any key.
+/// GCM-SIV is what makes the fixed nonce safe: it derives the per-message
+/// nonce from the plaintext itself, so encrypting distinct plaintexts under
+/// one key never reuses a true nonce, and even a repeated plaintext leaks only
+/// equality. (See `docs/design/encryption.md`, "Fact identity, and why
+/// sealing is deterministic".)
+///
+/// The caller must bind the full context in the AAD — the key identity,
+/// epoch, attribute, optionally the entity, and the value type (the design's
+/// `"corium/seal-v1" ‖ context ‖ vtype`) — so a sealed body cannot be moved
+/// to another attribute, epoch, or subject.
+///
+/// The output is `ciphertext ‖ 16-byte tag`.
+///
+/// # Errors
+///
+/// Returns a [`CryptError`] if encryption fails.
+pub fn seal_deterministic(
+    key: &SecretKey,
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptError> {
+    let cipher =
+        Aes256GcmSiv::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
+    cipher
+        .encrypt(
+            Nonce::from_slice(&[0_u8; NONCE_LEN]),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| CryptError::EncryptionFailed)
+}
+
+/// Authenticates and opens a body produced by [`seal_deterministic`].
+///
+/// The nonce is the same all-zero nonce the sealer uses, so the caller must
+/// present the exact AAD the body was sealed under: any difference in key,
+/// context, or body fails authentication rather than returning plaintext.
+///
+/// # Errors
+///
+/// Returns [`CryptError::AuthenticationFailed`] when the body is shorter than
+/// the 16-byte tag, was sealed under another key or AAD, or was tampered
+/// with.
+pub fn open_deterministic(
+    key: &SecretKey,
+    aad: &[u8],
+    body: &[u8],
+) -> Result<Vec<u8>, CryptError> {
+    if body.len() < AEAD_TAG_LEN {
+        return Err(CryptError::AuthenticationFailed);
+    }
+    let cipher =
+        Aes256GcmSiv::new_from_slice(key.as_bytes()).map_err(|_| CryptError::InvalidKeyLength)?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(&[0_u8; NONCE_LEN]),
+            Payload { msg: body, aad },
+        )
+        .map_err(|_| CryptError::AuthenticationFailed)
+}
+
 /// Reports whether a log-record payload carries the encrypted-record header.
 ///
 /// The plaintext record encoding starts with its transaction number as a
@@ -666,6 +736,78 @@ mod tests {
 
     fn key(byte: u8) -> SecretKey {
         SecretKey::new([byte; 32])
+    }
+
+    proptest! {
+        #[test]
+        fn sealed_values_are_deterministic(
+            aad in prop::collection::vec(any::<u8>(), 0..256),
+            plaintext in prop::collection::vec(any::<u8>(), 0..4096)
+        ) {
+            let sealed = seal_deterministic(&key(7), &aad, &plaintext).expect("seal");
+            let repeated = seal_deterministic(&key(7), &aad, &plaintext).expect("repeat");
+            prop_assert_eq!(&sealed, &repeated);
+            prop_assert_eq!(sealed.len(), plaintext.len() + AEAD_TAG_LEN);
+        }
+
+        #[test]
+        fn sealed_values_round_trip(
+            aad in prop::collection::vec(any::<u8>(), 0..256),
+            plaintext in prop::collection::vec(any::<u8>(), 0..4096)
+        ) {
+            let sealed = seal_deterministic(&key(7), &aad, &plaintext).expect("seal");
+            prop_assert_eq!(
+                open_deterministic(&key(7), &aad, &sealed).expect("open"),
+                plaintext
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_values_fail_to_open_under_any_other_context() {
+        let aad = b"corium/seal-v1\0storage\0\0\0\x01\0person/email";
+        let sealed = seal_deterministic(&key(1), aad, b"ada@example.com").expect("seal");
+
+        // Wrong AAD, wrong key: both are authentication failures, never a
+        // panic or a decode error.
+        assert!(matches!(
+            open_deterministic(&key(1), b"person/name", &sealed),
+            Err(CryptError::AuthenticationFailed)
+        ));
+        assert!(matches!(
+            open_deterministic(&key(2), aad, &sealed),
+            Err(CryptError::AuthenticationFailed)
+        ));
+
+        let mut tampered = sealed;
+        *tampered.last_mut().expect("tag") ^= 1;
+        assert!(matches!(
+            open_deterministic(&key(1), aad, &tampered),
+            Err(CryptError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn sealed_values_round_trip_empty_plaintext() {
+        let sealed = seal_deterministic(&key(3), b"ctx", b"").expect("seal");
+        assert_eq!(sealed.len(), AEAD_TAG_LEN);
+        assert_eq!(open_deterministic(&key(3), b"ctx", &sealed).expect("open"), b"");
+    }
+
+    #[test]
+    fn open_deterministic_rejects_bodies_shorter_than_the_tag() {
+        for body in [&b""[..], &b"short"[..], &[0_u8; 15][..]] {
+            assert!(matches!(
+                open_deterministic(&key(3), b"ctx", body),
+                Err(CryptError::AuthenticationFailed)
+            ));
+        }
+        // Exactly one tag of zero bytes is well-formed but must not
+        // authenticate — only a body from `seal_deterministic` does.
+        assert!(matches!(
+            open_deterministic(&key(3), b"ctx", &[0_u8; 16]),
+            Err(CryptError::AuthenticationFailed)
+        ));
     }
 
     proptest! {

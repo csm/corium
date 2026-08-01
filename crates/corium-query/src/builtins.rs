@@ -182,6 +182,7 @@ pub fn value_to_display(value: &Value) -> String {
         Value::Keyword(id) => format!(":kw{id}"),
         Value::Ref(e) => e.raw().to_string(),
         Value::Bytes(b) => format!("{b:02x?}"),
+        Value::Sealed(_) => "#corium/redacted".to_string(),
     }
 }
 

@@ -35,6 +35,9 @@ const MAP: u8 = 0xA2;
 const SET: u8 = 0xA3;
 const TAGGED: u8 = 0xA4;
 const SYMBOL: u8 = 0xA5;
+// Sealed (attribute-level encrypted) value; distinct from the 0xA0 tag used
+// by `corium_core::encoding` because 0xA0 is LIST in this tag space.
+const SEALED: u8 = 0xA6;
 
 /// Codec failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -232,6 +235,14 @@ impl Writer {
                 self.buf.push(REF);
                 self.varint(e.raw());
             }
+            Value::Sealed(sealed) => {
+                self.buf.push(SEALED);
+                self.buf.extend_from_slice(&sealed.class.raw().to_be_bytes());
+                self.buf.extend_from_slice(&sealed.epoch.to_be_bytes());
+                self.buf.push(value_type_tag(sealed.vtype));
+                self.varint(sealed.body.len() as u64);
+                self.buf.extend_from_slice(&sealed.body);
+            }
         }
         Ok(())
     }
@@ -422,6 +433,26 @@ impl<'a> Reader<'a> {
                 Value::Bytes(Arc::from(self.take(len)?))
             }
             REF => Value::Ref(EntityId::from_raw(self.u64()?)),
+            SEALED => {
+                let class = EntityId::from_raw(u64::from_be_bytes(
+                    self.take(8)?
+                        .try_into()
+                        .map_err(|_| CodecError::Truncated)?,
+                ));
+                let epoch = u32::from_be_bytes(
+                    self.take(4)?
+                        .try_into()
+                        .map_err(|_| CodecError::Truncated)?,
+                );
+                let vtype = value_type_from(self.tag()?)?;
+                let len = self.count()?;
+                Value::Sealed(corium_core::Sealed {
+                    class,
+                    epoch,
+                    vtype,
+                    body: Arc::from(self.take(len)?),
+                })
+            }
             other => return Err(CodecError::UnknownTag(other)),
         })
     }

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::AttrId;
 
 /// Supported value types in v1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ValueType {
     /// Boolean values.
     Bool,

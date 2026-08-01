@@ -4,7 +4,39 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{EntityId, TotalF64, Value};
+use crate::{EntityId, KwId, Sealed, TotalF64, Value, ValueType};
+
+/// Encodes a value type as its tag byte in [`ValueType`] declaration order.
+#[must_use]
+pub(crate) fn value_type_tag(value_type: ValueType) -> u8 {
+    match value_type {
+        ValueType::Bool => 0,
+        ValueType::Long => 1,
+        ValueType::Double => 2,
+        ValueType::Instant => 3,
+        ValueType::Uuid => 4,
+        ValueType::Keyword => 5,
+        ValueType::Str => 6,
+        ValueType::Bytes => 7,
+        ValueType::Ref => 8,
+    }
+}
+
+/// Decodes a value type tag byte written by [`value_type_tag`].
+pub(crate) fn value_type_from_tag(tag: u8) -> Result<ValueType, DecodeError> {
+    Ok(match tag {
+        0 => ValueType::Bool,
+        1 => ValueType::Long,
+        2 => ValueType::Double,
+        3 => ValueType::Instant,
+        4 => ValueType::Uuid,
+        5 => ValueType::Keyword,
+        6 => ValueType::Str,
+        7 => ValueType::Bytes,
+        8 => ValueType::Ref,
+        other => return Err(DecodeError::InvalidValueType(other)),
+    })
+}
 
 const BOOL: u8 = 0x10;
 const LONG: u8 = 0x20;
@@ -15,6 +47,7 @@ const KEYWORD: u8 = 0x60;
 const STR: u8 = 0x70;
 const BYTES: u8 = 0x80;
 const REF: u8 = 0x90;
+const SEALED: u8 = 0xA0;
 
 /// Decoding failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -34,6 +67,20 @@ pub enum DecodeError {
     /// A complete value was followed by unexpected bytes.
     #[error("trailing bytes after sortable value")]
     Trailing,
+    /// A sealed value's declared value type byte is not known.
+    #[error("unknown value type tag {0:#x}")]
+    InvalidValueType(u8),
+}
+
+/// Seal plaintext encoding failure.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum SealPlaintextError {
+    /// A sealed value cannot itself be sealed again.
+    #[error("sealed values cannot nest")]
+    Nested,
+    /// The value's keyword id does not resolve in the interner.
+    #[error("unresolvable keyword id {0}")]
+    UnresolvableKeyword(KwId),
 }
 
 /// Trait for types with Corium sortable encodings.
@@ -104,6 +151,13 @@ impl Encodable for Value {
                 out.push(REF);
                 v.encode_into(out);
             }
+            Self::Sealed(v) => {
+                out.push(SEALED);
+                v.class.encode_into(out);
+                out.extend_from_slice(&v.epoch.to_be_bytes());
+                out.push(value_type_tag(v.vtype));
+                encode_escaped(&v.body, out);
+            }
         }
     }
 }
@@ -152,6 +206,21 @@ pub fn decode_value(input: &[u8]) -> Result<(Value, usize), DecodeError> {
                 (Value::Bytes(Arc::from(bytes)), used + 1)
             }
         }
+        SEALED => {
+            let class = EntityId::from_raw(u64::from_be_bytes(array_8(fixed(8)?)));
+            let epoch = u32::from_be_bytes(array_4(rest.get(8..12).ok_or(DecodeError::Truncated)?));
+            let vtype = value_type_from_tag(*rest.get(12).ok_or(DecodeError::Truncated)?)?;
+            let (body, used) = decode_escaped(rest.get(13..).ok_or(DecodeError::Truncated)?)?;
+            (
+                Value::Sealed(Sealed {
+                    class,
+                    epoch,
+                    vtype,
+                    body: Arc::from(body),
+                }),
+                1 + 13 + used,
+            )
+        }
         other => return Err(DecodeError::UnknownTag(other)),
     })
 }
@@ -194,6 +263,12 @@ fn decode_escaped(input: &[u8]) -> Result<(Vec<u8>, usize), DecodeError> {
         }
     }
     Err(DecodeError::Truncated)
+}
+
+fn array_4(bytes: &[u8]) -> [u8; 4] {
+    let mut out = [0; 4];
+    out.copy_from_slice(bytes);
+    out
 }
 
 fn array_8(bytes: &[u8]) -> [u8; 8] {

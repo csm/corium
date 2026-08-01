@@ -1,6 +1,6 @@
 //! Value conversion between engine values and boundary EDN.
 
-use corium_core::{EntityId, Value};
+use corium_core::{EntityId, Keyword, Value};
 use corium_db::Db;
 
 use crate::edn::Edn;
@@ -37,6 +37,41 @@ pub fn value_to_edn(db: &Db, value: &Value) -> Edn {
             |keyword| Edn::Keyword(keyword.clone()),
         ),
         Value::Ref(e) => Edn::Long(i64::try_from(e.raw()).unwrap_or(i64::MAX)),
+        // A sealed value at the boundary is always one the reader could not
+        // hydrate (hydrated values are plaintext before they get here), so it
+        // renders in its redacted form (docs/design/encryption.md).
+        Value::Sealed(sealed) => Edn::Tagged(
+            "corium/redacted".into(),
+            Box::new(Edn::Map(vec![
+                (
+                    Edn::Keyword(Keyword::new(None, "class")),
+                    db.idents().ident(sealed.class).map_or_else(
+                        || Edn::Long(i64::try_from(sealed.class.raw()).unwrap_or(i64::MAX)),
+                        |ident| Edn::Keyword(ident.clone()),
+                    ),
+                ),
+                (
+                    Edn::Keyword(Keyword::new(None, "type")),
+                    Edn::Keyword(Keyword::new(Some("db.type"), value_type_name(sealed.vtype))),
+                ),
+            ])),
+        ),
+    }
+}
+
+/// Renders a value type as its `:db.type/*` name.
+fn value_type_name(value_type: corium_core::ValueType) -> &'static str {
+    use corium_core::ValueType;
+    match value_type {
+        ValueType::Bool => "boolean",
+        ValueType::Long => "long",
+        ValueType::Double => "double",
+        ValueType::Instant => "instant",
+        ValueType::Uuid => "uuid",
+        ValueType::Keyword => "keyword",
+        ValueType::Str => "string",
+        ValueType::Bytes => "bytes",
+        ValueType::Ref => "ref",
     }
 }
 

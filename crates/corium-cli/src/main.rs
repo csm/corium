@@ -2338,6 +2338,7 @@ fn format_value(value: &corium_core::Value, interner: &KeywordInterner) -> Strin
         Value::Str(v) => format!("{v:?}"),
         Value::Bytes(bytes) => format!("#bytes[{}]", bytes.len()),
         Value::Ref(e) => format!("#eid {}", e.raw()),
+        Value::Sealed(_) => "<redacted>".to_string(),
     }
 }
 
