@@ -8,7 +8,7 @@ use corium_core::TotalF64;
 use corium_ffi::{
     ClientTlsOptions, CompositeValue, DbHandle, DirectStorageOptions, ErrorKind, FfiError, Index,
     LocalConnectOptions, PeerHandle, RemoteConnectOptions, SegmentCacheOptions,
-    compiled_storage_backends,
+    compiled_storage_backends, discover_storage_backend,
 };
 use corium_protocol::codec;
 use corium_query::edn::Edn;
@@ -346,6 +346,25 @@ fn _storage_backends() -> Vec<&'static str> {
     compiled_storage_backends()
 }
 
+#[pyfunction]
+#[pyo3(signature = (endpoints, *, database, token=None, tls=false, tls_ca=None, tls_domain=None))]
+fn _discover_storage_backend(
+    py: Python<'_>,
+    endpoints: Vec<String>,
+    database: String,
+    token: Option<String>,
+    tls: bool,
+    tls_ca: Option<Vec<u8>>,
+    tls_domain: Option<String>,
+) -> PyResult<Bound<'_, PyAny>> {
+    let tls = client_tls_options(tls, tls_ca, tls_domain)?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        discover_storage_backend(&endpoints, &database, token, tls)
+            .await
+            .map_err(ffi_error)
+    })
+}
+
 fn client_tls_options(
     tls: bool,
     ca_certificate: Option<Vec<u8>>,
@@ -669,6 +688,7 @@ fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(connect_local, module)?)?;
     module.add_function(wrap_pyfunction!(_roundtrip, module)?)?;
     module.add_function(wrap_pyfunction!(_storage_backends, module)?)?;
+    module.add_function(wrap_pyfunction!(_discover_storage_backend, module)?)?;
     module.add_class::<PythonPeer>()?;
     module.add_class::<PythonDb>()?;
     Ok(())
