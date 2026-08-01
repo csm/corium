@@ -428,13 +428,6 @@ def _native_module() -> Any:
     return _native_modules()[0]
 
 
-def _unsupported_storage(error: StorageError) -> bool:
-    message = str(error)
-    return message.startswith("this build lacks ") and message.endswith(
-        " direct-storage support"
-    )
-
-
 def available_storage_backends() -> frozenset[str]:
     """Return direct-storage backends provided by installed native artifacts."""
 
@@ -534,20 +527,30 @@ class LocalPeer(_BasePeer):
             ),
         }
         modules = _native_modules()
-        unsupported_error: StorageError | None = None
-        for module in modules:
-            try:
-                backend = await module.connect_local(endpoint_list, **options)
-                break
-            except StorageError as error:
-                if storage is None or not _unsupported_storage(error):
-                    raise
-                unsupported_error = error
-        else:
-            # Every installed artifact reported that it lacked the discovered
-            # driver. Preserve the stable StorageError from the last attempt.
-            assert unsupported_error is not None
-            raise unsupported_error
+        module = modules[0]
+        if storage is not None:
+            storage_backend = await module._discover_storage_backend(
+                endpoint_list,
+                database=database,
+                token=token,
+                tls=tls,
+                tls_ca=tls_ca,
+                tls_domain=tls_domain,
+            )
+            module = next(
+                (
+                    candidate
+                    for candidate in modules
+                    if storage_backend in candidate._storage_backends()
+                ),
+                None,
+            )
+            if module is None:
+                raise StorageError(
+                    "no installed Corium native artifact supports "
+                    f"{storage_backend} direct storage"
+                )
+        backend = await module.connect_local(endpoint_list, **options)
         return cls(backend)
 
 

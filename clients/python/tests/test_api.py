@@ -21,7 +21,6 @@ from corium import (
     Peer,
     RemotePeer,
     SegmentCache,
-    StorageError,
     Symbol,
     Tagged,
     available_storage_backends,
@@ -102,9 +101,13 @@ class FakePeerBackend:
 
 
 class FakeNative:
-    def __init__(self, backends: list[str] | None = None) -> None:
+    def __init__(
+        self, backends: list[str] | None = None, advertised_backend: str = "turso"
+    ) -> None:
         self.calls: list[tuple[Any, ...]] = []
         self.backends = backends or ["filesystem", "turso"]
+        self.advertised_backend = advertised_backend
+        self.discovery_calls: list[tuple[Any, ...]] = []
 
     async def connect_local(
         self, endpoints: list[str], **options: Any
@@ -118,6 +121,12 @@ class FakeNative:
 
     def _storage_backends(self) -> list[str]:
         return self.backends
+
+    async def _discover_storage_backend(
+        self, endpoints: list[str], **options: Any
+    ) -> str:
+        self.discovery_calls.append((endpoints, options))
+        return self.advertised_backend
 
 
 class PeerApiTests(unittest.IsolatedAsyncioTestCase):
@@ -141,17 +150,10 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report.tempids, {"ada": 42})
             self.assertEqual(await report.db_after.basis_t(), 7)
 
-    async def test_local_direct_storage_tries_each_installed_artifact(self) -> None:
-        unsupported = FakeNative()
-        supported = FakeNative()
+    async def test_local_direct_storage_selects_the_advertised_artifact(self) -> None:
+        unsupported = FakeNative(["filesystem", "turso"], advertised_backend="s3")
+        supported = FakeNative(["filesystem", "s3"])
 
-        async def reject_storage(
-            endpoints: list[str], **options: Any
-        ) -> FakePeerBackend:
-            unsupported.calls.append(("local", endpoints, options))
-            raise StorageError("this build lacks S3 direct-storage support")
-
-        unsupported.connect_local = reject_storage  # type: ignore[method-assign]
         with patch.object(
             api, "_native_modules", return_value=(unsupported, supported)
         ):
@@ -161,7 +163,8 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 storage=DirectStorage(),
             )
 
-        self.assertEqual(len(unsupported.calls), 1)
+        self.assertEqual(len(unsupported.discovery_calls), 1)
+        self.assertEqual(len(unsupported.calls), 0)
         self.assertEqual(len(supported.calls), 1)
         await peer.close()
 
