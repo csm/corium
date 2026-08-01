@@ -1,8 +1,8 @@
 package dev.corium.client;
 
 import com.google.protobuf.ByteString;
-import corium.v1.Corium;
-import corium.v1.PeerServerGrpc;
+import dev.corium.protocol.v1.Corium;
+import dev.corium.protocol.v1.PeerServerGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.Status;

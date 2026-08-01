@@ -1,6 +1,6 @@
 package dev.corium.client;
 
-import corium.v1.Corium;
+import dev.corium.protocol.v1.Corium;
 
 import java.time.Instant;
 import java.util.Arrays;

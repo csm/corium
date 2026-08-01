@@ -4,8 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.ByteString;
-import corium.v1.Corium;
-import corium.v1.PeerServerGrpc;
+import dev.corium.protocol.v1.Corium;
+import dev.corium.protocol.v1.PeerServerGrpc;
 import io.grpc.Server;
 import io.grpc.stub.StreamObserver;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
