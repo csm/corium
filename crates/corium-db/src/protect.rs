@@ -56,6 +56,14 @@ pub enum ProtectError {
     /// The plaintext could not be encoded or decoded.
     #[error("seal plaintext: {0}")]
     Plaintext(#[from] corium_core::SealPlaintextError),
+    /// The value is not of the attribute's declared type.
+    #[error("attribute {attr} holds {vtype:?} values; this one is not")]
+    TypeMismatch {
+        /// Attribute being sealed for.
+        attr: AttrId,
+        /// Type the schema declares.
+        vtype: ValueType,
+    },
     /// The sealed header names a class the attribute has never used.
     #[error("attribute {attr} was never sealed under class {class}")]
     ForeignClass {
@@ -207,8 +215,9 @@ fn pad(plaintext: &mut Vec<u8>, padding: Option<u32>) {
 /// # Errors
 ///
 /// Returns [`ProtectError`] when the attribute is unprotected, its class is
-/// missing or entity-scoped, the process holds no key for it, or the value
-/// cannot be encoded as seal plaintext.
+/// missing or entity-scoped, the value is not of the attribute's declared
+/// type, the process holds no key for it, or the value cannot be encoded as
+/// seal plaintext.
 pub fn seal_value(
     schema: &Schema,
     keys: &ClassKeys,
@@ -228,6 +237,14 @@ pub fn seal_value(
     let vtype = schema
         .get(attr)
         .map_or(ValueType::Str, |attribute| attribute.value_type);
+    // The declared type is cleartext in the sealed header, and the transactor
+    // checks the value against it there. Taking it from the schema rather than
+    // from the value would make that check vacuous: a wrongly typed plaintext
+    // would be sealed under the right label and pass. It is checked here, the
+    // last place that can still see the plaintext.
+    if !value.has_type(vtype) {
+        return Err(ProtectError::TypeMismatch { attr, vtype });
+    }
     let key = keys.key(class_id, class.current_epoch)?;
 
     let mut plaintext = encode_seal_plaintext(value, interner)?;
@@ -729,6 +746,29 @@ mod tests {
             Err(ProtectError::ForeignClass {
                 attr: SSN,
                 class: foreign.class,
+            })
+        );
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_never_sealed() {
+        // The declared type is cleartext in the header and is what the
+        // transactor checks the value against. If sealing took it from the
+        // schema without looking at the value, a wrongly typed plaintext
+        // would be sealed under the right label and sail past that check.
+        let schema = schema_with(ValueType::Long, None);
+        assert_eq!(
+            seal_value(
+                &schema,
+                &keys(),
+                SSN,
+                Some(ALICE),
+                &Value::Str("not a long".into()),
+                &KeywordInterner::default()
+            ),
+            Err(ProtectError::TypeMismatch {
+                attr: SSN,
+                vtype: ValueType::Long,
             })
         );
     }
