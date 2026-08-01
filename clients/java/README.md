@@ -5,10 +5,10 @@ It follows the same immutable database-value model as the Python client and
 uses `CompletableFuture` for network operations.
 
 ```java
-import io.corium.client.EntityMap;
-import io.corium.client.Query;
-import io.corium.client.RemotePeer;
-import io.corium.client.TxBuilder;
+import dev.corium.client.EntityMap;
+import dev.corium.client.Query;
+import dev.corium.client.RemotePeer;
+import dev.corium.client.TxBuilder;
 
 try (RemotePeer peer = RemotePeer.builder(
         "http://127.0.0.1:4336", "people").build()) {

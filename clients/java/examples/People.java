@@ -1,7 +1,7 @@
-import io.corium.client.EntityMap;
-import io.corium.client.Query;
-import io.corium.client.RemotePeer;
-import io.corium.client.TxBuilder;
+import dev.corium.client.EntityMap;
+import dev.corium.client.Query;
+import dev.corium.client.RemotePeer;
+import dev.corium.client.TxBuilder;
 
 public final class People {
     public static void main(String[] args) {
