@@ -125,8 +125,12 @@ index order (e.g. EAVT: `e ‖ a ‖ v ‖ tx-with-added-bit`), giving pure
 
 ## Schema
 
-Schema is data: attributes are entities in `:db.part/db` described by datoms,
-installed through ordinary transactions. v1 supports:
+Schema is data: attributes are entities in `:db.part/db` described by schema
+facts. The creation-time schema is an immutable pre-basis seed rather than a
+transaction at `t = 0`. This preserves the time model's empty basis 0. Later
+schema changes are ordinary transactions. See
+[schema-migrations.md](schema-migrations.md#schema-as-basis-versioned-data).
+v1 supports:
 
 - `:db/ident` — keyword identity for any entity (required for attributes).
 - `:db/valueType` — one of the value types above.

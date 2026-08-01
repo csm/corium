@@ -10,6 +10,12 @@ from it remain unmanaged unless `--prune` explicitly requests retirement.
 `schema-version` versions this file format; it is not a migration sequence.
 See [the schema migration design](design/schema-migrations.md).
 
+The current parser accepts only the options documented below. Implementing the
+migration design also extends the normalized schema model and this authoring
+format with `doc` and, when attribute protection is enabled, `protection`. Those
+properties are design commitments rather than accepted fields in the current
+binary.
+
 ## Grouped attributes
 
 The common form groups attributes under a familiar entity-shaped declaration:

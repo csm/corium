@@ -24,6 +24,14 @@ Given a connection whose latest known basis is `t-now`:
 | `sync(t)` / `sync()` | future that completes when the peer's basis ≥ `t` (or ≥ transactor's latest) | tx-report stream bookkeeping |
 | `as-of(db, inst)` / `since(db, inst)` | the same two views named by wall clock | resolve `inst` → the last `t` committed at or before it, then as above |
 
+The proposed schema-migration design keeps creation-time schema in an immutable
+**pre-basis seed**, not a transaction at `t = 0`. A view always carries that
+seed so it can interpret attributes. The seed is not a datom. It does not appear
+in `datoms`, `since`, `history`, `tx-range`, or tx reports. Later schema
+changes are ordinary datoms at ordinary transaction bases. Consequently
+`as-of 0` still returns no facts and `since 0` still returns every transacted
+fact. See [schema-migrations.md](schema-migrations.md#schema-as-basis-versioned-data).
+
 Rules baked into the index design to make these work:
 
 - **Current indexes** hold live datoms only.
@@ -81,7 +89,8 @@ the database value rather than something to go looking for:
   behind it are AVET-indexed for direct index seeks as well.
 - **Out-of-range instants.** An instant older than the database resolves to
   basis 0: `as-of` it is the empty value, `since` it is everything. Datomic
-  interprets out-of-range instants the same way.
+  interprets out-of-range instants the same way. The pre-basis schema seed is
+  interpretation metadata, not a fact in either result.
 - **View independence.** A derived view (`as-of`, `since`, `history`) keeps the
   whole correspondence, so naming an instant means the same thing whatever
   value you start from — otherwise `since(t).as-of(inst)` would silently

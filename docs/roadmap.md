@@ -259,13 +259,13 @@ Engine and API:
 - **Schema migration planning and execution.** *(Specified.)* Add
   `corium schema update` as a plan-first declarative diff against the installed
   schema, with exact impact counts and additive, validate/reindex, rewrite, and
-  destructive classes. Before apply is enabled, close the implementation gap
-  between the data model and creation-only schema metadata: schema vocabulary
-  becomes basis-versioned datoms, peers apply schema generations from tx
-  reports, index/unique activation waits for a verified backfill, and old
-  databases receive a deterministic compatibility transaction preserving
-  attribute ids. Removal means retirement; in-place type change and hard
-  deletion remain rejected. See
+  destructive classes. Before apply is enabled, close the gap between the data
+  model and creation-only schema metadata. Schema vocabulary becomes
+  basis-versioned datoms. Peers apply schema generations from tx reports.
+  Index and unique activation waits for a validated backfill. Old databases
+  retain their creation metadata as a deterministic pre-basis seed. This seed
+  preserves basis 0 and attribute ids. Removal means retirement. In-place type
+  change and hard deletion remain rejected. See
   [schema-migrations.md](design/schema-migrations.md) and
   [ADR-0020](adr/0020-planned-schema-migrations.md).
 - Fulltext (`tantivy`) and tuple value types; excision (design reserved in
