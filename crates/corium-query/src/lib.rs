@@ -15,7 +15,7 @@ pub mod pull;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use corium_core::{Keyword, Value};
+use corium_core::{EntityId, Keyword, Value};
 use corium_db::Db;
 use thiserror::Error;
 
@@ -59,6 +59,13 @@ pub enum QueryError {
     /// The execution fuel budget was exhausted.
     #[error("query fuel exhausted")]
     FuelExhausted,
+    /// The read needed the plaintext of a value it holds no key for.
+    ///
+    /// Raised by value-ordered aggregates over sealed values, and by a scan
+    /// whose class sets `:db.protect/on-missing-key :db.protect.missing/error`
+    /// (`docs/design/encryption.md`).
+    #[error("protection class {0} is not readable without its key")]
+    Protected(EntityId),
 }
 
 /// One query input, positionally matching the query's `:in` specification.

@@ -559,11 +559,7 @@ pub fn seal_deterministic(
 /// Returns [`CryptError::AuthenticationFailed`] when the body is shorter than
 /// the 16-byte tag, was sealed under another key or AAD, or was tampered
 /// with.
-pub fn open_deterministic(
-    key: &SecretKey,
-    aad: &[u8],
-    body: &[u8],
-) -> Result<Vec<u8>, CryptError> {
+pub fn open_deterministic(key: &SecretKey, aad: &[u8], body: &[u8]) -> Result<Vec<u8>, CryptError> {
     if body.len() < AEAD_TAG_LEN {
         return Err(CryptError::AuthenticationFailed);
     }
@@ -791,7 +787,10 @@ mod tests {
     fn sealed_values_round_trip_empty_plaintext() {
         let sealed = seal_deterministic(&key(3), b"ctx", b"").expect("seal");
         assert_eq!(sealed.len(), AEAD_TAG_LEN);
-        assert_eq!(open_deterministic(&key(3), b"ctx", &sealed).expect("open"), b"");
+        assert_eq!(
+            open_deterministic(&key(3), b"ctx", &sealed).expect("open"),
+            b""
+        );
     }
 
     #[test]

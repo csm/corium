@@ -408,23 +408,22 @@ mod tests {
         for (conflict, attr) in [
             (
                 ":db/index",
-                r#"{:db/ident :person/ssn :db/valueType :db.type/string
-                    :db/index true :db/protection :protect/pii}"#,
+                r"{:db/ident :person/ssn :db/valueType :db.type/string
+                    :db/index true :db/protection :protect/pii}",
             ),
             (
                 ":db/unique",
-                r#"{:db/ident :person/ssn :db/valueType :db.type/string
-                    :db/unique :db.unique/identity :db/protection :protect/pii}"#,
+                r"{:db/ident :person/ssn :db/valueType :db.type/string
+                    :db/unique :db.unique/identity :db/protection :protect/pii}",
             ),
             (
                 ":db.type/ref",
-                r#"{:db/ident :person/ssn :db/valueType :db.type/ref
-                    :db/protection :protect/pii}"#,
+                r"{:db/ident :person/ssn :db/valueType :db.type/ref
+                    :db/protection :protect/pii}",
             ),
         ] {
-            let text = format!(
-                r#"[{{:db.protect/ident :protect/pii :db.protect/key "file:/k"}} {attr}]"#
-            );
+            let text =
+                format!(r#"[{{:db.protect/ident :protect/pii :db.protect/key "file:/k"}} {attr}]"#);
             let error = schema_from_edn(&forms(&text)).expect_err("conflict must be rejected");
             assert_eq!(
                 error,
@@ -438,8 +437,8 @@ mod tests {
 
     #[test]
     fn protection_naming_an_undeclared_class_is_rejected() {
-        let text = r#"[{:db/ident :person/ssn :db/valueType :db.type/string
-                        :db/protection :protect/nope}]"#;
+        let text = r"[{:db/ident :person/ssn :db/valueType :db.type/string
+                        :db/protection :protect/nope}]";
         assert_eq!(
             schema_from_edn(&forms(text)).expect_err("unknown class must be rejected"),
             SchemaFormError::UnknownProtectionClass {
@@ -453,7 +452,7 @@ mod tests {
     fn malformed_class_declarations_are_rejected() {
         for (text, expected) in [
             (
-                r#"[{:db.protect/ident :protect/pii}]"#,
+                r"[{:db.protect/ident :protect/pii}]",
                 ":db.protect/key must be a key identity string",
             ),
             (
