@@ -10,6 +10,7 @@ corium peer-server --config corium.edn     # run a peer server for thin clients
 corium db create|delete|list <uri>
 corium db fork <src> <dst> [--as-of t]     # point-in-time fork (writable sandbox)
 corium db stats <uri>                      # datom counts, index sizes, basis
+corium schema update <uri> --schema <file> # plan; --apply requires its digest
 corium gc <uri> [--window 72h]             # segment garbage collection
 corium backup <uri> <dest>                 # see below
 corium restore <src> <uri>
@@ -21,6 +22,11 @@ corium tui <uri>                           # full-screen dashboard (queries + me
 
 Config files are EDN (read via cljrs-reader): storage backend + credentials,
 listen addresses, TLS, memory/fuel budgets, index thresholds.
+
+Schema updates are plan-first and basis-fenced. The command compares a
+normalized desired file with the installed schema, measures affected data, and
+separates additive changes from validation/reindex work, data rewrites, and
+destructive operations. See [schema-migrations.md](schema-migrations.md).
 
 For several of these the CLI is not a client but the implementation: `backup`
 and `restore` open the blob store and native log directly, and offline `gc` runs

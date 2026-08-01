@@ -68,6 +68,29 @@ cadence; treat silence for a few multiples of it as a dead upstream and
 reconnect. After reconnect, send the last fully applied basis and
 deduplicate by transaction number.
 
+## Planned schema-migration compatibility
+
+Protocol v1 does not expose schema plan/apply operations. Those remain
+administrative `Catalog` calls rather than `PeerServerService` calls. The
+proposed [schema migration design](design/schema-migrations.md) requires a
+later protocol version because schema can then change while a subscription is
+live.
+
+That version adds a schema basis and generation to the handshake and a resulting
+schema generation to tx reports. The handshake snapshot is effective at the
+subscriber's requested `from_basis_t`. Subsequent reports advance schema and
+data together in transaction order. A subscriber from basis 0 receives the
+creation-time pre-basis schema seed in the handshake. The seed is not a
+transaction and is never emitted by the exclusive `t > from_basis_t` backfill.
+The server rejects an older client during protocol version validation. Thus,
+the client cannot replay data against the wrong schema.
+
+Thin clients that merely query through a peer server need no local schema
+planner: the server applies generations before it serves each database value.
+Clients consuming raw tx reports must apply schema datoms before other datoms
+from the same report. They must invalidate affected local assumptions. They
+must persist their last fully applied basis and schema generation together.
+
 ## Conformance
 
 The language-neutral behavioral corpus is in
