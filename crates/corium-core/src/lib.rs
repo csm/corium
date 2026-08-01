@@ -15,5 +15,8 @@ pub use encoding::{
 };
 pub use ids::{AttrId, EntityId, KwId, Partition, PartitionId, TxId};
 pub use keyword::{FIRST_LOCAL_KW_ID, Keyword, KeywordInterner};
-pub use schema::{Attribute, Cardinality, Schema, Unique, ValueType};
+pub use schema::{
+    Attribute, Cardinality, FIRST_KEY_EPOCH, LegacyPlaintextPolicy, MissingKeyPolicy,
+    ProtectionClass, ProtectionScope, ProtectionTimeline, Schema, SealAlgorithm, Unique, ValueType,
+};
 pub use value::{Sealed, TotalF64, Value};

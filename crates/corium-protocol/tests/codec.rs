@@ -199,3 +199,50 @@ fn schema_and_naming_round_trip() {
         decoded.iter().collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn protection_classes_and_timelines_round_trip() {
+    let class_id = EntityId::new(Partition::Db as u32, 100);
+    let ssn = EntityId::new(Partition::Db as u32, 101);
+    let mut schema = Schema::default();
+    schema.insert(attribute(
+        101,
+        ValueType::Str,
+        corium_core::Cardinality::One,
+        None,
+    ));
+    schema.insert_class(corium_core::ProtectionClass {
+        id: class_id,
+        key_id: "file:/etc/corium/pii.key".into(),
+        algorithm: corium_core::SealAlgorithm::Aes256GcmSiv,
+        scope: corium_core::ProtectionScope::Entity,
+        padding: Some(64),
+        on_missing_key: corium_core::MissingKeyPolicy::Hide,
+        legacy_plaintext: corium_core::LegacyPlaintextPolicy::PassThrough,
+        current_epoch: 3,
+    });
+    // A timeline with an unprotect entry, which only schema alteration can
+    // produce today, so the codec is ready for it.
+    schema.set_protection(
+        ssn,
+        corium_core::ProtectionTimeline::from_entries(vec![(0, Some(class_id)), (7, None)]),
+    );
+
+    let bytes = codec::encode_schema(&schema, &Idents::default());
+    let (decoded, _) = codec::decode_schema(&bytes).expect("decode");
+    assert_eq!(decoded, schema);
+    assert_eq!(decoded.protection(ssn).current(), None);
+    assert!(decoded.protection(ssn).ever_protected());
+    assert_eq!(decoded.protection(ssn).at(0), Some(class_id));
+}
+
+#[test]
+fn a_schema_payload_from_a_newer_build_reports_an_upgrade() {
+    let mut writer = codec::Writer::new();
+    writer.u64(u64::MAX);
+    writer.u64(99);
+    assert_eq!(
+        codec::decode_schema(&writer.finish()).err(),
+        Some(codec::CodecError::UnsupportedSchemaFormat(99))
+    );
+}

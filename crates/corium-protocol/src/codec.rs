@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use corium_core::{
-    Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, Schema, TotalF64, Unique,
-    Value, ValueType,
+    Attribute, Cardinality, Datom, EntityId, Keyword, KeywordInterner, LegacyPlaintextPolicy,
+    MissingKeyPolicy, ProtectionClass, ProtectionScope, ProtectionTimeline, Schema, SealAlgorithm,
+    TotalF64, Unique, Value, ValueType,
 };
 use corium_db::Idents;
 use corium_query::edn::Edn;
@@ -66,6 +67,12 @@ pub enum CodecError {
     /// Field value outside its legal range.
     #[error("invalid wire field: {0}")]
     InvalidField(&'static str),
+    /// The schema payload was written by a newer Corium.
+    #[error(
+        "schema format {0} is newer than this build understands; \
+         upgrade Corium to read this database"
+    )]
+    UnsupportedSchemaFormat(u64),
 }
 
 /// Streaming writer with a per-message string interning table.
@@ -237,7 +244,8 @@ impl Writer {
             }
             Value::Sealed(sealed) => {
                 self.buf.push(SEALED);
-                self.buf.extend_from_slice(&sealed.class.raw().to_be_bytes());
+                self.buf
+                    .extend_from_slice(&sealed.class.raw().to_be_bytes());
                 self.buf.extend_from_slice(&sealed.epoch.to_be_bytes());
                 self.buf.push(value_type_tag(sealed.vtype));
                 self.varint(sealed.body.len() as u64);
@@ -527,10 +535,23 @@ pub fn decode_datoms(
     Ok(datoms)
 }
 
+/// Marker that opens a versioned schema payload.
+///
+/// Version 1 opened with an attribute count, which no schema will ever come
+/// near, so a reader tells the two apart by inspection. A build that predates
+/// the marker fails on the count rather than mis-parsing the payload.
+const SCHEMA_FORMAT_MARKER: u64 = u64::MAX;
+
+/// Current schema payload format: version 1 plus protection classes and
+/// per-attribute protection timelines.
+const SCHEMA_FORMAT: u64 = 2;
+
 /// Encodes schema attributes plus the ident registry (handshake payload).
 #[must_use]
 pub fn encode_schema(schema: &Schema, idents: &Idents) -> Vec<u8> {
     let mut writer = Writer::new();
+    writer.u64(SCHEMA_FORMAT_MARKER);
+    writer.u64(SCHEMA_FORMAT);
     let attrs: Vec<_> = schema.iter().collect();
     writer.u64(attrs.len() as u64);
     for (_, attr) in attrs {
@@ -557,6 +578,44 @@ pub fn encode_schema(schema: &Schema, idents: &Idents) -> Vec<u8> {
         writer.edn(&Edn::Keyword(keyword.clone()));
         writer.u64(id.raw());
     }
+    let classes: Vec<_> = schema.classes().collect();
+    writer.u64(classes.len() as u64);
+    for (_, class) in classes {
+        writer.u64(class.id.raw());
+        writer.edn(&Edn::Str(class.key_id.clone()));
+        writer.byte(match class.algorithm {
+            SealAlgorithm::Aes256GcmSiv => 0,
+        });
+        writer.byte(match class.scope {
+            ProtectionScope::Attribute => 0,
+            ProtectionScope::Entity => 1,
+        });
+        // Zero means "no padding": a class that sets one is required to set
+        // at least a full AEAD block.
+        writer.u64(u64::from(class.padding.unwrap_or(0)));
+        writer.byte(match class.on_missing_key {
+            MissingKeyPolicy::Redact => 0,
+            MissingKeyPolicy::Hide => 1,
+            MissingKeyPolicy::Error => 2,
+        });
+        writer.byte(match class.legacy_plaintext {
+            LegacyPlaintextPolicy::Redact => 0,
+            LegacyPlaintextPolicy::PassThrough => 1,
+        });
+        writer.u64(u64::from(class.current_epoch));
+    }
+    let protections: Vec<_> = schema.protections().collect();
+    writer.u64(protections.len() as u64);
+    for (attr, timeline) in protections {
+        writer.u64(attr.raw());
+        writer.u64(timeline.entries().len() as u64);
+        for (t, class) in timeline.entries() {
+            writer.u64(*t);
+            // Entity id zero is the reserved head of `:db.part/db` and never
+            // names a class, so it stands for "unprotected from here".
+            writer.u64(class.map_or(0, EntityId::raw));
+        }
+    }
     writer.finish()
 }
 
@@ -567,7 +626,19 @@ pub fn encode_schema(schema: &Schema, idents: &Idents) -> Vec<u8> {
 pub fn decode_schema(bytes: &[u8]) -> Result<(Schema, Idents), CodecError> {
     let mut reader = Reader::new(bytes);
     let mut schema = Schema::default();
-    let attr_count = usize::try_from(reader.u64()?).map_err(|_| CodecError::Length)?;
+    let first = reader.u64()?;
+    let (format, attr_count) = if first == SCHEMA_FORMAT_MARKER {
+        let format = reader.u64()?;
+        if format > SCHEMA_FORMAT {
+            return Err(CodecError::UnsupportedSchemaFormat(format));
+        }
+        (
+            format,
+            usize::try_from(reader.u64()?).map_err(|_| CodecError::Length)?,
+        )
+    } else {
+        (1, usize::try_from(first).map_err(|_| CodecError::Length)?)
+    };
     for _ in 0..attr_count {
         let id = EntityId::from_raw(reader.u64()?);
         let value_type = value_type_from(reader.byte()?)?;
@@ -602,8 +673,73 @@ pub fn decode_schema(bytes: &[u8]) -> Result<(Schema, Idents), CodecError> {
         let id = EntityId::from_raw(reader.u64()?);
         idents.insert(keyword, id);
     }
+    if format >= 2 {
+        decode_protection(&mut reader, &mut schema)?;
+    }
     reader.expect_end()?;
     Ok((schema, idents))
+}
+
+/// Reads the class table and per-attribute protection timelines.
+fn decode_protection(reader: &mut Reader<'_>, schema: &mut Schema) -> Result<(), CodecError> {
+    let class_count = usize::try_from(reader.u64()?).map_err(|_| CodecError::Length)?;
+    for _ in 0..class_count {
+        let id = EntityId::from_raw(reader.u64()?);
+        let Edn::Str(key_id) = reader.edn()? else {
+            return Err(CodecError::InvalidField("protection class key"));
+        };
+        let algorithm = match reader.byte()? {
+            0 => SealAlgorithm::Aes256GcmSiv,
+            _ => return Err(CodecError::InvalidField("protection algorithm")),
+        };
+        let scope = match reader.byte()? {
+            0 => ProtectionScope::Attribute,
+            1 => ProtectionScope::Entity,
+            _ => return Err(CodecError::InvalidField("protection scope")),
+        };
+        let padding = match reader.u64()? {
+            0 => None,
+            bytes => Some(u32::try_from(bytes).map_err(|_| CodecError::Length)?),
+        };
+        let on_missing_key = match reader.byte()? {
+            0 => MissingKeyPolicy::Redact,
+            1 => MissingKeyPolicy::Hide,
+            2 => MissingKeyPolicy::Error,
+            _ => return Err(CodecError::InvalidField("on-missing-key policy")),
+        };
+        let legacy_plaintext = match reader.byte()? {
+            0 => LegacyPlaintextPolicy::Redact,
+            1 => LegacyPlaintextPolicy::PassThrough,
+            _ => return Err(CodecError::InvalidField("legacy-plaintext policy")),
+        };
+        let current_epoch = u32::try_from(reader.u64()?).map_err(|_| CodecError::Length)?;
+        schema.insert_class(ProtectionClass {
+            id,
+            key_id,
+            algorithm,
+            scope,
+            padding,
+            on_missing_key,
+            legacy_plaintext,
+            current_epoch,
+        });
+    }
+    let attr_count = usize::try_from(reader.u64()?).map_err(|_| CodecError::Length)?;
+    for _ in 0..attr_count {
+        let attr = EntityId::from_raw(reader.u64()?);
+        let entry_count = usize::try_from(reader.u64()?).map_err(|_| CodecError::Length)?;
+        let mut entries = Vec::with_capacity(entry_count.min(1024));
+        for _ in 0..entry_count {
+            let t = reader.u64()?;
+            let class = match reader.u64()? {
+                0 => None,
+                raw => Some(EntityId::from_raw(raw)),
+            };
+            entries.push((t, class));
+        }
+        schema.set_protection(attr, ProtectionTimeline::from_entries(entries));
+    }
+    Ok(())
 }
 
 /// Encodes an interner snapshot (keywords in dense id order).
