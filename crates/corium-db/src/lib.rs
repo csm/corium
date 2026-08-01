@@ -17,6 +17,7 @@
 //! also be named by wall clock ([`Db::as_of_instant`], [`Db::since_instant`]).
 
 pub mod bootstrap;
+pub mod protect;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};

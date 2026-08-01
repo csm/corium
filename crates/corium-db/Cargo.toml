@@ -9,7 +9,9 @@ description = "Immutable database values"
 
 [dependencies]
 corium-core = { workspace = true }
+corium-crypt = { workspace = true }
 rpds = { workspace = true }
+thiserror = "2"
 
 [lints]
 workspace = true
