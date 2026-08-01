@@ -16,7 +16,7 @@ pub mod pull;
 use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{EntityId, Keyword, Value};
-use corium_db::Db;
+use corium_db::{Db, protect::Hydrator};
 use thiserror::Error;
 
 use crate::aggregate::AggOut;
@@ -27,7 +27,7 @@ use crate::exec::{ExecCtx, Frame, to_entity};
 
 pub use crate::cache::QueryCache;
 pub use crate::entity::Entity;
-pub use crate::pull::{pull, pull_many};
+pub use crate::pull::{pull, pull_many, pull_many_with, pull_with};
 
 /// Query failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -100,6 +100,12 @@ pub struct ExecOptions {
     pub fuel: Option<u64>,
     /// Optional resolver for non-native call clause names.
     pub extern_call: Option<ExternCall>,
+    /// Keys this read may open sealed values with.
+    ///
+    /// Hydration is a property of the read, not of the `Db`: one peer server
+    /// answers principals with different key sets from the same immutable
+    /// value, so the key set travels with the query.
+    pub hydrator: Option<std::sync::Arc<Hydrator>>,
 }
 
 impl std::fmt::Debug for ExecOptions {
@@ -107,6 +113,7 @@ impl std::fmt::Debug for ExecOptions {
         f.debug_struct("ExecOptions")
             .field("fuel", &self.fuel)
             .field("extern_call", &self.extern_call.is_some())
+            .field("hydrator", &self.hydrator.is_some())
             .finish()
     }
 }
@@ -243,6 +250,9 @@ pub fn run(
     }
     if let Some(extern_call) = options.extern_call.clone() {
         ctx.set_extern_call(extern_call);
+    }
+    if let Some(hydrator) = options.hydrator.clone() {
+        ctx.set_hydrator(hydrator);
     }
     let frames = exec::eval_clauses(&ctx, &query.wheres, frames, &mut Vec::new())?;
 

@@ -19,7 +19,10 @@ use std::time::Duration;
 
 use corium_core::{Datom, EntityId, KeywordInterner, Schema};
 use corium_crypt::Keyring;
-use corium_db::{Db, Idents, bootstrap, protect::ClassKeys};
+use corium_db::{
+    Db, Idents, bootstrap,
+    protect::{ClassKeys, Hydrator},
+};
 use corium_log::TxRecord;
 use corium_protocol::auth::TokenInterceptor;
 use corium_protocol::codec::{self, CodecError};
@@ -271,6 +274,8 @@ struct Inner {
     /// Server-advertised heartbeat interval (ms); 0 disables the
     /// heartbeat-silence timeout.
     heartbeat_ms: std::sync::atomic::AtomicU64,
+    /// Class keys resolved from `config.keyring`, once.
+    hydrator: tokio::sync::OnceCell<Arc<Hydrator>>,
 }
 
 impl Inner {
@@ -381,6 +386,7 @@ impl Connection {
             client: Mutex::new(client),
             endpoint_index: std::sync::atomic::AtomicUsize::new(index),
             heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            hydrator: tokio::sync::OnceCell::new(),
             config,
         });
         let handshake_basis = pump_handshake(&inner, &mut stream).await?;
@@ -513,6 +519,33 @@ impl Connection {
         })
     }
 
+    /// The key set this connection reads protected values with.
+    ///
+    /// Resolution is async and happens once: a class key is stable for the
+    /// life of a connection, and schema is fixed at database creation. The
+    /// hydrator also carries the connection's bounded plaintext cache, so
+    /// repeated scans of the same values stay off the AEAD path.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] when a class names a malformed key identity. A
+    /// key that is merely absent is not an error: it is what a keyless peer
+    /// looks like.
+    pub async fn hydrator(&self) -> Result<Arc<Hydrator>, PeerError> {
+        self.inner
+            .hydrator
+            .get_or_try_init(|| async {
+                let keys = match &self.inner.config.keyring {
+                    Some(keyring) => ClassKeys::resolve(self.db().schema(), keyring.as_ref())
+                        .await
+                        .map_err(|error| PeerError::Protocol(error.to_string()))?,
+                    None => ClassKeys::default(),
+                };
+                Ok(Arc::new(Hydrator::new(keys)))
+            })
+            .await
+            .cloned()
+    }
+
     /// Seals every value written to a protected attribute, against the
     /// schema at this peer's current basis.
     ///
@@ -524,13 +557,8 @@ impl Connection {
         if db.schema().protections().next().is_none() {
             return Ok(forms);
         }
-        let keys = match &self.inner.config.keyring {
-            Some(keyring) => ClassKeys::resolve(db.schema(), keyring.as_ref())
-                .await
-                .map_err(|error| PeerError::Protocol(error.to_string()))?,
-            None => ClassKeys::default(),
-        };
-        seal::seal_forms(&db, &keys, forms)
+        let hydrator = self.hydrator().await?;
+        seal::seal_forms(&db, hydrator.keys(), forms)
     }
 
     /// Submits already-encoded transaction data, returning the raw wire

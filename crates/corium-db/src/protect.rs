@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use corium_core::{
-    AttrId, EntityId, KeywordInterner, MissingKeyPolicy, ProtectionClass, ProtectionScope, Schema,
-    Sealed, Value, ValueType, decode_seal_plaintext, encode_seal_plaintext,
+    AttrId, EntityId, KeywordInterner, LegacyPlaintextPolicy, MissingKeyPolicy, ProtectionClass,
+    ProtectionScope, Schema, Sealed, Value, ValueType, decode_seal_plaintext,
+    encode_seal_plaintext,
 };
 use corium_crypt::{KeyError, Keyring, SecretKey, open_deterministic, seal_deterministic};
 
@@ -319,6 +320,186 @@ pub fn disposition(class: &ProtectionClass, holds_key: bool) -> Disposition {
         MissingKeyPolicy::Hide => Disposition::Hide,
         MissingKeyPolicy::Error => Disposition::Fail,
     }
+}
+
+/// What a read should bind for one scanned datom.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Hydration {
+    /// Bind this value: plaintext for a key holder, the sealed value for a
+    /// reader under `redact`.
+    Bind(Value),
+    /// Drop the datom from the results entirely (`hide`).
+    Hide,
+    /// Fail the read (`error`), naming the class.
+    Refuse(EntityId),
+}
+
+/// Largest number of opened plaintexts one hydrator keeps.
+///
+/// The cache exists to keep repeated scans of the same values off the AEAD
+/// path, not to hold a working set; when it fills it is cleared rather than
+/// evicted one entry at a time, which costs one re-open per value and no
+/// bookkeeping.
+const PLAINTEXT_CACHE_CAP: usize = 10_000;
+
+/// Opens sealed values for one reader, against one key set.
+///
+/// Hydration is a property of the read, not of the database value: one peer
+/// server answers principals with different key sets from the same immutable
+/// `Db`, so the key set travels with the query rather than with the data.
+#[derive(Debug, Default)]
+pub struct Hydrator {
+    keys: ClassKeys,
+    cache: std::sync::Mutex<std::collections::HashMap<[u8; 32], Value>>,
+}
+
+impl Hydrator {
+    /// Builds a hydrator over a resolved key snapshot.
+    #[must_use]
+    pub fn new(keys: ClassKeys) -> Self {
+        Self {
+            keys,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The keys this reader holds.
+    #[must_use]
+    pub const fn keys(&self) -> &ClassKeys {
+        &self.keys
+    }
+
+    /// Decides and performs what a read does with one scanned value.
+    ///
+    /// A value on an unprotected attribute passes straight through, which is
+    /// every value in a database that declares no class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtectError`] when a value the reader *can* open turns out
+    /// to be unopenable — a foreign class, a body that does not
+    /// authenticate. A value it simply holds no key for is not an error; it
+    /// follows the class policy.
+    pub fn hydrate(
+        &self,
+        schema: &Schema,
+        interner: &KeywordInterner,
+        attr: AttrId,
+        e: EntityId,
+        value: &Value,
+    ) -> Result<Hydration, ProtectError> {
+        let Some(class_id) = schema.protection(attr).current() else {
+            return Ok(Hydration::Bind(value.clone()));
+        };
+        let class = schema
+            .class(class_id)
+            .ok_or(ProtectError::UnknownClass(class_id))?;
+        let Value::Sealed(sealed) = value else {
+            return Ok(self.hydrate_legacy(schema, class, attr, value));
+        };
+        match disposition(class, self.keys.holds(sealed.class, sealed.epoch)) {
+            Disposition::Hydrate => {
+                let digest = cache_key(attr, sealed);
+                if let Some(hit) = self.cached(&digest) {
+                    return Ok(Hydration::Bind(hit));
+                }
+                let plaintext = open_value(schema, &self.keys, attr, Some(e), sealed, interner)?;
+                self.remember(digest, &plaintext);
+                Ok(Hydration::Bind(plaintext))
+            }
+            Disposition::Redact => Ok(Hydration::Bind(value.clone())),
+            Disposition::Hide => Ok(Hydration::Hide),
+            Disposition::Fail => Ok(Hydration::Refuse(class_id)),
+        }
+    }
+
+    /// Applies the class policy to a plaintext datom asserted before the
+    /// attribute was protected.
+    ///
+    /// The reader that holds the class key sees plaintext for old datoms and
+    /// hydrated values for new ones, uniformly. A reader without it gets the
+    /// class's `legacy-plaintext` policy, which defaults to treating the
+    /// datom exactly like a sealed value it has no key for — policy, not
+    /// cryptography, and documented as such.
+    ///
+    /// Create-time protection cannot produce such a datom; forward-only
+    /// alteration will.
+    fn hydrate_legacy(
+        &self,
+        schema: &Schema,
+        class: &ProtectionClass,
+        attr: AttrId,
+        value: &Value,
+    ) -> Hydration {
+        let holds_key = self.keys.holds(class.id, class.current_epoch);
+        if holds_key || class.legacy_plaintext == LegacyPlaintextPolicy::PassThrough {
+            return Hydration::Bind(value.clone());
+        }
+        match disposition(class, false) {
+            Disposition::Redact => Hydration::Bind(redacted_stand_in(schema, class, attr, value)),
+            Disposition::Hide => Hydration::Hide,
+            // `holds_key` is false here, so `disposition` never says hydrate.
+            Disposition::Hydrate | Disposition::Fail => Hydration::Refuse(class.id),
+        }
+    }
+
+    fn cached(&self, digest: &[u8; 32]) -> Option<Value> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(digest)
+            .cloned()
+    }
+
+    fn remember(&self, digest: [u8; 32], value: &Value) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= PLAINTEXT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(digest, value.clone());
+    }
+}
+
+/// Cache key for one opened body, bound to the attribute it was found on.
+fn cache_key(attr: AttrId, sealed: &Sealed) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&attr.raw().to_be_bytes());
+    hasher.update(&sealed.class.raw().to_be_bytes());
+    hasher.update(&sealed.epoch.to_be_bytes());
+    hasher.update(&sealed.body);
+    *hasher.finalize().as_bytes()
+}
+
+/// The redacted value bound in place of legacy plaintext.
+///
+/// The body is a digest of the plaintext rather than a constant, so two
+/// legacy values that differ stay distinct and two that match stay equal.
+/// That is the same equality the class's own determinism already exposes; a
+/// constant placeholder would instead make every redacted value join with
+/// every other, which is exactly the "matches by accident" this design rules
+/// out.
+fn redacted_stand_in(
+    schema: &Schema,
+    class: &ProtectionClass,
+    attr: AttrId,
+    value: &Value,
+) -> Value {
+    let vtype = schema
+        .get(attr)
+        .map_or(ValueType::Str, |attribute| attribute.value_type);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"corium/redacted-legacy-v1");
+    hasher.update(&attr.raw().to_be_bytes());
+    hasher.update(&corium_core::encode_value(value));
+    Value::Sealed(Sealed {
+        class: class.id,
+        epoch: class.current_epoch,
+        vtype,
+        body: Arc::from(hasher.finalize().as_bytes().as_slice()),
+    })
 }
 
 #[cfg(test)]

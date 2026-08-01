@@ -101,6 +101,18 @@ impl PeerServerSvc {
         self.connection.db_name().to_owned()
     }
 
+    /// The key set this server opens sealed values with.
+    ///
+    /// One key set for the whole server today; a per-principal `KeyPolicy`,
+    /// and seal-through mode where the thin client hydrates for itself, are
+    /// deferred surfaces work (`docs/design/encryption.md`).
+    async fn hydrator(&self) -> Result<std::sync::Arc<corium_db::protect::Hydrator>, Status> {
+        self.connection
+            .hydrator()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+
     fn view_db(&self, spec: Option<&pb::DbViewSpec>) -> Result<Db, Status> {
         let spec = spec.ok_or_else(|| Status::invalid_argument("request names no database"))?;
         if spec.db != self.connection.db_name() {
@@ -236,6 +248,7 @@ impl PeerServer for PeerServerSvc {
             &inputs,
             ExecOptions {
                 fuel: Some(fuel),
+                hydrator: Some(self.hydrator().await?),
                 ..ExecOptions::default()
             },
         )
@@ -293,7 +306,8 @@ impl PeerServer for PeerServerSvc {
         let db = self.view_db(request.db.as_ref())?;
         let pattern = decode_edn(&request.pattern, "pull pattern")?;
         let eid = resolve_eid(&db, &decode_edn(&request.eid, "entity")?)?;
-        let result = corium_query::pull(&db, &pattern, eid)
+        let hydrator = self.hydrator().await?;
+        let result = corium_query::pull_with(&db, &pattern, eid, Some(&hydrator))
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(pb::PullResponse {
             result: codec::encode_edn(&result),
@@ -404,11 +418,27 @@ impl PeerServer for PeerServerSvc {
                 .unwrap_or(usize::MAX)
                 .min(self.config.max_datoms)
         };
-        let datoms: Vec<corium_core::Datom> = db
-            .datoms_prefix(order, &prefix)
-            .take(limit)
-            .cloned()
-            .collect();
+        // Sealed values are opened here, with the server's own keys; a
+        // per-principal key policy is deferred surfaces work.
+        let hydrator = self.hydrator().await?;
+        let mut datoms: Vec<corium_core::Datom> = Vec::new();
+        for datom in db.datoms_prefix(order, &prefix) {
+            if datoms.len() >= limit {
+                break;
+            }
+            match hydrator.hydrate(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
+                Ok(corium_db::protect::Hydration::Bind(v)) => {
+                    datoms.push(corium_core::Datom { v, ..datom.clone() });
+                }
+                Ok(corium_db::protect::Hydration::Hide) => {}
+                Ok(corium_db::protect::Hydration::Refuse(class)) => {
+                    return Err(Status::permission_denied(format!(
+                        "protection class {class} is not readable without its key"
+                    )));
+                }
+                Err(error) => return Err(Status::internal(error.to_string())),
+            }
+        }
         let interner = db.interner();
         let mut chunks = Vec::new();
         let groups: Vec<&[corium_core::Datom]> = if datoms.is_empty() {
