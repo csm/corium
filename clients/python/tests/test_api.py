@@ -10,6 +10,7 @@ from unittest.mock import patch
 import corium._api as api
 from corium import (
     ClosedError,
+    ConnectionFailedError,
     Datom,
     DbStats,
     DirectStorage,
@@ -21,6 +22,7 @@ from corium import (
     Peer,
     RemotePeer,
     SegmentCache,
+    StorageError,
     Symbol,
     Tagged,
     available_storage_backends,
@@ -102,11 +104,15 @@ class FakePeerBackend:
 
 class FakeNative:
     def __init__(
-        self, backends: list[str] | None = None, advertised_backend: str = "turso"
+        self,
+        backends: list[str] | None = None,
+        advertised_backend: str = "turso",
+        discovery_error: Exception | None = None,
     ) -> None:
         self.calls: list[tuple[Any, ...]] = []
         self.backends = backends or ["filesystem", "turso"]
         self.advertised_backend = advertised_backend
+        self.discovery_error = discovery_error
         self.discovery_calls: list[tuple[Any, ...]] = []
 
     async def connect_local(
@@ -126,6 +132,8 @@ class FakeNative:
         self, endpoints: list[str], **options: Any
     ) -> str:
         self.discovery_calls.append((endpoints, options))
+        if self.discovery_error is not None:
+            raise self.discovery_error
         return self.advertised_backend
 
 
@@ -167,6 +175,43 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(unsupported.calls), 0)
         self.assertEqual(len(supported.calls), 1)
         await peer.close()
+
+    async def test_local_direct_storage_requires_a_supporting_artifact(self) -> None:
+        native = FakeNative(["filesystem", "turso"], advertised_backend="s3")
+
+        with (
+            patch.object(api, "_native_modules", return_value=(native,)),
+            self.assertRaisesRegex(
+                StorageError,
+                "no installed Corium native artifact supports s3 direct storage",
+            ),
+        ):
+            await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                storage=DirectStorage(),
+            )
+
+        self.assertEqual(len(native.discovery_calls), 1)
+        self.assertEqual(len(native.calls), 0)
+
+    async def test_local_direct_storage_propagates_discovery_failure(self) -> None:
+        discovery_error = ConnectionFailedError("connection refused")
+        native = FakeNative(discovery_error=discovery_error)
+
+        with (
+            patch.object(api, "_native_modules", return_value=(native,)),
+            self.assertRaises(ConnectionFailedError) as raised,
+        ):
+            await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                storage=DirectStorage(),
+            )
+
+        self.assertIs(raised.exception, discovery_error)
+        self.assertEqual(len(native.discovery_calls), 1)
+        self.assertEqual(len(native.calls), 0)
 
     async def test_database_views_are_immutable_and_forward_raw_operations(
         self,
