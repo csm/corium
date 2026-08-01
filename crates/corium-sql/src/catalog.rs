@@ -234,6 +234,13 @@ impl WideTable {
                 attribute.name == column.name && attribute.attribute.cardinality == cardinality
             })?
             .clone();
+        // A protected column never takes a pushed predicate: the values in
+        // the index are ciphertext, so both equality and ordering over them
+        // would answer a question the reader did not ask
+        // (`docs/design/encryption.md`).
+        if self.db.schema().is_protected(attribute.id) {
+            return None;
+        }
         let scalar = literal_scalar(literal)?;
         let value = scalar_value(&self.db, attribute.attribute.value_type, scalar)?;
         Some(PushedPredicate::Attribute {
@@ -252,32 +259,33 @@ impl WideTable {
                 value,
             } => {
                 let covered = attribute.attribute.indexed || attribute.attribute.unique.is_some();
-                if covered {
-                    let start = matches!(
-                        comparison,
-                        Comparison::Eq | Comparison::Gt | Comparison::GtEq
-                    )
-                    .then_some(value);
-                    let end = matches!(comparison, Comparison::Lt).then_some(value);
-                    if matches!(comparison, Comparison::Eq) {
-                        self.db
-                            .index_range(attribute.id, start, end)
-                            .take_while(|datom| datom.v == *value)
-                            .map(|datom| datom.e)
-                            .collect()
-                    } else {
-                        self.db
-                            .index_range(attribute.id, start, end)
-                            .filter(|datom| comparison.matches(&datom.v, value))
-                            .map(|datom| datom.e)
-                            .collect()
-                    }
-                } else {
-                    self.db
+                let start = matches!(
+                    comparison,
+                    Comparison::Eq | Comparison::Gt | Comparison::GtEq
+                )
+                .then_some(value);
+                let end = matches!(comparison, Comparison::Lt).then_some(value);
+                // A protected attribute is never AVET-covered — schema
+                // validation forbids `:db/index` on one — so `index_range`
+                // refusing it is belt and braces rather than a live path.
+                let range = covered
+                    .then(|| self.db.index_range(attribute.id, start, end).ok())
+                    .flatten();
+                match range {
+                    Some(range) if matches!(comparison, Comparison::Eq) => range
+                        .take_while(|datom| datom.v == *value)
+                        .map(|datom| datom.e)
+                        .collect(),
+                    Some(range) => range
+                        .filter(|datom| comparison.matches(&datom.v, value))
+                        .map(|datom| datom.e)
+                        .collect(),
+                    None => self
+                        .db
                         .datoms_for_attribute(attribute.id)
                         .filter(|datom| comparison.matches(&datom.v, value))
                         .map(|datom| datom.e)
-                        .collect()
+                        .collect(),
                 }
             }
         }
