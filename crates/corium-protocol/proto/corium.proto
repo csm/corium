@@ -6,6 +6,10 @@ syntax = "proto3";
 
 package corium.v1;
 
+// Keep generated Java types stable for the published dev.corium client.
+option java_package = "dev.corium.protocol.v1";
+option java_outer_classname = "Corium";
+
 // ---------------------------------------------------------------------------
 // Shared messages
 // ---------------------------------------------------------------------------
