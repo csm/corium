@@ -166,12 +166,14 @@ const fn value_type_byte(vtype: ValueType) -> u8 {
 
 /// The entity an entity-scoped seal binds, or `None` under attribute scope.
 ///
-/// `entity` is unused until entity scope is sealable: doing so needs the
-/// entity id before tempid resolution would assign one, which costs an
-/// id-reservation round trip the peer does not make yet.
+/// `entity` is `None` where the caller does not know one — the writing peer
+/// sealing a value for a tempid. Attribute scope does not bind the entity, so
+/// that is not a problem for it; entity scope needs the id before tempid
+/// resolution would assign one, which costs an id-reservation round trip the
+/// peer does not make yet, so it is refused either way for now.
 fn scoped_entity(
     class: &ProtectionClass,
-    _entity: EntityId,
+    _entity: Option<EntityId>,
 ) -> Result<Option<EntityId>, ProtectError> {
     match class.scope {
         ProtectionScope::Attribute => Ok(None),
@@ -195,7 +197,11 @@ fn pad(plaintext: &mut Vec<u8>, padding: Option<u32>) {
     }
 }
 
-/// Seals `value` for `attr` on entity `e` under the attribute's current class.
+/// Seals `value` for `attr` under the attribute's current class.
+///
+/// `e` is the entity the value belongs to, or `None` when the caller does not
+/// know it yet — a writing peer sealing for a tempid. Attribute scope, the
+/// only scope this build seals, does not bind the entity.
 ///
 /// # Errors
 ///
@@ -206,7 +212,7 @@ pub fn seal_value(
     schema: &Schema,
     keys: &ClassKeys,
     attr: AttrId,
-    e: EntityId,
+    e: Option<EntityId>,
     value: &Value,
     interner: &KeywordInterner,
 ) -> Result<Value, ProtectError> {
@@ -241,6 +247,7 @@ pub fn seal_value(
 
 /// Opens a sealed value found on `attr` of entity `e`.
 ///
+///
 /// The class and epoch come from the value's own cleartext header, so a
 /// mixed attribute — one re-classified or rotated mid-life — decodes without
 /// schema archaeology.
@@ -253,7 +260,7 @@ pub fn open_value(
     schema: &Schema,
     keys: &ClassKeys,
     attr: AttrId,
-    e: EntityId,
+    e: Option<EntityId>,
     sealed: &Sealed,
     interner: &KeywordInterner,
 ) -> Result<Value, ProtectError> {
@@ -380,7 +387,7 @@ mod tests {
             (ValueType::Bytes, Value::Bytes(Arc::from(vec![0, 1, 0, 0]))),
         ] {
             let schema = schema_with(vtype, None);
-            let sealed = seal_value(&schema, &keys, SSN, ALICE, &value, &interner)
+            let sealed = seal_value(&schema, &keys, SSN, Some(ALICE), &value, &interner)
                 .unwrap_or_else(|error| panic!("{vtype:?} seals: {error}"));
             let Value::Sealed(header) = &sealed else {
                 panic!("sealing must produce a sealed value")
@@ -388,7 +395,7 @@ mod tests {
             assert_eq!(header.vtype, vtype);
             assert_eq!(header.class, CLASS);
             assert_eq!(
-                open_value(&schema, &keys, SSN, ALICE, header, &interner).expect("opens"),
+                open_value(&schema, &keys, SSN, Some(ALICE), header, &interner).expect("opens"),
                 value
             );
         }
@@ -400,14 +407,21 @@ mod tests {
         let keys = keys();
         let mut writer = KeywordInterner::default();
         let kw = writer.intern(Keyword::new(Some("status"), "active"));
-        let sealed =
-            seal_value(&schema, &keys, SSN, ALICE, &Value::Keyword(kw), &writer).expect("seals");
+        let sealed = seal_value(
+            &schema,
+            &keys,
+            SSN,
+            Some(ALICE),
+            &Value::Keyword(kw),
+            &writer,
+        )
+        .expect("seals");
         let Value::Sealed(header) = &sealed else {
             panic!("sealed expected")
         };
 
         let reader = KeywordInterner::default();
-        let opened = open_value(&schema, &keys, SSN, ALICE, header, &reader).expect("opens");
+        let opened = open_value(&schema, &keys, SSN, Some(ALICE), header, &reader).expect("opens");
         let Value::Keyword(id) = opened else {
             panic!("keyword expected")
         };
@@ -425,8 +439,8 @@ mod tests {
         let keys = keys();
         let interner = KeywordInterner::default();
         let value = Value::Str("123-45-6789".into());
-        let first = seal_value(&schema, &keys, SSN, ALICE, &value, &interner).expect("seals");
-        let again = seal_value(&schema, &keys, SSN, ALICE, &value, &interner).expect("seals");
+        let first = seal_value(&schema, &keys, SSN, Some(ALICE), &value, &interner).expect("seals");
+        let again = seal_value(&schema, &keys, SSN, Some(ALICE), &value, &interner).expect("seals");
         assert_eq!(first, again);
     }
 
@@ -439,7 +453,7 @@ mod tests {
             &schema,
             &keys,
             SSN,
-            ALICE,
+            Some(ALICE),
             &Value::Str("123-45-6789".into()),
             &interner,
         )
@@ -448,7 +462,7 @@ mod tests {
             panic!("sealed expected")
         };
         assert_eq!(
-            open_value(&schema, &keys, OTHER, ALICE, header, &interner),
+            open_value(&schema, &keys, OTHER, Some(ALICE), header, &interner),
             Err(ProtectError::Authentication {
                 class: CLASS,
                 epoch: 1,
@@ -467,7 +481,7 @@ mod tests {
                 &schema,
                 &keys,
                 SSN,
-                ALICE,
+                Some(ALICE),
                 &Value::Str(text.into()),
                 &interner,
             )
@@ -477,7 +491,7 @@ mod tests {
             };
             lengths.insert(header.body.len());
             assert_eq!(
-                open_value(&schema, &keys, SSN, ALICE, header, &interner).expect("opens"),
+                open_value(&schema, &keys, SSN, Some(ALICE), header, &interner).expect("opens"),
                 Value::Str(text.into())
             );
         }
@@ -494,7 +508,7 @@ mod tests {
             &schema,
             &keys(),
             SSN,
-            ALICE,
+            Some(ALICE),
             &Value::Str("123-45-6789".into()),
             &interner,
         )
@@ -505,7 +519,7 @@ mod tests {
         let mut wrong = ClassKeys::default();
         wrong.insert(CLASS, 1, SecretKey::from_slice(&[9_u8; 32]).expect("key"));
         assert_eq!(
-            open_value(&schema, &wrong, SSN, ALICE, header, &interner),
+            open_value(&schema, &wrong, SSN, Some(ALICE), header, &interner),
             Err(ProtectError::Authentication {
                 class: CLASS,
                 epoch: 1,
@@ -527,7 +541,7 @@ mod tests {
                 &schema,
                 &keys(),
                 SSN,
-                ALICE,
+                Some(ALICE),
                 &foreign,
                 &KeywordInterner::default()
             ),
@@ -547,7 +561,7 @@ mod tests {
                 &schema,
                 &keys(),
                 SSN,
-                ALICE,
+                Some(ALICE),
                 &Value::Str("x".into()),
                 &KeywordInterner::default()
             ),

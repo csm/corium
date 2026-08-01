@@ -9,6 +9,7 @@
 
 pub mod authz;
 pub mod metrics;
+pub mod seal;
 pub mod segment;
 pub mod server;
 
@@ -18,7 +19,7 @@ use std::time::Duration;
 
 use corium_core::{Datom, EntityId, KeywordInterner, Schema};
 use corium_crypt::Keyring;
-use corium_db::{Db, Idents, bootstrap};
+use corium_db::{Db, Idents, bootstrap, protect::ClassKeys};
 use corium_log::TxRecord;
 use corium_protocol::auth::TokenInterceptor;
 use corium_protocol::codec::{self, CodecError};
@@ -59,6 +60,27 @@ pub enum PeerError {
     /// The connection background task has stopped.
     #[error("connection closed")]
     Closed,
+    /// A transaction form could not be expanded far enough to seal it.
+    #[error(transparent)]
+    TxForm(#[from] corium_forms::txforms::TxFormError),
+    /// The transaction writes a protected attribute whose key this peer
+    /// cannot resolve.
+    ///
+    /// The whole transaction is refused: writing is never partial.
+    #[error("cannot seal for protection class {0}: this peer holds no key for it")]
+    MissingKey(EntityId),
+    /// Sealing failed for a reason other than a missing key.
+    #[error(transparent)]
+    Protection(corium_db::protect::ProtectError),
+}
+
+impl From<corium_db::protect::ProtectError> for PeerError {
+    fn from(error: corium_db::protect::ProtectError) -> Self {
+        match error {
+            corium_db::protect::ProtectError::MissingKey { class, .. } => Self::MissingKey(class),
+            other => Self::Protection(other),
+        }
+    }
 }
 
 /// Connection configuration.
@@ -465,6 +487,7 @@ impl Connection {
         forms: Vec<Edn>,
         expected_basis_t: Option<u64>,
     ) -> Result<TxResult, PeerError> {
+        let forms = self.seal_protected(forms).await?;
         let tx_data = codec::encode_edn(&Edn::Vector(forms));
         let deadline = tokio::time::Instant::now() + self.inner.config.failover_timeout;
         let response = loop {
@@ -490,8 +513,32 @@ impl Connection {
         })
     }
 
+    /// Seals every value written to a protected attribute, against the
+    /// schema at this peer's current basis.
+    ///
+    /// A protection change committed between here and the transactor's own
+    /// validation rejects the transaction rather than storing a value in the
+    /// stale form; the caller retries against the new schema.
+    async fn seal_protected(&self, forms: Vec<Edn>) -> Result<Vec<Edn>, PeerError> {
+        let db = self.db();
+        if db.schema().protections().next().is_none() {
+            return Ok(forms);
+        }
+        let keys = match &self.inner.config.keyring {
+            Some(keyring) => ClassKeys::resolve(db.schema(), keyring.as_ref())
+                .await
+                .map_err(|error| PeerError::Protocol(error.to_string()))?,
+            None => ClassKeys::default(),
+        };
+        seal::seal_forms(&db, &keys, forms)
+    }
+
     /// Submits already-encoded transaction data, returning the raw wire
     /// response (used by the peer server's transact proxy).
+    ///
+    /// Transaction data arriving here is already encoded, so a value on a
+    /// protected attribute must already be sealed: this is the peer server's
+    /// proxy path, where the thin client — not the server — holds the keys.
     ///
     /// # Errors
     /// Returns [`PeerError`] for rejected transactions or transport failure.
