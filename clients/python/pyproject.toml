@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "corium"
-version = "0.1.0"
+version = "0.1.67"
 description = "Async local and remote Python client for Corium"
 readme = "README.md"
 requires-python = ">=3.10"
