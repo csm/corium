@@ -10,6 +10,7 @@ from unittest.mock import patch
 import corium._api as api
 from corium import (
     ClosedError,
+    ConnectionFailedError,
     Datom,
     DbStats,
     DirectStorage,
@@ -21,6 +22,7 @@ from corium import (
     Peer,
     RemotePeer,
     SegmentCache,
+    StorageError,
     Symbol,
     Tagged,
     available_storage_backends,
@@ -101,8 +103,17 @@ class FakePeerBackend:
 
 
 class FakeNative:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        backends: list[str] | None = None,
+        advertised_backend: str = "turso",
+        discovery_error: Exception | None = None,
+    ) -> None:
         self.calls: list[tuple[Any, ...]] = []
+        self.backends = backends or ["filesystem", "turso"]
+        self.advertised_backend = advertised_backend
+        self.discovery_error = discovery_error
+        self.discovery_calls: list[tuple[Any, ...]] = []
 
     async def connect_local(
         self, endpoints: list[str], **options: Any
@@ -115,15 +126,23 @@ class FakeNative:
         return FakePeerBackend()
 
     def _storage_backends(self) -> list[str]:
-        return ["filesystem", "turso"]
+        return self.backends
+
+    async def _discover_storage_backend(
+        self, endpoints: list[str], **options: Any
+    ) -> str:
+        self.discovery_calls.append((endpoints, options))
+        if self.discovery_error is not None:
+            raise self.discovery_error
+        return self.advertised_backend
 
 
 class PeerApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        api._native_module.cache_clear()
+        api._native_modules.cache_clear()
 
     def tearDown(self) -> None:
-        api._native_module.cache_clear()
+        api._native_modules.cache_clear()
 
     async def test_local_and_remote_satisfy_the_same_protocol(self) -> None:
         for peer_type in (LocalPeer, RemotePeer):
@@ -138,6 +157,61 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             report = await peer.transact([{"person/name": "Ada"}])
             self.assertEqual(report.tempids, {"ada": 42})
             self.assertEqual(await report.db_after.basis_t(), 7)
+
+    async def test_local_direct_storage_selects_the_advertised_artifact(self) -> None:
+        unsupported = FakeNative(["filesystem", "turso"], advertised_backend="s3")
+        supported = FakeNative(["filesystem", "s3"])
+
+        with patch.object(
+            api, "_native_modules", return_value=(unsupported, supported)
+        ):
+            peer = await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                storage=DirectStorage(),
+            )
+
+        self.assertEqual(len(unsupported.discovery_calls), 1)
+        self.assertEqual(len(unsupported.calls), 0)
+        self.assertEqual(len(supported.calls), 1)
+        await peer.close()
+
+    async def test_local_direct_storage_requires_a_supporting_artifact(self) -> None:
+        native = FakeNative(["filesystem", "turso"], advertised_backend="s3")
+
+        with (
+            patch.object(api, "_native_modules", return_value=(native,)),
+            self.assertRaisesRegex(
+                StorageError,
+                "no installed Corium native artifact supports s3 direct storage",
+            ),
+        ):
+            await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                storage=DirectStorage(),
+            )
+
+        self.assertEqual(len(native.discovery_calls), 1)
+        self.assertEqual(len(native.calls), 0)
+
+    async def test_local_direct_storage_propagates_discovery_failure(self) -> None:
+        discovery_error = ConnectionFailedError("connection refused")
+        native = FakeNative(discovery_error=discovery_error)
+
+        with (
+            patch.object(api, "_native_modules", return_value=(native,)),
+            self.assertRaises(ConnectionFailedError) as raised,
+        ):
+            await LocalPeer.connect(
+                "http://127.0.0.1:4334",
+                database="people",
+                storage=DirectStorage(),
+            )
+
+        self.assertIs(raised.exception, discovery_error)
+        self.assertEqual(len(native.discovery_calls), 1)
+        self.assertEqual(len(native.calls), 0)
 
     async def test_database_views_are_immutable_and_forward_raw_operations(
         self,
@@ -207,7 +281,10 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tls_is_inferred_and_tokens_require_https(self) -> None:
         native = FakeNative()
-        with patch.object(api, "_native_module", return_value=native):
+        with (
+            patch.object(api, "_native_module", return_value=native),
+            patch.object(api, "_native_modules", return_value=(native,)),
+        ):
             await LocalPeer.connect(
                 "https://local.test",
                 database="people",
@@ -253,7 +330,10 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 tls_ca="not bytes",  # type: ignore[arg-type]
             )
 
-        with patch.object(api, "_native_module", return_value=native):
+        with (
+            patch.object(api, "_native_module", return_value=native),
+            patch.object(api, "_native_modules", return_value=(native,)),
+        ):
             await LocalPeer.connect(
                 "http://127.0.0.1:4334",
                 database="people",
@@ -278,7 +358,10 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
                 capacity_bytes=128 * 1024 * 1024,
             )
         )
-        with patch.object(api, "_native_module", return_value=native):
+        with (
+            patch.object(api, "_native_module", return_value=native),
+            patch.object(api, "_native_modules", return_value=(native,)),
+        ):
             await LocalPeer.connect(
                 "http://127.0.0.1:4334",
                 database="people",
@@ -308,8 +391,6 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
 
     def test_missing_native_extension_has_a_dedicated_error(self) -> None:
         def import_missing(module_name: str) -> object:
-            if module_name == "corium._corium":
-                raise ImportError("missing base extension")
             raise ModuleNotFoundError(name=module_name)
 
         with patch.object(importlib, "import_module", side_effect=import_missing):
@@ -318,12 +399,15 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             ):
                 api._native_module()
 
-    def test_optional_native_artifact_is_preferred_and_must_be_unique(self) -> None:
-        turso = object()
+    def test_installed_native_artifacts_are_all_available(self) -> None:
+        turso = FakeNative(["filesystem", "turso"])
+        s3 = FakeNative(["filesystem", "s3"])
 
         def import_one(module_name: str) -> object:
             if module_name == "corium._corium_turso":
                 return turso
+            if module_name == "corium._corium_s3":
+                return s3
             raise ModuleNotFoundError(name=module_name)
 
         with patch.object(
@@ -331,18 +415,12 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         ) as import_module:
             self.assertIs(api._native_module(), turso)
             self.assertIs(api._native_module(), turso)
-            self.assertEqual(import_module.call_count, 3)
-
-        api._native_module.cache_clear()
-
-        def import_two(module_name: str) -> object:
-            if module_name in ("corium._corium_turso", "corium._corium_s3"):
-                return object()
-            raise ModuleNotFoundError(name=module_name)
-
-        with patch.object(importlib, "import_module", side_effect=import_two):
-            with self.assertRaisesRegex(NativeExtensionError, "multiple"):
-                api._native_module()
+            self.assertEqual(api._native_modules(), (turso, s3))
+            self.assertEqual(
+                available_storage_backends(),
+                frozenset({"filesystem", "turso", "s3"}),
+            )
+            self.assertEqual(import_module.call_count, 4)
 
 
 class ValueAndTimeTests(unittest.IsolatedAsyncioTestCase):

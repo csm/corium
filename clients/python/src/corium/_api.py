@@ -14,7 +14,7 @@ from types import TracebackType
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from ._forms import lower_form
-from .errors import ClosedError, NativeExtensionError
+from .errors import ClosedError, NativeExtensionError, StorageError
 
 
 class Index(str, Enum):
@@ -395,43 +395,47 @@ class _BasePeer(Peer):
 
 
 @functools.cache
-def _native_module() -> Any:
-    optional_modules = (
+def _native_modules() -> tuple[Any, ...]:
+    module_names = (
         "corium._corium_turso",
         "corium._corium_postgres",
         "corium._corium_s3",
+        "corium._corium",
     )
     found: list[Any] = []
-    for module_name in optional_modules:
+    for module_name in module_names:
         try:
             found.append(importlib.import_module(module_name))
         except ModuleNotFoundError as error:
             if error.name != module_name:
                 raise NativeExtensionError(
-                    f"the optional native extension {module_name} failed to load"
+                    f"the native extension {module_name} failed to load"
                 ) from error
         except ImportError as error:
             raise NativeExtensionError(
-                f"the optional native extension {module_name} failed to load"
+                f"the native extension {module_name} failed to load"
             ) from error
-    if len(found) > 1:
-        raise NativeExtensionError(
-            "multiple Corium direct-storage artifacts are installed; install only one"
-        )
     if found:
-        return found[0]
-    try:
-        return importlib.import_module("corium._corium")
-    except ImportError as error:
-        raise NativeExtensionError(
-            "the Corium native extension is not installed for this platform"
-        ) from error
+        return tuple(found)
+    raise NativeExtensionError(
+        "the Corium native extension is not installed for this platform"
+    )
+
+
+def _native_module() -> Any:
+    """Return one native module for operations independent of storage drivers."""
+
+    return _native_modules()[0]
 
 
 def available_storage_backends() -> frozenset[str]:
-    """Return direct-storage backends compiled into the native artifact."""
+    """Return direct-storage backends provided by installed native artifacts."""
 
-    return frozenset(_native_module()._storage_backends())
+    return frozenset(
+        backend
+        for module in _native_modules()
+        for backend in module._storage_backends()
+    )
 
 
 def _tls_from_endpoints(
@@ -499,30 +503,54 @@ class LocalPeer(_BasePeer):
             tls_ca,
             tls_domain,
         )
-        backend = await _native_module().connect_local(
-            endpoint_list,
-            database=database,
-            token=token,
-            tls=tls,
-            tls_ca=tls_ca,
-            tls_domain=tls_domain,
-            direct_storage=storage is not None,
-            segment_cache_directory=(
+        options = {
+            "database": database,
+            "token": token,
+            "tls": tls,
+            "tls_ca": tls_ca,
+            "tls_domain": tls_domain,
+            "direct_storage": storage is not None,
+            "segment_cache_directory": (
                 storage.cache.directory
                 if storage is not None and storage.cache is not None
                 else None
             ),
-            segment_cache_capacity_bytes=(
+            "segment_cache_capacity_bytes": (
                 storage.cache.capacity_bytes
                 if storage is not None and storage.cache is not None
                 else None
             ),
-            segment_cache_memory_bytes=(
+            "segment_cache_memory_bytes": (
                 storage.cache.memory_capacity_bytes
                 if storage is not None and storage.cache is not None
                 else None
             ),
-        )
+        }
+        modules = _native_modules()
+        module = modules[0]
+        if storage is not None:
+            storage_backend = await module._discover_storage_backend(
+                endpoint_list,
+                database=database,
+                token=token,
+                tls=tls,
+                tls_ca=tls_ca,
+                tls_domain=tls_domain,
+            )
+            module = next(
+                (
+                    candidate
+                    for candidate in modules
+                    if storage_backend in candidate._storage_backends()
+                ),
+                None,
+            )
+            if module is None:
+                raise StorageError(
+                    "no installed Corium native artifact supports "
+                    f"{storage_backend} direct storage"
+                )
+        backend = await module.connect_local(endpoint_list, **options)
         return cls(backend)
 
 
