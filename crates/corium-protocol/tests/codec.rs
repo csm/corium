@@ -152,7 +152,7 @@ fn datoms_round_trip_with_keyword_renumbering() {
     // The peer assigned its own id, but the same name.
     assert_eq!(
         peer.resolve(id),
-        Some(&Keyword::new(Some("palette"), "blue"))
+        Some(Keyword::new(Some("palette"), "blue"))
     );
     assert_eq!(decoded[0].e, datoms[0].e);
 }

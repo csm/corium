@@ -689,7 +689,7 @@ fn value_scalar(db: &Db, value: &Value) -> ScalarValue {
         Value::Keyword(value) => ScalarValue::Utf8(Some(
             db.interner()
                 .resolve(*value)
-                .map_or_else(|| format!("#kw/{value}"), ToString::to_string),
+                .map_or_else(|| format!("#kw/{value}"), |keyword| keyword.to_string()),
         )),
         Value::Str(value) => ScalarValue::Utf8(Some(value.to_string())),
         Value::Bytes(value) => ScalarValue::Binary(Some(value.to_vec())),

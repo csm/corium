@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{EntityId, KwId, Sealed, TotalF64, Value, ValueType};
+use crate::{EntityId, Keyword, KeywordInterner, KwId, Sealed, TotalF64, Value, ValueType};
 
 /// Encodes a value type as its tag byte in [`ValueType`] declaration order.
 #[must_use]
@@ -81,6 +81,114 @@ pub enum SealPlaintextError {
     /// The value's keyword id does not resolve in the interner.
     #[error("unresolvable keyword id {0}")]
     UnresolvableKeyword(KwId),
+    /// The opened plaintext is not a well-formed value encoding.
+    #[error("malformed seal plaintext: {0}")]
+    Malformed(#[from] DecodeError),
+    /// The opened plaintext does not carry the value type the sealed header
+    /// declares.
+    #[error("seal plaintext holds a {actual:?} where the header declares {expected:?}")]
+    TypeMismatch {
+        /// Type named by the sealed header.
+        expected: ValueType,
+        /// Type actually found in the plaintext.
+        actual: ValueType,
+    },
+}
+
+/// Encodes a value as the plaintext of a sealed value.
+///
+/// This is [`encode_value`] with one difference: a keyword is encoded as its
+/// *text*, under the string tag, rather than as its interner id. Ids are
+/// assigned by the transactor's naming table, and a protected attribute's
+/// vocabulary must never reach it — an id would leak the very value the seal
+/// is meant to hide, and would not survive a reader that interns differently.
+/// [`decode_seal_plaintext`] reverses this using the declared value type.
+///
+/// # Errors
+///
+/// Returns [`SealPlaintextError::Nested`] for an already-sealed value and
+/// [`SealPlaintextError::UnresolvableKeyword`] when a keyword id has no text
+/// in `interner`.
+pub fn encode_seal_plaintext(
+    value: &Value,
+    interner: &KeywordInterner,
+) -> Result<Vec<u8>, SealPlaintextError> {
+    match value {
+        Value::Sealed(_) => Err(SealPlaintextError::Nested),
+        Value::Keyword(id) => {
+            let keyword = interner
+                .resolve(*id)
+                .ok_or(SealPlaintextError::UnresolvableKeyword(*id))?;
+            let mut out = vec![STR];
+            encode_escaped(keyword_text(&keyword).as_bytes(), &mut out);
+            Ok(out)
+        }
+        other => Ok(encode_value(other)),
+    }
+}
+
+/// Decodes plaintext produced by [`encode_seal_plaintext`].
+///
+/// `expected` is the value type from the sealed header, which the AEAD has
+/// already authenticated. Bytes after the first complete value are ignored:
+/// every value encoding is self-delimiting, which is what lets a protection
+/// class pad plaintext to a fixed multiple without recording the true length.
+///
+/// A keyword is re-interned locally ([`KeywordInterner::intern_local`]), so
+/// the durable naming table stays free of the protected vocabulary.
+///
+/// # Errors
+///
+/// Returns [`SealPlaintextError::Malformed`] when the bytes are not a value
+/// encoding, and [`SealPlaintextError::TypeMismatch`] when the value found is
+/// not of the declared type.
+pub fn decode_seal_plaintext(
+    bytes: &[u8],
+    expected: ValueType,
+    interner: &KeywordInterner,
+) -> Result<Value, SealPlaintextError> {
+    let (value, _) = decode_value(bytes)?;
+    if expected == ValueType::Keyword {
+        let Value::Str(text) = value else {
+            return Err(SealPlaintextError::TypeMismatch {
+                expected,
+                actual: value_type_of(&value)?,
+            });
+        };
+        return Ok(Value::Keyword(interner.intern_local(Keyword::parse(&text))));
+    }
+    if value.has_type(expected) {
+        Ok(value)
+    } else {
+        Err(SealPlaintextError::TypeMismatch {
+            expected,
+            actual: value_type_of(&value)?,
+        })
+    }
+}
+
+/// Renders a keyword the way [`Keyword::parse`] reads it back: no leading
+/// colon, namespace and name joined by `/`.
+fn keyword_text(keyword: &Keyword) -> String {
+    keyword.namespace.as_ref().map_or_else(
+        || keyword.name.clone(),
+        |namespace| format!("{namespace}/{}", keyword.name),
+    )
+}
+
+fn value_type_of(value: &Value) -> Result<ValueType, SealPlaintextError> {
+    Ok(match value {
+        Value::Bool(_) => ValueType::Bool,
+        Value::Long(_) => ValueType::Long,
+        Value::Double(_) => ValueType::Double,
+        Value::Instant(_) => ValueType::Instant,
+        Value::Uuid(_) => ValueType::Uuid,
+        Value::Keyword(_) => ValueType::Keyword,
+        Value::Str(_) => ValueType::Str,
+        Value::Bytes(_) => ValueType::Bytes,
+        Value::Ref(_) => ValueType::Ref,
+        Value::Sealed(_) => return Err(SealPlaintextError::Nested),
+    })
 }
 
 /// Trait for types with Corium sortable encodings.
