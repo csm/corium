@@ -26,10 +26,11 @@ public final class RemoteClient implements Client, AutoCloseable {
     final ManagedChannel channel;
     private final CatalogGrpc.CatalogStub catalogStub;
     private volatile boolean closed;
+    private final boolean tls;
 
     private RemoteClient(Builder builder) {
         URI endpoint = parseEndpoint(builder.endpoint);
-        boolean tls = endpoint.getScheme().equalsIgnoreCase("https");
+        tls = endpoint.getScheme().equalsIgnoreCase("https");
         if (builder.token != null && !tls && !builder.allowInsecureToken) {
             throw new IllegalArgumentException("bearer tokens require an https:// endpoint");
         }
@@ -88,6 +89,10 @@ public final class RemoteClient implements Client, AutoCloseable {
 
     void ensureOpen() {
         if (closed) throw new CoriumException("peer is closed");
+    }
+
+    boolean isTls() {
+        return tls;
     }
 
     public static final class Builder {

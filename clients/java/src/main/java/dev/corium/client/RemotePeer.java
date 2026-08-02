@@ -39,6 +39,9 @@ public final class RemotePeer implements Peer, AutoCloseable {
     private volatile boolean closed;
 
     RemotePeer(Builder builder) {
+        if (builder.token != null && !builder.client.isTls() && !builder.allowInsecureToken) {
+            throw new IllegalArgumentException("bearer tokens require an https:// endpoint");
+        }
         this.databaseName = builder.databaseName;
         this.client = builder.client;
         this.channel = client.channel;
@@ -216,21 +219,6 @@ public final class RemotePeer implements Peer, AutoCloseable {
         return channel.awaitTermination(timeout, unit);
     }
 
-    private static URI parseEndpoint(String value) {
-        try {
-            URI uri = new URI(Objects.requireNonNull(value, "endpoint"));
-            if (!("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme()))
-                    || uri.getHost() == null || uri.getUserInfo() != null || uri.getQuery() != null
-                    || uri.getFragment() != null
-                    || (uri.getPath() != null && !uri.getPath().isEmpty() && !"/".equals(uri.getPath()))) {
-                throw new IllegalArgumentException("endpoint must be an http:// or https:// origin");
-            }
-            return uri;
-        } catch (URISyntaxException error) {
-            throw new IllegalArgumentException("invalid endpoint", error);
-        }
-    }
-
     private static QueryResult.Shape queryShape(Corium.ResultShape shape) {
         switch (shape) {
             case RESULT_SHAPE_RELATION: return QueryResult.Shape.RELATION;
@@ -246,8 +234,6 @@ public final class RemotePeer implements Peer, AutoCloseable {
         private final String databaseName;
         private String token;
         private boolean allowInsecureToken;
-        private byte[] tlsCa;
-        private String tlsDomain;
 
         private Builder(RemoteClient client, String databaseName) {
             this.client = Objects.requireNonNull(client, "client");
@@ -257,12 +243,6 @@ public final class RemotePeer implements Peer, AutoCloseable {
 
         public Builder token(String token) { this.token = Objects.requireNonNull(token, "token"); return this; }
         public Builder allowInsecureToken(boolean allowed) { this.allowInsecureToken = allowed; return this; }
-        public Builder tlsCa(byte[] pem) { this.tlsCa = Objects.requireNonNull(pem, "pem").clone(); return this; }
-        public Builder tlsDomain(String domain) {
-            this.tlsDomain = Objects.requireNonNull(domain, "domain");
-            if (domain.isEmpty()) throw new IllegalArgumentException("TLS domain must not be empty");
-            return this;
-        }
         public RemotePeer build() { return new RemotePeer(this); }
     }
 }
