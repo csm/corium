@@ -32,32 +32,33 @@ final class RemotePeerIntegrationTest {
 
     @Test
     void performsTheInitialRemoteApiOverGrpc() {
-        try (RemotePeer peer = RemotePeer.builder(
-                "http://127.0.0.1:" + server.getPort(), "people").build()) {
-            Db db = peer.db().asOf(7);
-            QueryResult names = db.query(Query.findCollection("?name")
-                    .where("?entity", ":person/name", "?name")).join();
-            assertEquals(QueryResult.Shape.COLLECTION, names.shape());
-            assertEquals(List.of("Ada", "Grace"), names.value());
-            assertEquals(7, service.queryRequest.getDbs(0).getAsOf());
+        try (RemoteClient client = RemoteClient.builder("http://127.0.0.1:" + server.getPort()).build()) {
+            try (RemotePeer peer = RemotePeer.builder(client, "people").build()) {
+                Db db = peer.db().asOf(7);
+                QueryResult names = db.query(Query.findCollection("?name")
+                        .where("?entity", ":person/name", "?name")).join();
+                assertEquals(QueryResult.Shape.COLLECTION, names.shape());
+                assertEquals(List.of("Ada", "Grace"), names.value());
+                assertEquals(7, service.queryRequest.getDbs(0).getAsOf());
 
-            assertEquals(Map.of(new Keyword("person/name"), "Ada"),
-                    db.pull(new Pull().attr("person/name"), EntityId.of(42)).join());
+                assertEquals(Map.of(new Keyword("person/name"), "Ada"),
+                        db.pull(new Pull().attr("person/name"), EntityId.of(42)).join());
 
-            List<Datom> datoms = db.datoms(Index.EAVT, EntityId.of(42)).join();
-            assertEquals("Ada", datoms.get(0).value());
-            assertTrue(datoms.get(0).added());
+                List<Datom> datoms = db.datoms(Index.EAVT, EntityId.of(42)).join();
+                assertEquals("Ada", datoms.get(0).value());
+                assertTrue(datoms.get(0).added());
 
-            DbStats stats = db.stats().join();
-            assertEquals(7, stats.basisT());
-            assertEquals(12, stats.datoms());
+                DbStats stats = db.stats().join();
+                assertEquals(7, stats.basisT());
+                assertEquals(12, stats.datoms());
 
-            TxReport report = peer.transact(new TxBuilder().entity(
-                    EntityMap.withId("ada").set("person/name", "Ada"))).join();
-            assertEquals(8, report.basisT());
-            assertEquals(Instant.ofEpochMilli(1_700_000_000_000L), report.transactionInstant());
-            assertEquals(Map.of("ada", 42L), report.tempids());
-            assertTrue(CoriumCodec.decode(service.transactRequest.getTxData().toByteArray()) instanceof List<?>);
+                TxReport report = peer.transact(new TxBuilder().entity(
+                        EntityMap.withId("ada").set("person/name", "Ada"))).join();
+                assertEquals(8, report.basisT());
+                assertEquals(Instant.ofEpochMilli(1_700_000_000_000L), report.transactionInstant());
+                assertEquals(Map.of("ada", 42L), report.tempids());
+                assertTrue(CoriumCodec.decode(service.transactRequest.getTxData().toByteArray()) instanceof List<?>);
+            }
         }
     }
 

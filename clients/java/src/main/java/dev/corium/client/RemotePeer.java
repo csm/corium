@@ -25,41 +25,23 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static dev.corium.client.RemoteSupport.mapError;
+import static dev.corium.client.RemoteSupport.unary;
+
 /** A lightweight asynchronous client connected to {@code corium peer-server}. */
-public final class RemotePeer implements AutoCloseable {
+public final class RemotePeer implements Peer, AutoCloseable {
     public static final int PROTOCOL_VERSION = 1;
 
+    private final RemoteClient client;
     private final String databaseName;
     private final ManagedChannel channel;
     private final PeerServerGrpc.PeerServerStub stub;
     private volatile boolean closed;
 
-    private RemotePeer(Builder builder) {
+    RemotePeer(Builder builder) {
         this.databaseName = builder.databaseName;
-        URI endpoint = parseEndpoint(builder.endpoint);
-        boolean tls = endpoint.getScheme().equalsIgnoreCase("https");
-        if (builder.token != null && !tls && !builder.allowInsecureToken) {
-            throw new IllegalArgumentException("bearer tokens require an https:// endpoint");
-        }
-        if (!tls && (builder.tlsCa != null || builder.tlsDomain != null)) {
-            throw new IllegalArgumentException("custom TLS options require an https:// endpoint");
-        }
-
-        int port = endpoint.getPort() >= 0 ? endpoint.getPort() : (tls ? 443 : 80);
-        NettyChannelBuilder channelBuilder = NettyChannelBuilder.forAddress(endpoint.getHost(), port);
-        if (tls) {
-            try {
-                io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder ssl = GrpcSslContexts.forClient();
-                if (builder.tlsCa != null) ssl.trustManager(TrustManagers.platformAndPem(builder.tlsCa));
-                channelBuilder.sslContext(ssl.build());
-            } catch (Exception error) {
-                throw new IllegalArgumentException("could not configure TLS", error);
-            }
-            if (builder.tlsDomain != null) channelBuilder.overrideAuthority(builder.tlsDomain);
-        } else {
-            channelBuilder.usePlaintext();
-        }
-        this.channel = channelBuilder.build();
+        this.client = builder.client;
+        this.channel = client.channel;
         PeerServerGrpc.PeerServerStub created = PeerServerGrpc.newStub(channel);
         if (builder.token != null) {
             Metadata headers = new Metadata();
@@ -70,22 +52,25 @@ public final class RemotePeer implements AutoCloseable {
         this.stub = created;
     }
 
-    public static Builder builder(String endpoint, String databaseName) {
-        return new Builder(endpoint, databaseName);
+    public static Builder builder(RemoteClient client, String databaseName) {
+        return new Builder(client, databaseName);
     }
 
     public String databaseName() { return databaseName; }
 
+    @Override
     public Db db() {
         ensureOpen();
         return new Db(this);
     }
 
     /** Remote views are always current, so sync completes with a fresh current view. */
+    @Override
     public CompletableFuture<Db> sync() {
         return CompletableFuture.completedFuture(db());
     }
 
+    @Override
     public CompletableFuture<TxReport> transact(Object transactionData) {
         ensureOpen();
         Corium.TransactRequest request = Corium.TransactRequest.newBuilder()
@@ -216,6 +201,7 @@ public final class RemotePeer implements AutoCloseable {
     }
 
     void ensureOpen() {
+        client.ensureOpen();
         if (closed) throw new CoriumException("peer is closed");
     }
 
@@ -223,7 +209,7 @@ public final class RemotePeer implements AutoCloseable {
     public synchronized void close() {
         if (closed) return;
         closed = true;
-        channel.shutdown();
+        // leave the channel from
     }
 
     public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
@@ -245,36 +231,6 @@ public final class RemotePeer implements AutoCloseable {
         }
     }
 
-    private interface Decoder<I, O> { O decode(I input); }
-
-    private static <I, O> StreamObserver<I> unary(CompletableFuture<O> future, Decoder<I, O> decoder) {
-        return new StreamObserver<I>() {
-            private boolean received;
-            @Override public void onNext(I value) {
-                if (received) {
-                    future.completeExceptionally(new DecodeException("unary RPC returned multiple responses"));
-                    return;
-                }
-                received = true;
-                try { future.complete(decoder.decode(value)); }
-                catch (Throwable error) { future.completeExceptionally(error); }
-            }
-            @Override public void onError(Throwable error) { future.completeExceptionally(mapError(error)); }
-            @Override public void onCompleted() {
-                if (!received && !future.isDone()) future.completeExceptionally(new DecodeException("unary RPC returned no response"));
-            }
-        };
-    }
-
-    private static CoriumException mapError(Throwable error) {
-        if (!(error instanceof StatusRuntimeException) && !(error instanceof StatusException)) {
-            return new CoriumException(error.getMessage(), null, error);
-        }
-        Status status = Status.fromThrowable(error);
-        String message = status.getDescription() == null ? status.getCode().name() : status.getDescription();
-        return new CoriumException(message, status.getCode().name(), error);
-    }
-
     private static QueryResult.Shape queryShape(Corium.ResultShape shape) {
         switch (shape) {
             case RESULT_SHAPE_RELATION: return QueryResult.Shape.RELATION;
@@ -286,15 +242,15 @@ public final class RemotePeer implements AutoCloseable {
     }
 
     public static final class Builder {
-        private final String endpoint;
+        private final RemoteClient client;
         private final String databaseName;
         private String token;
         private boolean allowInsecureToken;
         private byte[] tlsCa;
         private String tlsDomain;
 
-        private Builder(String endpoint, String databaseName) {
-            this.endpoint = Objects.requireNonNull(endpoint, "endpoint");
+        private Builder(RemoteClient client, String databaseName) {
+            this.client = Objects.requireNonNull(client, "client");
             this.databaseName = Objects.requireNonNull(databaseName, "databaseName");
             if (databaseName.isEmpty()) throw new IllegalArgumentException("database name must not be empty");
         }

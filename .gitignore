@@ -4,3 +4,4 @@ examples/postgres-jdbc/target/
 examples/musicbrainz/data/logs/
 examples/musicbrainz/data/store.db
 examples/musicbrainz/data/store.db-wal
+worktrees/
