@@ -802,6 +802,11 @@ fn value_to_edn(db: &Db, value: &Value) -> Result<Edn, SqlError> {
             Edn::Tagged("bytes".into(), Box::new(Edn::Str(hex)))
         }
         Value::Ref(value) => return eid(*value),
+        Value::Sealed(_) => {
+            return Err(SqlError::Mutation(
+                "sealed values cannot be written through SQL".into(),
+            ));
+        }
     })
 }
 

@@ -48,6 +48,7 @@ impl LocalPeer {
             Arc::new(LocalDbBackend {
                 snapshot,
                 db_name: self.connection.db_name().to_owned(),
+                connection: Arc::clone(&self.connection),
             }),
             View::Current,
         )
@@ -84,9 +85,16 @@ impl Peer for LocalPeer {
 struct LocalDbBackend {
     snapshot: DbValue,
     db_name: String,
+    /// Source of the connection's class keys; an embedded peer reads its own
+    /// protected values without any extra configuration.
+    connection: Arc<Connection>,
 }
 
 impl LocalDbBackend {
+    async fn hydrator(&self) -> Result<Arc<corium_db::protect::Hydrator>, ClientError> {
+        Ok(self.connection.hydrator().await?)
+    }
+
     fn resolve(&self, view: View) -> DbValue {
         match view {
             View::Current => self.snapshot.clone(),
@@ -147,6 +155,7 @@ impl DbBackend for LocalDbBackend {
             &inputs,
             ExecOptions {
                 fuel,
+                hydrator: Some(self.hydrator().await?),
                 ..ExecOptions::default()
             },
         )?;
@@ -156,7 +165,13 @@ impl DbBackend for LocalDbBackend {
     async fn pull(&self, view: View, pattern: Edn, eid: Edn) -> Result<Edn, ClientError> {
         let db = self.resolve(view);
         let entity = resolve_eid(&db, &eid)?;
-        Ok(corium_query::pull(&db, &pattern, entity)?)
+        let hydrator = self.hydrator().await?;
+        Ok(corium_query::pull_with(
+            &db,
+            &pattern,
+            entity,
+            Some(&hydrator),
+        )?)
     }
 
     async fn datoms(
@@ -171,17 +186,32 @@ impl DbBackend for LocalDbBackend {
         let (e, a, v) = resolve_components(&db, order, &components)?;
         let prefix = key_prefix(order, e, a, v.as_ref());
         let limit = if limit == 0 { usize::MAX } else { limit };
-        Ok(db
-            .datoms_prefix(order, &prefix)
-            .take(limit)
-            .map(|datom| DatomRow {
+        let hydrator = self.hydrator().await?;
+        let mut rows = Vec::new();
+        for datom in db.datoms_prefix(order, &prefix) {
+            if rows.len() >= limit {
+                break;
+            }
+            let value =
+                match hydrator.hydrate(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
+                    Ok(corium_db::protect::Hydration::Bind(value)) => value,
+                    Ok(corium_db::protect::Hydration::Hide) => continue,
+                    Ok(corium_db::protect::Hydration::Refuse(class)) => {
+                        return Err(ClientError::Query(QueryError::Protected(class)));
+                    }
+                    Err(error) => {
+                        return Err(ClientError::Query(QueryError::Type(error.to_string())));
+                    }
+                };
+            rows.push(DatomRow {
                 e: datom.e.raw(),
                 a: datom.a.raw(),
-                v: boundary::value_to_edn(&db, &datom.v),
+                v: boundary::value_to_edn(&db, &value),
                 tx: datom.tx.raw(),
                 added: datom.added,
-            })
-            .collect())
+            });
+        }
+        Ok(rows)
     }
 
     async fn stats(&self, view: View) -> Result<DbStats, ClientError> {

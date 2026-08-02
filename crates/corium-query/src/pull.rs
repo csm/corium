@@ -8,7 +8,10 @@
 use std::collections::BTreeSet;
 
 use corium_core::{AttrId, EntityId, IndexOrder, Keyword, Value, ValueType};
-use corium_db::{Db, key_prefix};
+use corium_db::{
+    Db, key_prefix,
+    protect::{Hydration, Hydrator},
+};
 
 use crate::QueryError;
 use crate::boundary::value_to_edn;
@@ -181,10 +184,25 @@ fn parse_attr_spec(db: &Db, form: &Edn, sub: SubSelect) -> Result<PullSpec, Quer
 /// # Errors
 /// Returns [`QueryError`] for malformed patterns or unknown attribute idents.
 pub fn pull(db: &Db, pattern: &Edn, eid: EntityId) -> Result<Edn, QueryError> {
+    pull_with(db, pattern, eid, None)
+}
+
+/// Pulls `pattern` for `eid`, opening sealed values this reader holds keys
+/// for.
+///
+/// # Errors
+/// Returns [`QueryError`] for malformed patterns, unknown attribute idents,
+/// and classes whose policy is to fail the read.
+pub fn pull_with(
+    db: &Db,
+    pattern: &Edn,
+    eid: EntityId,
+    hydrator: Option<&Hydrator>,
+) -> Result<Edn, QueryError> {
     let parsed = parse_pattern(db, pattern)?;
     // The root is on the recursion path: a cycle back to it stops.
     let mut path = BTreeSet::from([eid]);
-    pull_entity(db, &parsed, eid, &mut path)
+    pull_entity(db, hydrator, &parsed, eid, &mut path)
 }
 
 /// Pulls `pattern` for each entity, preserving order.
@@ -192,22 +210,64 @@ pub fn pull(db: &Db, pattern: &Edn, eid: EntityId) -> Result<Edn, QueryError> {
 /// # Errors
 /// Returns [`QueryError`] for malformed patterns or unknown attribute idents.
 pub fn pull_many(db: &Db, pattern: &Edn, eids: &[EntityId]) -> Result<Edn, QueryError> {
+    pull_many_with(db, pattern, eids, None)
+}
+
+/// Pulls `pattern` for each entity, opening sealed values this reader holds
+/// keys for.
+///
+/// # Errors
+/// Returns [`QueryError`] for malformed patterns, unknown attribute idents,
+/// and classes whose policy is to fail the read.
+pub fn pull_many_with(
+    db: &Db,
+    pattern: &Edn,
+    eids: &[EntityId],
+    hydrator: Option<&Hydrator>,
+) -> Result<Edn, QueryError> {
     let parsed = parse_pattern(db, pattern)?;
     let results = eids
         .iter()
         .map(|eid| {
             let mut path = BTreeSet::from([*eid]);
-            pull_entity(db, &parsed, *eid, &mut path)
+            pull_entity(db, hydrator, &parsed, *eid, &mut path)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Edn::Vector(results))
 }
 
-fn entity_datoms(db: &Db, eid: EntityId) -> Vec<(AttrId, Value)> {
+fn entity_datoms(
+    db: &Db,
+    hydrator: Option<&Hydrator>,
+    eid: EntityId,
+) -> Result<Vec<(AttrId, Value)>, QueryError> {
     let prefix = key_prefix(IndexOrder::Eavt, Some(eid), None, None);
-    db.datoms_prefix(IndexOrder::Eavt, &prefix)
-        .map(|datom| (datom.a, datom.v.clone()))
-        .collect()
+    let mut out = Vec::new();
+    for datom in db.datoms_prefix(IndexOrder::Eavt, &prefix) {
+        if let Some(value) = hydrate(db, hydrator, datom.a, datom.e, &datom.v)? {
+            out.push((datom.a, value));
+        }
+    }
+    Ok(out)
+}
+
+/// Resolves one value for this reader; `None` means the class hides it.
+pub(crate) fn hydrate(
+    db: &Db,
+    hydrator: Option<&Hydrator>,
+    a: AttrId,
+    e: EntityId,
+    value: &Value,
+) -> Result<Option<Value>, QueryError> {
+    let Some(hydrator) = hydrator else {
+        return Ok(Some(value.clone()));
+    };
+    match hydrator.hydrate(db.schema(), db.interner(), a, e, value) {
+        Ok(Hydration::Bind(value)) => Ok(Some(value)),
+        Ok(Hydration::Hide) => Ok(None),
+        Ok(Hydration::Refuse(class)) => Err(QueryError::Protected(class)),
+        Err(error) => Err(QueryError::Type(error.to_string())),
+    }
 }
 
 fn reverse_refs(db: &Db, attr: AttrId, eid: EntityId) -> Vec<EntityId> {
@@ -220,11 +280,12 @@ fn reverse_refs(db: &Db, attr: AttrId, eid: EntityId) -> Vec<EntityId> {
 
 fn pull_entity(
     db: &Db,
+    hydrator: Option<&Hydrator>,
     pattern: &PullPattern,
     eid: EntityId,
     path: &mut BTreeSet<EntityId>,
 ) -> Result<Edn, QueryError> {
-    let own = entity_datoms(db, eid);
+    let own = entity_datoms(db, hydrator, eid)?;
     let mut pairs: Vec<(Edn, Edn)> = Vec::new();
     if pattern.db_id || pattern.wildcard {
         pairs.push((
@@ -258,13 +319,13 @@ fn pull_entity(
                 // Wildcard recursively pulls component entities.
                 sub: SubSelect::None,
             };
-            if let Some((key, value)) = pull_spec(db, &spec, pattern, eid, &own, path)? {
+            if let Some((key, value)) = pull_spec(db, hydrator, &spec, pattern, eid, &own, path)? {
                 pairs.push((key, value));
             }
         }
     }
     for spec in &pattern.specs {
-        if let Some((key, value)) = pull_spec(db, spec, pattern, eid, &own, path)? {
+        if let Some((key, value)) = pull_spec(db, hydrator, spec, pattern, eid, &own, path)? {
             pairs.push((key, value));
         }
     }
@@ -279,6 +340,7 @@ fn pull_entity(
 #[allow(clippy::too_many_lines)]
 fn pull_spec(
     db: &Db,
+    hydrator: Option<&Hydrator>,
     spec: &PullSpec,
     enclosing: &PullPattern,
     eid: EntityId,
@@ -311,13 +373,14 @@ fn pull_spec(
                 });
                 return Ok(default);
             }
-            let render =
-                |value: &Value, path: &mut BTreeSet<EntityId>| -> Result<Edn, QueryError> {
-                    if is_ref && let Value::Ref(child) = value {
-                        return render_ref(db, spec, enclosing, *child, is_component, path);
-                    }
-                    Ok(value_to_edn(db, value))
-                };
+            let render = |value: &Value,
+                          path: &mut BTreeSet<EntityId>|
+             -> Result<Edn, QueryError> {
+                if is_ref && let Value::Ref(child) = value {
+                    return render_ref(db, hydrator, spec, enclosing, *child, is_component, path);
+                }
+                Ok(value_to_edn(db, value))
+            };
             let rendered = if many {
                 let items = values
                     .iter()
@@ -357,7 +420,7 @@ fn pull_spec(
                     Edn::keyword("db/id"),
                     Edn::Long(i64::try_from(parent.raw()).unwrap_or(i64::MAX)),
                 )])),
-                SubSelect::Pattern(sub) => pull_entity(db, sub, parent, path),
+                SubSelect::Pattern(sub) => pull_entity(db, hydrator, sub, parent, path),
                 SubSelect::Recur(_) => Err(QueryError::Parse(
                     "recursion is not supported on reverse refs".into(),
                 )),
@@ -384,6 +447,7 @@ fn pull_spec(
 
 fn render_ref(
     db: &Db,
+    hydrator: Option<&Hydrator>,
     spec: &PullSpec,
     enclosing: &PullPattern,
     child: EntityId,
@@ -406,7 +470,7 @@ fn render_ref(
             if !path.insert(child) {
                 return Ok(db_id_map(child));
             }
-            let result = pull_entity(db, sub, child, path);
+            let result = pull_entity(db, hydrator, sub, child, path);
             path.remove(&child);
             result
         }
@@ -424,7 +488,7 @@ fn render_ref(
                     candidate.sub = SubSelect::Recur(d.map(|d| d.saturating_sub(1)));
                 }
             }
-            let result = pull_entity(db, &sub, child, path);
+            let result = pull_entity(db, hydrator, &sub, child, path);
             path.remove(&child);
             result
         }
@@ -439,7 +503,7 @@ fn render_ref(
                     db_id: true,
                     specs: Vec::new(),
                 };
-                let result = pull_entity(db, &wildcard, child, path);
+                let result = pull_entity(db, hydrator, &wildcard, child, path);
                 path.remove(&child);
                 result
             } else {

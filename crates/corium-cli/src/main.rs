@@ -2334,10 +2334,11 @@ fn format_value(value: &corium_core::Value, interner: &KeywordInterner) -> Strin
         Value::Uuid(v) => format!("#uuid \"{v:032x}\""),
         Value::Keyword(id) => interner
             .resolve(*id)
-            .map_or_else(|| format!("#kw {id}"), ToString::to_string),
+            .map_or_else(|| format!("#kw {id}"), |keyword| keyword.to_string()),
         Value::Str(v) => format!("{v:?}"),
         Value::Bytes(bytes) => format!("#bytes[{}]", bytes.len()),
         Value::Ref(e) => format!("#eid {}", e.raw()),
+        Value::Sealed(_) => "<redacted>".to_string(),
     }
 }
 

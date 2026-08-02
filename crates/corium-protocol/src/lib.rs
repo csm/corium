@@ -15,12 +15,18 @@ pub mod oidc;
 pub use corium_forms::{schemaform, txforms};
 
 /// Protocol version spoken by this crate.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Version 3 adds the sealed value tag (`0xA6`) and the versioned schema
+/// payload that carries protection classes.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest protocol version accepted by this crate's servers.
 ///
 /// Version 1 clients cannot request a transaction basis fence, but remain
-/// safe for operations that predate that optional field.
+/// safe for operations that predate that optional field. A pre-v3 client
+/// never receives a sealed value either: values reach a thin client through
+/// the boundary EDN, which renders an unhydrated one as
+/// `#corium/redacted` — a tagged element any EDN reader parses.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 
 /// Generated protobuf/tonic bindings for `corium.v1`.

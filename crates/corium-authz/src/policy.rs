@@ -539,7 +539,7 @@ impl Reader {
             Value::Keyword(id) => self
                 .interner
                 .resolve(*id)
-                .map(std::string::ToString::to_string),
+                .map(|keyword| keyword.to_string()),
             _ => None,
         }
     }

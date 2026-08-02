@@ -55,6 +55,14 @@ fn as_num(value: &Value) -> Option<Num> {
 /// # Errors
 /// Returns [`QueryError::Type`] for incomparable operand types.
 pub fn compare(left: &Value, right: &Value) -> Result<Ordering, QueryError> {
+    // A value the reader could not hydrate has no value order — its bytes are
+    // ciphertext. Predicates turn this into "no match"; aggregates let it
+    // through as the failure it is.
+    if let Some(class) = protected_class(std::slice::from_ref(left))
+        .or_else(|| protected_class(std::slice::from_ref(right)))
+    {
+        return Err(QueryError::Protected(class));
+    }
     if let (Some(l), Some(r)) = (as_num(left), as_num(right)) {
         return Ok(match (l, r) {
             (Num::Long(l), Num::Long(r)) => l.cmp(&r),
@@ -80,6 +88,19 @@ pub fn compare(left: &Value, right: &Value) -> Result<Ordering, QueryError> {
 #[must_use]
 pub fn loose_eq(left: &Value, right: &Value) -> bool {
     compare(left, right).is_ok_and(Ordering::is_eq)
+}
+
+/// The protection class of the first value the reader could not hydrate.
+///
+/// Under every missing-key policy such a value never satisfies a constant or
+/// a predicate: it binds, or it disappears, or it raises — it never matches
+/// by accident (`docs/design/encryption.md`).
+#[must_use]
+pub fn protected_class(values: &[Value]) -> Option<corium_core::EntityId> {
+    values.iter().find_map(|value| match value {
+        Value::Sealed(sealed) => Some(sealed.class),
+        _ => None,
+    })
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -163,8 +184,13 @@ fn chain_compare(
     accept: impl Fn(Ordering) -> bool,
 ) -> Result<CallResult, QueryError> {
     for window in args.windows(2) {
-        if !accept(compare(&window[0], &window[1])?) {
-            return Ok(CallResult::Test(false));
+        match compare(&window[0], &window[1]) {
+            Ok(ordering) if accept(ordering) => {}
+            // An unhydratable operand fails the test rather than the query:
+            // the class's policy already decided that this reader does not
+            // get the value, and a predicate over it must simply not match.
+            Ok(_) | Err(QueryError::Protected(_)) => return Ok(CallResult::Test(false)),
+            Err(error) => return Err(error),
         }
     }
     Ok(CallResult::Test(true))
@@ -182,6 +208,7 @@ pub fn value_to_display(value: &Value) -> String {
         Value::Keyword(id) => format!(":kw{id}"),
         Value::Ref(e) => e.raw().to_string(),
         Value::Bytes(b) => format!("{b:02x?}"),
+        Value::Sealed(_) => "#corium/redacted".to_string(),
     }
 }
 
@@ -242,11 +269,14 @@ pub fn call(name: &str, args: &[Value]) -> Result<CallResult, QueryError> {
         "<=" => chain_compare(args, Ordering::is_le),
         ">" => chain_compare(args, Ordering::is_gt),
         ">=" => chain_compare(args, Ordering::is_ge),
+        // Neither equality nor inequality is satisfiable over a value the
+        // reader could not hydrate: it is not known to be equal, and claiming
+        // it differs would leak just as much.
         "=" | "==" => Ok(CallResult::Test(
-            args.windows(2).all(|w| loose_eq(&w[0], &w[1])),
+            protected_class(args).is_none() && args.windows(2).all(|w| loose_eq(&w[0], &w[1])),
         )),
         "!=" | "not=" => Ok(CallResult::Test(
-            args.windows(2).any(|w| !loose_eq(&w[0], &w[1])),
+            protected_class(args).is_none() && args.windows(2).any(|w| !loose_eq(&w[0], &w[1])),
         )),
         "even?" => Ok(CallResult::Test(one_long(name, args)? % 2 == 0)),
         "odd?" => Ok(CallResult::Test(one_long(name, args)? % 2 != 0)),
@@ -355,6 +385,11 @@ pub fn call(name: &str, args: &[Value]) -> Result<CallResult, QueryError> {
         "min" | "max" => {
             if args.is_empty() {
                 return Err(arity_error(name));
+            }
+            // Ciphertext order is not value order, so there is no smallest
+            // sealed value to return.
+            if let Some(class) = protected_class(args) {
+                return Err(QueryError::Protected(class));
             }
             let mut best = args[0].clone();
             for arg in &args[1..] {

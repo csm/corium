@@ -1,6 +1,8 @@
 # ADR-0018: Attribute-level protection with per-class keys
 
-**Status:** Proposed (2026-07-28); design in
+**Status:** Accepted (2026-07-28); implemented for protection declared at
+database creation (2026-07-31) — schema alteration, entity scope, and the
+operational surface remain, see the status header in the design. Design in
 [`docs/design/encryption.md`](../design/encryption.md). Builds on
 [ADR-0017](0017-encryption-at-rest.md) (storage encryption) and extends the
 visibility model of [ADR-0012](0012-optional-authn-authz.md) /

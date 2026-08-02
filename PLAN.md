@@ -164,10 +164,10 @@ reserved `"datomic.tx"` tempid (or `:db/current-tx`), and `as-of`/`since`
 accept a wall-clock instant as well as a basis `t` — in Rust, cljrs, the wire
 protocol, the console, and the SQL shell.
 
-Confidentiality is specified but not yet built
-([docs/design/encryption.md](docs/design/encryption.md)). Two layers:
-envelope encryption of every durable artifact — index blobs, log records,
-backups, cached segments — under a per-database data key wrapped by a KMS
+Confidentiality is built in two layers
+([docs/design/encryption.md](docs/design/encryption.md)). Envelope encryption
+of every durable artifact — index blobs, log records, cached segments — under
+a per-database data key wrapped by a KMS
 ([ADR-0017](docs/adr/0017-encryption-at-rest.md)); and attribute **protection
 classes**, where values on a protected attribute are sealed with that class's
 key by the writing peer and hydrated only by readers granted it
@@ -175,7 +175,17 @@ key by the writing peer and hydrated only by readers granted it
 is unchanged — a keyless peer still reads storage, holds a `Db`, and queries
 locally, with protected values redacted — and protected datoms are excluded
 from AVET and VAET, which the schema enforces by rejecting `:db/protection`
-alongside `:db/index`, `:db/unique`, and `:db.type/ref`.
+alongside `:db/index`, `:db/unique`, and `:db.type/ref`. Sealing is
+deterministic (AES-256-GCM-SIV with the context in the AAD), which is what
+lets a transactor holding no key keep pairing retractions, superseding
+cardinality-one values, and comparing `:db/cas` bytewise.
+
+Protection is declared in the create-time schema today. Changing an
+attribute's protection needs a schema-alteration mechanism Corium does not yet
+have, and is the largest remaining piece of that work; entity scope, the
+per-principal key policy on the peer server, and the class rotation and shred
+commands are the rest. Backups of an encrypted database and KMS-backed
+keyrings remain to finish layer 1.
 
 Operator-level management is specified as its own surface
 ([docs/design/operator-service.md](docs/design/operator-service.md),

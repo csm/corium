@@ -3,6 +3,27 @@
 //!
 //! Queries execute server-side against the hosted peer's local database
 //! values with per-request fuel and chunked result streams.
+//!
+//! # Protected attributes: one key set for every client
+//!
+//! **A key-holding peer server discloses every class it holds to every client
+//! it serves.** Hydration here uses the hosted connection's own keyring, and
+//! the authorization guard gates *databases and operations*, not protection
+//! classes — so "this server can resolve the PII class key" and "any client
+//! authorized to query this database reads PII" are currently the same
+//! statement.
+//!
+//! The design's answer is a per-principal `KeyPolicy: Principal → [KeyId]`,
+//! which is where protection meets authorization, together with seal-through
+//! mode (`--seal-through`) where the server forwards sealed values and the
+//! thin client hydrates with its own keyring. Neither is implemented
+//! (`docs/design/encryption.md`, "Peer server, thin clients, SQL").
+//!
+//! Until they are, the deployment rule is: **give a peer server class keys
+//! only when every client it serves is entitled to every class it holds.**
+//! To serve less-trusted clients, run a peer server with no keyring — it
+//! answers every query that does not touch a protected value identically, and
+//! protected values come back redacted, hidden, or refused per class policy.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -99,6 +120,20 @@ impl PeerServerSvc {
     /// The database this peer server hosts, for building an [`Access`].
     fn db_target(&self) -> String {
         self.connection.db_name().to_owned()
+    }
+
+    /// The key set this server opens sealed values with.
+    ///
+    /// The hosted connection's keyring, for every request, whoever made it:
+    /// the principal is not consulted, because there is nothing yet to
+    /// consult it against. See this module's header — a key-holding peer
+    /// server discloses every class it holds to every client it serves, and
+    /// must not be exposed to clients that are not entitled to all of them.
+    async fn hydrator(&self) -> Result<std::sync::Arc<corium_db::protect::Hydrator>, Status> {
+        self.connection
+            .hydrator()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))
     }
 
     fn view_db(&self, spec: Option<&pb::DbViewSpec>) -> Result<Db, Status> {
@@ -236,6 +271,7 @@ impl PeerServer for PeerServerSvc {
             &inputs,
             ExecOptions {
                 fuel: Some(fuel),
+                hydrator: Some(self.hydrator().await?),
                 ..ExecOptions::default()
             },
         )
@@ -293,7 +329,8 @@ impl PeerServer for PeerServerSvc {
         let db = self.view_db(request.db.as_ref())?;
         let pattern = decode_edn(&request.pattern, "pull pattern")?;
         let eid = resolve_eid(&db, &decode_edn(&request.eid, "entity")?)?;
-        let result = corium_query::pull(&db, &pattern, eid)
+        let hydrator = self.hydrator().await?;
+        let result = corium_query::pull_with(&db, &pattern, eid, Some(&hydrator))
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(pb::PullResponse {
             result: codec::encode_edn(&result),
@@ -404,11 +441,28 @@ impl PeerServer for PeerServerSvc {
                 .unwrap_or(usize::MAX)
                 .min(self.config.max_datoms)
         };
-        let datoms: Vec<corium_core::Datom> = db
-            .datoms_prefix(order, &prefix)
-            .take(limit)
-            .cloned()
-            .collect();
+        // Sealed values are opened with the server's own keys, for whoever
+        // asked — the raw datom stream discloses exactly as much as `query`
+        // and `pull` do. See this module's header.
+        let hydrator = self.hydrator().await?;
+        let mut datoms: Vec<corium_core::Datom> = Vec::new();
+        for datom in db.datoms_prefix(order, &prefix) {
+            if datoms.len() >= limit {
+                break;
+            }
+            match hydrator.hydrate(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
+                Ok(corium_db::protect::Hydration::Bind(v)) => {
+                    datoms.push(corium_core::Datom { v, ..datom.clone() });
+                }
+                Ok(corium_db::protect::Hydration::Hide) => {}
+                Ok(corium_db::protect::Hydration::Refuse(class)) => {
+                    return Err(Status::permission_denied(format!(
+                        "protection class {class} is not readable without its key"
+                    )));
+                }
+                Err(error) => return Err(Status::internal(error.to_string())),
+            }
+        }
         let interner = db.interner();
         let mut chunks = Vec::new();
         let groups: Vec<&[corium_core::Datom]> = if datoms.is_empty() {
