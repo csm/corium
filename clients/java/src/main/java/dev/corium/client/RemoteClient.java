@@ -15,22 +15,29 @@ import java.net.URISyntaxException;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import static dev.corium.client.RemoteSupport.parseEndpoint;
 import static dev.corium.client.RemoteSupport.unary;
 
-public final class RemoteClient implements Client, AutoCloseable {
+public final class RemoteClient implements Client<RemotePeer>, AutoCloseable {
     public static final int PROTOCOL_VERSION = 1;
 
     final ManagedChannel channel;
     private final CatalogGrpc.CatalogStub catalogStub;
     private volatile boolean closed;
     private final boolean tls;
+    private final ConcurrentHashMap<RemotePeer, RemotePeer> peers;
+    private final String token;
+    private final boolean allowInsecureToken;
 
     private RemoteClient(Builder builder) {
+        peers = new ConcurrentHashMap<>();
         URI endpoint = parseEndpoint(builder.endpoint);
         tls = endpoint.getScheme().equalsIgnoreCase("https");
+        token = builder.token;
+        allowInsecureToken = builder.allowInsecureToken;
         if (builder.token != null && !tls && !builder.allowInsecureToken) {
             throw new IllegalArgumentException("bearer tokens require an https:// endpoint");
         }
@@ -64,6 +71,15 @@ public final class RemoteClient implements Client, AutoCloseable {
     }
 
     @Override
+    public RemotePeer peer(String dbName) {
+        var builder = RemotePeer.builder(this, dbName).allowInsecureToken(allowInsecureToken);
+        if (token != null) {
+            builder.token(token);
+        }
+        return builder.build();
+    }
+
+    @Override
     public CompletableFuture<List<String>> listDatabases() {
         ensureOpen();
         Corium.ListDatabasesRequest request = Corium.ListDatabasesRequest.getDefaultInstance();
@@ -75,6 +91,8 @@ public final class RemoteClient implements Client, AutoCloseable {
     @Override
     public void close() {
         if (closed) return;
+        peers.keySet().forEach(RemotePeer::close);
+        peers.clear();
         closed = true;
         channel.shutdown();
     }
@@ -93,6 +111,15 @@ public final class RemoteClient implements Client, AutoCloseable {
 
     boolean isTls() {
         return tls;
+    }
+
+    void addPeer(RemotePeer peer) {
+        ensureOpen();
+        peers.putIfAbsent(peer, peer);
+    }
+
+    void removePeer(RemotePeer peer) {
+        peers.remove(peer);
     }
 
     public static final class Builder {

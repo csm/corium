@@ -53,6 +53,7 @@ public final class RemotePeer implements Peer, AutoCloseable {
             created = created.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
         }
         this.stub = created;
+        client.addPeer(this);
     }
 
     public static Builder builder(RemoteClient client, String databaseName) {
@@ -212,11 +213,8 @@ public final class RemotePeer implements Peer, AutoCloseable {
     public synchronized void close() {
         if (closed) return;
         closed = true;
-        // leave the channel from
-    }
-
-    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
-        return channel.awaitTermination(timeout, unit);
+        client.removePeer(this);
+        // leave the channel from the client open.
     }
 
     private static QueryResult.Shape queryShape(Corium.ResultShape shape) {
