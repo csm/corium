@@ -2,38 +2,30 @@ package dev.corium.client;
 
 import dev.corium.protocol.v1.CatalogGrpc;
 import dev.corium.protocol.v1.Corium;
-import dev.corium.protocol.v1.PeerServerGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.MetadataUtils;
-import io.grpc.stub.StreamObserver;
 
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import static dev.corium.client.RemoteSupport.parseEndpoint;
 import static dev.corium.client.RemoteSupport.unary;
 
 public final class RemoteClient implements Client<RemotePeer>, AutoCloseable {
-    public static final int PROTOCOL_VERSION = 1;
-
     final ManagedChannel channel;
     private final CatalogGrpc.CatalogStub catalogStub;
     private volatile boolean closed;
     private final boolean tls;
-    private final ConcurrentHashMap<RemotePeer, RemotePeer> peers;
     private final String token;
     private final boolean allowInsecureToken;
 
     private RemoteClient(Builder builder) {
-        peers = new ConcurrentHashMap<>();
         URI endpoint = parseEndpoint(builder.endpoint);
         tls = endpoint.getScheme().equalsIgnoreCase("https");
         token = builder.token;
@@ -91,8 +83,6 @@ public final class RemoteClient implements Client<RemotePeer>, AutoCloseable {
     @Override
     public void close() {
         if (closed) return;
-        peers.keySet().forEach(RemotePeer::close);
-        peers.clear();
         closed = true;
         channel.shutdown();
     }
@@ -111,15 +101,6 @@ public final class RemoteClient implements Client<RemotePeer>, AutoCloseable {
 
     boolean isTls() {
         return tls;
-    }
-
-    void addPeer(RemotePeer peer) {
-        ensureOpen();
-        peers.putIfAbsent(peer, peer);
-    }
-
-    void removePeer(RemotePeer peer) {
-        peers.remove(peer);
     }
 
     public static final class Builder {

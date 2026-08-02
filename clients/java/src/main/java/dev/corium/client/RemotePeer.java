@@ -5,16 +5,9 @@ import dev.corium.protocol.v1.Corium;
 import dev.corium.protocol.v1.PeerServerGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
-import io.grpc.Status;
-import io.grpc.StatusException;
-import io.grpc.StatusRuntimeException;
 import io.grpc.stub.MetadataUtils;
 import io.grpc.stub.StreamObserver;
-import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
-import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -23,18 +16,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 import static dev.corium.client.RemoteSupport.mapError;
 import static dev.corium.client.RemoteSupport.unary;
 
 /** A lightweight asynchronous client connected to {@code corium peer-server}. */
-public final class RemotePeer implements Peer, AutoCloseable {
+public final class RemotePeer implements Peer {
     public static final int PROTOCOL_VERSION = 1;
 
     private final RemoteClient client;
     private final String databaseName;
-    private final ManagedChannel channel;
     private final PeerServerGrpc.PeerServerStub stub;
     private volatile boolean closed;
 
@@ -44,7 +35,7 @@ public final class RemotePeer implements Peer, AutoCloseable {
         }
         this.databaseName = builder.databaseName;
         this.client = builder.client;
-        this.channel = client.channel;
+        ManagedChannel channel = client.channel;
         PeerServerGrpc.PeerServerStub created = PeerServerGrpc.newStub(channel);
         if (builder.token != null) {
             Metadata headers = new Metadata();
@@ -53,7 +44,6 @@ public final class RemotePeer implements Peer, AutoCloseable {
             created = created.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
         }
         this.stub = created;
-        client.addPeer(this);
     }
 
     public static Builder builder(RemoteClient client, String databaseName) {
@@ -109,18 +99,20 @@ public final class RemotePeer implements Peer, AutoCloseable {
                 .setFuel(fuel)
                 .build();
         CompletableFuture<QueryResult> future = new CompletableFuture<>();
-        stub.query(request, new StreamObserver<Corium.QueryResultChunk>() {
+        stub.query(request, new StreamObserver<>() {
             private Corium.ResultShape shape;
             private final List<Object> rows = new ArrayList<>();
             private Object single;
             private boolean receivedSingle;
             private boolean sawLast;
 
-            @Override public void onNext(Corium.QueryResultChunk chunk) {
+            @Override
+            public void onNext(Corium.QueryResultChunk chunk) {
                 try {
                     if (sawLast) throw new DecodeException("query stream sent a chunk after its last chunk");
                     if (shape == null) shape = chunk.getShape();
-                    if (chunk.getShape() != shape) throw new DecodeException("query result shape changed between chunks");
+                    if (chunk.getShape() != shape)
+                        throw new DecodeException("query result shape changed between chunks");
                     if (shape == Corium.ResultShape.RESULT_SHAPE_UNSPECIFIED
                             || shape == Corium.ResultShape.UNRECOGNIZED) {
                         throw new DecodeException("query result has unspecified shape");
@@ -128,7 +120,8 @@ public final class RemotePeer implements Peer, AutoCloseable {
                     Object decoded = CoriumCodec.decode(chunk.getRows().toByteArray());
                     if (shape == Corium.ResultShape.RESULT_SHAPE_RELATION
                             || shape == Corium.ResultShape.RESULT_SHAPE_COLLECTION) {
-                        if (!(decoded instanceof List<?>)) throw new DecodeException("chunked query result is not a vector");
+                        if (!(decoded instanceof List<?>))
+                            throw new DecodeException("chunked query result is not a vector");
                         rows.addAll((List<?>) decoded);
                     } else {
                         if (receivedSingle) throw new DecodeException("tuple/scalar query returned multiple chunks");
@@ -140,8 +133,14 @@ public final class RemotePeer implements Peer, AutoCloseable {
                     future.completeExceptionally(error);
                 }
             }
-            @Override public void onError(Throwable error) { future.completeExceptionally(mapError(error)); }
-            @Override public void onCompleted() {
+
+            @Override
+            public void onError(Throwable error) {
+                future.completeExceptionally(mapError(error));
+            }
+
+            @Override
+            public void onCompleted() {
                 if (future.isDone()) return;
                 if (!sawLast || shape == null) {
                     future.completeExceptionally(new DecodeException("query stream ended before its last chunk"));
@@ -206,15 +205,6 @@ public final class RemotePeer implements Peer, AutoCloseable {
 
     void ensureOpen() {
         client.ensureOpen();
-        if (closed) throw new CoriumException("peer is closed");
-    }
-
-    @Override
-    public synchronized void close() {
-        if (closed) return;
-        closed = true;
-        client.removePeer(this);
-        // leave the channel from the client open.
     }
 
     private static QueryResult.Shape queryShape(Corium.ResultShape shape) {
