@@ -118,9 +118,10 @@ pub struct ConnectConfig {
     /// Optional direct blob/root storage used to bootstrap from the newest
     /// published index before subscribing to the transaction-log tail.
     storage: Option<Arc<dyn PeerStorage>>,
-    /// Keys this peer can resolve. Needed only for a storage-aware peer
-    /// reading an encrypted database: everything arriving over the wire is
-    /// already plaintext.
+    /// Keys this peer can resolve: the storage key of a database encrypted
+    /// at rest, and the protection-class keys it seals and hydrates attribute
+    /// values with. A peer server hydrates every request with these,
+    /// whichever principal made it.
     keyring: Option<Arc<dyn Keyring>>,
     segment_cache_metrics: Option<SegmentCacheMetricsHandle>,
 }
@@ -207,11 +208,27 @@ impl ConnectConfig {
         Ok(self)
     }
 
-    /// Supplies the keys this peer can resolve.
+    /// Supplies the keys this peer can resolve: both the storage key of a
+    /// database encrypted at rest and the protection-class keys it seals and
+    /// hydrates attribute values with.
     ///
-    /// Only a storage-aware peer needs them, and only for a database that is
-    /// encrypted at rest: without direct storage every datom arrives over the
-    /// wire already decrypted by the transactor's peers.
+    /// A storage key is needed only by a storage-aware peer — without direct
+    /// storage every datom arrives over the wire already decrypted by the
+    /// transactor's peers. Class keys are needed by any peer that writes or
+    /// reads a protected attribute, storage-aware or not, because sealing
+    /// happens before tx-data leaves the peer and hydration after it arrives.
+    ///
+    /// A class whose key this keyring cannot resolve is not an error: the
+    /// peer reads its values under the class's missing-key policy, which is
+    /// what an intentionally keyless peer looks like.
+    ///
+    /// # Hosting other clients
+    ///
+    /// Keys given here are the ones [`crate::server::PeerServerSvc`] hydrates
+    /// *every* request with, for every principal it serves — there is no
+    /// per-principal key policy yet. Handing a keyring to a connection that a
+    /// peer server will host is therefore a decision about every client of
+    /// that server; see the header of [`crate::server`].
     #[must_use]
     pub fn with_keyring(mut self, keyring: Arc<dyn Keyring>) -> Self {
         self.keyring = Some(keyring);

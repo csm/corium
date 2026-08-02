@@ -3,6 +3,27 @@
 //!
 //! Queries execute server-side against the hosted peer's local database
 //! values with per-request fuel and chunked result streams.
+//!
+//! # Protected attributes: one key set for every client
+//!
+//! **A key-holding peer server discloses every class it holds to every client
+//! it serves.** Hydration here uses the hosted connection's own keyring, and
+//! the authorization guard gates *databases and operations*, not protection
+//! classes — so "this server can resolve the PII class key" and "any client
+//! authorized to query this database reads PII" are currently the same
+//! statement.
+//!
+//! The design's answer is a per-principal `KeyPolicy: Principal → [KeyId]`,
+//! which is where protection meets authorization, together with seal-through
+//! mode (`--seal-through`) where the server forwards sealed values and the
+//! thin client hydrates with its own keyring. Neither is implemented
+//! (`docs/design/encryption.md`, "Peer server, thin clients, SQL").
+//!
+//! Until they are, the deployment rule is: **give a peer server class keys
+//! only when every client it serves is entitled to every class it holds.**
+//! To serve less-trusted clients, run a peer server with no keyring — it
+//! answers every query that does not touch a protected value identically, and
+//! protected values come back redacted, hidden, or refused per class policy.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -103,9 +124,11 @@ impl PeerServerSvc {
 
     /// The key set this server opens sealed values with.
     ///
-    /// One key set for the whole server today; a per-principal `KeyPolicy`,
-    /// and seal-through mode where the thin client hydrates for itself, are
-    /// deferred surfaces work (`docs/design/encryption.md`).
+    /// The hosted connection's keyring, for every request, whoever made it:
+    /// the principal is not consulted, because there is nothing yet to
+    /// consult it against. See this module's header — a key-holding peer
+    /// server discloses every class it holds to every client it serves, and
+    /// must not be exposed to clients that are not entitled to all of them.
     async fn hydrator(&self) -> Result<std::sync::Arc<corium_db::protect::Hydrator>, Status> {
         self.connection
             .hydrator()
@@ -418,8 +441,9 @@ impl PeerServer for PeerServerSvc {
                 .unwrap_or(usize::MAX)
                 .min(self.config.max_datoms)
         };
-        // Sealed values are opened here, with the server's own keys; a
-        // per-principal key policy is deferred surfaces work.
+        // Sealed values are opened with the server's own keys, for whoever
+        // asked — the raw datom stream discloses exactly as much as `query`
+        // and `pull` do. See this module's header.
         let hydrator = self.hydrator().await?;
         let mut datoms: Vec<corium_core::Datom> = Vec::new();
         for datom in db.datoms_prefix(order, &prefix) {

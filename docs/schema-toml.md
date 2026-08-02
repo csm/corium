@@ -144,6 +144,14 @@ values.
 drops the datom out of scans entirely, and `"error"` fails the read. Under all
 three, an unopenable value never satisfies a constant or a predicate.
 
+Who may read a class is a question about key distribution, not about Corium:
+give the key identity to the processes that should hydrate it, and to no
+others. One caveat while the per-principal key policy is unimplemented: a
+**peer server** hydrates every request with its own keyring, so any client it
+serves reads every class it holds. See
+[docs/operations.md](operations.md#attribute-protection) before pointing
+less-trusted clients at a key-holding peer server.
+
 Protection cannot be combined with `index`, `unique`, or `type = "ref"`:
 ciphertext order is not value order, so a protected attribute can never appear
 in the value-ordered indexes, and the schema rejects the combination rather
