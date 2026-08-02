@@ -185,9 +185,7 @@ impl AckCode {
             Self::ComponentEnable => {
                 "existing references acquire cascade retract and pull semantics"
             }
-            Self::ComponentDisable => {
-                "existing references lose cascade retract and pull semantics"
-            }
+            Self::ComponentDisable => "existing references lose cascade retract and pull semantics",
             Self::UniqueModeChange => "upsert and conflict behaviour changes for future writes",
             Self::NoHistoryEnable => "history stops being recorded from this transaction onward",
             Self::NoHistoryDisable => {
@@ -532,9 +530,9 @@ impl SchemaPlan {
 
     /// Steps this command can never execute.
     pub fn blocked_steps(&self) -> impl Iterator<Item = &PlanStep> {
-        self.steps.iter().filter(|step| {
-            step.blocked.is_some() || !step.class.executable()
-        })
+        self.steps
+            .iter()
+            .filter(|step| step.blocked.is_some() || !step.class.executable())
     }
 
     /// Steps of one execution class, in plan order.
@@ -907,7 +905,10 @@ mod tests {
 
     #[test]
     fn observations_do_not_change_the_plan_digest() {
-        let base = plan(vec![step(":person/email#unique", ExecutionClass::ValidateReindex)]);
+        let base = plan(vec![step(
+            ":person/email#unique",
+            ExecutionClass::ValidateReindex,
+        )]);
         let mut drifted = base.clone();
         drifted.basis_t = 999;
         drifted.database = "other".to_owned();
@@ -919,7 +920,10 @@ mod tests {
 
     #[test]
     fn logical_changes_change_the_plan_digest() {
-        let base = plan(vec![step(":person/email#unique", ExecutionClass::ValidateReindex)]);
+        let base = plan(vec![step(
+            ":person/email#unique",
+            ExecutionClass::ValidateReindex,
+        )]);
         for mutate in [
             (|plan: &mut SchemaPlan| plan.prune = true) as fn(&mut SchemaPlan),
             |plan| plan.desired_digest = "sha256:other".to_owned(),

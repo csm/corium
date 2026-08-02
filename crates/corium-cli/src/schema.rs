@@ -161,7 +161,10 @@ async fn run_update(args: UpdateArgs) -> Result<ExitCode, CommandError> {
         // operator learns about a stale plan or a missing acknowledgement even
         // while the operation itself is unavailable.
         check_apply(&plan, args.plan.as_deref(), &allowed, &acknowledged)?;
-        return Err(CommandError::new(ERROR_APPLY_UNSUPPORTED, APPLY_UNSUPPORTED));
+        return Err(CommandError::new(
+            ERROR_APPLY_UNSUPPORTED,
+            APPLY_UNSUPPORTED,
+        ));
     }
 
     if args.json {
@@ -255,8 +258,12 @@ fn check_apply(
 }
 
 fn read_desired(path: &Path) -> Result<DesiredSchema, CommandError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| CommandError::new(ERROR_PARSE, format!("cannot read {}: {error}", path.display())))?;
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        CommandError::new(
+            ERROR_PARSE,
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
     if path
         .extension()
         .and_then(std::ffi::OsStr::to_str)
@@ -265,8 +272,8 @@ fn read_desired(path: &Path) -> Result<DesiredSchema, CommandError> {
         return DesiredSchema::from_toml(&text)
             .map_err(|error| CommandError::new(ERROR_PARSE, format!("bad schema TOML: {error}")));
     }
-    let forms = crate::read_schema_edn(&text)
-        .map_err(|error| CommandError::new(ERROR_PARSE, error))?;
+    let forms =
+        crate::read_schema_edn(&text).map_err(|error| CommandError::new(ERROR_PARSE, error))?;
     DesiredSchema::from_edn(&forms)
         .map_err(|error| CommandError::new(ERROR_PARSE, format!("bad schema EDN: {error}")))
 }
@@ -295,8 +302,9 @@ fn parse_acks(values: &[String]) -> Result<BTreeSet<AckCode>, CommandError> {
     values
         .iter()
         .map(|value| {
-            AckCode::parse(value)
-                .ok_or_else(|| CommandError::new(ERROR_PARSE, format!("unknown change code {value:?}")))
+            AckCode::parse(value).ok_or_else(|| {
+                CommandError::new(ERROR_PARSE, format!("unknown change code {value:?}"))
+            })
         })
         .collect()
 }
@@ -463,7 +471,11 @@ pub(crate) fn render_json(plan: &SchemaPlan) -> String {
         None => out.push_str("null"),
     }
     push_string_field(&mut out, "desired_digest", &plan.desired_digest);
-    push_string_field(&mut out, "installed_fingerprint", &plan.installed_fingerprint);
+    push_string_field(
+        &mut out,
+        "installed_fingerprint",
+        &plan.installed_fingerprint,
+    );
     push_string_field(&mut out, "plan_digest", &plan.digest());
     out.push_str(",\"prune\":");
     out.push_str(if plan.prune { "true" } else { "false" });
@@ -487,10 +499,15 @@ pub(crate) fn render_json(plan: &SchemaPlan) -> String {
     out.push_str(",\"required_allowances\":");
     push_string_array(
         &mut out,
-        plan.required_allowances().iter().map(|class| class.as_str()),
+        plan.required_allowances()
+            .iter()
+            .map(|class| class.as_str()),
     );
     out.push_str(",\"required_acks\":");
-    push_string_array(&mut out, plan.required_acks().iter().map(|ack| ack.as_str()));
+    push_string_array(
+        &mut out,
+        plan.required_acks().iter().map(|ack| ack.as_str()),
+    );
 
     out.push_str(",\"apply\":{\"supported\":false");
     push_string_field(&mut out, "reason", APPLY_UNSUPPORTED);
@@ -784,8 +801,13 @@ mod tests {
     #[test]
     fn apply_requires_the_exact_plan_digest() {
         let plan = sample_plan();
-        let error = check_apply(&plan, Some("sha256:stale"), &BTreeSet::new(), &BTreeSet::new())
-            .expect_err("a stale digest is refused");
+        let error = check_apply(
+            &plan,
+            Some("sha256:stale"),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect_err("a stale digest is refused");
         assert_eq!(error.code, ERROR_PLAN_MISMATCH);
         assert!(error.message.contains("review the new plan"));
 

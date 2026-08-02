@@ -109,7 +109,10 @@ fn a_new_attribute_is_additive() {
     assert!(added.blocked.is_none());
     // No fact can exist yet, so an index or constraint costs nothing.
     assert!(added.observations.is_empty());
-    assert_eq!(added.desired.as_deref(), Some("string cardinality-one unique-identity"));
+    assert_eq!(
+        added.desired.as_deref(),
+        Some("string cardinality-one unique-identity")
+    );
     assert_eq!(plan.required_classes().len(), 0);
 }
 
@@ -355,7 +358,10 @@ fn disabling_no_history_states_the_interval_it_cannot_reconstruct() {
     .expect("plans");
     let step = step(&planned, ":person/age#no-history");
     assert_eq!(step.acks, vec![AckCode::NoHistoryDisable]);
-    assert!(step.notes.iter().any(|note| note.contains("basis 7")), "{step:?}");
+    assert!(
+        step.notes.iter().any(|note| note.contains("basis 7")),
+        "{step:?}"
+    );
     // `:db/noHistory` means the exact historical count cannot be produced.
     assert!(matches!(
         observation(step, "recorded-history-datoms"),
@@ -453,7 +459,10 @@ fn engine_attributes_are_never_managed_by_a_file() {
         &options(),
     )
     .expect_err("engine attributes are refused");
-    assert_eq!(error, PlanError::EngineAttribute(":db/txInstant".to_owned()));
+    assert_eq!(
+        error,
+        PlanError::EngineAttribute(":db/txInstant".to_owned())
+    );
 }
 
 #[test]
@@ -609,9 +618,8 @@ fn documentation_is_reported_as_untracked_rather_than_planned() {
 fn every_property_difference_is_classified_exactly_once() {
     // One installed attribute, one desired attribute differing in every
     // property the model has.
-    let db = database(
-        r"{:db/ident :a/b :db/valueType :db.type/long :db/unique :db.unique/identity}",
-    );
+    let db =
+        database(r"{:db/ident :a/b :db/valueType :db.type/long :db/unique :db.unique/identity}");
     let planned = plan(
         &desired(
             r"
@@ -684,13 +692,12 @@ fn observations_are_advisory_and_never_reach_the_digest() {
 #[test]
 fn plans_render_their_observations_for_review() {
     assert_eq!(
-        Observation::count("current-datoms", 12_204).value.to_string(),
+        Observation::count("current-datoms", 12_204)
+            .value
+            .to_string(),
         "12,204"
     );
-    assert_eq!(
-        ObservationValue::Estimate(1_000).to_string(),
-        "~1,000"
-    );
+    assert_eq!(ObservationValue::Estimate(1_000).to_string(), "~1,000");
     assert_eq!(
         ObservationValue::Entities(vec![EntityId::new(Partition::User as u32, 7)]).to_string(),
         "7"
@@ -785,7 +792,10 @@ fn a_documented_installed_schema_plans_documentation_changes() {
         &options(),
     )
     .expect("plans");
-    assert_eq!(step(&retracted, ":person/email#doc").summary, "doc retracted");
+    assert_eq!(
+        step(&retracted, ":person/email#doc").summary,
+        "doc retracted"
+    );
 }
 
 #[test]

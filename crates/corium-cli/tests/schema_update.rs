@@ -141,7 +141,10 @@ fn tx(forms: &str) -> Vec<Edn> {
 /// enough to read positionally, and this keeps the test dependency-free.
 fn json_field<'a>(json: &'a str, name: &str) -> &'a str {
     let key = format!("\"{name}\":\"");
-    let start = json.find(&key).unwrap_or_else(|| panic!("{name} in {json}")) + key.len();
+    let start = json
+        .find(&key)
+        .unwrap_or_else(|| panic!("{name} in {json}"))
+        + key.len();
     let rest = &json[start..];
     &rest[..rest.find('"').expect("terminated string")]
 }
@@ -183,17 +186,17 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
     let home = people.tempids.get("a").expect("tempid a").raw();
     let resident = people.tempids.get("b").expect("tempid b").raw();
     connection
-        .transact(tx(&format!(
-            "[:db/add {resident} :person/address {home}]"
-        )))
+        .transact(tx(&format!("[:db/add {resident} :person/address {home}]")))
         .await
         .expect("transact reference");
 
     // 1. The installed schema is its own plan: no changes, exit 0.
     let unchanged = schema_update(&transactor.endpoint(), &installed_path, &[]);
-    assert_eq!(unchanged.code, 0, "{unchanged:?}", );
+    assert_eq!(unchanged.code, 0, "{unchanged:?}",);
     assert!(
-        unchanged.stdout.contains("No changes. Nothing was written."),
+        unchanged
+            .stdout
+            .contains("No changes. Nothing was written."),
         "{}",
         unchanged.stdout
     );
@@ -235,10 +238,7 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
     assert!(report.contains("[ack: component-enable]"), "{report}");
     assert!(report.contains("live refs: 1"), "{report}");
     assert!(report.contains("DESTRUCTIVE (blocked)"), "{report}");
-    assert!(
-        report.contains("~ :person/age long -> string"),
-        "{report}"
-    );
+    assert!(report.contains("~ :person/age long -> string"), "{report}");
     assert!(
         report.contains("recipe: add :person/age-string"),
         "{report}"
@@ -283,7 +283,11 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
 
     // 5. `--prune` turns the unmanaged attribute into a retirement, and that
     //    is a different plan.
-    let pruned = schema_update(&transactor.endpoint(), &desired_path, &["--json", "--prune"]);
+    let pruned = schema_update(
+        &transactor.endpoint(),
+        &desired_path,
+        &["--json", "--prune"],
+    );
     assert_eq!(pruned.code, 0, "{}", pruned.stderr);
     let pruned_json = pruned.stdout.trim();
     assert!(
@@ -355,7 +359,9 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
     let additive = write(
         dir.path(),
         "additive.toml",
-        &format!("{INSTALLED}\n[[attribute]]\ngroup = \"person\"\nname = \"nickname\"\ntype = \"string\"\n"),
+        &format!(
+            "{INSTALLED}\n[[attribute]]\ngroup = \"person\"\nname = \"nickname\"\ntype = \"string\"\n"
+        ),
     );
     let additive_json = schema_update(&transactor.endpoint(), &additive, &["--json"]);
     let digest = json_field(additive_json.stdout.trim(), "plan_digest").to_owned();

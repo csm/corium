@@ -11,10 +11,10 @@ use corium_core::{
     Attribute, Cardinality, Datom, EntityId, IndexOrder, Partition, Schema, Unique, Value,
     ValueType,
 };
+use corium_db::Db;
 use corium_db::impact::{
     DEFAULT_SAMPLE_LIMIT, attribute_impact, cardinality_conflicts, duplicate_values, live_refs,
 };
-use corium_db::Db;
 use proptest::prelude::*;
 
 const ATTRS: [u64; 3] = [100, 101, 102];
@@ -57,9 +57,13 @@ struct Op {
 
 fn operations() -> impl Strategy<Value = Vec<Op>> {
     prop::collection::vec(
-        (0_u64..6, prop::sample::select(ATTRS.to_vec()), 0_i64..4, any::<bool>()).prop_map(
-            |(e, a, v, added)| Op { e, a, v, added },
-        ),
+        (
+            0_u64..6,
+            prop::sample::select(ATTRS.to_vec()),
+            0_i64..4,
+            any::<bool>(),
+        )
+            .prop_map(|(e, a, v, added)| Op { e, a, v, added }),
         0..40,
     )
 }

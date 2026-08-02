@@ -24,11 +24,11 @@ use corium_core::migration::{
     value_type_name,
 };
 use corium_core::{Cardinality, Partition};
+use corium_db::Db;
 use corium_db::impact::{
     self, DEFAULT_SAMPLE_LIMIT, attribute_impact, cardinality_conflicts, duplicate_values,
     history_impact, live_refs,
 };
-use corium_db::Db;
 use thiserror::Error;
 
 use crate::desired::{DesiredAttribute, DesiredSchema};
@@ -288,9 +288,8 @@ fn property_steps(
     // A value-type change is refused, but the other differences on the same
     // attribute are still classified — and made to depend on it, so the plan
     // shows plainly that none of them can run first.
-    let type_step = (current.value_type != declaration.value_type).then(|| {
-        value_type_step(current, declaration, db)
-    });
+    let type_step = (current.value_type != declaration.value_type)
+        .then(|| value_type_step(current, declaration, db));
     let blocked_by: Vec<String> = type_step
         .as_ref()
         .map(|step| vec![step.key.clone()])
@@ -311,9 +310,8 @@ fn property_steps(
 
     // AVET coverage is planned before the constraint that depends on it: the
     // uniqueness step is only ready once the backfill covers its basis.
-    let index_key = (current.indexed != declaration.indexed).then(|| {
-        PlanStep::key_for(ident, ChangeKind::Property(SchemaProperty::Index))
-    });
+    let index_key = (current.indexed != declaration.indexed)
+        .then(|| PlanStep::key_for(ident, ChangeKind::Property(SchemaProperty::Index)));
     if current.indexed != declaration.indexed {
         steps.push(index_step(current, declaration, db, &blocked_by));
     }
@@ -324,7 +322,13 @@ fn property_steps(
         {
             depends.push(key.clone());
         }
-        steps.push(unique_step(current, declaration, db, sample_limit, &depends));
+        steps.push(unique_step(
+            current,
+            declaration,
+            db,
+            sample_limit,
+            &depends,
+        ));
     }
     if current.is_component != declaration.is_component {
         steps.push(component_step(current, declaration, db, &blocked_by));
@@ -379,9 +383,7 @@ fn value_type_step(
             Observation::count("current-datoms", impact.datoms),
             Observation::count("distinct-values", impact.distinct_values),
         ],
-        notes: vec![
-            "the conversion policy cannot be inferred from the two type names".to_owned(),
-        ],
+        notes: vec!["the conversion policy cannot be inferred from the two type names".to_owned()],
     }
 }
 
@@ -413,7 +415,10 @@ fn cardinality_step(
         )
     };
     if !widening {
-        observations.push(Observation::count("conflicting-entities", conflicts.entities));
+        observations.push(Observation::count(
+            "conflicting-entities",
+            conflicts.entities,
+        ));
         observations.push(Observation::count("conflicting-datoms", conflicts.datoms));
         if !conflicts.sample.is_empty() {
             observations.push(Observation::entities(
@@ -464,7 +469,10 @@ fn index_step(
     let impact = attribute_impact(db, current.id);
     let enabling = declaration.indexed;
     let blocked = (enabling && current.ever_protected).then_some(BlockedReason::EverProtected);
-    let mut observations = vec![Observation::count("distinct-values", impact.distinct_values)];
+    let mut observations = vec![Observation::count(
+        "distinct-values",
+        impact.distinct_values,
+    )];
     let mut notes = Vec::new();
     if enabling {
         observations.insert(0, Observation::count("avet-backfill-datoms", impact.datoms));
@@ -522,7 +530,10 @@ fn unique_step(
         (None, Some(_)) => {
             let mut duplicates = duplicate_values(db, current.id, sample_limit);
             observations.push(Observation::count("duplicate-values", duplicates.groups));
-            observations.push(Observation::count("duplicate-entities", duplicates.entities));
+            observations.push(Observation::count(
+                "duplicate-entities",
+                duplicates.entities,
+            ));
             let sample = std::mem::take(&mut duplicates.sample);
             if !sample.is_empty() {
                 observations.push(Observation::entities("duplicate-entity-sample", sample));
@@ -715,4 +726,3 @@ fn history_observation(history: impact::HistoryImpact) -> Observation {
         )
     }
 }
-

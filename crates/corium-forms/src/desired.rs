@@ -14,9 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use corium_core::migration::{
-    cardinality_name, digest_hex, flag, unique_name, value_type_name,
-};
+use corium_core::migration::{cardinality_name, digest_hex, flag, unique_name, value_type_name};
 use corium_core::{Cardinality, Keyword, Unique, ValueType};
 use corium_query::edn::Edn;
 use thiserror::Error;
@@ -378,7 +376,8 @@ unique = "value"
         )
         .expect("TOML parses");
         assert!(toml.get(":id").expect("declared").indexed);
-        let edn = edn_schema("{:db/ident :id :db/valueType :db.type/uuid :db/unique :db.unique/value}");
+        let edn =
+            edn_schema("{:db/ident :id :db/valueType :db.type/uuid :db/unique :db.unique/value}");
         assert!(edn.get(":id").expect("declared").indexed);
     }
 
@@ -394,13 +393,18 @@ unique = "value"
         .expect_err("duplicate idents must fail");
         assert_eq!(duplicate.to_string(), "duplicate attribute :a/b");
 
-        let missing = DesiredSchema::from_edn(&read_all("{:db/valueType :db.type/string}").unwrap())
-            .expect_err("missing ident must fail");
-        assert_eq!(missing.to_string(), "attribute requires a :db/ident keyword");
+        let missing =
+            DesiredSchema::from_edn(&read_all("{:db/valueType :db.type/string}").unwrap())
+                .expect_err("missing ident must fail");
+        assert_eq!(
+            missing.to_string(),
+            "attribute requires a :db/ident keyword"
+        );
 
-        let bad_type =
-            DesiredSchema::from_edn(&read_all("{:db/ident :a/b :db/valueType :db.type/tuple}").unwrap())
-                .expect_err("unknown type must fail");
+        let bad_type = DesiredSchema::from_edn(
+            &read_all("{:db/ident :a/b :db/valueType :db.type/tuple}").unwrap(),
+        )
+        .expect_err("unknown type must fail");
         assert!(bad_type.to_string().contains(":db/valueType"), "{bad_type}");
 
         let bad_doc = DesiredSchema::from_edn(
@@ -409,9 +413,12 @@ unique = "value"
         .expect_err("non-string doc must fail");
         assert!(bad_doc.to_string().contains(":db/doc"), "{bad_doc}");
 
-        let not_a_map = DesiredSchema::from_edn(&read_all("[1 2]").unwrap())
-            .expect_err("non-map must fail");
-        assert!(not_a_map.to_string().contains("must be a map"), "{not_a_map}");
+        let not_a_map =
+            DesiredSchema::from_edn(&read_all("[1 2]").unwrap()).expect_err("non-map must fail");
+        assert!(
+            not_a_map.to_string().contains("must be a map"),
+            "{not_a_map}"
+        );
     }
 
     #[test]

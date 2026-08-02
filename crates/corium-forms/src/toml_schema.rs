@@ -585,9 +585,10 @@ doc = "points earned"
         );
         // Documentation is optional and is not invented for declarations
         // that omit it.
-        assert_eq!(parse("[[attribute]]\nname = \"n\"\ntype = \"long\"")
-            .expect("schema parses")[0]
-            .doc, None);
+        assert_eq!(
+            parse("[[attribute]]\nname = \"n\"\ntype = \"long\"").expect("schema parses")[0].doc,
+            None
+        );
     }
 
     #[test]

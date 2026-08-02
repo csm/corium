@@ -177,9 +177,7 @@ pub fn history_impact(db: &Db, a: AttrId) -> HistoryImpact {
     };
     let datoms = db
         .recorded_datoms()
-        .filter(|datom| {
-            datom.a == a && cutoff.is_none_or(|t| datom.tx.sequence() <= t)
-        })
+        .filter(|datom| datom.a == a && cutoff.is_none_or(|t| datom.tx.sequence() <= t))
         .count();
     HistoryImpact {
         datoms: count(datoms),
