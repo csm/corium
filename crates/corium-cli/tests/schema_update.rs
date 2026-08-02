@@ -192,7 +192,7 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
 
     // 1. The installed schema is its own plan: no changes, exit 0.
     let unchanged = schema_update(&transactor.endpoint(), &installed_path, &[]);
-    assert_eq!(unchanged.code, 0, "{unchanged:?}",);
+    assert_eq!(unchanged.code, 0, "{unchanged:?}");
     assert!(
         unchanged
             .stdout
