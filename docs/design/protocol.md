@@ -69,6 +69,14 @@ service Transactor {
   basis fence, or receive a sealed value); a v3 client still sends version 3
   and is rejected by an older server before that server can ignore what it
   does not understand. Upgrade transactors first, then peers and clients.
+- The proposed schema-migration protocol adds `schema_basis_t` and
+  `schema_generation` to the handshake and `schema_generation_after` to tx
+  reports. The handshake schema is the snapshot effective at the subscriber's
+  `from_basis_t`, not the server's newest schema. Reports with
+  `t > from_basis_t` advance data and schema together. A subscriber from basis
+  0 receives the pre-basis schema seed in the handshake, never as a `t = 0`
+  report. These semantics require a protocol-version bump so an older peer
+  cannot silently install a current schema before replaying older data.
 
 #### Future fleet routing
 
@@ -99,6 +107,32 @@ indexes of its own. `GetBackupInfo` briefly serializes with commit to return a
 definite current basis and the underlying storage connection; the backup
 client then leaves the transactor and reads the bounded native log range
 directly.
+
+Schema migration adds two administrative calls:
+
+```proto
+rpc PlanSchemaUpdate(PlanSchemaUpdateRequest) returns (SchemaUpdatePlan);
+rpc ApplySchemaUpdate(ApplySchemaUpdateRequest) returns (SchemaUpdateResult);
+```
+
+`PlanSchemaUpdate` is read-only. It returns the normalized logical steps and the
+installed-schema fingerprint. It also returns the observed basis, stable
+acknowledgement codes, and advisory impact observations. `ApplySchemaUpdate`
+carries the desired schema, `--prune` mode, plan digest, fingerprint, observed
+basis, and supplied acknowledgements. The transactor recomputes the logical
+digest and validates safety preconditions in the writer queue. Advisory counts
+are not part of the digest. The response either records a completed short
+schema transaction or returns the remaining long-job specifications. The CLI
+submits those to the operator service when configured. Otherwise, it executes
+the same job contract in-process. `Catalog` never depends on the operator
+service. The exact messages and stable error codes land with the implementation
+and protocol-version bump described in
+[schema-migrations.md](schema-migrations.md).
+
+Published-root and status metadata gain the schema generation plus per-attribute
+AVET readiness basis. A migration-triggered backfill invokes the existing index
+publisher immediately, bypassing interval/tail pacing, and readiness is never
+reported ahead of the root that proves coverage.
 
 ### OperatorService (operator tools → operator peer service) *(proposed)*
 

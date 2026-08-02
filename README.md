@@ -90,7 +90,8 @@ processes. Each crate has its own README.
 
 Language clients live under `clients/`; the
 [`clients/python`](clients/python/README.md) package provides the shared
-asynchronous local/remote Python API.
+asynchronous local/remote Python API, and [`clients/java`](clients/java/README.md)
+provides an asynchronous remote Java API.
 
 ## Examples
 

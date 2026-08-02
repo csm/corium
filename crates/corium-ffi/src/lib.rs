@@ -370,6 +370,36 @@ async fn fetch_storage_connection(
     Err(last_error)
 }
 
+/// Returns the backend advertised by a transactor without opening its storage.
+///
+/// # Errors
+/// Returns a categorized connection, authentication, protocol, or storage failure.
+pub async fn discover_storage_backend(
+    endpoints: &[String],
+    database: &str,
+    token: Option<String>,
+    tls: Option<ClientTlsOptions>,
+) -> Result<&'static str, FfiError> {
+    let storage = fetch_storage_connection(endpoints, database, token, tls).await?;
+    storage_backend_name(&storage)
+}
+
+fn storage_backend_name(storage: &pb::StorageConnection) -> Result<&'static str, FfiError> {
+    use pb::storage_connection::Backend;
+
+    match storage.backend {
+        Some(Backend::Memory(_)) => Ok("memory"),
+        Some(Backend::Filesystem(_)) => Ok("filesystem"),
+        Some(Backend::Postgres(_)) => Ok("postgres"),
+        Some(Backend::Turso(_)) => Ok("turso"),
+        Some(Backend::S3(_)) => Ok("s3"),
+        None => Err(FfiError::new(
+            ErrorKind::Storage,
+            "transactor returned no direct-storage backend",
+        )),
+    }
+}
+
 async fn open_discovered_storage(
     storage: pb::StorageConnection,
     #[cfg_attr(not(feature = "s3"), allow(unused_variables))] discovery: StorageDiscovery,
@@ -1054,6 +1084,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn storage_backend_name_does_not_depend_on_compiled_drivers() {
+        use pb::storage_connection::Backend;
+
+        let cases = [
+            (Backend::Memory(pb::MemoryStorage {}), "memory"),
+            (
+                Backend::Filesystem(pb::FilesystemStorage::default()),
+                "filesystem",
+            ),
+            (
+                Backend::Postgres(pb::PostgreSqlStorage::default()),
+                "postgres",
+            ),
+            (Backend::Turso(pb::TursoStorage::default()), "turso"),
+            (Backend::S3(pb::S3Storage::default()), "s3"),
+        ];
+        for (backend, expected) in cases {
+            assert_eq!(
+                storage_backend_name(&pb::StorageConnection {
+                    backend: Some(backend)
+                })
+                .expect("backend name"),
+                expected
+            );
+        }
+    }
 
     struct FailingPeer;
 
