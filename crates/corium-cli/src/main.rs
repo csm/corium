@@ -6,6 +6,7 @@ mod console;
 mod instant;
 mod metrics_http;
 mod pg_catalog;
+mod schema;
 mod sql;
 mod tui;
 
@@ -757,6 +758,10 @@ enum Command {
     /// Database catalog operations.
     #[command(subcommand)]
     Db(DbCommand),
+    /// Declarative schema: compare a schema file with the schema installed in
+    /// a database, and apply the exact plan you reviewed.
+    #[command(subcommand)]
+    Schema(schema::SchemaCommand),
     /// Self-hosted authorization database: create it, grant and revoke
     /// relationships, and ask what the policy decides.
     #[command(subcommand)]
@@ -1006,7 +1011,7 @@ async fn main() -> ExitCode {
         init_logging(cli.log_format);
     }
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(message) => {
             eprintln!("corium: {message}");
             ExitCode::FAILURE
@@ -1014,9 +1019,22 @@ async fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-async fn run(cli: Cli) -> Result<(), String> {
+/// Dispatches one command, returning the process exit code.
+///
+/// Most commands succeed or fail; `schema update` also distinguishes "no
+/// change" from "changes planned" when asked for a detailed exit code.
+async fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
+        Command::Schema(command) => schema::run(command).await,
+        command => run_command(command).await.map(|()| ExitCode::SUCCESS),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_command(command: Command) -> Result<(), String> {
+    match command {
+        // Dispatched by `run`, which needs its exit code.
+        Command::Schema(_) => unreachable!("schema commands are dispatched before this point"),
         Command::Transactor {
             config: config_file,
             store,
@@ -2200,9 +2218,13 @@ fn read_schema_file(path: &Path) -> Result<Vec<Edn>, String> {
         return corium_forms::toml_schema::parse_edn(&text)
             .map_err(|error| format!("bad schema TOML: {error}"));
     }
+    read_schema_edn(&text)
+}
 
-    let mut forms = read_all(&text).map_err(|error| format!("bad schema EDN: {error}"))?;
-    // Accept either one vector of maps or bare maps.
+/// Parses EDN attribute maps, accepting either one vector of maps or bare
+/// maps.
+fn read_schema_edn(text: &str) -> Result<Vec<Edn>, String> {
+    let mut forms = read_all(text).map_err(|error| format!("bad schema EDN: {error}"))?;
     if forms.len() == 1 && matches!(forms[0], Edn::Vector(_)) {
         let Edn::Vector(items) = forms.remove(0) else {
             unreachable!()

@@ -127,6 +127,67 @@ this same endpoint; its configuration and exact metric contract are in
 the transactor `Status` RPC provide basis, index lag, counts, queue depth, and
 GC counters on demand.
 
+## Schema updates
+
+`corium schema update` compares a schema file with the schema installed in a
+database and prints what would change, what it would cost, and what it would
+mean. It is read-only unless `--apply` is given:
+
+```sh
+corium schema update people --schema schema.toml
+```
+
+The plan is computed against one immutable database value, so every count in
+it is measured at one basis and one schema. Each difference is reported as a
+property-level change with an execution class:
+
+| Class | Meaning |
+|---|---|
+| `additive` | No existing fact is inspected or rewritten (a new attribute, or cardinality one → many). |
+| `validate-reindex` | Existing facts stay valid, but a bounded scan, constraint validation, or covering-index rebuild is needed (adding `index` or `unique`, changing uniqueness mode, toggling `isComponent`, retirement). |
+| `rewrite` | Current facts must change first (collapsing cardinality where entities hold several values). |
+| `destructive` | Information or historical interpretation would be lost (changing an attribute's value type in place). This command can never run one; the plan prints a replacement-attribute recipe instead. |
+
+Risk is reported separately from the class: an AVET backfill is expensive but
+semantically harmless, while a metadata-only `isComponent` flip can change the
+meaning of every live reference. Changes whose *meaning* changes carry a
+stable acknowledgement code — `component-enable`, `component-disable`,
+`unique-mode-change`, `no-history-enable`, `no-history-disable`,
+`retire-live-attribute`, `protection-forward-only` — printed next to the
+change and passed back with `--ack`.
+
+A file manages the declarations it contains. Installed attributes it does not
+mention are reported as `unmanaged` and left alone; `--prune` turns them into
+retirement requests instead. Retirement refuses new assertions while keeping
+the ident, its metadata, and its history readable — it is not deletion, and
+`schema update` has no hard-delete or excision facility. Idents match exactly:
+a removed ident and an added ident are two changes, never an inferred rename.
+Engine attributes such as `:db/txInstant` are never managed by a file.
+
+| Flag | Effect |
+|---|---|
+| `--prune` | Retire installed attributes the file omits. Part of the plan digest. |
+| `--json` | Emit the versioned machine contract instead of the human report. Scripts must read this, not the human rendering. |
+| `--detailed-exit-code` | Exit 0 for no change and 2 for changes planned. Without it a successful plan always exits 0, so `&&` chains keep working. |
+| `--apply --plan <digest>` | Apply exactly the plan whose digest was printed. |
+| `--allow <class>` | Permit an execution class above `additive`. `destructive` has no allowance. |
+| `--ack <change-code>` | Acknowledge a semantic change by its stable code. |
+
+Parse, plan, stale-plan, and blocked-change failures exit 1 and carry stable
+codes (`parse-error`, `plan-error`, `plan-mismatch`, `allow-required`,
+`ack-required`, `blocked-change`, `apply-unsupported`) when `--json` is set.
+
+> **Not yet implemented:** `--apply` is refused with `apply-unsupported`.
+> Applying a plan needs schema to be basis-versioned data — schema
+> transactions, schema generations carried through recovery roots, handshakes,
+> and tx reports, and an `AlterSchema` authorization action — which this build
+> does not have: attribute metadata is still fixed when a database is created.
+> Planning is complete and exact; every precondition `--apply` can check
+> without writing (the plan digest, blocked changes, allowances,
+> acknowledgements) is still checked, in that order, before the operation is
+> reported as unavailable. The staged delivery is in
+> [schema-migrations.md](design/schema-migrations.md#delivery-plan).
+
 ## Index publication pacing and bulk loading
 
 The transactor republishes its covering indexes in the background so cold

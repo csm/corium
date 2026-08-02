@@ -33,6 +33,8 @@ pub struct AttributeDefinition {
     pub component: bool,
     /// Whether history storage is disabled for the attribute.
     pub no_history: bool,
+    /// Optional documentation (`:db/doc`).
+    pub doc: Option<String>,
 }
 
 impl AttributeDefinition {
@@ -76,6 +78,9 @@ impl AttributeDefinition {
         }
         if self.no_history {
             pairs.push((kw("db/noHistory"), Edn::Bool(true)));
+        }
+        if let Some(doc) = &self.doc {
+            pairs.push((kw("db/doc"), Edn::Str(doc.clone())));
         }
         pairs.sort_unstable();
         Edn::Map(pairs)
@@ -239,6 +244,8 @@ struct AttributeOptions {
     component: bool,
     #[serde(default)]
     no_history: bool,
+    #[serde(default)]
+    doc: Option<String>,
 }
 
 impl RawAttribute {
@@ -252,6 +259,7 @@ impl RawAttribute {
                 index: false,
                 component: false,
                 no_history: false,
+                doc: None,
             },
             Self::Detailed(options) => options,
         }
@@ -367,6 +375,7 @@ fn normalize(
         indexed,
         component: options.component,
         no_history: options.no_history,
+        doc: options.doc,
     })
 }
 
@@ -556,6 +565,29 @@ type = "ref"
                 .expect("employees attribute")
                 .no_history
         );
+    }
+
+    #[test]
+    fn documentation_reaches_the_edn_form() {
+        let definitions = parse(
+            r#"
+[[attribute]]
+name = "score"
+type = "long"
+doc = "points earned"
+"#,
+        )
+        .expect("schema parses");
+        assert_eq!(definitions[0].doc.as_deref(), Some("points earned"));
+        assert_eq!(
+            definitions[0].to_edn().get(&kw("db/doc")),
+            Some(&Edn::Str("points earned".into()))
+        );
+        // Documentation is optional and is not invented for declarations
+        // that omit it.
+        assert_eq!(parse("[[attribute]]\nname = \"n\"\ntype = \"long\"")
+            .expect("schema parses")[0]
+            .doc, None);
     }
 
     #[test]

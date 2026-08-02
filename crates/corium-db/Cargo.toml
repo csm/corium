@@ -11,5 +11,8 @@ description = "Immutable database values"
 corium-core = { workspace = true }
 rpds = { workspace = true }
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true
