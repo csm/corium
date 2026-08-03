@@ -6,7 +6,7 @@
 
   <groupId>dev.corium</groupId>
   <artifactId>corium-client</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.70</version>
   <name>Corium Java client</name>
   <description>Asynchronous remote Java client for Corium</description>
   <url>https://github.com/csm/corium</url>
