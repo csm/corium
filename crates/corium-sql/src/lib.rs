@@ -9,6 +9,7 @@ mod mutation;
 mod value;
 
 use arrow::record_batch::RecordBatch;
+use corium_db::read::ReadContext;
 use corium_db::{Db, DbView};
 use datafusion::execution::context::SQLOptions;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -43,12 +44,13 @@ pub enum SqlError {
 pub struct SqlSession {
     context: SessionContext,
     db: Db,
+    read: ReadContext,
     basis_t: u64,
     view: DbView,
 }
 
 impl SqlSession {
-    /// Builds the SQL catalog for `db`.
+    /// Builds the SQL catalog for `db`, read without restriction.
     ///
     /// Current, as-of, and since views get namespace-derived wide tables in
     /// `corium`; every view gets normalized relations in `corium_sys`.
@@ -56,11 +58,24 @@ impl SqlSession {
     /// # Errors
     /// Returns [`SqlError`] when the database schema cannot be projected.
     pub fn new(db: &Db) -> Result<Self, SqlError> {
+        Self::with_read(db, &ReadContext::open())
+    }
+
+    /// Builds the SQL catalog for `db` as one principal sees it.
+    ///
+    /// A column `read` hides keeps its declared type and reports NULL, and
+    /// never takes a pushed predicate — so a restricted session runs the same
+    /// SQL as an unrestricted one and simply learns less from it.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the database schema cannot be projected.
+    pub fn with_read(db: &Db, read: &ReadContext) -> Result<Self, SqlError> {
         let context = SessionContext::new();
-        catalog::register(&context, db)?;
+        catalog::register(&context, db, read)?;
         Ok(Self {
             context,
             db: db.clone(),
+            read: read.clone(),
             basis_t: db.basis_t(),
             view: db.view(),
         })
@@ -170,7 +185,7 @@ impl SqlSession {
         sql: &str,
         params: &[SqlValue],
     ) -> Result<Option<SqlMutation>, SqlError> {
-        mutation::plan(&self.db, sql, params).await
+        mutation::plan(&self.db, &self.read, sql, params).await
     }
 
     /// Describes the columns produced by a mutation's `RETURNING` clause
@@ -187,7 +202,7 @@ impl SqlSession {
         sql: &str,
         params: &[SqlValue],
     ) -> Result<Option<Vec<SqlColumn>>, SqlError> {
-        mutation::describe(&self.db, sql, params).await
+        mutation::describe(&self.db, &self.read, sql, params).await
     }
 }
 

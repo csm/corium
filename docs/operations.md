@@ -630,21 +630,35 @@ fully working peer: it commits, indexes, syncs, and answers every query that
 does not touch a protected value identically, and protected values come back
 redacted, hidden, or refused according to the class's `on-missing-key` policy.
 
-> **Do not expose a key-holding peer server to clients that are not entitled
-> to every class it holds.** A peer server hydrates every request with its own
-> keyring, whichever principal made it: the per-principal key policy that
-> would narrow this — and seal-through mode, where the server forwards sealed
-> values and the thin client hydrates for itself — are not implemented. The
-> authorization guard gates databases and operations, not classes, so it does
-> not close the gap either. Until they land:
->
-> - Give a peer server class keys only when **every** client it serves may
->   read **every** class it holds.
-> - For mixed or less-trusted clients, run the peer server with no class keys
->   and let entitled applications use an embedded peer (`LocalPeer`) with
->   their own keyring, where the keys stay in the process that owns them.
-> - Splitting by class means splitting by peer server for now: one per
->   entitlement group, each holding only its own keys.
+A **peer server** and a **pgwire server** serve many principals from one
+process, so which of their keys a given request may use is a policy question.
+Name the key ids on a view and bind it to the relation that may read them:
+
+```clojure
+{:authz.view/name "pii-reader" :authz.view/key ["file:/etc/corium/pii.key"]}
+{:authz.binding/relation "hr" :authz.binding/object "database:people"
+ :authz.binding/view "pii-reader"}
+```
+
+A guarded server defaults to **strict** key policy: a principal whose decision
+names no key id hydrates nothing, and its protected values come back redacted,
+hidden, or refused per class policy. A server with authorization disabled keeps
+the old behaviour and hydrates every request with its whole keyring. Two things
+to know:
+
+- `:authz.binding/unfiltered` grants full *attribute* visibility and **no**
+  keys. Keys are named by key id and that binding names none, so a relation
+  that must read protected values names them explicitly.
+- Granting a key id a process does not hold does nothing. Policy narrows the
+  process's keyring; it never extends it.
+
+> **This is authorization, not cryptography.** A key-holding server still has
+> the plaintext and is choosing not to disclose it, so a compromised or
+> misconfigured server defeats it. Seal-through mode — where the server
+> forwards sealed values and the thin client hydrates for itself — is not
+> implemented. For a genuinely less-trusted deployment, run the server with no
+> class keys and let entitled applications use an embedded peer (`LocalPeer`)
+> with their own keyring, where the keys stay in the process that owns them.
 
 Unlike encryption at rest, protection is *not* fixed at database creation:
 `corium schema update` can protect, unprotect, or re-classify an attribute.

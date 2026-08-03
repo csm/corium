@@ -26,6 +26,11 @@ use std::sync::Arc;
 
 use corium_core::EntityId;
 use corium_db::Db;
+use corium_db::protect::Hydrator;
+use corium_db::read::{AttrVisibility, ReadContext};
+use corium_protocol::authz::{
+    Access, Action, Credentials, Guard, KeyGrant, KeyPolicyMode, Principal, ReadGrant,
+};
 use corium_query::edn::Edn;
 use corium_sql::{MutationKind, SqlColumn, SqlError, SqlSession, SqlType};
 use thiserror::Error;
@@ -90,6 +95,16 @@ pub trait DbCatalog: Send + Sync + 'static {
     /// permitted, and [`CatalogError::Unavailable`] when it cannot be opened.
     async fn db(&self, name: &str) -> Result<Db, CatalogError>;
 
+    /// The class keys this process can resolve for `name`.
+    ///
+    /// What a given *principal* may hydrate is decided per request from this
+    /// set and the authorization policy; a catalog only reports what it
+    /// holds. The default holds none, which is the correct answer for a
+    /// catalog serving snapshots it never had keys for.
+    async fn hydrator(&self, _name: &str) -> Result<Arc<Hydrator>, CatalogError> {
+        Ok(Arc::new(Hydrator::default()))
+    }
+
     /// Commits forms only if `expected_basis_t` is still current.
     ///
     /// The default keeps read-only catalog implementations source-compatible.
@@ -104,13 +119,39 @@ pub trait DbCatalog: Send + Sync + 'static {
 }
 
 /// Server-wide configuration for the `PostgreSQL` front end.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgWireConfig {
     /// If set, clients must send this cleartext password to connect. When
-    /// `None`, connections are trusted.
+    /// `None` and no [`Guard`] is configured, connections are trusted.
+    ///
+    /// Ignored once `guard` is enforcing: the password field then carries the
+    /// caller's own credential, not one shared secret.
     pub password: Option<String>,
     /// `server_version` reported to clients in a `ParameterStatus` message.
     pub server_version: String,
+    /// The identity and authorization policy this server enforces.
+    ///
+    /// `PostgreSQL` has no bearer-token field, so the **password carries the
+    /// token**: whatever the client sends is offered to the guard's
+    /// [`IdentityProvider`] as a credential, and the startup `user` is
+    /// informational. That is what makes a SQL client a Corium principal
+    /// rather than an anonymous sharer of the server's own identity.
+    pub guard: Guard,
+    /// How a principal's key set is chosen, or `None` to derive it from the
+    /// guard (see [`KeyPolicyMode`]).
+    pub key_policy: Option<KeyPolicyMode>,
+}
+
+impl std::fmt::Debug for PgWireConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PgWireConfig")
+            .field("password", &self.password.is_some())
+            .field("server_version", &self.server_version)
+            .field("guard_enabled", &!self.guard.is_disabled())
+            .field("key_policy", &self.key_policy)
+            .finish()
+    }
 }
 
 impl Default for PgWireConfig {
@@ -118,6 +159,8 @@ impl Default for PgWireConfig {
         Self {
             password: None,
             server_version: concat!("16.0 (corium ", env!("CARGO_PKG_VERSION"), ")").to_owned(),
+            guard: Guard::disabled(),
+            key_policy: None,
         }
     }
 }
@@ -199,6 +242,12 @@ enum Statement {
     Mutation,
 }
 
+/// One statement's database value and the read it is answered under.
+struct Scope {
+    db: Db,
+    read: ReadContext,
+}
+
 /// A failure while dispatching one statement.
 enum Dispatch {
     /// No database is selected for a query.
@@ -207,6 +256,8 @@ enum Dispatch {
     Catalog(CatalogError),
     /// `SqlSession` rejected or failed the query.
     Sql(SqlError),
+    /// The authorization policy refused this principal.
+    Denied(String),
 }
 
 /// The per-connection protocol state machine.
@@ -217,6 +268,10 @@ struct ConnectionSession<R, W, C> {
     config: Arc<PgWireConfig>,
     /// The connection's active database, chosen at startup or by `USE`.
     current_db: Option<String>,
+    /// The authenticated caller. Every statement is authorized as this
+    /// principal, and every read is answered under the view and key set the
+    /// policy grants it.
+    principal: Principal,
     statements: HashMap<String, PreparedStatement>,
     portals: HashMap<String, Portal>,
     /// Set after an extended-protocol error; frontend messages are ignored
@@ -253,6 +308,7 @@ where
             catalog,
             config,
             current_db: None,
+            principal: Principal::anonymous(),
             statements: HashMap::new(),
             portals: HashMap::new(),
             failed: false,
@@ -330,8 +386,45 @@ where
     }
 
     /// Runs the authentication exchange. Returns `false` if the connection
-    /// should be closed (bad password).
+    /// should be closed.
+    ///
+    /// With a [`Guard`] configured the password field carries the caller's
+    /// own credential — a bearer token, typically a JWT — and the resulting
+    /// [`Principal`] is what every statement is then authorized as. Without
+    /// one, the legacy shared password applies and the caller stays
+    /// anonymous.
     async fn authenticate(&mut self) -> std::io::Result<bool> {
+        if self.config.guard.is_disabled() {
+            return self.authenticate_with_shared_password().await;
+        }
+        self.writer.authentication_cleartext_password();
+        self.writer.flush().await?;
+        let supplied = match self.reader.read_message().await? {
+            Some(Frontend::Password(supplied)) => supplied,
+            _ => String::new(),
+        };
+        let credentials = Credentials {
+            bearer: (!supplied.is_empty()).then_some(supplied),
+            client_cert_subject: None,
+        };
+        match self.config.guard.authenticate(&credentials) {
+            Ok(principal) => {
+                self.principal = principal;
+                self.writer.authentication_ok();
+                Ok(true)
+            }
+            Err(error) => {
+                self.writer.error_response(&ErrorFields {
+                    code: "28000",
+                    message: &error.to_string(),
+                });
+                self.writer.flush().await?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn authenticate_with_shared_password(&mut self) -> std::io::Result<bool> {
         let Some(expected) = self.config.password.clone() else {
             self.writer.authentication_ok();
             return Ok(true);
@@ -437,14 +530,14 @@ where
                 }
             },
             Statement::Query => {
-                let db = match self.snapshot(None).await {
-                    Ok(db) => db,
+                let scope = match self.scope(None, Action::Query).await {
+                    Ok(scope) => scope,
                     Err(error) => {
                         self.report_dispatch(&error);
                         return Ok(false);
                     }
                 };
-                match self.run_statement(&db, sql, &[], true, &[]).await {
+                match self.run_statement(&scope, sql, &[], true, &[]).await {
                     Ok(rows) => {
                         self.writer.command_complete(&command_tag(sql, rows));
                         Ok(true)
@@ -464,14 +557,17 @@ where
                     self.report_dispatch(&Dispatch::NoDatabase);
                     return Ok(false);
                 };
-                let db = match self.snapshot(Some(&database)).await {
-                    Ok(db) => db,
+                let scope = match self.scope(Some(&database), Action::Transact).await {
+                    Ok(scope) => scope,
                     Err(error) => {
                         self.report_dispatch(&error);
                         return Ok(false);
                     }
                 };
-                match self.run_mutation(&database, &db, sql, &[], true, &[]).await {
+                match self
+                    .run_mutation(&database, &scope, sql, &[], true, &[])
+                    .await
+                {
                     Ok((kind, rows)) => {
                         self.writer
                             .command_complete(&mutation_command_tag(kind, rows));
@@ -606,14 +702,14 @@ where
                 self.write_row_description(&[database_field()], &result_formats);
             }
             Statement::Query if !sql.trim().is_empty() => {
-                let db = match self.snapshot(database.as_deref()).await {
-                    Ok(db) => db,
+                let scope = match self.scope(database.as_deref(), Action::Query).await {
+                    Ok(scope) => scope,
                     Err(error) => {
                         self.fail_dispatch(&error);
                         return Ok(());
                     }
                 };
-                match self.describe_columns(&db, &sql, &params).await {
+                match self.describe_columns(&scope, &sql, &params).await {
                     Ok(fields) => {
                         self.write_row_description(&fields, &result_formats);
                     }
@@ -621,14 +717,14 @@ where
                 }
             }
             Statement::Mutation => {
-                let db = match self.snapshot(database.as_deref()).await {
-                    Ok(db) => db,
+                let scope = match self.scope(database.as_deref(), Action::Transact).await {
+                    Ok(scope) => scope,
                     Err(error) => {
                         self.fail_dispatch(&error);
                         return Ok(());
                     }
                 };
-                match SqlSession::new(&db) {
+                match SqlSession::with_read(&scope.db, &scope.read) {
                     Ok(session) => match session.mutation_columns(&sql, &params).await {
                         Ok(Some(columns)) if columns.is_empty() => self.writer.no_data(),
                         Ok(Some(columns)) => {
@@ -701,15 +797,15 @@ where
                 }
             }
             Statement::Query => {
-                let db = match self.snapshot(database.as_deref()).await {
-                    Ok(db) => db,
+                let scope = match self.scope(database.as_deref(), Action::Query).await {
+                    Ok(scope) => scope,
                     Err(error) => {
                         self.fail_dispatch(&error);
                         return Ok(());
                     }
                 };
                 match self
-                    .run_statement(&db, &sql, &params, false, &result_formats)
+                    .run_statement(&scope, &sql, &params, false, &result_formats)
                     .await
                 {
                     Ok(rows) => self.writer.command_complete(&command_tag(&sql, rows)),
@@ -725,15 +821,15 @@ where
                     self.fail_dispatch(&Dispatch::NoDatabase);
                     return Ok(());
                 };
-                let db = match self.snapshot(Some(&database)).await {
-                    Ok(db) => db,
+                let scope = match self.scope(Some(&database), Action::Transact).await {
+                    Ok(scope) => scope,
                     Err(error) => {
                         self.fail_dispatch(&error);
                         return Ok(());
                     }
                 };
                 match self
-                    .run_mutation(&database, &db, &sql, &params, false, &result_formats)
+                    .run_mutation(&database, &scope, &sql, &params, false, &result_formats)
                     .await
                 {
                     Ok((kind, rows)) => self
@@ -749,22 +845,35 @@ where
     /// Validates and activates `name` as the connection's database, warming
     /// the catalog cache in the process.
     async fn use_database(&mut self, name: &str) -> Result<(), Dispatch> {
+        // Switching to a database this principal cannot inspect fails here
+        // rather than on its first query, which is both friendlier and the
+        // reason `SHOW DATABASES` and `USE` agree with each other.
+        self.authorize(name, Action::Inspect).await?;
         self.snapshot(Some(name)).await?;
         self.current_db = Some(name.to_owned());
         Ok(())
     }
 
     /// Emits a one-column `database` result listing the catalog.
+    ///
+    /// The catalog is filtered to what this principal may inspect: the list
+    /// of database names is itself information.
     async fn show_databases(
         &mut self,
         with_row_description: bool,
         result_formats: &[i16],
     ) -> Result<(), Dispatch> {
         let names = self.catalog.list().await.map_err(Dispatch::Catalog)?;
+        let mut visible = Vec::with_capacity(names.len());
+        for name in names {
+            if self.authorize(&name, Action::Inspect).await.is_ok() {
+                visible.push(name);
+            }
+        }
         if with_row_description {
             self.write_row_description(&[database_field()], result_formats);
         }
-        for name in &names {
+        for name in &visible {
             self.writer.data_row(&[Some(name.clone().into_bytes())]);
         }
         self.writer.command_complete("SHOW");
@@ -795,6 +904,71 @@ where
         }
     }
 
+    /// Authorizes `action` on `database` for this connection's principal and
+    /// resolves the snapshot to answer it from.
+    ///
+    /// This is the single place a statement becomes a decision, so no read
+    /// path can reach a database value without one.
+    async fn scope(&mut self, database: Option<&str>, action: Action) -> Result<Scope, Dispatch> {
+        let name = database
+            .map(str::to_owned)
+            .or_else(|| self.current_db.clone())
+            .ok_or(Dispatch::NoDatabase)?;
+        let grant = self.authorize(&name, action).await?;
+        let db = self.snapshot(Some(&name)).await?;
+        let read = self.read_context(&name, &db, &grant).await?;
+        Ok(Scope { db, read })
+    }
+
+    /// The policy's decision for `action` on `database`.
+    async fn authorize(&self, database: &str, action: Action) -> Result<ReadGrant, Dispatch> {
+        self.config
+            .guard
+            .authorize(&self.principal, &Access::on(action, database))
+            .await
+            .map(Option::unwrap_or_default)
+            .map_err(|error| Dispatch::Denied(error.to_string()))
+    }
+
+    /// Turns a decision into the read one statement is answered under: the
+    /// attributes this principal may see, and the class keys it may hydrate.
+    async fn read_context(
+        &self,
+        database: &str,
+        db: &Db,
+        grant: &ReadGrant,
+    ) -> Result<ReadContext, Dispatch> {
+        let held = self
+            .catalog
+            .hydrator(database)
+            .await
+            .map_err(Dispatch::Catalog)?;
+        let mode = self.config.key_policy.unwrap_or({
+            if self.config.guard.is_disabled() {
+                KeyPolicyMode::ServerWide
+            } else {
+                KeyPolicyMode::Strict
+            }
+        });
+        let hydrator = match (&grant.keys, mode) {
+            (KeyGrant::Unrestricted, KeyPolicyMode::ServerWide) => held,
+            (KeyGrant::Only(allowed), _) => {
+                Arc::new(Hydrator::new(held.keys().restrict_to(db.schema(), allowed)))
+            }
+            // Strict: a decision that names no key grants none.
+            (KeyGrant::Unrestricted, KeyPolicyMode::Strict) => Arc::new(Hydrator::default()),
+        };
+        let mut read = ReadContext::open().with_hydrator(hydrator);
+        if let Some(view) = &grant.view {
+            read = read.with_visibility(Arc::new(AttrVisibility::resolve(
+                db.schema(),
+                db.idents(),
+                |ident| view.attribute_visible(&ident.to_string()),
+            )));
+        }
+        Ok(read)
+    }
+
     fn ready_status(&self) -> u8 {
         if self.transaction_failed {
             b'E'
@@ -808,11 +982,11 @@ where
     /// Plans a query and returns its result columns without streaming rows.
     async fn describe_columns(
         &self,
-        db: &Db,
+        scope: &Scope,
         sql: &str,
         params: &[corium_sql::SqlValue],
     ) -> Result<Vec<FieldDescription>, SqlError> {
-        let session = SqlSession::new(db)?;
+        let session = SqlSession::with_read(&scope.db, &scope.read)?;
         let query = session.query_params(sql, params).await?;
         Ok(query.columns().iter().map(field_of).collect())
     }
@@ -821,13 +995,13 @@ where
     /// streaming its rows as `DataRow` messages. Returns the row count.
     async fn run_statement(
         &mut self,
-        db: &Db,
+        scope: &Scope,
         sql: &str,
         params: &[corium_sql::SqlValue],
         with_row_description: bool,
         result_formats: &[i16],
     ) -> Result<usize, SqlError> {
-        let session = SqlSession::new(db)?;
+        let session = SqlSession::with_read(&scope.db, &scope.read)?;
         let mut query = session.query_params(sql, params).await?;
         let columns = query.columns().to_vec();
         let formats = expand_result_formats(result_formats, columns.len())
@@ -863,13 +1037,14 @@ where
     async fn run_mutation(
         &mut self,
         database: &str,
-        db: &Db,
+        scope: &Scope,
         sql: &str,
         params: &[corium_sql::SqlValue],
         with_row_description: bool,
         result_formats: &[i16],
     ) -> Result<(MutationKind, usize), Dispatch> {
-        let session = SqlSession::new(db).map_err(Dispatch::Sql)?;
+        let db = &scope.db;
+        let session = SqlSession::with_read(db, &scope.read).map_err(Dispatch::Sql)?;
         let mutation = session
             .mutation_params(sql, params)
             .await
@@ -1006,6 +1181,7 @@ fn dispatch_error_fields(error: &Dispatch) -> (&'static str, String) {
         Dispatch::Catalog(error @ CatalogError::Denied(_)) => ("42501", error.to_string()),
         Dispatch::Catalog(error @ CatalogError::Unsupported(_)) => ("0A000", error.to_string()),
         Dispatch::Sql(error) => (sqlstate_for(error), error.to_string()),
+        Dispatch::Denied(reason) => ("42501", reason.clone()),
     }
 }
 

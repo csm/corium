@@ -21,6 +21,12 @@ The attribute-protection scenario exercises protected writes, keyed reads,
 and keyless redaction through the real engine. The security scenarios use
 signed RS256 JWTs with issuer and audience validation, the self-hosted ReBAC
 authorizer, and real direct-peer, peer-server, and PostgreSQL-wire clients.
+The peer-server and pgwire scenarios put two principals on one key-holding
+server and check that each sees only what policy grants: Alice reads the
+protected value as plaintext, Bob reads the same column of the same database
+value redacted. The pgwire client authenticates with its own bearer token in
+the password field, so a SQL session is a Corium principal.
+
 Known product gaps have a separate `LIMITATION` status: they are verified and
 prominent in the report without being confused with a harness failure. The
 schema-update scenario reviews the plan digest, applies the expected additive

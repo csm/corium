@@ -157,13 +157,21 @@ pub(crate) fn subscription_stream(
 pub struct TransactorSvc(pub Arc<TransactorNode>, pub Guard);
 
 /// Authorizes `access` for the request's [`Principal`], mapping the guard's
-/// decision onto a gRPC status. A returned [`ViewFilter`](authz::ViewFilter) is
-/// rejected for now: no transactor/catalog surface applies one yet, so honoring
-/// a filtered decision by returning full data would be an authorization bypass.
+/// decision onto a gRPC status.
+///
+/// A decision carrying an attribute [`ViewFilter`](authz::ViewFilter) is
+/// rejected: no transactor or catalog surface applies one, so honouring it by
+/// returning full data would be an authorization bypass.
+///
+/// A decision that only restricts *keys* is honoured by doing nothing, which
+/// is correct rather than lenient: the transactor holds no class key, so every
+/// protected value it accepts, logs, indexes, and hands back is already sealed.
+/// There is nothing here for a key policy to withhold.
 async fn authorize(guard: &Guard, principal: &Principal, access: Access) -> Result<(), Status> {
     match guard.authorize(principal, &access).await {
         Ok(None) => Ok(()),
-        Ok(Some(_filter)) => Err(Status::unimplemented(
+        Ok(Some(grant)) if grant.view.is_none() => Ok(()),
+        Ok(Some(_)) => Err(Status::unimplemented(
             "view filtering is not enforced on this surface yet",
         )),
         Err(error) => Err(error.to_status()),

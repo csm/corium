@@ -13,6 +13,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 corium-core = { workspace = true }
 corium-db = { workspace = true }
 corium-query = { workspace = true }
+corium-protocol = { workspace = true }
 corium-sql = { workspace = true }
 thiserror = "2"
 tokio = { version = "1.53.0", features = [

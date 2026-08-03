@@ -9,6 +9,8 @@ use corium_core::{
     AttrId, Attribute, Cardinality, EntityId, IndexOrder, Keyword, TotalF64, Unique, Value,
     ValueType,
 };
+use corium_db::protect::Hydration;
+use corium_db::read::ReadContext;
 use corium_db::{Db, DbView};
 use datafusion::catalog::{MemTable, MemorySchemaProvider, SchemaProvider, Session};
 use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
@@ -29,23 +31,31 @@ struct ProjectedAttribute {
     attribute: Attribute,
 }
 
-pub(crate) fn register(context: &SessionContext, db: &Db) -> Result<(), SqlError> {
+pub(crate) fn register(
+    context: &SessionContext,
+    db: &Db,
+    read: &ReadContext,
+) -> Result<(), SqlError> {
     let catalog = context
         .catalog("datafusion")
         .ok_or_else(|| SqlError::Schema("DataFusion default catalog is unavailable".into()))?;
     let system = Arc::new(MemorySchemaProvider::new());
     catalog.register_schema(SYSTEM_SCHEMA, system.clone())?;
-    register_system_tables(&system, db)?;
+    register_system_tables(&system, db, read)?;
 
     if db.view() != DbView::History {
         let wide = Arc::new(MemorySchemaProvider::new());
         catalog.register_schema(WIDE_SCHEMA, wide.clone())?;
-        register_wide_tables(&wide, db)?;
+        register_wide_tables(&wide, db, read)?;
     }
     Ok(())
 }
 
-fn register_wide_tables(schema: &MemorySchemaProvider, db: &Db) -> Result<(), SqlError> {
+fn register_wide_tables(
+    schema: &MemorySchemaProvider,
+    db: &Db,
+    read: &ReadContext,
+) -> Result<(), SqlError> {
     let mut namespaces: BTreeMap<String, Vec<ProjectedAttribute>> = BTreeMap::new();
     for (id, attribute) in db.schema().iter() {
         let Some(ident) = db.idents().ident(*id) else {
@@ -85,6 +95,7 @@ fn register_wide_tables(schema: &MemorySchemaProvider, db: &Db) -> Result<(), Sq
             namespace,
             Arc::new(WideTable {
                 db: db.clone(),
+                read: read.clone(),
                 schema: Arc::new(Schema::new(fields)),
                 attributes,
             }),
@@ -99,6 +110,10 @@ fn register_wide_tables(schema: &MemorySchemaProvider, db: &Db) -> Result<(), Sq
 #[derive(Debug)]
 struct WideTable {
     db: Db,
+    /// The view and key set this session reads under. A column the session
+    /// may not see keeps its declared type and reports NULL, the same way an
+    /// unhydrated protected column does.
+    read: ReadContext,
     schema: SchemaRef,
     attributes: Vec<ProjectedAttribute>,
 }
@@ -237,8 +252,11 @@ impl WideTable {
         // A protected column never takes a pushed predicate: the values in
         // the index are ciphertext, so both equality and ordering over them
         // would answer a question the reader did not ask
-        // (`docs/design/encryption.md`).
-        if self.db.schema().is_protected(attribute.id) {
+        // (`docs/design/encryption.md`). A column this session may not see is
+        // refused for the same reason and a stronger one — the projection
+        // reports NULL, so a pushed predicate would be the one way to learn
+        // the value behind it.
+        if self.db.schema().is_protected(attribute.id) || !self.read.visible(attribute.id) {
             return None;
         }
         let scalar = literal_scalar(literal)?;
@@ -291,6 +309,32 @@ impl WideTable {
         }
     }
 
+    /// One stored value as this session reads it: `None` when the view hides
+    /// the column or the session holds no key and the class asks to hide.
+    ///
+    /// A value the session may see but cannot open comes back sealed, and
+    /// [`value_scalar`] renders that as NULL — so "policy hides it" and "no
+    /// key for it" reach SQL as the same NULL, which is what a column with a
+    /// declared type can honestly say.
+    fn readable(
+        &self,
+        entity: EntityId,
+        attr: AttrId,
+        value: &Value,
+    ) -> DataFusionResult<Option<Value>> {
+        match self
+            .read
+            .read(self.db.schema(), self.db.interner(), attr, entity, value)
+        {
+            Ok(Hydration::Bind(value)) => Ok(Some(value)),
+            Ok(Hydration::Hide) => Ok(None),
+            Ok(Hydration::Refuse(class)) => Err(DataFusionError::Execution(format!(
+                "protection class {class} is not readable without its key"
+            ))),
+            Err(error) => Err(DataFusionError::Execution(error.to_string())),
+        }
+    }
+
     fn all_rows(&self) -> DataFusionResult<Vec<Vec<ScalarValue>>> {
         let attribute_ids: BTreeSet<AttrId> = self
             .attributes
@@ -299,13 +343,15 @@ impl WideTable {
             .collect();
         let mut facts: BTreeMap<EntityId, BTreeMap<AttrId, Vec<Value>>> = BTreeMap::new();
         for datom in self.db.datoms_at(IndexOrder::Eavt) {
-            if attribute_ids.contains(&datom.a) {
+            if attribute_ids.contains(&datom.a)
+                && let Some(value) = self.readable(datom.e, datom.a, &datom.v)?
+            {
                 facts
                     .entry(datom.e)
                     .or_default()
                     .entry(datom.a)
                     .or_default()
-                    .push(datom.v.clone());
+                    .push(value);
             }
         }
         facts
@@ -315,12 +361,18 @@ impl WideTable {
     }
 
     fn row_for(&self, entity: EntityId) -> DataFusionResult<Option<Vec<ScalarValue>>> {
-        let values = self
-            .attributes
-            .iter()
-            .map(|attribute| (attribute.id, self.db.values(entity, attribute.id)))
-            .filter(|(_, values)| !values.is_empty())
-            .collect::<BTreeMap<_, _>>();
+        let mut values: BTreeMap<AttrId, Vec<Value>> = BTreeMap::new();
+        for attribute in &self.attributes {
+            let readable = self
+                .db
+                .values(entity, attribute.id)
+                .into_iter()
+                .filter_map(|value| self.readable(entity, attribute.id, &value).transpose())
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            if !readable.is_empty() {
+                values.insert(attribute.id, readable);
+            }
+        }
         if values.is_empty() {
             Ok(None)
         } else {
@@ -522,14 +574,23 @@ fn parse_uuid(value: &str) -> Option<u128> {
         .flatten()
 }
 
-fn register_system_tables(schema: &MemorySchemaProvider, db: &Db) -> Result<(), SqlError> {
-    schema.register_table("datoms".into(), datoms_table(db)?)?;
+fn register_system_tables(
+    schema: &MemorySchemaProvider,
+    db: &Db,
+    read: &ReadContext,
+) -> Result<(), SqlError> {
+    schema.register_table("datoms".into(), datoms_table(db, read)?)?;
     schema.register_table("attributes".into(), attributes_table(db)?)?;
     schema.register_table("idents".into(), idents_table(db)?)?;
     Ok(())
 }
 
-fn datoms_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {
+/// `corium_sys.datoms`: the raw fact table.
+///
+/// This is the one relation that would otherwise route around every column
+/// projection, so the read is applied per datom here exactly as it is in the
+/// wide tables.
+fn datoms_table(db: &Db, read: &ReadContext) -> Result<Arc<dyn TableProvider>, SqlError> {
     let fields = vec![
         Field::new("e", DataType::UInt64, false),
         Field::new("a", DataType::UInt64, false),
@@ -554,11 +615,21 @@ fn datoms_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {
     ];
     let mut rows = Vec::new();
     for datom in db.datoms_at(IndexOrder::Eavt) {
+        let value = match read.read(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
+            Ok(Hydration::Bind(value)) => value,
+            Ok(Hydration::Hide) => continue,
+            Ok(Hydration::Refuse(class)) => {
+                return Err(SqlError::Schema(format!(
+                    "protection class {class} is not readable without its key"
+                )));
+            }
+            Err(error) => return Err(SqlError::Schema(error.to_string())),
+        };
         let mut row = vec![
             ScalarValue::UInt64(Some(datom.e.raw())),
             ScalarValue::UInt64(Some(datom.a.raw())),
             ScalarValue::Utf8(db.idents().ident(datom.a).map(ToString::to_string)),
-            ScalarValue::Utf8(Some(value_type_name(&datom.v).into())),
+            ScalarValue::Utf8(Some(value_type_name(&value).into())),
         ];
         for expected in [
             ValueType::Bool,
@@ -571,8 +642,8 @@ fn datoms_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {
             ValueType::Bytes,
             ValueType::Ref,
         ] {
-            if datom.v.has_type(expected) {
-                row.push(value_scalar(db, &datom.v));
+            if value.has_type(expected) {
+                row.push(value_scalar(db, &value));
             } else {
                 row.push(ScalarValue::try_new_null(&arrow_type(expected))?);
             }

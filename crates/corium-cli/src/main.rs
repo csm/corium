@@ -746,6 +746,9 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:5432")]
         listen: SocketAddr,
         /// Require this cleartext password from clients (trust when omitted).
+        /// Ignored once authentication is configured: the password field then
+        /// carries each client's own bearer token, which is what makes a SQL
+        /// client a Corium principal.
         #[arg(long)]
         password: Option<String>,
         /// Enable guarded autocommit INSERT, UPDATE, and DELETE. Without this
@@ -753,7 +756,11 @@ enum Command {
         #[arg(long)]
         allow_writes: bool,
         #[command(flatten)]
+        keys: KeyFlags,
+        #[command(flatten)]
         client: ClientFlags,
+        #[command(flatten)]
+        serve: ServeFlags,
     },
     /// Database catalog operations.
     #[command(subcommand)]
@@ -1315,18 +1322,49 @@ async fn run_command(command: Command) -> Result<(), String> {
             listen,
             password,
             allow_writes,
+            keys,
             client,
+            serve,
         } => {
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|error| format!("cannot bind {listen}: {error}"))?;
+            // The policy database is read over its own peer connection, the
+            // same way the peer server reads it, so checks stay in-process.
+            let authorizer = match serve.authz()? {
+                Some((authz_db, authz_config)) => {
+                    let authz_config_client = client.connect_config(authz_db.clone()).await?;
+                    let authz_connection =
+                        Arc::new(Connection::connect(authz_config_client).await.map_err(
+                            |error| {
+                                format!(
+                                    "cannot connect to authorization database {authz_db:?}: {error}"
+                                )
+                            },
+                        )?);
+                    Some(
+                        start_authorizer(
+                            Arc::new(corium_peer::authz::ConnectionPolicySource::new(
+                                authz_connection,
+                            )),
+                            authz_config,
+                            &authz_db,
+                        )
+                        .await,
+                    )
+                }
+                None => None,
+            };
+            let guard = serve.guard_with(authorizer).await?;
             let catalog = Arc::new(pg_catalog::PeerCatalog::new(
                 client,
                 databases,
                 allow_writes,
+                keys.keyring()?,
             ));
             let pg_config = corium_pgwire::PgWireConfig {
                 password,
+                guard,
                 ..corium_pgwire::PgWireConfig::default()
             };
             tracing::info!(%listen, allow_writes, "postgres server serving");

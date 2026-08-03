@@ -336,16 +336,12 @@ def direct_peer_security(context: Context) -> str:
 
 def peer_server_security(context: Context) -> str:
     require_server(context)
-    detail = security_test("peer_server_real_jwt_authz_and_current_class_key_scope")
-    raise ScenarioLimitation(detail)
+    return security_test("peer_server_real_jwt_authz_and_per_principal_class_keys")
 
 
 def pgwire_security(context: Context) -> str:
     require_server(context)
-    detail = security_test(
-        "pgwire_real_authz_and_current_authentication_protection_boundaries"
-    )
-    raise ScenarioLimitation(detail)
+    return security_test("pgwire_maps_sql_clients_onto_corium_principals")
 
 
 def key_rotation(context: Context) -> str:

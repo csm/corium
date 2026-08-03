@@ -23,7 +23,8 @@ use corium_transactor::node::{NodeConfig, TransactorNode};
 use tonic::Request;
 
 const SCHEMA: &str = r"[{:db/ident :person/name :db/valueType :db.type/string
-                        :db/unique :db.unique/identity}]";
+                        :db/unique :db.unique/identity}
+                       {:db/ident :person/email :db/valueType :db.type/string}]";
 
 /// Tokens for the three callers the tests use.
 fn tokens() -> StaticTokens {
@@ -301,7 +302,7 @@ async fn peer_server_enforces_relationship_policy() {
     )
     .with_guard(guard);
 
-    let query = |principal: Principal| {
+    let query_for = |principal: Principal, datalog: &str| {
         // The interceptor attaches the principal; calling the handler directly
         // exercises the same handler-side authorization it feeds.
         let mut request = Request::new(pb::QueryRequest {
@@ -309,16 +310,14 @@ async fn peer_server_enforces_relationship_policy() {
                 db: "music".to_owned(),
                 view: None,
             }],
-            query: codec::encode_edn(
-                &corium_query::edn::read_one("[:find ?e :where [?e :person/name]]")
-                    .expect("query parses"),
-            ),
+            query: codec::encode_edn(&corium_query::edn::read_one(datalog).expect("query parses")),
             args: codec::encode_edn(&Edn::Vector(Vec::new())),
             fuel: 0,
         });
         request.extensions_mut().insert(principal);
         request
     };
+    let query = |principal: Principal| query_for(principal, "[:find ?e :where [?e :person/name]]");
 
     assert!(
         service
@@ -342,13 +341,69 @@ async fn peer_server_enforces_relationship_policy() {
         .expect("anonymous has no relation to music");
     assert_eq!(anonymous.code(), tonic::Code::PermissionDenied);
 
-    // carol's read is allowed *through a view*, and no read path applies one
-    // yet. The surface refuses rather than returning unfiltered data — the
-    // fail-safe that keeps a bound view from silently doing nothing.
-    let filtered = service
-        .query(query(Principal::new("static-token", "carol")))
+    // carol's read is allowed *through a view* that allows `:person/name` and
+    // nothing else. She and bob run the identical query against the identical
+    // database value and get different answers.
+    let writer = cluster.connect("music").await;
+    writer
+        .transact(forms(
+            r#"[{:db/id "p" :person/name "Ada" :person/email "ada@example.test"}]"#,
+        ))
         .await
-        .err()
-        .expect("a filtered decision is not servable yet");
-    assert_eq!(filtered.code(), tonic::Code::Unimplemented);
+        .expect("a person with an email is written");
+
+    let emails = "[:find ?email :where [?e :person/email ?email]]";
+    let alice_sees = rows_of(
+        service
+            .query(query_for(Principal::new("static-token", "alice"), emails))
+            .await
+            .expect("alice reads unfiltered"),
+    )
+    .await;
+    assert_eq!(alice_sees.len(), 1, "the email is there for an open reader");
+
+    let carol_sees = rows_of(
+        service
+            .query(query_for(Principal::new("static-token", "carol"), emails))
+            .await
+            .expect("a filtered decision is servable"),
+    )
+    .await;
+    assert!(
+        carol_sees.is_empty(),
+        "carol's view allows :person/name only: {carol_sees:?}"
+    );
+
+    // What her view does allow still comes back, so the filter narrows the
+    // answer rather than refusing the request.
+    let carol_names = rows_of(
+        service
+            .query(query_for(
+                Principal::new("static-token", "carol"),
+                "[:find ?name :where [?e :person/name ?name]]",
+            ))
+            .await
+            .expect("carol reads the attribute her view allows"),
+    )
+    .await;
+    assert_eq!(carol_names.len(), 1, "{carol_names:?}");
+}
+
+/// The peer server's chunked query stream.
+type QueryChunks = std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<pb::QueryResultChunk, tonic::Status>> + Send>,
+>;
+
+/// Collects a chunked query response into its result rows.
+async fn rows_of(response: tonic::Response<QueryChunks>) -> Vec<Edn> {
+    use tokio_stream::StreamExt as _;
+    let mut stream = response.into_inner();
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        chunks.push(chunk.expect("chunk"));
+    }
+    match corium_peer::server::assemble_query_result(&chunks).expect("assemble") {
+        Edn::Vector(rows) => rows,
+        other => panic!("expected a relation, got {other}"),
+    }
 }

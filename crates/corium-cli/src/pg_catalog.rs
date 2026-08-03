@@ -7,7 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use corium_crypt::Keyring;
 use corium_db::Db;
+use corium_db::protect::Hydrator;
 use corium_peer::Connection;
 use corium_peer::PeerError;
 use corium_pgwire::{CatalogError, CatalogTxResult, DbCatalog};
@@ -24,6 +26,9 @@ pub struct PeerCatalog {
     /// When present, only these database names are exposed.
     whitelist: Option<HashSet<String>>,
     allow_writes: bool,
+    /// Class keys this process can resolve. Which of them a given SQL
+    /// principal may use is decided per statement by the pgwire front end.
+    keyring: Option<Arc<dyn Keyring>>,
     connections: Mutex<HashMap<String, Arc<Connection>>>,
 }
 
@@ -31,7 +36,12 @@ impl PeerCatalog {
     /// Builds a catalog. An empty `databases` list exposes the whole catalog;
     /// otherwise only the listed databases are reachable. Writes are rejected
     /// unless `allow_writes` was explicitly enabled by the operator.
-    pub fn new(client: ClientFlags, databases: Vec<String>, allow_writes: bool) -> Self {
+    pub fn new(
+        client: ClientFlags,
+        databases: Vec<String>,
+        allow_writes: bool,
+        keyring: Option<Arc<dyn Keyring>>,
+    ) -> Self {
         let whitelist = if databases.is_empty() {
             None
         } else {
@@ -41,6 +51,7 @@ impl PeerCatalog {
             client,
             whitelist,
             allow_writes,
+            keyring,
             connections: Mutex::new(HashMap::new()),
         }
     }
@@ -61,11 +72,14 @@ impl PeerCatalog {
                 return Ok(Arc::clone(connection));
             }
         }
-        let config = self
+        let mut config = self
             .client
             .connect_config(name.to_owned())
             .await
             .map_err(CatalogError::Unavailable)?;
+        if let Some(keyring) = &self.keyring {
+            config = config.with_keyring(Arc::clone(keyring));
+        }
         let connection = Arc::new(
             Connection::connect(config)
                 .await
@@ -97,6 +111,17 @@ impl DbCatalog for PeerCatalog {
 
     async fn db(&self, name: &str) -> Result<Db, CatalogError> {
         Ok(self.connection(name).await?.db())
+    }
+
+    async fn hydrator(&self, name: &str) -> Result<Arc<Hydrator>, CatalogError> {
+        // The connection resolves its keyring once and caches the snapshot;
+        // which of those keys a given SQL principal may use is decided per
+        // statement by the pgwire front end.
+        self.connection(name)
+            .await?
+            .hydrator()
+            .await
+            .map_err(|error| CatalogError::Unavailable(error.to_string()))
     }
 
     async fn transact(
@@ -133,6 +158,10 @@ fn map_write_error(error: &PeerError) -> CatalogError {
         {
             CatalogError::Denied(status.message().to_owned())
         }
+        // The transactor refuses a principal whose policy view hides
+        // attributes, because it cannot apply one. That is a policy decision
+        // wearing an UNIMPLEMENTED status, and a SQL client should hear it as
+        // insufficient privilege rather than as a missing feature.
         PeerError::Rpc(status)
             if status.code() == Code::Unimplemented
                 && status.message().contains("view filtering") =>
@@ -174,6 +203,7 @@ mod tests {
             },
             Vec::new(),
             false,
+            None,
         );
         let Err(error) = catalog.transact("corium", 0, Vec::new()).await else {
             panic!("writes default to disabled");

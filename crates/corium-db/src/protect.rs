@@ -9,7 +9,7 @@
 //! Key resolution is async and happens once, into a [`ClassKeys`] snapshot,
 //! so the sync transact and query paths never touch a keyring.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use corium_core::{
@@ -123,6 +123,33 @@ impl ClassKeys {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// The subset of this snapshot whose classes name a key id in `allowed`.
+    ///
+    /// This is where a `KeyPolicy` meets the key set a process actually holds
+    /// (`docs/design/encryption.md`, "Peer server, thin clients, SQL"). A
+    /// server resolves its own keyring once, at connect time, and then hands
+    /// each principal the subset that principal is entitled to — so one peer
+    /// server serves readers with different key sets from one immutable
+    /// database value, and holding a key is never the same as disclosing it.
+    ///
+    /// A class the schema does not define cannot be matched to a key id, so
+    /// it is dropped: the policy names key ids, and a key whose class has
+    /// vanished from the schema is not one the policy granted.
+    #[must_use]
+    pub fn restrict_to(&self, schema: &Schema, allowed: &BTreeSet<String>) -> Self {
+        let keys = self
+            .keys
+            .iter()
+            .filter(|((class, _), _)| {
+                schema
+                    .class(*class)
+                    .is_some_and(|class| allowed.contains(&class.key_id))
+            })
+            .map(|(id, key)| (*id, Arc::clone(key)))
+            .collect();
+        Self { keys }
     }
 
     fn key(&self, class: EntityId, epoch: u32) -> Result<&SecretKey, ProtectError> {

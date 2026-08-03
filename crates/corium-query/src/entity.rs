@@ -1,7 +1,7 @@
 //! The lazy entity API: map-like navigation over EAVT.
 
 use corium_core::{AttrId, EntityId, IndexOrder, Keyword, Value};
-use corium_db::{Db, key_prefix, protect::Hydrator};
+use corium_db::{Db, key_prefix, read::ReadContext};
 
 use crate::QueryError;
 use crate::pull::hydrate;
@@ -12,27 +12,28 @@ use crate::pull::hydrate;
 pub struct Entity<'a> {
     db: &'a Db,
     id: EntityId,
-    hydrator: Option<&'a Hydrator>,
+    read: &'a ReadContext,
 }
 
 impl<'a> Entity<'a> {
-    /// Wraps an entity id over a database value.
+    /// Wraps an entity id over a database value, read without restriction.
     ///
     /// Values on protected attributes come back sealed; use
-    /// [`Entity::with_keys`] to read them as a key holder.
+    /// [`Entity::with_read`] to read them as a key holder, or under a policy
+    /// view.
     #[must_use]
-    pub const fn new(db: &'a Db, id: EntityId) -> Self {
+    pub fn new(db: &'a Db, id: EntityId) -> Self {
         Self {
             db,
             id,
-            hydrator: None,
+            read: ReadContext::unrestricted(),
         }
     }
 
-    /// Returns this entity reading through `hydrator`'s key set.
+    /// Returns this entity read under `read`'s view and key set.
     #[must_use]
-    pub const fn with_keys(mut self, hydrator: &'a Hydrator) -> Self {
-        self.hydrator = Some(hydrator);
+    pub const fn with_read(mut self, read: &'a ReadContext) -> Self {
+        self.read = read;
         self
     }
 
@@ -66,7 +67,7 @@ impl<'a> Entity<'a> {
         self.db
             .values(self.id, attr)
             .into_iter()
-            .filter_map(|value| hydrate(self.db, self.hydrator, attr, self.id, &value).transpose())
+            .filter_map(|value| hydrate(self.db, self.read, attr, self.id, &value).transpose())
             .collect()
     }
 
@@ -81,6 +82,10 @@ impl<'a> Entity<'a> {
     }
 
     /// Attributes present on this entity, in id order.
+    ///
+    /// Attributes this reader's view hides are absent: the key list is itself
+    /// information, so an entity looks to a restricted reader exactly as if
+    /// those datoms had never been asserted.
     #[must_use]
     pub fn keys(&self) -> Vec<AttrId> {
         let prefix = key_prefix(IndexOrder::Eavt, Some(self.id), None, None);
@@ -88,6 +93,7 @@ impl<'a> Entity<'a> {
             .db
             .datoms_prefix(IndexOrder::Eavt, &prefix)
             .map(|datom| datom.a)
+            .filter(|attr| self.read.visible(*attr))
             .collect();
         attrs.dedup();
         attrs
@@ -102,7 +108,7 @@ impl<'a> Entity<'a> {
                 Value::Ref(child) => Some(Self {
                     db: self.db,
                     id: child,
-                    hydrator: self.hydrator,
+                    read: self.read,
                 }),
                 _ => None,
             })
@@ -110,8 +116,13 @@ impl<'a> Entity<'a> {
     }
 
     /// Reverse navigation: entities whose `attr` references this entity.
+    ///
+    /// A reference this reader cannot see forward does not point back either.
     #[must_use]
     pub fn reverse(&self, attr: AttrId) -> Vec<Entity<'a>> {
+        if !self.read.visible(attr) {
+            return Vec::new();
+        }
         let value = Value::Ref(self.id);
         let prefix = key_prefix(IndexOrder::Vaet, None, Some(attr), Some(&value));
         self.db
@@ -119,7 +130,7 @@ impl<'a> Entity<'a> {
             .map(|datom| Entity {
                 db: self.db,
                 id: datom.e,
-                hydrator: self.hydrator,
+                read: self.read,
             })
             .collect()
     }
