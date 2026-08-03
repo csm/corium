@@ -2114,6 +2114,7 @@ dependencies = [
  "corium-core",
  "corium-db",
  "corium-forms",
+ "corium-protocol",
  "corium-query",
  "corium-sql",
  "corium-tx",

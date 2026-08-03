@@ -171,16 +171,27 @@ impl FilterKind {
     }
 }
 
-/// A named, reusable [`ViewFilter`](corium_protocol::authz::ViewFilter)
-/// definition.
+/// A named, reusable restriction on what a reader sees: an attribute
+/// [`ViewFilter`](corium_protocol::authz::ViewFilter), a set of protection
+/// class keys it may hydrate, or both.
+///
+/// Both parts are optional, and a view that sets neither restricts nothing.
+/// Keeping keys here rather than in a parallel vocabulary is deliberate: a
+/// deployment says "what this relation may read" in one place, even though
+/// the two halves are enforced by completely different mechanisms
+/// (`docs/design/auth.md`, "Relationship to encryption").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewDef {
     /// Name bindings refer to.
     pub name: String,
-    /// What the filter does.
-    pub kind: FilterKind,
+    /// What the attribute filter does, or `None` for no attribute
+    /// restriction — a view that only names keys.
+    pub kind: Option<FilterKind>,
     /// Attribute idents (e.g. `:person/email`) the filter names.
     pub attributes: Vec<String>,
+    /// Protection class key ids this view permits hydrating. Empty imposes no
+    /// key restriction of its own; see [`KeyGrant`](corium_protocol::authz::KeyGrant).
+    pub keys: Vec<String>,
 }
 
 /// Attaches a view (or explicit full visibility) to a successful relation on

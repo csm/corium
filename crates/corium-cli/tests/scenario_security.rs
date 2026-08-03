@@ -202,6 +202,15 @@ impl Cluster {
             bootstrap::tuple_form("alice", "writer", "database:people"),
             bootstrap::tuple_form("bob", "viewer", "database:people"),
         ]);
+        // The policy names the PII class key, and binds it to `writer`. Bob
+        // is a `viewer`: he reads the same database from the same key-holding
+        // server and never gets that key.
+        policy.extend(forms(&format!(
+            r#"[{{:db/id "v-pii" :authz.view/name "pii-reader" :authz.view/key ["{key}"]}}
+                {{:db/id "b-pii" :authz.binding/relation "writer"
+                  :authz.binding/object "database:people"
+                  :authz.binding/view "pii-reader"}}]"#,
+        )));
         authz.transact(policy).await.expect("install ReBAC policy");
 
         let authorizer = Arc::new(SystemDbAuthorizer::with_config(
@@ -406,7 +415,7 @@ async fn start_peer_server(cluster: &Cluster, with_key: bool) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn peer_server_real_jwt_authz_and_current_class_key_scope() {
+async fn peer_server_real_jwt_authz_and_per_principal_class_keys() {
     let cluster = Cluster::start().await;
     let keyed_endpoint = start_peer_server(&cluster, true).await;
 
@@ -421,16 +430,17 @@ async fn peer_server_real_jwt_authz_and_current_class_key_scope() {
         vec![SENTINEL.to_owned()]
     );
 
+    // Bob queries the same database value on the same key-holding server.
+    // The policy grants the PII key to `writer`, and Bob is a `viewer`.
     let bob = RemotePeer::connect(&keyed_endpoint, "people", Some(jwt("bob")), None)
         .await
         .expect("Bob remote peer");
-    assert_eq!(
-        query_ssn(&bob)
-            .await
-            .values_as::<String>()
-            .expect("the server's key hydrates for every authorized reader"),
-        vec![SENTINEL.to_owned()],
-        "current peer-server class keys are server-wide, not principal-scoped"
+    let bob_ssn = query_ssn(&bob).await;
+    let bob_ssn = bob_ssn.values();
+    assert!(
+        bob_ssn[0].to_string().starts_with("#corium/redacted"),
+        "a server key Bob was not granted must not hydrate for him: {}",
+        bob_ssn[0]
     );
     let denied = bob
         .transact(
@@ -468,9 +478,9 @@ async fn peer_server_real_jwt_authz_and_current_class_key_scope() {
     );
 
     println!(
-        "KNOWN LIMITATION: peer-server JWT authn and ReBAC operation checks work, \
-         but a class key belongs to the whole server; every authorized reader gets plaintext. \
-         A keyless peer server safely returns redacted values."
+        "verified: RS256 signature/issuer/audience checks; ReBAC read/write denial; \
+         per-principal class keys through one key-holding peer server (Alice hydrates, \
+         Bob is redacted); a keyless peer server redacts for everyone"
     );
 }
 
@@ -490,6 +500,21 @@ impl DbCatalog for ConnectionCatalog {
         } else {
             Err(CatalogError::NotFound(name.to_owned()))
         }
+    }
+
+    /// Every class key this process can resolve. Which of them a given SQL
+    /// principal may use is the pgwire front end's decision, not ours.
+    async fn hydrator(
+        &self,
+        name: &str,
+    ) -> Result<Arc<corium_db::protect::Hydrator>, CatalogError> {
+        if name != "people" {
+            return Err(CatalogError::NotFound(name.to_owned()));
+        }
+        self.connection
+            .hydrator()
+            .await
+            .map_err(|error| CatalogError::Unavailable(error.to_string()))
     }
 
     async fn transact(
@@ -522,13 +547,27 @@ impl DbCatalog for ConnectionCatalog {
     }
 }
 
+/// Connects a `PostgreSQL` client whose password field carries `token`.
+async fn pg_connect(port: u16, user: &str, token: &str) -> tokio_postgres::Client {
+    let config = format!("host=127.0.0.1 port={port} user={user} password={token} dbname=people");
+    let (client, connection) = tokio_postgres::connect(&config, tokio_postgres::NoTls)
+        .await
+        .expect("pgwire authenticates the presented token");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn pgwire_real_authz_and_current_authentication_protection_boundaries() {
+async fn pgwire_maps_sql_clients_onto_corium_principals() {
     let cluster = Cluster::start().await;
-    let bob = Arc::new(
-        Connection::connect(cluster.direct_config("bob", true))
+    // The catalog's own peer connection holds the class key, exactly the
+    // configuration that used to disclose PII to every SQL client.
+    let hosted = Arc::new(
+        Connection::connect(cluster.direct_config("alice", true))
             .await
-            .expect("pgwire's server-wide Bob JWT is authenticated for reads"),
+            .expect("key-holding catalog connection"),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -536,46 +575,57 @@ async fn pgwire_real_authz_and_current_authentication_protection_boundaries() {
     let address = listener.local_addr().expect("pgwire address");
     tokio::spawn(corium_pgwire::serve(
         listener,
-        Arc::new(ConnectionCatalog { connection: bob }),
+        Arc::new(ConnectionCatalog { connection: hosted }),
         PgWireConfig {
-            password: Some("pg-scenario-password".to_owned()),
+            guard: guard(cluster.peer_authorizer().await),
             ..PgWireConfig::default()
         },
         std::future::pending(),
     ));
+    wait_for_port(address.port()).await;
 
-    let config = format!(
-        "host=127.0.0.1 port={} user=mallory password=pg-scenario-password dbname=people",
-        address.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&config, tokio_postgres::NoTls)
-        .await
-        .expect("PostgreSQL password authenticates");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-
-    let row = client
+    // Alice's own JWT, presented in the password field, makes her a Corium
+    // principal — and the policy grants her role the PII class key.
+    let alice = pg_connect(address.port(), "alice", &jwt("alice")).await;
+    let row = alice
         .query_one(
             "SELECT name, ssn FROM corium.person WHERE name = 'Alice'",
             &[],
         )
         .await
-        .expect("read through pgwire");
+        .expect("Alice reads through pgwire");
+    assert_eq!(row.get::<_, String>(0), "Alice");
+    assert_eq!(
+        row.get::<_, Option<String>>(1),
+        Some(SENTINEL.to_owned()),
+        "a granted key hydrates a protected column"
+    );
+
+    // Bob queries the same server, the same database value, the same column.
+    let bob = pg_connect(address.port(), "bob", &jwt("bob")).await;
+    let row = bob
+        .query_one(
+            "SELECT name, ssn FROM corium.person WHERE name = 'Alice'",
+            &[],
+        )
+        .await
+        .expect("Bob reads through pgwire");
     assert_eq!(row.get::<_, String>(0), "Alice");
     assert_eq!(
         row.get::<_, Option<String>>(1),
         None,
-        "pgwire does not hydrate protected columns even when its peer holds the key"
+        "the server holds the key; Bob was not granted it, so the column is NULL"
     );
 
-    let denied = client
+    // Bob is a viewer, so the pgwire guard refuses his write before it ever
+    // reaches the transactor.
+    let denied = bob
         .execute(
             "UPDATE corium.person SET age = 41 WHERE name = 'Alice'",
             &[],
         )
         .await
-        .expect_err("the server-wide Bob principal is a viewer, not a writer");
+        .expect_err("Bob is a viewer, not a writer");
     let denied_message = denied
         .as_db_error()
         .map(|error| error.message().to_owned())
@@ -587,20 +637,23 @@ async fn pgwire_real_authz_and_current_authentication_protection_boundaries() {
         "{denied_message}"
     );
 
-    let bad_config = format!(
-        "host=127.0.0.1 port={} user=alice password=wrong dbname=people",
-        address.port()
+    // A forged token is rejected at connect time by the same OIDC verifier
+    // the gRPC surfaces use.
+    let forged = format!(
+        "host=127.0.0.1 port={} user=mallory password={}x dbname=people",
+        address.port(),
+        jwt("mallory")
     );
     assert!(
-        tokio_postgres::connect(&bad_config, tokio_postgres::NoTls)
+        tokio_postgres::connect(&forged, tokio_postgres::NoTls)
             .await
             .is_err(),
-        "pgwire still enforces its own password"
+        "pgwire verifies the token it is handed"
     );
 
     println!(
-        "KNOWN LIMITATION: pgwire's password/user is not mapped to a Corium principal. \
-         Every SQL client shares the server's Bob JWT and ReBAC decision; protected values \
-         are currently NULL even when that server-side peer holds the class key."
+        "verified: a SQL client's bearer token becomes a Corium principal; ReBAC decides \
+         its reads and writes; per-principal class keys hydrate for Alice and report NULL \
+         for Bob through one key-holding pgwire server"
     );
 }

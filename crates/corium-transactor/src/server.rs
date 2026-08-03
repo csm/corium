@@ -157,17 +157,61 @@ pub(crate) fn subscription_stream(
 pub struct TransactorSvc(pub Arc<TransactorNode>, pub Guard);
 
 /// Authorizes `access` for the request's [`Principal`], mapping the guard's
-/// decision onto a gRPC status. A returned [`ViewFilter`](authz::ViewFilter) is
-/// rejected for now: no transactor/catalog surface applies one yet, so honoring
-/// a filtered decision by returning full data would be an authorization bypass.
+/// decision onto a gRPC status.
+///
+/// A decision carrying an attribute [`ViewFilter`](authz::ViewFilter) is
+/// rejected: no transactor or catalog surface applies one, so honouring it by
+/// returning full data would be an authorization bypass.
+///
+/// A decision that only restricts *keys* is honoured by doing nothing, which
+/// is correct rather than lenient: the transactor holds no class key, so every
+/// protected value it accepts, logs, indexes, and hands back is already sealed.
+/// There is nothing here for a key policy to withhold.
 async fn authorize(guard: &Guard, principal: &Principal, access: Access) -> Result<(), Status> {
     match guard.authorize(principal, &access).await {
         Ok(None) => Ok(()),
-        Ok(Some(_filter)) => Err(Status::unimplemented(
+        Ok(Some(grant)) if grant.view.is_none() => Ok(()),
+        Ok(Some(_)) => Err(Status::unimplemented(
             "view filtering is not enforced on this surface yet",
         )),
         Err(error) => Err(error.to_status()),
     }
+}
+
+/// Authorizes a write against `database`, refusing a principal whose view
+/// actually hides one of its attributes.
+///
+/// Holding a view is not the test — one that hides nothing restricts nothing —
+/// and asking the same question the peer server and SQL ask is what keeps one
+/// principal under one policy from getting three different answers. The schema
+/// is resolved only for a principal the policy already allowed *and* handed a
+/// view, so a denied caller never causes a database to be opened.
+async fn authorize_write(
+    node: &TransactorNode,
+    guard: &Guard,
+    principal: &Principal,
+    database: &str,
+) -> Result<(), Status> {
+    let access = Access::on(Action::Transact, database);
+    let grant = match guard.authorize(principal, &access).await {
+        Ok(None) => return Ok(()),
+        Ok(Some(grant)) => grant,
+        Err(error) => return Err(error.to_status()),
+    };
+    if grant.view.is_none() {
+        return Ok(());
+    }
+    let state = node
+        .db_state(database)
+        .await
+        .map_err(|error| to_status(&error))?;
+    let db = state.db();
+    if grant.hides_attributes(db.schema(), db.idents()) {
+        return Err(Status::unimplemented(
+            "view filtering is not enforced on this surface yet",
+        ));
+    }
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -179,12 +223,7 @@ impl Transactor for TransactorSvc {
         let principal = authz::principal(&request);
         let request = request.into_inner();
         check_version(request.protocol_version)?;
-        authorize(
-            &self.1,
-            &principal,
-            Access::on(Action::Transact, &request.db),
-        )
-        .await?;
+        authorize_write(&self.0, &self.1, &principal, &request.db).await?;
         self.0
             .transact_at(&request.db, &request.tx_data, request.expected_basis_t)
             .await

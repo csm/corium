@@ -170,18 +170,47 @@ enable the mutation path explicitly:
 corium postgres-server --listen 127.0.0.1:5432 --allow-writes
 ```
 
-Pass `--password` to require a cleartext password; TLS is not terminated by the
-server, so front it with a proxy when transport security is needed. The SQL
-dialect is DataFusion's, not PostgreSQL's — wire compatibility does not imply
-`pg_catalog` or dialect compatibility. See
+Pass `--password` to require one shared cleartext password. TLS is not
+terminated by the server, so front it with a proxy when transport security is
+needed. The SQL dialect is DataFusion's, not PostgreSQL's — wire compatibility
+does not imply `pg_catalog` or dialect compatibility. See
 [ADR-0013](adr/0013-postgres-wire-interface.md).
 
-When writes are enabled, the CLI server's catalog uses its cached
-`corium-peer` connection, so its configured Corium bearer principal and the
-transactor's authorization gate apply. The PostgreSQL login is currently only
-a wire-server credential; it is not mapped to a distinct Corium principal.
-Per-user authn/authz parity, TLS termination, and PostgreSQL role/catalog
-semantics remain separate work.
+### Authentication and authorization
+
+`postgres-server` takes the same `--serve-token`, `--oidc-*`, and `--authz-db`
+flags as `peer-server`. Once any of them is set, **the password field carries
+the caller's own bearer token** — `PostgreSQL` has no separate token field —
+and the startup `user` is informational:
+
+```console
+corium postgres-server --listen 127.0.0.1:5432 \
+  --oidc-issuer https://issuer.example --oidc-audience corium \
+  --authz-db corium.authz --storage-key file:/etc/corium/pii.key
+psql "host=127.0.0.1 port=5432 dbname=people user=alice password=$JWT"
+```
+
+> **The token travels in cleartext.** `postgres-server` does not terminate
+> TLS — it rejects `--tls-cert`/`--tls-key` rather than accepting flags it
+> cannot honour — so a client's bearer token crosses the wire unencrypted.
+> Run it behind a TLS-terminating proxy, or bind it to loopback. The server
+> prints this warning at startup whenever authentication is configured.
+
+Every statement is then authorized as that principal: `SELECT` needs `Query`,
+DML needs `Transact`, and `SHOW DATABASES` lists only what the principal may
+inspect. Reads are answered through the principal's own view — a column its
+policy hides keeps its declared type and reports `NULL`, and never takes a
+pushed-down predicate — and through its own protection class keys, so one
+key-holding server serves principals with different entitlements from one
+database value. Pass `--key-policy server-wide` to keep the pre-`ADR-0021`
+behaviour of hydrating every authorized caller with the server's whole keyring.
+A principal whose view hides attributes may not write. See
+[ADR-0021](adr/0021-contextual-read-authorization.md) and
+[auth.md](design/auth.md).
+
+Writes still *commit* through the catalog's own `corium-peer` connection, so
+the transactor additionally applies that connection's bearer principal. TLS
+termination and PostgreSQL role/catalog semantics remain separate work.
 
 ## Engine choice and tradeoffs
 

@@ -163,16 +163,40 @@ trait — it implements `Authorizer` directly and awaits inside. The spike's
 `external_async_oracle_authorizer` test demonstrates a `Check`-style oracle
 plugged into a `Guard` via `Arc<dyn Authorizer>`.
 
-### ViewFilter — different views, one server
+### ReadGrant — different views, one server
 
 This is how two tenants read the same database and see different facts. When an
-authorizer returns `AllowFiltered`, the read paths consult the filter before
-returning data. The spike defines the cheapest useful cut — **attribute-level
-visibility** (`AttributeAllowlist`), enforceable directly in the peer's datom
-scan — and leaves entity-level and value-predicate filtering as further
-implementations of the same trait. Filtering *what a legitimate reader sees* is
-distinct from *whether the read is allowed*; both live in the authorizer so the
-policy is in one place.
+authorizer returns `AllowFiltered`, it carries a `ReadGrant`: an optional
+attribute `ViewFilter`, and the protection class keys the principal may hydrate
+(`KeyGrant`). The read paths apply both. Attribute-level visibility is the
+cheapest useful cut and is enforced directly in the datom scan; entity-level
+and value-predicate filtering remain further implementations of the same trait.
+Filtering *what a legitimate reader sees* is distinct from *whether the read is
+allowed*; both live in the authorizer so the policy is in one place.
+
+A surface resolves the grant into a `corium_db::read::ReadContext` — the
+engine-facing form, where the filter has already been resolved against one
+database value's schema into a set of attribute ids. Every read path takes one:
+`ExecOptions::read`, `pull_with`, `Entity::with_read`, `SqlSession::with_read`.
+That single value is also where the key set lives, because "which attributes"
+and "which keys" are both properties of the *read* rather than of the `Db`.
+
+**Hidden means hidden, not blank.** A datom on a hidden attribute is dropped in
+the scan, so it never binds, never joins, and never satisfies a predicate; a
+pull omits the key; SQL reports `NULL` and refuses predicate pushdown on the
+column. The engine paths that reach the index directly are closed with it —
+`get-else` falls to its default, `missing?` reports missing, a lookup ref does
+not resolve, reverse-ref traversal returns nothing, and `Entity::keys` omits
+the attribute. Each of those would otherwise be an existence oracle over
+exactly the attribute the view withholds.
+
+**Surfaces that cannot filter fail closed.** The peer server refuses `Transact`
+and `Subscribe` for a principal whose view hides attributes: transaction data
+arrives already encoded, and `Subscribe` proxies the transactor's own stream,
+so neither can honour a filter. SQL DML is refused for the same reason. A grant
+that restricts only *keys* is not a reason to refuse any of them — it hides no
+attribute, and the transactor holds no class key, so everything protected on
+those paths is sealed already.
 
 ### Guard — the chosen policy
 
@@ -223,6 +247,9 @@ Action mapping:
 | `Catalog.GcDeletedDatabases` | `GarbageCollect` |
 | `Catalog.RequestIndex` / `SetIndexPolicy` | `ManageIndex` |
 | `Catalog.AlterSchema` | `AlterSchema` |
+| pgwire `SELECT` | `Query` |
+| pgwire `INSERT` / `UPDATE` / `DELETE` | `Transact` |
+| pgwire `USE` / `SHOW DATABASES` | `Inspect`, per database |
 
 Schema migration adds `Action::AlterSchema` with wire name `alter-schema`.
 It is an Admin-class, database-scoped action, so the built-in `admin`
@@ -243,7 +270,14 @@ Enforcement points differ by surface:
   datom scans run server-side against local `Db` values, so a `ViewFilter` can
   be applied to results before they leave the process.
 - **Transactor** authz is coarser — mostly action/database gating on transact
-  and catalog operations. It has no query surface to filter.
+  and catalog operations. It has no query surface to filter, so it refuses a
+  decision carrying an attribute view and ignores one carrying only a key
+  grant: it holds no class key, so there is nothing there for a key policy to
+  withhold.
+- **pgwire** enforces the same model over SQL. `PostgreSQL` has no bearer-token
+  field, so the password carries the caller's credential and the startup `user`
+  is informational; every statement is then authorized as the resulting
+  principal, and each session reads through its own `ReadContext`.
 - **Embedded transport** (`corium-peer` → `corium-transactor` in-process) runs
   no interceptor; `authz::principal` returns anonymous, and a `Guard::disabled`
   keeps the single-process path exactly as it is today.
@@ -511,15 +545,21 @@ enforceable directly in the datom scan, with no executor predicate.
 
 ## Open questions
 
-- **View filtering in the query engine.** This is now the gap that matters: an
-  authorizer *can* return `AllowFiltered`, but no read path applies a filter
-  yet, so the peer server rejects a filtered decision with `UNIMPLEMENTED`
-  rather than returning unfiltered data. Attribute-level visibility is
-  enforceable in the datom scan; a `ViewFilter` that hides *entities* or
-  filters by *value* needs a hook inside `corium-query` (a predicate in the
-  executor) and interacts with the query cache (cache keys must include the
-  filter). Until then, policies that bind views are expressible and testable
-  but not servable.
+- **Entity- and value-level view filtering.** Attribute visibility is enforced
+  in the datom scan ([ADR-0021](../adr/0021-contextual-read-authorization.md)).
+  A `ViewFilter` that hides *entities* or filters by *value* still needs a hook
+  inside `corium-query` — a predicate in the executor rather than a set lookup
+  in the scan — and is the natural next implementation of the same trait.
+- **Filtered `Subscribe`.** The peer server proxies the transactor's stream
+  untouched, so it refuses a view-restricted principal rather than filtering.
+  Lifting that means decoding, filtering, and re-encoding each tx report,
+  changing `SubscribeStream` from the proxied `tonic::Streaming` to a boxed
+  stream.
+- **Writes under a view.** A view-restricted principal may not transact on any
+  surface, because transaction data is opaque bytes by the time authorization
+  runs and a write that cannot be read back is how a view gets probed. Allowing
+  it needs per-attribute write authorization in `corium-tx`, not a check at the
+  edge.
 - **Pinning the authz database across fork and restore.** The database is named
   by configuration (`--authz-db`), not recorded in the catalog, so a restore
   under a different name or a fork of the policy database is an operator
@@ -541,7 +581,8 @@ enforceable directly in the datom scan, with no executor predicate.
   (+ `AllowAnonymous`, `StaticTokens`, `ExternalTokens`, `CompositeProvider`),
   `TokenVerifier`, `Action`/`Access`, `Authorizer` (+ `AllowAll`,
   `PolicyAuthorizer`/`Grant`), `ViewFilter` (+ `AttributeAllowlist`),
-  `Decision`, `Guard`, and `IdentityInterceptor`.
+  `KeyGrant`/`KeyPolicyMode`, `ReadGrant`, `Decision`, `Guard`, and
+  `IdentityInterceptor`.
 - `corium-protocol::oidc` (feature `oidc`): `OidcVerifier`, a concrete
   `TokenVerifier` that validates RSA-signed (`RS256`/`RS384`/`RS512`) JWTs
   against a JWKS and maps `sub`/roles/claims onto a `Principal`, with issuer,
@@ -554,8 +595,8 @@ enforceable directly in the datom scan, with no executor predicate.
   attributes and the EDN that installs them), `model` (objects, tuples,
   permissions, rewrites, views, bindings), `policy::Policy` (the compiled
   snapshot and its indexes), `eval` (the bounded, cycle-safe search),
-  `subject` (principal → subjects), `view` (filters and their conservative
-  combination), `source::PolicySource` (+ `MemoryPolicySource`), `audit`
+  `subject` (principal → subjects), `view` (filters, key grants, and their
+  conservative combination), `source::PolicySource` (+ `MemoryPolicySource`), `audit`
   (`AuditEvent`/`AuditSink`/`TracingAudit`), `bootstrap` (in-process policy
   databases and the grant/revoke transaction forms), and `SystemDbAuthorizer`
   with snapshot caching, a refresh task, result caching, consistency modes,
@@ -564,15 +605,25 @@ enforceable directly in the datom scan, with no executor predicate.
   (the node's own `DbState`, woken by its basis watch) and
   `corium_peer::authz::ConnectionPolicySource` (a second peer connection, woken
   by its tx-report broadcast).
-- Server wiring: the transactor (`Transactor` + `Catalog`) and peer server
-  authenticate every request in the interceptor and authorize the concrete
+- Server wiring: the transactor (`Transactor` + `Catalog`), the peer server,
+  and the pgwire server authenticate every request and authorize the concrete
   `Access` in each handler. Authorization defaults to `AllowAll`, or to the
   relationship policy when `--authz-db` names one.
+- Read-time enforcement: `corium_db::read::{AttrVisibility, ReadContext}`, the
+  engine paths that apply it (scan, `pull`, entity API, `get-else`, `missing?`,
+  lookup refs), per-principal hydration via `ClassKeys::restrict_to`, and the
+  peer-server and pgwire surfaces that build a `ReadContext` per request. See
+  [ADR-0021](../adr/0021-contextual-read-authorization.md).
+- pgwire identity: `PgWireConfig::guard`, with the caller's bearer token in the
+  `PostgreSQL` password field, per-statement authorization, a catalog listing
+  filtered to what the principal may inspect, and `DbCatalog::hydrator` as the
+  seam that supplies the process's class keys.
 - CLI: a shared development token defaulted across every program, `ServeFlags`
   that build the server `Guard` (`--serve-token`, `--require-auth`,
   `--serve-open`, `--oidc-issuer`/`--oidc-audience`/`--oidc-jwks-file`,
   `--authz-db`, `--authz-fresh-writes`, `--authz-break-glass-role`,
-  `--authz-max-depth`), `CORIUM_TOKEN` / `CORIUM_SERVE_TOKEN` /
+  `--authz-max-depth`) on both `peer-server` and `postgres-server`,
+  `CORIUM_TOKEN` / `CORIUM_SERVE_TOKEN` /
   `CORIUM_AUTHZ_DB` environment overrides, and
   `corium authz init|grant|revoke|check|status`.
 - Unit tests covering each model requirement: optional-off, distinct

@@ -11,7 +11,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use corium_protocol::authz::{Access, ActionClass, Authorizer, Decision, Principal, ViewFilter};
+use corium_protocol::authz::{
+    Access, ActionClass, Authorizer, Decision, Principal, ReadGrant, ViewFilter,
+};
 
 use crate::audit::{AuditEvent, AuditSink, TracingAudit};
 use crate::eval::{self, Denial, Limits, Outcome};
@@ -123,11 +125,20 @@ impl AuthzDecision {
         !matches!(self.decision, Decision::Deny(_))
     }
 
-    /// The view filter, when the decision narrows visibility.
+    /// The read restriction, when the decision narrows what the caller sees.
+    #[must_use]
+    pub fn grant(&self) -> Option<ReadGrant> {
+        match &self.decision {
+            Decision::AllowFiltered(grant) => Some(grant.clone()),
+            _ => None,
+        }
+    }
+
+    /// The attribute filter, when the decision narrows visibility.
     #[must_use]
     pub fn filter(&self) -> Option<Arc<dyn ViewFilter>> {
         match &self.decision {
-            Decision::AllowFiltered(filter) => Some(Arc::clone(filter)),
+            Decision::AllowFiltered(grant) => grant.view.clone(),
             _ => None,
         }
     }
@@ -381,10 +392,10 @@ impl SystemDbAuthorizer {
             },
             Outcome::AllowFiltered {
                 matches,
-                filter,
+                grant,
                 views,
             } => AuthzDecision {
-                decision: Decision::AllowFiltered(Arc::clone(filter)),
+                decision: Decision::AllowFiltered(grant.clone()),
                 authz_t,
                 object,
                 path: matches.first().map(eval::Match::render_path),

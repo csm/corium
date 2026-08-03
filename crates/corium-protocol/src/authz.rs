@@ -39,6 +39,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use corium_core::Schema;
+use corium_db::Idents;
+use corium_db::read::AttrVisibility;
 use tonic::metadata::MetadataMap;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
@@ -466,13 +469,180 @@ impl ViewFilter for AttributeAllowlist {
     }
 }
 
+/// Which protection classes a principal may hydrate.
+///
+/// This is the `KeyPolicy` of `docs/design/encryption.md`, and it is where
+/// authorization meets encryption: policy names *key ids*, the same way it
+/// names view filters, and a serving process hands each principal the subset
+/// of its own keyring that the policy grants. Holding a class key stops being
+/// the same thing as disclosing it.
+///
+/// Note what this is not: withholding a key from a request is enforced by the
+/// process that holds it, exactly like a [`ViewFilter`]. The cryptographic
+/// floor is a process that was never given the key at all.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum KeyGrant {
+    /// Every key the serving process itself resolves.
+    #[default]
+    Unrestricted,
+    /// Only the named key ids, and only if the process holds them.
+    Only(BTreeSet<String>),
+}
+
+impl KeyGrant {
+    /// Grants exactly `key_ids`.
+    pub fn only(key_ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Only(key_ids.into_iter().map(Into::into).collect())
+    }
+
+    /// Grants no key at all: every protected value follows its class's
+    /// missing-key policy.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::Only(BTreeSet::new())
+    }
+
+    /// Whether this grant withholds nothing.
+    #[must_use]
+    pub const fn is_unrestricted(&self) -> bool {
+        matches!(self, Self::Unrestricted)
+    }
+
+    /// Whether `key_id` may be used to hydrate for this principal.
+    #[must_use]
+    pub fn allows(&self, key_id: &str) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Only(allowed) => allowed.contains(key_id),
+        }
+    }
+
+    /// The conservative combination of two grants.
+    ///
+    /// Intersection, for the same reason [`ViewFilter`]s intersect: holding
+    /// one more relation must never *reveal* more than holding it alone.
+    #[must_use]
+    pub fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unrestricted, other) | (other, Self::Unrestricted) => other,
+            (Self::Only(mine), Self::Only(theirs)) => {
+                Self::Only(mine.intersection(&theirs).cloned().collect())
+            }
+        }
+    }
+}
+
+/// What a decision that names no protection class key means for a request.
+///
+/// A serving process holds one keyring; this is how it decides which part of
+/// it a given request may use.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KeyPolicyMode {
+    /// The principal hydrates only the classes its decision names by key id.
+    ///
+    /// A policy that says nothing about keys therefore grants none, and a
+    /// protected value follows its class's missing-key policy — redacted,
+    /// hidden, or refused. This is the safe default for a surface that knows
+    /// who its callers are.
+    #[default]
+    Strict,
+    /// Every request hydrates with the process's whole keyring, whoever made
+    /// it. Appropriate only when every client is entitled to every class the
+    /// process holds.
+    ServerWide,
+}
+
+/// What a principal may see within a database it is allowed to read: an
+/// optional attribute view, and the protection classes it may hydrate.
+///
+/// The two controls are independent and are enforced independently — policy
+/// for "who should", keys for "who can" — but they are decided together,
+/// because one policy database is where a deployment says both.
+#[derive(Clone, Default)]
+pub struct ReadGrant {
+    /// Attribute visibility, or `None` for full visibility.
+    pub view: Option<Arc<dyn ViewFilter>>,
+    /// Protection classes this principal may hydrate.
+    pub keys: KeyGrant,
+}
+
+impl ReadGrant {
+    /// A grant that withholds nothing.
+    #[must_use]
+    pub fn unrestricted() -> Self {
+        Self::default()
+    }
+
+    /// Restricts visibility to `view` (builder style).
+    #[must_use]
+    pub fn with_view(mut self, view: Arc<dyn ViewFilter>) -> Self {
+        self.view = Some(view);
+        self
+    }
+
+    /// Restricts hydration to `keys` (builder style).
+    #[must_use]
+    pub fn with_keys(mut self, keys: KeyGrant) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// Whether this grant withholds anything at all.
+    ///
+    /// Surfaces that cannot filter their output refuse a restricted grant
+    /// rather than answering it in full.
+    #[must_use]
+    pub fn is_restricted(&self) -> bool {
+        self.view.is_some() || !self.keys.is_unrestricted()
+    }
+
+    /// Whether this grant hides any attribute of a particular database.
+    ///
+    /// Holding a view is not the same as hiding something: an allowlist that
+    /// names every attribute, or a denylist that names none of this
+    /// database's, restricts nothing here. Answering needs a schema, because a
+    /// view names idents and hiding is a property of the pair.
+    ///
+    /// This is the question every surface that refuses restricted readers
+    /// asks — the peer server before `Transact` and `Subscribe`, the
+    /// transactor before a write, SQL before DML — so that one principal
+    /// under one policy gets the same answer from all of them.
+    #[must_use]
+    pub fn hides_attributes(&self, schema: &Schema, idents: &Idents) -> bool {
+        self.view.as_ref().is_some_and(|view| {
+            !AttrVisibility::resolve(schema, idents, |ident| {
+                view.attribute_visible(&ident.to_string())
+            })
+            .is_empty()
+        })
+    }
+
+    /// Whether datoms of `attribute` reach this principal.
+    #[must_use]
+    pub fn attribute_visible(&self, attribute: &str) -> bool {
+        self.view
+            .as_ref()
+            .is_none_or(|view| view.attribute_visible(attribute))
+    }
+}
+
+impl fmt::Debug for ReadGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReadGrant")
+            .field("view", &self.view)
+            .field("keys", &self.keys)
+            .finish()
+    }
+}
+
 /// The outcome of an authorization check.
 #[derive(Clone)]
 pub enum Decision {
-    /// Permit the access with full visibility.
+    /// Permit the access with full visibility and every key.
     Allow,
-    /// Permit the access, but only through `filter`.
-    AllowFiltered(Arc<dyn ViewFilter>),
+    /// Permit the access, but only through `grant`.
+    AllowFiltered(ReadGrant),
     /// Refuse the access; the string explains why.
     Deny(String),
 }
@@ -481,7 +651,7 @@ impl fmt::Debug for Decision {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Allow => formatter.write_str("Allow"),
-            Self::AllowFiltered(filter) => write!(formatter, "AllowFiltered({filter:?})"),
+            Self::AllowFiltered(grant) => write!(formatter, "AllowFiltered({grant:?})"),
             Self::Deny(reason) => write!(formatter, "Deny({reason:?})"),
         }
     }
@@ -637,7 +807,7 @@ impl Authorizer for PolicyAuthorizer {
             ));
         }
         match view {
-            Some(filter) => Decision::AllowFiltered(filter),
+            Some(filter) => Decision::AllowFiltered(ReadGrant::unrestricted().with_view(filter)),
             None => Decision::Allow,
         }
     }
@@ -711,7 +881,12 @@ impl Guard {
         }
     }
 
-    /// Authorizes `access` for `principal`, returning any view restriction.
+    /// Authorizes `access` for `principal`, returning any read restriction.
+    ///
+    /// `Ok(None)` is an unrestricted allow; `Ok(Some(grant))` permits the
+    /// access through `grant`'s view and key set. A surface that cannot apply
+    /// a grant must refuse it rather than answer in full — returning
+    /// unfiltered data for a filtered decision is an authorization bypass.
     ///
     /// Async because [`Authorizer`] may consult an external policy oracle; local
     /// authorizers resolve without awaiting.
@@ -722,10 +897,10 @@ impl Guard {
         &self,
         principal: &Principal,
         access: &Access,
-    ) -> Result<Option<Arc<dyn ViewFilter>>, AuthError> {
+    ) -> Result<Option<ReadGrant>, AuthError> {
         match self.authorizer.authorize(principal, access).await {
             Decision::Allow => Ok(None),
-            Decision::AllowFiltered(filter) => Ok(Some(filter)),
+            Decision::AllowFiltered(grant) => Ok(Some(grant)),
             Decision::Deny(reason) => Err(AuthError::Forbidden(reason)),
         }
     }
@@ -1141,5 +1316,52 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A view that hides nothing must not count as a restriction, or the
+    /// surfaces that refuse restricted writers refuse a principal whose policy
+    /// takes nothing away.
+    #[test]
+    fn a_view_that_hides_nothing_does_not_hide_attributes() {
+        use corium_core::{Attribute, Cardinality, Keyword, Schema, ValueType};
+        use corium_db::Idents;
+
+        let mut schema = Schema::default();
+        let mut idents = Idents::default();
+        for (raw, ident) in [(100_u64, "person/name"), (101, "person/email")] {
+            let id = corium_core::EntityId::from_raw(raw);
+            schema.insert(Attribute {
+                id,
+                value_type: ValueType::Str,
+                cardinality: Cardinality::One,
+                unique: None,
+                is_component: false,
+                indexed: false,
+                no_history: false,
+            });
+            idents.insert(Keyword::parse(ident), id);
+        }
+
+        let covering: Arc<dyn ViewFilter> =
+            Arc::new(AttributeAllowlist::new([":person/name", ":person/email"]));
+        let grant = ReadGrant::unrestricted().with_view(covering);
+        assert!(grant.is_restricted(), "it still carries a view");
+        assert!(
+            !grant.hides_attributes(&schema, &idents),
+            "but it takes nothing away from this database"
+        );
+
+        let narrowing: Arc<dyn ViewFilter> = Arc::new(AttributeAllowlist::new([":person/name"]));
+        assert!(
+            ReadGrant::unrestricted()
+                .with_view(narrowing)
+                .hides_attributes(&schema, &idents)
+        );
+
+        // A key grant hides no attribute, so a writer restricted only in what
+        // it may hydrate is not refused by the surfaces that check this.
+        let keyed = ReadGrant::unrestricted().with_keys(KeyGrant::only(["pii"]));
+        assert!(keyed.is_restricted());
+        assert!(!keyed.hides_attributes(&schema, &idents));
     }
 }
