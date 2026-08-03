@@ -1,0 +1,8 @@
+schema-version = 1
+
+[[entity]]
+name = "person"
+
+[entity.attributes]
+name = { type = "string", unique = "identity", index = true }
+age = "long"
