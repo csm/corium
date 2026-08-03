@@ -88,6 +88,8 @@ The remaining options are:
 | `index` | Boolean | `false` |
 | `component` | Boolean | `false` |
 | `no-history` | Boolean | `false` |
+| `doc` | String documentation (`:db/doc`) | unset |
+| `protection` | A `[protect.<name>]` class, as `"protect/<name>"` | unset |
 
 Use only one of `many` and `cardinality` on a declaration. Unique attributes
 receive index coverage whether or not `index = true` is present.
@@ -104,6 +106,72 @@ does not bypass this validation:
 "active?" = "boolean"
 ```
 
+## Protection classes
+
+A protection class names the key that seals values on the attributes assigned
+to it. The class never holds key material: the database records only the key
+*identity*, and each process resolves it through its own keyring, so who may
+read a protected attribute is a question about key distribution rather than
+about Corium (see
+[docs/design/encryption.md](design/encryption.md) and
+[ADR-0018](adr/0018-attribute-protection-classes.md)).
+
+```toml
+[protect.pii]
+key = "file:/etc/corium/pii.key"
+padding = 64
+on-missing-key = "redact"
+
+[[entity]]
+name = "person"
+
+[entity.attributes]
+name = "string"
+ssn = { type = "string", protection = "protect/pii" }
+```
+
+A section `[protect.<name>]` declares the class `:protect/<name>`. Its options:
+
+| Option | Values | Default |
+|---|---|---|
+| `key` | Key identity, e.g. `"file:/etc/corium/pii.key"` | required |
+| `algorithm` | `"aes-256-gcm-siv"` | `"aes-256-gcm-siv"` |
+| `scope` | `"attribute"` or `"entity"` | `"attribute"` |
+| `padding` | Bytes to round plaintext up to, at least 16 | unset |
+| `on-missing-key` | `"redact"`, `"hide"`, or `"error"` | `"redact"` |
+| `legacy-plaintext` | `"redact"` or `"pass-through"` | `"redact"` |
+| `epoch` | Key epoch new values seal under | `1` |
+
+`scope` chooses what the sealing determinism leaks. Under `"attribute"` a
+reader without the key can tell that two entities share a value on that
+attribute; `"entity"` also binds the entity, so it leaks only that one
+entity's value repeated over time. Entity scope is declarable but not yet
+sealable — a writing peer refuses it rather than binding the wrong subject.
+
+`padding` rounds plaintext up to a multiple of that many bytes before sealing,
+which costs storage and removes the length side channel for short, guessable
+values.
+
+`on-missing-key` decides what a reader who cannot open a value gets:
+`"redact"` binds it in redacted form (structure visible, value not), `"hide"`
+drops the datom out of scans entirely, and `"error"` fails the read. Under all
+three, an unopenable value never satisfies a constant or a predicate.
+
+Who may read a class is a question about key distribution, not about Corium:
+give the key identity to the processes that should hydrate it, and to no
+others. One caveat while the per-principal key policy is unimplemented: a
+**peer server** hydrates every request with its own keyring, so any client it
+serves reads every class it holds. See
+[docs/operations.md](operations.md#attribute-protection) before pointing
+less-trusted clients at a key-holding peer server.
+
+Protection cannot be combined with `index`, `unique`, or `type = "ref"`:
+ciphertext order is not value order, so a protected attribute can never appear
+in the value-ordered indexes, and the schema rejects the combination rather
+than surprising a range query later. When an application genuinely needs
+indexed lookup on a protected field, it adds a second, unprotected attribute
+holding a keyed hash of the value and accepts that leak explicitly.
+
 ## Creating a database
 
 ```sh
@@ -113,3 +181,14 @@ corium db create people --schema schema.toml
 The CLI selects TOML for `.toml` paths. Other extensions retain the existing
 EDN behavior, including a single vector of attribute maps or a sequence of
 bare attribute maps.
+
+## Updating an existing database
+
+`corium schema update` compares the same file with the schema installed in a
+database. It is read-only by default and is documented in
+[Operations](operations.md#schema-updates); the model behind it is
+[schema migrations](design/schema-migrations.md).
+
+```sh
+corium schema update people --schema schema.toml
+```

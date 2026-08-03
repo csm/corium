@@ -60,3 +60,11 @@ impl EntityId {
         self.0 & SEQUENCE_MASK
     }
 }
+
+impl std::fmt::Display for EntityId {
+    /// Prints the raw integer, which is how an entity id appears at every
+    /// boundary that does not resolve it to an ident.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}

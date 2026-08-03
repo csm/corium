@@ -1927,6 +1927,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "corium-core",
+ "corium-crypt",
  "corium-db",
  "corium-peer",
  "corium-protocol",
@@ -1968,6 +1969,7 @@ name = "corium-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
@@ -1990,8 +1992,12 @@ dependencies = [
 name = "corium-db"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "corium-core",
+ "corium-crypt",
+ "proptest",
  "rpds",
+ "thiserror",
 ]
 
 [[package]]
@@ -2082,6 +2088,7 @@ dependencies = [
  "corium-core",
  "corium-crypt",
  "corium-db",
+ "corium-forms",
  "corium-log",
  "corium-protocol",
  "corium-query",

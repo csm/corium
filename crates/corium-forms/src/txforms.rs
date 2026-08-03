@@ -122,10 +122,98 @@ fn scalar_value(form: &Edn, interner: &mut KeywordInterner) -> Option<Value> {
             ("inst", Edn::Long(ms)) => Some(Value::Instant(*ms)),
             ("uuid", Edn::Str(hex)) => u128::from_str_radix(hex, 16).ok().map(Value::Uuid),
             ("bytes", Edn::Str(hex)) => decode_hex(hex).map(|b| Value::Bytes(b.into())),
+            (SEALED_TAG, map) => sealed_value(map),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// EDN tag naming a value that is already sealed.
+///
+/// A sealed value travels as ordinary EDN so the transactor decodes tx-data
+/// with the same pure expansion it uses for everything else, and validates
+/// the cleartext header without holding any key.
+pub const SEALED_TAG: &str = "corium/sealed";
+
+/// Reads `#corium/sealed {:class … :epoch … :vtype … :body "hex"}`.
+fn sealed_value(form: &Edn) -> Option<Value> {
+    let class = match form.get(&kw("class"))? {
+        Edn::Long(raw) => EntityId::from_raw(u64::try_from(*raw).ok()?),
+        _ => return None,
+    };
+    let epoch = match form.get(&kw("epoch"))? {
+        Edn::Long(epoch) => u32::try_from(*epoch).ok()?,
+        _ => return None,
+    };
+    let vtype = value_type_named(form.get(&kw("vtype"))?.as_keyword()?)?;
+    let body = match form.get(&kw("body"))? {
+        Edn::Str(hex) => decode_hex(hex)?,
+        Edn::Tagged(tag, value) if tag == "bytes" => match value.as_ref() {
+            Edn::Str(hex) => decode_hex(hex)?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(Value::Sealed(corium_core::Sealed {
+        class,
+        epoch,
+        vtype,
+        body: body.into(),
+    }))
+}
+
+/// Writes the wire form [`sealed_value`] reads.
+#[must_use]
+pub fn sealed_to_edn(sealed: &corium_core::Sealed) -> Edn {
+    use std::fmt::Write as _;
+    let body = sealed.body.iter().fold(String::new(), |mut acc, byte| {
+        let _ = write!(acc, "{byte:02x}");
+        acc
+    });
+    let mut pairs = vec![
+        (
+            kw("class"),
+            Edn::Long(i64::try_from(sealed.class.raw()).unwrap_or(i64::MAX)),
+        ),
+        (kw("epoch"), Edn::Long(i64::from(sealed.epoch))),
+        (
+            kw("vtype"),
+            kw(&format!("db.type/{}", value_type_name(sealed.vtype))),
+        ),
+        (kw("body"), Edn::Str(body)),
+    ];
+    pairs.sort_unstable();
+    Edn::Tagged(SEALED_TAG.to_owned(), Box::new(Edn::Map(pairs)))
+}
+
+const fn value_type_name(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::Bool => "boolean",
+        ValueType::Long => "long",
+        ValueType::Double => "double",
+        ValueType::Instant => "instant",
+        ValueType::Uuid => "uuid",
+        ValueType::Keyword => "keyword",
+        ValueType::Str => "string",
+        ValueType::Bytes => "bytes",
+        ValueType::Ref => "ref",
+    }
+}
+
+fn value_type_named(keyword: &Keyword) -> Option<ValueType> {
+    Some(match keyword.name.as_str() {
+        "boolean" => ValueType::Bool,
+        "long" => ValueType::Long,
+        "double" => ValueType::Double,
+        "instant" => ValueType::Instant,
+        "uuid" => ValueType::Uuid,
+        "keyword" => ValueType::Keyword,
+        "string" => ValueType::Str,
+        "bytes" => ValueType::Bytes,
+        "ref" => ValueType::Ref,
+        _ => return None,
+    })
 }
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
@@ -151,7 +239,11 @@ fn coerce(value: Value, value_type: ValueType) -> Value {
 }
 
 /// Converts a value-position form for `attr`, resolving reference values.
-fn tx_value(
+///
+/// # Errors
+/// Returns [`TxFormError`] when `attr` is not in the schema or the form is
+/// not a value that attribute can hold.
+pub fn tx_value(
     db: &Db,
     interner: &mut KeywordInterner,
     attr: EntityId,
@@ -288,4 +380,48 @@ fn map_form(
         attributes.push((attr, values));
     }
     Ok(TxItem::Map(EntityMap { entity, attributes }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corium_core::{Sealed, ValueType};
+    use corium_query::edn::read_one;
+
+    #[test]
+    fn a_sealed_value_round_trips_through_its_edn_form() {
+        let sealed = Sealed {
+            class: EntityId::new(corium_core::Partition::Db as u32, 100),
+            epoch: 3,
+            vtype: ValueType::Keyword,
+            body: vec![0x00, 0x7f, 0xff, 0x10].into(),
+        };
+        let form = sealed_to_edn(&sealed);
+        // The form is ordinary EDN, so it survives a trip through text — which
+        // is what lets the transactor expand tx-data with no special case.
+        let printed = form.to_string();
+        assert_eq!(read_one(&printed).expect("prints as readable EDN"), form);
+        assert_eq!(
+            scalar_value(&form, &mut KeywordInterner::default()),
+            Some(Value::Sealed(sealed))
+        );
+    }
+
+    #[test]
+    fn a_malformed_sealed_form_is_not_a_value() {
+        for text in [
+            r#"#corium/sealed {:epoch 1 :vtype :db.type/string :body "00"}"#,
+            r#"#corium/sealed {:class 100 :vtype :db.type/string :body "00"}"#,
+            r#"#corium/sealed {:class 100 :epoch 1 :vtype :db.type/thing :body "00"}"#,
+            r#"#corium/sealed {:class 100 :epoch 1 :vtype :db.type/string :body "0"}"#,
+            r"#corium/sealed {:class 100 :epoch 1 :vtype :db.type/string}",
+        ] {
+            let form = read_one(text).expect("parses as EDN");
+            assert_eq!(
+                scalar_value(&form, &mut KeywordInterner::default()),
+                None,
+                "{text} must not decode"
+            );
+        }
+    }
 }

@@ -37,6 +37,20 @@ impl Ord for TotalF64 {
     }
 }
 
+/// An encrypted value whose cleartext header names its protection class,
+/// key epoch, and declared value type (see `docs/design/encryption.md`).
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Sealed {
+    /// Protection class entity id.
+    pub class: crate::EntityId,
+    /// Key epoch within the class.
+    pub epoch: u32,
+    /// Declared plaintext value type.
+    pub vtype: crate::ValueType,
+    /// Deterministic AEAD ciphertext and tag.
+    pub body: Arc<[u8]>,
+}
+
 /// Core v1 Corium value types.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Value {
@@ -58,23 +72,28 @@ pub enum Value {
     Bytes(Arc<[u8]>),
     /// Entity reference.
     Ref(EntityId),
+    /// Encrypted value (sorts after every plaintext type).
+    Sealed(Sealed),
 }
 
 impl Value {
     /// Returns whether this value has the requested schema type.
     #[must_use]
-    pub const fn has_type(&self, value_type: crate::ValueType) -> bool {
-        matches!(
-            (self, value_type),
-            (Self::Bool(_), crate::ValueType::Bool)
-                | (Self::Long(_), crate::ValueType::Long)
-                | (Self::Double(_), crate::ValueType::Double)
-                | (Self::Instant(_), crate::ValueType::Instant)
-                | (Self::Uuid(_), crate::ValueType::Uuid)
-                | (Self::Keyword(_), crate::ValueType::Keyword)
-                | (Self::Str(_), crate::ValueType::Str)
-                | (Self::Bytes(_), crate::ValueType::Bytes)
-                | (Self::Ref(_), crate::ValueType::Ref)
-        )
+    pub fn has_type(&self, value_type: crate::ValueType) -> bool {
+        match self {
+            Self::Sealed(sealed) => sealed.vtype == value_type,
+            _ => matches!(
+                (self, value_type),
+                (Self::Bool(_), crate::ValueType::Bool)
+                    | (Self::Long(_), crate::ValueType::Long)
+                    | (Self::Double(_), crate::ValueType::Double)
+                    | (Self::Instant(_), crate::ValueType::Instant)
+                    | (Self::Uuid(_), crate::ValueType::Uuid)
+                    | (Self::Keyword(_), crate::ValueType::Keyword)
+                    | (Self::Str(_), crate::ValueType::Str)
+                    | (Self::Bytes(_), crate::ValueType::Bytes)
+                    | (Self::Ref(_), crate::ValueType::Ref)
+            ),
+        }
     }
 }

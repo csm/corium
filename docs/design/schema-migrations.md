@@ -435,6 +435,12 @@ store counts and digests rather than application values.
 
 ### Phase 1: diff-only planner
 
+**Implemented.** `corium_forms::desired` normalizes both syntaxes,
+`corium_db::impact` runs the fixed-basis scans, `corium_forms::planner`
+produces the plan, `corium_core::migration` owns the change/plan types and
+digests, and `corium-cli` renders it. Operator documentation is in
+[operations.md](../operations.md#schema-updates).
+
 - Extract normalized desired attributes from both TOML and EDN without
   allocating ids.
 - Add a read-only planner and impact analyzer over `Db`.
@@ -442,6 +448,11 @@ store counts and digests rather than application values.
   property tests for change classification.
 - Report the current implementation limitation clearly: all applies are
   blocked until schema transactions land.
+- Read the installed protection timeline so an ever-protected attribute is
+  blocked from gaining index or unique coverage, and report a file's
+  `:db/protection` as unplanned rather than dropping it: the class is not part
+  of the normalized desired model yet, so a file that names one must not read
+  as "no changes".
 
 ### Phase 2: transactional additive schema
 

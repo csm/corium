@@ -8,9 +8,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use corium_core::{AttrId, EntityId, IndexOrder, Value, ValueType};
-use corium_db::{Db, avet_covered, key_prefix};
+use corium_db::{
+    Db, avet_covered, key_prefix,
+    protect::{Hydration, Hydrator},
+};
 
 use crate::QueryError;
 use crate::ast::{BindTarget, Binding, Clause, Pattern, RuleDef, Term, Var};
@@ -41,6 +45,7 @@ pub struct ExecCtx<'a> {
     fuel: Cell<u64>,
     rule_state: RefCell<RuleState>,
     extern_call: Option<crate::ExternCall>,
+    hydrator: Option<Arc<Hydrator>>,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -58,6 +63,7 @@ impl<'a> ExecCtx<'a> {
             fuel: Cell::new(u64::MAX),
             rule_state: RefCell::new(RuleState::default()),
             extern_call: None,
+            hydrator: None,
         }
     }
 
@@ -69,6 +75,35 @@ impl<'a> ExecCtx<'a> {
     /// Installs the resolver consulted for non-native call clause names.
     pub fn set_extern_call(&mut self, extern_call: crate::ExternCall) {
         self.extern_call = Some(extern_call);
+    }
+
+    /// Installs the key set this execution opens sealed values with.
+    pub fn set_hydrator(&mut self, hydrator: Arc<Hydrator>) {
+        self.hydrator = Some(hydrator);
+    }
+
+    /// Resolves one scanned value for this reader.
+    ///
+    /// `Ok(None)` means the class asked for the datom to be hidden, so the
+    /// caller drops it. Without a hydrator every value passes through as it
+    /// stands, which for a protected attribute means the sealed form —
+    /// exactly what a reader with no keys would see.
+    fn hydrate(
+        &self,
+        db: &Db,
+        a: AttrId,
+        e: EntityId,
+        value: &Value,
+    ) -> Result<Option<Value>, QueryError> {
+        let Some(hydrator) = &self.hydrator else {
+            return Ok(Some(value.clone()));
+        };
+        match hydrator.hydrate(db.schema(), db.interner(), a, e, value) {
+            Ok(Hydration::Bind(value)) => Ok(Some(value)),
+            Ok(Hydration::Hide) => Ok(None),
+            Ok(Hydration::Refuse(class)) => Err(QueryError::Protected(class)),
+            Err(error) => Err(QueryError::Type(error.to_string())),
+        }
     }
 
     /// Evaluates a call clause: the native set first, then the extern
@@ -463,10 +498,16 @@ fn eval_pattern(
         for datom in db.datoms_prefix(choice.order, &prefix) {
             ctx.spend(1)?;
             ctx.scanned.set(ctx.scanned.get() + 1);
+            // Hydration happens here, at scan output, so predicates,
+            // functions, aggregates, sorting, and pull all see plaintext with
+            // no further changes.
+            let Some(value) = ctx.hydrate(db, datom.a, datom.e, &datom.v)? else {
+                continue;
+            };
             let fields = [
                 (Position::E, Value::Ref(datom.e)),
                 (Position::A, Value::Ref(datom.a)),
-                (Position::V, datom.v.clone()),
+                (Position::V, value),
                 (Position::Tx, Value::Ref(datom.tx)),
                 (Position::Added, Value::Bool(datom.added)),
             ];

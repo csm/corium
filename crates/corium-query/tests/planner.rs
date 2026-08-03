@@ -136,3 +136,100 @@ fn fuel_bounds_runaway_scans() {
     );
     assert_eq!(result.unwrap_err(), QueryError::FuelExhausted);
 }
+
+/// A database whose `:t/secret` is protected and therefore absent from AVET.
+fn protected_db() -> Db {
+    use corium_core::{
+        LegacyPlaintextPolicy, MissingKeyPolicy, ProtectionClass, ProtectionScope,
+        ProtectionTimeline, SealAlgorithm, Sealed,
+    };
+    let class = attr_id(1);
+    let secret = attr_id(2);
+    let mut schema = Schema::default();
+    let mut idents = Idents::default();
+    schema.insert(Attribute {
+        id: secret,
+        value_type: ValueType::Str,
+        cardinality: Cardinality::One,
+        unique: None,
+        is_component: false,
+        // Schema validation forbids `:db/index` here; the planner must not
+        // rely on that alone.
+        indexed: false,
+        no_history: false,
+    });
+    idents.insert(Keyword::parse("t/secret"), secret);
+    schema.insert_class(ProtectionClass {
+        id: class,
+        key_id: "file:/etc/corium/pii.key".into(),
+        algorithm: SealAlgorithm::Aes256GcmSiv,
+        scope: ProtectionScope::Attribute,
+        padding: None,
+        on_missing_key: MissingKeyPolicy::Redact,
+        legacy_plaintext: LegacyPlaintextPolicy::Redact,
+        current_epoch: 1,
+    });
+    schema.set_protection(secret, ProtectionTimeline::protected_from(0, class));
+    let datoms: Vec<Datom> = (0..50_u64)
+        .map(|n| Datom {
+            e: EntityId::new(Partition::User as u32, n),
+            a: secret,
+            // Ten distinct ciphertexts across fifty datoms: a distinct-value
+            // estimate would be five times too optimistic, and would be a leak.
+            v: Value::Sealed(Sealed {
+                class,
+                epoch: 1,
+                vtype: ValueType::Str,
+                body: vec![u8::try_from(n % 10).expect("fits"); 32].into(),
+            }),
+            tx: EntityId::new(Partition::Tx as u32, 1),
+            added: true,
+        })
+        .collect();
+    Db::new(schema)
+        .with_naming(idents, KeywordInterner::default())
+        .with_transaction(1, &datoms)
+}
+
+#[test]
+fn a_bound_value_on_a_protected_attribute_scans_aevt() {
+    let db = protected_db();
+    let secret = attr_id(2);
+    // Protection forbids `:db/index`, so the attribute is not AVET-covered
+    // and the planner cannot choose that order however the value is bound.
+    assert!(!corium_db::avet_covered(db.schema(), secret));
+    let choice = choose_index(
+        false,
+        true,
+        true,
+        corium_db::avet_covered(db.schema(), secret),
+        false,
+    );
+    assert_eq!(choice.order, IndexOrder::Aevt);
+}
+
+#[test]
+fn a_bound_protected_value_contributes_no_selectivity_estimate() {
+    let db = protected_db();
+    let secret = attr_id(2);
+    let stats = db.planner_stats();
+    let attr = stats.per_attr.get(&secret).expect("attribute has stats");
+    assert!(attr.protected);
+    assert_eq!(attr.count, 50);
+    // The distinct count is collected but never used: a distinct-ciphertext
+    // estimate would be a real number and a real leak, so a bound value on a
+    // protected attribute costs a full attribute scan.
+    assert_eq!(attr.distinct_values, 10);
+    assert_eq!(stats.estimate(false, Some(secret), true), 50);
+    assert_eq!(stats.estimate(false, Some(secret), false), 50);
+}
+
+#[test]
+fn a_range_over_a_protected_attribute_is_refused() {
+    let db = protected_db();
+    let secret = attr_id(2);
+    assert_eq!(
+        db.index_range(secret, None, None).err(),
+        Some(corium_db::RangeError::Protected(secret))
+    );
+}

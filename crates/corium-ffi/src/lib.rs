@@ -132,6 +132,12 @@ impl FfiError {
             ClientError::Peer(PeerError::Closed) => {
                 Self::new(ErrorKind::Closed, "connection closed")
             }
+            // Sealing failures happen while the transaction is still being
+            // built, so they are transaction failures, not connection ones.
+            ClientError::Peer(
+                error
+                @ (PeerError::TxForm(_) | PeerError::MissingKey(_) | PeerError::Protection(_)),
+            ) => Self::new(ErrorKind::Transaction, error.to_string()),
             ClientError::Query(QueryError::FuelExhausted) => {
                 Self::new(ErrorKind::FuelExhausted, "query fuel exhausted")
             }

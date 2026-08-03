@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use corium_core::{EntityId, KeywordInterner, TotalF64, Value};
+use corium_core::{EntityId, Keyword, KeywordInterner, TotalF64, Value};
 use corium_peer::server::assemble_query_result;
 use corium_protocol::auth::TokenInterceptor;
 use corium_protocol::codec;
@@ -254,6 +254,34 @@ fn value_to_edn(interner: &KeywordInterner, value: &Value) -> Edn {
             .resolve(*id)
             .map_or(Edn::Nil, |keyword| Edn::Keyword(keyword.clone())),
         Value::Ref(e) => Edn::Long(i64::try_from(e.raw()).unwrap_or(i64::MAX)),
+        // A sealed value reaching the client is one nobody hydrated; render it
+        // redacted (class id — the client has no ident registry for classes).
+        Value::Sealed(sealed) => Edn::Tagged(
+            "corium/redacted".into(),
+            Box::new(Edn::Map(vec![
+                (
+                    Edn::Keyword(Keyword::new(None, "class")),
+                    Edn::Long(i64::try_from(sealed.class.raw()).unwrap_or(i64::MAX)),
+                ),
+                (
+                    Edn::Keyword(Keyword::new(None, "type")),
+                    Edn::Keyword(Keyword::new(
+                        Some("db.type"),
+                        match sealed.vtype {
+                            corium_core::ValueType::Bool => "boolean",
+                            corium_core::ValueType::Long => "long",
+                            corium_core::ValueType::Double => "double",
+                            corium_core::ValueType::Instant => "instant",
+                            corium_core::ValueType::Uuid => "uuid",
+                            corium_core::ValueType::Keyword => "keyword",
+                            corium_core::ValueType::Str => "string",
+                            corium_core::ValueType::Bytes => "bytes",
+                            corium_core::ValueType::Ref => "ref",
+                        },
+                    )),
+                ),
+            ])),
+        ),
     }
 }
 
