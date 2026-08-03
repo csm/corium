@@ -8,22 +8,29 @@ scenarios:
 2. authz initialization
 3. encrypted database initialization
 4. attribute protection classes
-5. storage-key rotation
-6. schema updates
-7. Python client access
-8. Java client access
-9. Rust client access
+5. direct-peer JWT authentication, ReBAC authorization, and protected access
+6. peer-server JWT authentication, ReBAC authorization, and protected access
+7. pgwire authorization and protected access
+8. storage-key rotation
+9. schema updates
+10. Python client access
+11. Java client access
+12. Rust client access
 
 The attribute-protection scenario exercises protected writes, keyed reads,
-and keyless redaction through the real engine. The schema-update scenario
-exercises the shipped plan-first CLI and verifies its expected additive change.
-Every scenario is isolated by the runner, so a failure does not prevent later
-scenarios from running.
+and keyless redaction through the real engine. The security scenarios use
+signed RS256 JWTs with issuer and audience validation, the self-hosted ReBAC
+authorizer, and real direct-peer, peer-server, and PostgreSQL-wire clients.
+Known product gaps have a separate `LIMITATION` status: they are verified and
+prominent in the report without being confused with a harness failure. The
+schema-update scenario exercises the shipped plan-first CLI and verifies its
+expected additive change. Every scenario is isolated by the runner, so a
+failure does not prevent later scenarios from running.
 
 Build the CLI and install the Python client before running locally:
 
 ```sh
-cargo build -p corium-cli
+cargo build -p corium-cli --features oidc
 python3 -m pip install -e clients/python
 python3 tests/scenarios/run.py
 ```
