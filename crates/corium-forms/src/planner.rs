@@ -23,7 +23,7 @@ use corium_core::migration::{
     Observation, PlanStep, Risk, SchemaPlan, SchemaProperty, cardinality_name, flag, unique_name,
     value_type_name,
 };
-use corium_core::{Cardinality, Partition};
+use corium_core::{Cardinality, Partition, ValueType};
 use corium_db::Db;
 use corium_db::impact::{
     self, DEFAULT_SAMPLE_LIMIT, attribute_impact, cardinality_conflicts, duplicate_values,
@@ -87,6 +87,7 @@ pub fn installed_schema(db: &Db) -> InstalledSchema {
             || format!("<unnamed attribute {}:{}>", id.partition(), id.sequence()),
             ToString::to_string,
         );
+        let timeline = db.schema().protection(*id);
         attrs.push(InstalledAttribute {
             ident,
             id: *id,
@@ -96,27 +97,24 @@ pub fn installed_schema(db: &Db) -> InstalledSchema {
             indexed: attribute.indexed,
             is_component: attribute.is_component,
             no_history: attribute.no_history,
-            // `:db/doc` and retirement are not yet carried by the installed
-            // schema; see `InstalledSchema::doc_tracked` and the plan note the
-            // planner adds for docs.
-            doc: None,
-            retired: false,
+            doc: db.schema().doc(*id).map(ToOwned::to_owned),
+            retired: db.schema().is_retired(*id),
+            // The class in force now is what a desired file compares against.
+            protection: timeline
+                .current()
+                .and_then(|class| db.idents().ident(class))
+                .map(ToString::to_string),
             // Protection is forward-only, so the whole timeline matters, not
             // just the class in force now: an attribute that was protected and
             // later unprotected still holds sealed facts that AVET cannot
             // order.
-            ever_protected: db
-                .schema()
-                .protection(*id)
-                .entries()
-                .iter()
-                .any(|(_, class)| class.is_some()),
+            ever_protected: timeline.ever_protected(),
             engine: engine || named.is_none(),
         });
     }
     InstalledSchema::new(attrs)
-        .with_doc_tracking(false)
-        .with_generation(None)
+        .with_doc_tracking(true)
+        .with_generation(Some(db.schema_generation()))
 }
 
 /// Whether the engine owns this attribute id.
@@ -204,10 +202,10 @@ pub fn plan_against(
                 .to_owned(),
         );
     }
-    if desired.declares_protection() {
+    if desired.declares_classes() {
         notes.push(
-            "this file names a protection class, and :db/protection is not planned in this \
-             build, so the class is neither compared against the installed timeline nor applied"
+            "this file defines protection classes; a schema update can name an installed class \
+             on an attribute but cannot install a class definition, which is create-time work"
                 .to_owned(),
         );
     }
@@ -235,7 +233,9 @@ pub fn plan_against(
 fn add_step(ident: &str, declaration: &DesiredAttribute) -> PlanStep {
     // An attribute the database does not have cannot carry a fact, so nothing
     // is inspected or rewritten even when the declaration requests uniqueness
-    // or an index.
+    // or an index — but a declaration that could never be installed at all is
+    // refused here rather than at commit time.
+    let conflict = protection_conflict(declaration);
     PlanStep {
         key: PlanStep::key_for(ident, ChangeKind::Add),
         ident: ident.to_owned(),
@@ -243,15 +243,39 @@ fn add_step(ident: &str, declaration: &DesiredAttribute) -> PlanStep {
         installed: None,
         desired: Some(declaration.rendering()),
         class: ExecutionClass::Additive,
-        risk: Risk::Low,
+        risk: if declaration.protection.is_some() {
+            Risk::Medium
+        } else {
+            Risk::Low
+        },
         acks: Vec::new(),
-        blocked: None,
+        blocked: conflict.map(|_| BlockedReason::ProtectionConflict),
         depends_on: Vec::new(),
         summary: declaration.rendering(),
-        recipe: Vec::new(),
+        recipe: conflict.map(str::to_owned).into_iter().collect(),
         observations: Vec::new(),
         notes: Vec::new(),
     }
+}
+
+/// Why a declaration cannot be both protected and what else it asks for.
+///
+/// Ciphertext order is not value order, so a protected attribute is absent
+/// from AVET and VAET (ADR-0018). The same rule `schema_from_edn` enforces at
+/// database creation is enforced here, so a file that would be rejected at
+/// creation is not silently accepted as an update.
+fn protection_conflict(declaration: &DesiredAttribute) -> Option<&'static str> {
+    declaration.protection.as_ref()?;
+    if declaration.value_type == ValueType::Ref {
+        return Some("a reference cannot be protected: VAET orders it by value");
+    }
+    if declaration.indexed || declaration.unique.is_some() {
+        return Some(
+            "drop :db/index and :db/unique from this declaration: a protected attribute is \
+             absent from AVET",
+        );
+    }
+    None
 }
 
 fn retire_step(current: &InstalledAttribute, db: &Db) -> PlanStep {
@@ -355,7 +379,99 @@ fn property_steps(
     if installed.doc_tracked() && current.doc != declaration.doc {
         steps.push(doc_step(current, declaration, &blocked_by));
     }
+    if current.protection != declaration.protection.as_ref().map(ToString::to_string) {
+        steps.push(protection_step(current, declaration, db, &blocked_by));
+    }
     steps
+}
+
+/// Plans a protect, unprotect, or re-classify change.
+///
+/// Forward-only, always: sealing starts or stops at this basis, and nothing
+/// already stored is re-sealed, opened, or rewritten. That is why the step is
+/// high risk even when it moves no bytes — a keyless reader's view of the
+/// attribute changes from this basis onward, and the values written before it
+/// keep the form they had.
+///
+/// Two combinations are refused outright rather than planned, because
+/// ciphertext order is not value order: a protected attribute can never appear
+/// in AVET or VAET (ADR-0018). Protecting an attribute therefore requires the
+/// same file to drop `:db/index` and `:db/unique`, and a `ref` can never be
+/// protected at all.
+fn protection_step(
+    current: &InstalledAttribute,
+    declaration: &DesiredAttribute,
+    db: &Db,
+    depends_on: &[String],
+) -> PlanStep {
+    let impact = attribute_impact(db, current.id);
+    let protecting = declaration.protection.is_some();
+    let installed_name = current.protection_name();
+    let desired_name = declaration.protection_name();
+    let mut notes = Vec::new();
+    let mut recipe = Vec::new();
+    let mut blocked = None;
+
+    if protecting {
+        if let Some(conflict) = protection_conflict(declaration) {
+            blocked = Some(BlockedReason::ProtectionConflict);
+            recipe.push(conflict.to_owned());
+        }
+        notes.push(
+            "values written from this basis onward are sealed; the plaintext already stored \
+             keeps its form and is read under the class's legacy-plaintext policy"
+                .to_owned(),
+        );
+        notes.push(
+            "lookup refs and value-ordered reads through this attribute stop working".to_owned(),
+        );
+        if current.ever_protected && installed_name != "none" {
+            notes.push(
+                "the previous class stays in the timeline: values sealed under it remain \
+                 readable to a holder of that key and remain retractable by naming them"
+                    .to_owned(),
+            );
+        }
+    } else {
+        notes.push(
+            "values written from this basis onward are plaintext; every value already sealed \
+             stays sealed and still needs its class key to read"
+                .to_owned(),
+        );
+        notes.push(
+            "the attribute stays permanently ineligible for :db/index and :db/unique".to_owned(),
+        );
+    }
+    notes.push(
+        "re-sealing or opening the values already stored is separate rewrite work this command \
+         does not do"
+            .to_owned(),
+    );
+
+    PlanStep {
+        key: PlanStep::key_for(
+            &current.ident,
+            ChangeKind::Property(SchemaProperty::Protection),
+        ),
+        ident: current.ident.clone(),
+        kind: ChangeKind::Property(SchemaProperty::Protection),
+        installed: Some(installed_name.clone()),
+        desired: Some(desired_name.clone()),
+        // Metadata-only to install, but the population it reinterprets is
+        // measured before the change is accepted.
+        class: ExecutionClass::ValidateReindex,
+        risk: Risk::High,
+        acks: vec![AckCode::ProtectionForwardOnly],
+        blocked,
+        depends_on: depends_on.to_vec(),
+        summary: format!("protection {installed_name} -> {desired_name}"),
+        recipe,
+        observations: vec![
+            Observation::count("current-datoms", impact.datoms),
+            Observation::count("current-entities", impact.entities),
+        ],
+        notes,
+    }
 }
 
 fn value_type_step(

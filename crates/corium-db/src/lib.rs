@@ -15,10 +15,17 @@
 //! Transaction time is data: every committed transaction asserts
 //! `:db/txInstant` on its transaction entity (see [`bootstrap`]), so views can
 //! also be named by wall clock ([`Db::as_of_instant`], [`Db::since_instant`]).
+//!
+//! Schema is data too: attribute metadata is stored under the vocabulary in
+//! [`bootstrap`] and folded back into a [`Schema`] by [`schemadatoms`], so
+//! applying a transaction derives the schema it leaves behind. Every holder of
+//! a `Db` — transactor, peer, replay — reaches the same schema from the same
+//! log without a side channel.
 
 pub mod bootstrap;
 pub mod impact;
 pub mod protect;
+pub mod schemadatoms;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -28,6 +35,15 @@ use corium_core::{
     Unique, Value, encoding::Encodable,
 };
 use rpds::{RedBlackTreeMapSync, VectorSync};
+
+/// Sequence of the first installable attribute entity in the db partition.
+///
+/// Everything below this in `:db.part/db` belongs to the engine: the schema
+/// vocabulary, `:db/txInstant`, and the schema-update audit trail
+/// ([`bootstrap`]). A schema that claims one of those ids is silently replaced
+/// when the engine installs its own, so the reservation is asserted in debug
+/// builds rather than left as a rule to remember.
+pub const FIRST_ATTR_ID: u64 = 100;
 
 /// The first user-assignable sequence number. Lower ids are reserved for bootstrap data.
 pub const FIRST_USER_ID: u64 = 1_000;
@@ -314,6 +330,12 @@ pub struct Db {
     recorded: VectorSync<Arc<Datom>>,
     idents: Arc<Idents>,
     interner: Arc<KeywordInterner>,
+    /// Monotone, database-local counter that advances once per committed
+    /// transaction containing a schema change. The basis says *when* a schema
+    /// changed; the generation says whether two database values — a peer's and
+    /// a transactor's, a published index root and the log — were built under
+    /// the same schema.
+    schema_generation: u64,
     view: DbView,
     instants: TxInstants,
     indexes: Arc<OnceLock<[Index; 4]>>,
@@ -333,6 +355,7 @@ impl Default for Db {
             recorded: VectorSync::new_sync(),
             idents: Arc::default(),
             interner: Arc::default(),
+            schema_generation: 0,
             view: DbView::default(),
             instants: TxInstants::default(),
             indexes: Arc::new(OnceLock::new()),
@@ -403,6 +426,7 @@ impl Db {
             recorded: datoms.into_iter().map(Arc::new).collect(),
             idents: Arc::new(idents),
             interner: Arc::new(interner),
+            schema_generation: 0,
             view: DbView::Current,
             instants,
             indexes: Arc::new(OnceLock::new()),
@@ -436,6 +460,16 @@ impl Db {
     #[must_use]
     pub fn idents(&self) -> &Idents {
         &self.idents
+    }
+
+    /// Schema generation of this value.
+    ///
+    /// A monotone database-local counter, separate from the transaction basis:
+    /// it advances once for a committed transaction that changes the schema.
+    /// Two values with the same generation were built under the same schema.
+    #[must_use]
+    pub const fn schema_generation(&self) -> u64 {
+        self.schema_generation
     }
 
     /// Keyword interner used by keyword values in this database.
@@ -760,6 +794,22 @@ impl Db {
         );
         let mut next = self.clone();
         next.basis_t = t;
+        // Schema effects come first, before a single user datom of the same
+        // transaction is indexed. That ordering is what makes a transaction
+        // that installs an attribute and immediately uses it legal, and it is
+        // derived from the record rather than from the order the datoms happen
+        // to be listed in.
+        let schema_changed = schemadatoms::changes_schema(datoms);
+        if schemadatoms::touches_naming(datoms) {
+            let mut schema = self.schema.clone();
+            let mut idents = (*self.idents).clone();
+            schemadatoms::derive(&mut schema, &mut idents, &self.interner, t, datoms);
+            next.schema = schema;
+            next.idents = Arc::new(idents);
+            if schema_changed {
+                next.schema_generation = self.schema_generation + 1;
+            }
+        }
         // Allocate each datom once here: the log entry and every covering
         // index entry derived from it below are handles on this one
         // allocation, not copies of the fact.
@@ -775,7 +825,15 @@ impl Db {
         next.stats = Arc::new(OnceLock::new());
         // Derive indexes incrementally when the parent already built them, so
         // transaction pipelines don't refold the whole history per operation.
-        if let Some(parent) = self.indexes.get() {
+        //
+        // Not when the schema changed: the parent's fold decided coverage
+        // under the parent's schema, so extending it would leave an attribute
+        // that just gained AVET covered for post-change datoms only — a
+        // silently partial index that reads as authoritative. Dropping the
+        // fold costs one rebuild per schema change and keeps coverage total.
+        if let Some(parent) = self.indexes.get()
+            && !schema_changed
+        {
             let mut derived = parent.clone();
             apply_current(&mut derived, arrived.iter(), &self.schema);
             let _ = next.indexes.set(derived);

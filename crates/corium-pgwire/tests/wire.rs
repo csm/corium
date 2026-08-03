@@ -69,9 +69,11 @@ impl DbCatalog for TestCatalog {
 
 /// Builds a small two-artist database mirroring the `corium-sql` fixture.
 fn fixture() -> Db {
-    let name = EntityId::from_raw(10);
-    let tags = EntityId::from_raw(11);
-    let release_year = EntityId::from_raw(12);
+    // At or above `FIRST_ATTR_ID`: the low db-partition range belongs to the
+    // engine's own attributes, and `Db::new` installs them over any schema.
+    let name = EntityId::from_raw(100);
+    let tags = EntityId::from_raw(101);
+    let release_year = EntityId::from_raw(102);
     let mut schema = Schema::default();
     schema.insert(Attribute {
         id: name,

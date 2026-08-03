@@ -20,6 +20,7 @@
 //! `corium-protocol` re-exports the EDN modules for back-compatible paths
 //! (`corium_protocol::schemaform`, `corium_protocol::txforms`).
 
+pub mod apply;
 pub mod desired;
 pub mod planner;
 pub mod schemaform;

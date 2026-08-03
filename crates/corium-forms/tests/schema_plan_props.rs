@@ -119,6 +119,7 @@ fn desired_schema(desired: &BTreeMap<String, Shape>) -> DesiredSchema {
                 is_component: shape.is_component,
                 no_history: shape.no_history,
                 doc: None,
+                protection: None,
             })
             .collect(),
     )

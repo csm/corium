@@ -23,11 +23,22 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::BadRequest(_)
         | NodeError::Codec(_)
         | NodeError::TxForm(_)
+        // A desired schema that cannot be planned at all is a bad request in
+        // the same sense a malformed schema form is.
+        | NodeError::SchemaUpdate(_)
         | NodeError::SchemaForm(_) => Status::invalid_argument(error.to_string()),
-        NodeError::BasisMismatch { .. } => Status::aborted(error.to_string()),
+        // A plan the database has moved past is retryable after a replan, so
+        // it aborts rather than failing outright — as a stale basis does.
+        NodeError::BasisMismatch { .. } | NodeError::StalePlan { .. } => {
+            Status::aborted(error.to_string())
+        }
         NodeError::Deposed(_)
         | NodeError::Standby { .. }
         | NodeError::UnsupportedFormat { .. }
+        // A plan whose precondition or authority is missing describes the
+        // database's state, not a malformed request: the caller resolves the
+        // violation or supplies the flag it was told to.
+        | NodeError::BlockedPlan(_)
         // A missing or unresolvable key is an operator misconfiguration, not
         // a transient fault: the caller must fix the deployment, not retry.
         | NodeError::Keys(_)
@@ -529,6 +540,31 @@ impl Catalog for CatalogSvc {
             .await
             .map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::RewrapKeysResponse {}))
+    }
+
+    async fn alter_schema(
+        &self,
+        request: Request<pb::AlterSchemaRequest>,
+    ) -> Result<Response<pb::AlterSchemaResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        // `AlterSchema`, not `Transact`: a writer that may add facts must not
+        // be able to broaden the vocabulary it writes them under.
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::AlterSchema, &request.db),
+        )
+        .await?;
+        // The requester recorded in the audit trail is the authenticated
+        // identity, never a field the caller supplies.
+        let requester = format!("{}:{}", principal.provider, principal.subject);
+        let response = self
+            .0
+            .alter_schema(&request, &requester)
+            .await
+            .map_err(|error| to_status(&error))?;
+        Ok(Response::new(response))
     }
 }
 

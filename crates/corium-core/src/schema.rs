@@ -1,6 +1,6 @@
 //! Schema model shared by transaction validation and peers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{AttrId, EntityId};
 
@@ -217,12 +217,17 @@ impl ProtectionTimeline {
 /// Protection lives beside the attribute table rather than inside
 /// [`Attribute`]: an attribute record mirrors the Datomic attribute map, while
 /// a protection timeline is engine state that is always consulted together
-/// with the class table.
+/// with the class table. Documentation and retirement sit beside it for the
+/// same reason — neither changes how a datom is stored or ordered, and both
+/// are answers a schema update needs about an attribute rather than about a
+/// value.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Schema {
     attrs: BTreeMap<AttrId, Attribute>,
     classes: BTreeMap<EntityId, ProtectionClass>,
     protection: BTreeMap<AttrId, ProtectionTimeline>,
+    docs: BTreeMap<AttrId, String>,
+    retired: BTreeSet<AttrId>,
 }
 
 impl Schema {
@@ -291,5 +296,44 @@ impl Schema {
     #[must_use]
     pub fn is_protected(&self, attr: AttrId) -> bool {
         self.protection(attr).current().is_some()
+    }
+
+    /// Records an attribute's documentation, or clears it with `None`.
+    pub fn set_doc(&mut self, attr: AttrId, doc: Option<String>) {
+        match doc {
+            Some(doc) => self.docs.insert(attr, doc),
+            None => self.docs.remove(&attr),
+        };
+    }
+
+    /// An attribute's documentation, when it has any.
+    #[must_use]
+    pub fn doc(&self, attr: AttrId) -> Option<&str> {
+        self.docs.get(&attr).map(String::as_str)
+    }
+
+    /// Retires an attribute, or reinstates one.
+    ///
+    /// Retirement refuses new assertions. It never hides the attribute from an
+    /// older basis, deletes a fact, or makes a retraction illegal: an
+    /// immutable database cannot make an attribute disappear from history
+    /// (`docs/design/schema-migrations.md`).
+    pub fn set_retired(&mut self, attr: AttrId, retired: bool) {
+        if retired {
+            self.retired.insert(attr);
+        } else {
+            self.retired.remove(&attr);
+        }
+    }
+
+    /// Whether new assertions on `attr` are refused.
+    #[must_use]
+    pub fn is_retired(&self, attr: AttrId) -> bool {
+        self.retired.contains(&attr)
+    }
+
+    /// Iterates every retired attribute in id order.
+    pub fn retired(&self) -> impl Iterator<Item = AttrId> + '_ {
+        self.retired.iter().copied()
     }
 }
