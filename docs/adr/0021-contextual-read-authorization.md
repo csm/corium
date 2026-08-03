@@ -74,11 +74,15 @@ engine applies both.**
   `SHOW DATABASES` is filtered to what it may inspect, and `DbCatalog::hydrator`
   is the seam supplying the process's class keys.
 - **Surfaces that cannot filter fail closed.** The peer server refuses
-  `Transact` and `Subscribe`, and SQL refuses DML, for a principal whose view
-  hides attributes: transaction data is opaque bytes by the time authorization
-  runs, and `Subscribe` proxies the transactor's own stream. A grant that
-  restricts only *keys* is refused nowhere — it hides no attribute, and the
-  transactor holds no class key, so what it streams is sealed already.
+  `Transact` and `Subscribe`, the transactor refuses a write, and SQL refuses
+  DML, for a principal whose view hides attributes: transaction data is opaque
+  bytes by the time authorization runs, and `Subscribe` proxies the
+  transactor's own stream. All four ask one question —
+  `ReadGrant::hides_attributes` — so one principal under one policy gets one
+  answer regardless of which surface it reached. *Holding* a view is not that
+  question: an allowlist naming every attribute takes nothing away. A grant
+  that restricts only keys is refused nowhere either — it hides no attribute,
+  and the transactor holds no class key, so what it streams is sealed already.
 
 ## Consequences
 
@@ -109,6 +113,12 @@ engine applies both.**
   including statements touching nothing protected. A `Refuse` must reach only
   a read that genuinely touches the datom, which is what the datalog engine
   already did.
+- Both surfaces cache hydrators by key set, because a `Hydrator` carries a
+  bounded plaintext cache and both build a read per request — pgwire per
+  *statement* — so deriving a fresh one each time would make a keyed principal
+  re-open every sealed value it reads. The caches are capped and cleared
+  wholesale when full: key sets are role-shaped, so the cap is generous, and
+  the alternative to a cap is a map that grows with the policy.
 - pgwire does not terminate TLS, and now carries each client's bearer token in
   the `PostgreSQL` password field. It rejects the TLS flags rather than
   accepting ones it cannot honour, and warns at startup; a deployment needs a

@@ -20,7 +20,7 @@
 mod protocol;
 mod types;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -183,6 +183,7 @@ where
     F: Future<Output = ()>,
 {
     let config = Arc::new(config);
+    let hydrators = Arc::new(Hydrators::default());
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -191,6 +192,7 @@ where
                 let (stream, peer) = accepted?;
                 let catalog = Arc::clone(&catalog);
                 let config = Arc::clone(&config);
+                let hydrators = Arc::clone(&hydrators);
                 tokio::spawn(async move {
                     let (read, write) = stream.into_split();
                     let mut session = ConnectionSession::new(
@@ -198,6 +200,7 @@ where
                         BackendWriter::new(write),
                         catalog,
                         config,
+                        hydrators,
                     );
                     if let Err(error) = session.run().await {
                         tracing::debug!(%peer, %error, "pgwire connection closed");
@@ -248,6 +251,48 @@ struct Scope {
     read: ReadContext,
 }
 
+/// Cache key for one principal's hydrator: the database, and the key ids the
+/// policy granted (`None` for the process's whole keyring).
+type HydratorKey = (String, Option<BTreeSet<String>>);
+
+/// Largest number of distinct key sets one server keeps hydrators for.
+///
+/// Key sets are role-shaped rather than user-shaped, so this is generous; a
+/// policy that somehow mints one per principal clears the map instead of
+/// growing without bound.
+const HYDRATOR_CACHE_CAP: usize = 256;
+
+/// Hydrators shared by every connection, keyed by database and key set.
+///
+/// A [`Hydrator`] carries a bounded plaintext cache, and pgwire builds a
+/// `SqlSession` per *statement*, so deriving a fresh one each time would make
+/// a keyed principal re-open every sealed value it reads, on every statement.
+#[derive(Default)]
+struct Hydrators {
+    entries: std::sync::Mutex<HashMap<HydratorKey, Arc<Hydrator>>>,
+}
+
+impl Hydrators {
+    fn get(&self, key: &HydratorKey) -> Option<Arc<Hydrator>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .map(Arc::clone)
+    }
+
+    fn insert(&self, key: HydratorKey, hydrator: &Arc<Hydrator>) -> Arc<Hydrator> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= HYDRATOR_CACHE_CAP {
+            entries.clear();
+        }
+        Arc::clone(entries.entry(key).or_insert_with(|| Arc::clone(hydrator)))
+    }
+}
+
 /// A failure while dispatching one statement.
 enum Dispatch {
     /// No database is selected for a query.
@@ -266,6 +311,7 @@ struct ConnectionSession<R, W, C> {
     writer: BackendWriter<W>,
     catalog: Arc<C>,
     config: Arc<PgWireConfig>,
+    hydrators: Arc<Hydrators>,
     /// The connection's active database, chosen at startup or by `USE`.
     current_db: Option<String>,
     /// The authenticated caller. Every statement is authorized as this
@@ -301,12 +347,14 @@ where
         writer: BackendWriter<W>,
         catalog: Arc<C>,
         config: Arc<PgWireConfig>,
+        hydrators: Arc<Hydrators>,
     ) -> Self {
         Self {
             reader,
             writer,
             catalog,
             config,
+            hydrators,
             current_db: None,
             principal: Principal::anonymous(),
             statements: HashMap::new(),
@@ -938,11 +986,6 @@ where
         db: &Db,
         grant: &ReadGrant,
     ) -> Result<ReadContext, Dispatch> {
-        let held = self
-            .catalog
-            .hydrator(database)
-            .await
-            .map_err(Dispatch::Catalog)?;
         let mode = self.config.key_policy.unwrap_or({
             if self.config.guard.is_disabled() {
                 KeyPolicyMode::ServerWide
@@ -950,13 +993,28 @@ where
                 KeyPolicyMode::Strict
             }
         });
-        let hydrator = match (&grant.keys, mode) {
-            (KeyGrant::Unrestricted, KeyPolicyMode::ServerWide) => held,
-            (KeyGrant::Only(allowed), _) => {
-                Arc::new(Hydrator::new(held.keys().restrict_to(db.schema(), allowed)))
-            }
+        let wanted = match (&grant.keys, mode) {
+            (KeyGrant::Unrestricted, KeyPolicyMode::ServerWide) => None,
+            (KeyGrant::Only(allowed), _) => Some(allowed.clone()),
             // Strict: a decision that names no key grants none.
-            (KeyGrant::Unrestricted, KeyPolicyMode::Strict) => Arc::new(Hydrator::default()),
+            (KeyGrant::Unrestricted, KeyPolicyMode::Strict) => Some(BTreeSet::new()),
+        };
+        let key = (database.to_owned(), wanted);
+        let hydrator = if let Some(hit) = self.hydrators.get(&key) {
+            hit
+        } else {
+            let held = self
+                .catalog
+                .hydrator(database)
+                .await
+                .map_err(Dispatch::Catalog)?;
+            let built = match &key.1 {
+                None => held,
+                Some(allowed) => {
+                    Arc::new(Hydrator::new(held.keys().restrict_to(db.schema(), allowed)))
+                }
+            };
+            self.hydrators.insert(key, &built)
         };
         let mut read = ReadContext::open().with_hydrator(hydrator);
         if let Some(view) = &grant.view {

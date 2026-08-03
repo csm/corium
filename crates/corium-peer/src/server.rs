@@ -109,6 +109,14 @@ pub struct PeerServerSvc {
 /// keyring, `Some(ids)` the classes those key ids resolve to.
 type KeySetKey = Option<std::collections::BTreeSet<String>>;
 
+/// Largest number of distinct key sets one server keeps hydrators for.
+///
+/// Key sets are role-shaped rather than user-shaped, so this is generous; a
+/// policy that somehow mints one per principal clears the map rather than
+/// growing without bound, at the cost of re-deriving from the already
+/// resolved keyring.
+const HYDRATOR_CACHE_CAP: usize = 256;
+
 impl PeerServerSvc {
     /// Hosts `connection` with the given limits and no auth
     /// ([`Guard::disabled`]); add a policy with [`PeerServerSvc::with_guard`].
@@ -216,6 +224,9 @@ impl PeerServerSvc {
             .hydrators
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= HYDRATOR_CACHE_CAP {
+            cache.clear();
+        }
         Ok(Arc::clone(
             cache.entry(wanted).or_insert_with(|| Arc::clone(&hydrator)),
         ))
@@ -486,10 +497,14 @@ impl PeerServer for PeerServerSvc {
         // principal whose view hides attributes is refused rather than
         // trusted.
         //
-        // A key restriction is not a reason to refuse: it hides no attribute,
-        // so a writer that may not hydrate a class can still be told honestly
-        // what it did and did not change.
-        if grant.view.is_some() {
+        // Holding a view is not itself the test: one that hides nothing in
+        // this database restricts nothing, and every surface asks the same
+        // question so one principal gets one answer. A key restriction is
+        // never a reason to refuse either — it hides no attribute, so a writer
+        // that may not hydrate a class can still be told honestly what it did
+        // and did not change.
+        let db = self.connection.db();
+        if grant.hides_attributes(db.schema(), db.idents()) {
             return Err(Status::permission_denied(
                 "this principal reads through a restricted view and may not transact",
             ));
@@ -750,7 +765,8 @@ impl PeerServer for PeerServerSvc {
         // A key restriction needs no refusal here: the transactor holds no
         // class key, so every protected value on this stream is already
         // sealed and stays that way.
-        if grant.view.is_some() {
+        let db = self.connection.db();
+        if grant.hides_attributes(db.schema(), db.idents()) {
             return Err(Status::permission_denied(
                 "this principal reads through a restricted view; \
                  Subscribe cannot filter its stream and is refused",

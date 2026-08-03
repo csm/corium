@@ -39,6 +39,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use corium_core::Schema;
+use corium_db::Idents;
+use corium_db::read::AttrVisibility;
 use tonic::metadata::MetadataMap;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
@@ -591,6 +594,27 @@ impl ReadGrant {
     #[must_use]
     pub fn is_restricted(&self) -> bool {
         self.view.is_some() || !self.keys.is_unrestricted()
+    }
+
+    /// Whether this grant hides any attribute of a particular database.
+    ///
+    /// Holding a view is not the same as hiding something: an allowlist that
+    /// names every attribute, or a denylist that names none of this
+    /// database's, restricts nothing here. Answering needs a schema, because a
+    /// view names idents and hiding is a property of the pair.
+    ///
+    /// This is the question every surface that refuses restricted readers
+    /// asks — the peer server before `Transact` and `Subscribe`, the
+    /// transactor before a write, SQL before DML — so that one principal
+    /// under one policy gets the same answer from all of them.
+    #[must_use]
+    pub fn hides_attributes(&self, schema: &Schema, idents: &Idents) -> bool {
+        self.view.as_ref().is_some_and(|view| {
+            !AttrVisibility::resolve(schema, idents, |ident| {
+                view.attribute_visible(&ident.to_string())
+            })
+            .is_empty()
+        })
     }
 
     /// Whether datoms of `attribute` reach this principal.
@@ -1292,5 +1316,52 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A view that hides nothing must not count as a restriction, or the
+    /// surfaces that refuse restricted writers refuse a principal whose policy
+    /// takes nothing away.
+    #[test]
+    fn a_view_that_hides_nothing_does_not_hide_attributes() {
+        use corium_core::{Attribute, Cardinality, Keyword, Schema, ValueType};
+        use corium_db::Idents;
+
+        let mut schema = Schema::default();
+        let mut idents = Idents::default();
+        for (raw, ident) in [(100_u64, "person/name"), (101, "person/email")] {
+            let id = corium_core::EntityId::from_raw(raw);
+            schema.insert(Attribute {
+                id,
+                value_type: ValueType::Str,
+                cardinality: Cardinality::One,
+                unique: None,
+                is_component: false,
+                indexed: false,
+                no_history: false,
+            });
+            idents.insert(Keyword::parse(ident), id);
+        }
+
+        let covering: Arc<dyn ViewFilter> =
+            Arc::new(AttributeAllowlist::new([":person/name", ":person/email"]));
+        let grant = ReadGrant::unrestricted().with_view(covering);
+        assert!(grant.is_restricted(), "it still carries a view");
+        assert!(
+            !grant.hides_attributes(&schema, &idents),
+            "but it takes nothing away from this database"
+        );
+
+        let narrowing: Arc<dyn ViewFilter> = Arc::new(AttributeAllowlist::new([":person/name"]));
+        assert!(
+            ReadGrant::unrestricted()
+                .with_view(narrowing)
+                .hides_attributes(&schema, &idents)
+        );
+
+        // A key grant hides no attribute, so a writer restricted only in what
+        // it may hydrate is not refused by the surfaces that check this.
+        let keyed = ReadGrant::unrestricted().with_keys(KeyGrant::only(["pii"]));
+        assert!(keyed.is_restricted());
+        assert!(!keyed.hides_attributes(&schema, &idents));
     }
 }
