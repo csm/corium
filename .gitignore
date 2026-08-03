@@ -1,4 +1,5 @@
 /target/
+/artifacts/scenarios/
 examples/postgres-jdbc/target/
 /.idea/
 examples/musicbrainz/data/logs/

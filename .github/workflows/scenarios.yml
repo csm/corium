@@ -1,0 +1,57 @@
+name: Scenario integration tests
+
+# Keep this observation suite manual until it is ready to become a release test.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: clients/python/pyproject.toml
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: clients/java/pom.xml
+
+      - name: Build Corium CLI
+        continue-on-error: true
+        run: cargo build -p corium-cli
+
+      - name: Install Python client
+        continue-on-error: true
+        run: python -m pip install -e clients/python
+
+      - name: Run scenarios
+        run: python tests/scenarios/run.py
+
+      - name: Add report to job summary
+        if: always()
+        run: |
+          if test -f artifacts/scenarios/scenario-report.md; then
+            cat artifacts/scenarios/scenario-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Scenario integration report" >> "$GITHUB_STEP_SUMMARY"
+            echo "The scenario runner did not produce a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload scenario report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-integration-report
+          path: artifacts/scenarios
+          if-no-files-found: warn
