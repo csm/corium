@@ -4,10 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "corium-s3"
-version = "0.1.0"
+version = "0.1.71"
 description = "Corium Python client with S3 direct-storage support"
 requires-python = ">=3.10"
-dependencies = ["corium==0.1.0"]
+dependencies = ["corium==0.1.71"]
 license = { text = "Apache-2.0 OR MIT" }
 classifiers = [
     "Programming Language :: Python :: 3",
