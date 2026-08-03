@@ -264,11 +264,14 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn fixture() -> Db {
-        let name = EntityId::from_raw(10);
-        let tags = EntityId::from_raw(11);
-        let release_year = EntityId::from_raw(12);
-        let status = EntityId::from_raw(13);
-        let uuid = EntityId::from_raw(14);
+        // At or above `FIRST_ATTR_ID`: the low db-partition range belongs to
+        // the engine's own attributes, and `Db::new` installs them over any
+        // schema that claims one of their ids.
+        let name = EntityId::from_raw(100);
+        let tags = EntityId::from_raw(101);
+        let release_year = EntityId::from_raw(102);
+        let status = EntityId::from_raw(103);
+        let uuid = EntityId::from_raw(104);
         let mut schema = Schema::default();
         schema.insert(Attribute {
             id: name,

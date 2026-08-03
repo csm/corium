@@ -18,9 +18,10 @@ use thiserror::Error;
 pub const MIN_PADDING: i64 = 16;
 
 /// Sequence of the first installable attribute entity in the db partition.
-/// Lower sequences are reserved for the engine's own attributes
-/// (`corium_db::bootstrap`).
-pub const FIRST_ATTR_ID: u64 = 100;
+///
+/// Re-exported from [`corium_db`], which owns the reservation because it owns
+/// the engine attributes that sit below it.
+pub use corium_db::FIRST_ATTR_ID;
 
 /// Schema form conversion failure.
 #[derive(Debug, Error, Eq, PartialEq)]

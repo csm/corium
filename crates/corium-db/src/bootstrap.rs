@@ -240,17 +240,44 @@ pub fn is_schema_attribute(a: AttrId) -> bool {
 /// metadata already implies and changes no basis, transaction number, or
 /// attribute id.
 pub fn install(schema: &mut Schema, idents: &mut Idents) {
+    install_schema(schema);
     for (keyword, attribute) in attributes() {
         idents.insert(keyword, attribute.id);
-        schema.insert(attribute);
     }
 }
 
 /// Installs the engine's attributes into a schema alone.
 pub fn install_schema(schema: &mut Schema) {
     for (_, attribute) in attributes() {
+        debug_assert!(
+            schema
+                .get(attribute.id)
+                .is_none_or(|existing| *existing == attribute),
+            "attribute {:?} occupies engine-reserved id {}:{}; ids below {} in the db \
+             partition belong to the engine, and installing over one silently replaces it",
+            existing_ident(schema, attribute.id),
+            attribute.id.partition(),
+            attribute.id.sequence(),
+            crate::FIRST_ATTR_ID,
+        );
         schema.insert(attribute);
     }
+}
+
+/// A description of whatever currently occupies `id`, for the assertion above.
+///
+/// Only reached when the assertion is about to fail, so the cost of building it
+/// never lands on the install path.
+#[cfg(debug_assertions)]
+fn existing_ident(schema: &Schema, id: AttrId) -> String {
+    schema
+        .get(id)
+        .map_or_else(|| "<none>".to_owned(), |attr| format!("{attr:?}"))
+}
+
+#[cfg(not(debug_assertions))]
+fn existing_ident(_schema: &Schema, _id: AttrId) -> &'static str {
+    ""
 }
 
 /// The `:db/txInstant` datom for transaction `t`.
