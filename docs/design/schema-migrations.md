@@ -448,6 +448,11 @@ digests, and `corium-cli` renders it. Operator documentation is in
   property tests for change classification.
 - Report the current implementation limitation clearly: all applies are
   blocked until schema transactions land.
+- Read the installed protection timeline so an ever-protected attribute is
+  blocked from gaining index or unique coverage, and report a file's
+  `:db/protection` as unplanned rather than dropping it: the class is not part
+  of the normalized desired model yet, so a file that names one must not read
+  as "no changes".
 
 ### Phase 2: transactional additive schema
 

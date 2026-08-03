@@ -96,12 +96,21 @@ pub fn installed_schema(db: &Db) -> InstalledSchema {
             indexed: attribute.indexed,
             is_component: attribute.is_component,
             no_history: attribute.no_history,
-            // `:db/doc`, retirement, and protection timelines are not yet
-            // carried by the installed schema; see `InstalledSchema::
-            // doc_tracked` and the plan note the planner adds for docs.
+            // `:db/doc` and retirement are not yet carried by the installed
+            // schema; see `InstalledSchema::doc_tracked` and the plan note the
+            // planner adds for docs.
             doc: None,
             retired: false,
-            ever_protected: false,
+            // Protection is forward-only, so the whole timeline matters, not
+            // just the class in force now: an attribute that was protected and
+            // later unprotected still holds sealed facts that AVET cannot
+            // order.
+            ever_protected: db
+                .schema()
+                .protection(*id)
+                .entries()
+                .iter()
+                .any(|(_, class)| class.is_some()),
             engine: engine || named.is_none(),
         });
     }
@@ -192,6 +201,13 @@ pub fn plan_against(
         notes.push(
             "documentation is not recorded by the installed schema in this build, so :db/doc \
              differences are not planned"
+                .to_owned(),
+        );
+    }
+    if desired.declares_protection() {
+        notes.push(
+            "this file names a protection class, and :db/protection is not planned in this \
+             build, so the class is neither compared against the installed timeline nor applied"
                 .to_owned(),
         );
     }

@@ -826,18 +826,26 @@ doc = "points earned"
 "#,
         )
         .expect("schema parses");
-        assert_eq!(definitions[0].doc.as_deref(), Some("points earned"));
         assert_eq!(
-            definitions[0].to_edn().get(&kw("db/doc")),
+            definitions.attributes[0].doc.as_deref(),
+            Some("points earned")
+        );
+        assert_eq!(
+            definitions.attributes[0].to_edn().get(&kw("db/doc")),
             Some(&Edn::Str("points earned".into()))
         );
         // Documentation is optional and is not invented for declarations
         // that omit it.
         assert_eq!(
-            parse("[[attribute]]\nname = \"n\"\ntype = \"long\"").expect("schema parses")[0].doc,
+            parse("[[attribute]]\nname = \"n\"\ntype = \"long\"")
+                .expect("schema parses")
+                .attributes[0]
+                .doc,
             None
         );
     }
+
+    #[test]
     fn protection_classes_install_through_the_edn_path() {
         let toml = r#"
 [protect.pii]

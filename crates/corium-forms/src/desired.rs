@@ -77,6 +77,7 @@ impl DesiredAttribute {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DesiredSchema {
     attrs: BTreeMap<String, DesiredAttribute>,
+    declares_protection: bool,
 }
 
 /// Failure to read a desired schema file.
@@ -121,7 +122,29 @@ impl DesiredSchema {
                 return Err(DesiredSchemaError::DuplicateAttribute(ident));
             }
         }
-        Ok(Self { attrs })
+        Ok(Self {
+            attrs,
+            declares_protection: false,
+        })
+    }
+
+    /// Records that the file named a protection class on at least one
+    /// declaration.
+    ///
+    /// Protection is not part of the normalized model this build plans
+    /// against, so a declared class is neither planned nor folded into
+    /// [`DesiredSchema::digest`]. The planner reports it rather than letting
+    /// the file read as "no changes".
+    #[must_use]
+    pub const fn with_protection_declared(mut self, declared: bool) -> Self {
+        self.declares_protection = declared;
+        self
+    }
+
+    /// Whether the file named a protection class this build cannot plan.
+    #[must_use]
+    pub const fn declares_protection(&self) -> bool {
+        self.declares_protection
     }
 
     /// Parses a hierarchical TOML schema document.
@@ -132,8 +155,14 @@ impl DesiredSchema {
     #[cfg(feature = "toml")]
     pub fn from_toml(input: &str) -> Result<Self, DesiredSchemaError> {
         let definitions = crate::toml_schema::parse(input)?;
+        let declares_protection = !definitions.classes.is_empty()
+            || definitions
+                .attributes
+                .iter()
+                .any(|definition| definition.protection.is_some());
         Self::new(
             definitions
+                .attributes
                 .into_iter()
                 .map(|definition| DesiredAttribute {
                     ident: definition.ident(),
@@ -147,6 +176,7 @@ impl DesiredSchema {
                 })
                 .collect(),
         )
+        .map(|desired| desired.with_protection_declared(declares_protection))
     }
 
     /// Parses Datomic-style EDN attribute maps.
@@ -155,10 +185,12 @@ impl DesiredSchema {
     /// Returns [`DesiredSchemaError`] for malformed attribute definitions.
     pub fn from_edn(forms: &[Edn]) -> Result<Self, DesiredSchemaError> {
         let mut attributes = Vec::with_capacity(forms.len());
+        let mut declares_protection = false;
         for form in forms {
+            declares_protection |= form.get(&Edn::keyword("db/protection")).is_some();
             attributes.push(attribute_from_edn(form)?);
         }
-        Self::new(attributes)
+        Self::new(attributes).map(|desired| desired.with_protection_declared(declares_protection))
     }
 
     /// Looks up a declaration by rendered ident.

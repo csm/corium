@@ -860,3 +860,87 @@ fn idents_registry_is_read_for_attribute_ids() {
     );
     let _ = Idents::default();
 }
+
+#[test]
+fn a_protected_attribute_is_read_as_ever_protected_from_the_installed_timeline() {
+    // The installed schema carries protection timelines, so the planner reads
+    // the blocker from the database rather than assuming nothing is sealed.
+    let db = database(
+        r#"
+        {:db.protect/ident :protect/pii
+         :db.protect/key "file:/etc/corium/pii.key"
+         :db.protect/on-missing-key :db.protect.missing/hide}
+        {:db/ident :person/ssn :db/valueType :db.type/string :db/protection :protect/pii}
+        {:db/ident :person/nickname :db/valueType :db.type/string}
+        "#,
+    );
+
+    let installed = corium_forms::planner::installed_schema(&db);
+    assert!(
+        installed
+            .iter()
+            .find(|attribute| attribute.ident == ":person/ssn")
+            .expect(":person/ssn is installed")
+            .ever_protected
+    );
+    assert!(
+        !installed
+            .iter()
+            .find(|attribute| attribute.ident == ":person/nickname")
+            .expect(":person/nickname is installed")
+            .ever_protected
+    );
+
+    let plan = plan(
+        &desired(
+            r"
+            {:db/ident :person/ssn :db/valueType :db.type/string :db/index true}
+            {:db/ident :person/nickname :db/valueType :db.type/string :db/index true}
+            ",
+        ),
+        &db,
+        &options(),
+    )
+    .expect("plans");
+    assert_eq!(
+        step(&plan, ":person/ssn#index").blocked,
+        Some(BlockedReason::EverProtected)
+    );
+    assert_eq!(step(&plan, ":person/nickname#index").blocked, None);
+}
+
+#[test]
+fn a_declared_protection_class_is_reported_rather_than_silently_dropped() {
+    // :db/protection is not part of the normalized desired model, so a file
+    // that names a class must not read as "no changes".
+    let db = database(r"{:db/ident :person/ssn :db/valueType :db.type/string}");
+    let protected = desired(
+        r"{:db/ident :person/ssn :db/valueType :db.type/string :db/protection :protect/pii}",
+    );
+    assert!(protected.declares_protection());
+
+    let planned = plan(&protected, &db, &options()).expect("plans");
+    assert!(planned.steps.is_empty());
+    assert!(
+        planned
+            .notes
+            .iter()
+            .any(|note| note.contains(":db/protection is not planned")),
+        "plan notes mention the unplanned class; notes: {:?}",
+        planned.notes
+    );
+
+    // A file that names no class says nothing about protection.
+    let plain = plan(
+        &desired(r"{:db/ident :person/ssn :db/valueType :db.type/string}"),
+        &db,
+        &options(),
+    )
+    .expect("plans");
+    assert!(
+        !plain
+            .notes
+            .iter()
+            .any(|note| note.contains(":db/protection"))
+    );
+}
