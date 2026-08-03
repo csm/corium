@@ -222,16 +222,19 @@ Action mapping:
 | `Catalog.ListDatabases` | `ListDatabases` (catalog-wide, no database) |
 | `Catalog.GcDeletedDatabases` | `GarbageCollect` |
 | `Catalog.RequestIndex` / `SetIndexPolicy` | `ManageIndex` |
-| `Catalog.PlanSchemaUpdate` *(proposed)* | `Inspect` |
-| `Catalog.ApplySchemaUpdate` *(proposed)* | `AlterSchema` |
+| `Catalog.AlterSchema` | `AlterSchema` |
 
 Schema migration adds `Action::AlterSchema` with wire name `alter-schema`.
 It is an Admin-class, database-scoped action, so the built-in `admin`
 permission continues to grant it only to database owners. Ordinary writers with
-the Write-class `Transact` action cannot broaden their own schema. Migration
-rewrite jobs additionally require database-level `Transact`. Transactor authz
-does not have attribute-scoped transact grants today, and schema migration does
-not imply adding them. See
+the Write-class `Transact` action cannot broaden their own schema — and the
+separation is enforced in the engine as well as the policy: `corium-tx` refuses
+the schema vocabulary outright, so there is no transaction shape that edits
+attribute metadata. Planning is read-only and needs only `Inspect`, because it
+runs against a peer's own database value rather than through a catalog call.
+Migration rewrite jobs will additionally require database-level `Transact`.
+Transactor authz does not have attribute-scoped transact grants today, and
+schema migration does not imply adding them. See
 [schema-migrations.md](schema-migrations.md#authorization-and-audit).
 
 Enforcement points differ by surface:
