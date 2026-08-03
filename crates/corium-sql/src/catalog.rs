@@ -168,12 +168,18 @@ impl TableProvider for WideTable {
                 }
             });
         }
+        // Only the projected columns are read. Besides the obvious saving,
+        // this is what keeps an unprojected column whose class refuses a
+        // keyless read from failing a statement that never asked for it —
+        // DataFusion projects away the value, but materializing it would
+        // already have raised.
+        let wanted = self.projected_attributes(projection);
         let rows = match candidates {
             Some(entities) => entities
                 .into_iter()
-                .filter_map(|entity| self.row_for(entity).transpose())
+                .filter_map(|entity| self.row_for(entity, &wanted).transpose())
                 .collect::<DataFusionResult<Vec<_>>>()?,
-            None => self.all_rows()?,
+            None => self.all_rows(&wanted)?,
         };
         let table = make_mem_table(self.schema.clone(), &rows)?;
         table.scan(state, projection, &[], None).await
@@ -335,37 +341,64 @@ impl WideTable {
         }
     }
 
-    fn all_rows(&self) -> DataFusionResult<Vec<Vec<ScalarValue>>> {
-        let attribute_ids: BTreeSet<AttrId> = self
-            .attributes
-            .iter()
-            .map(|attribute| attribute.id)
-            .collect();
+    /// The attributes a scan must actually read.
+    ///
+    /// Column 0 is the entity id, so attribute `i` sits at column `i + 1`. A
+    /// scan with no projection reads everything. `DataFusion` keeps a retained
+    /// (`Inexact`) filter's columns in the projection, so a predicate never
+    /// reads a column this leaves out.
+    fn projected_attributes(&self, projection: Option<&Vec<usize>>) -> BTreeSet<AttrId> {
+        match projection {
+            None => self.attributes.iter().map(|found| found.id).collect(),
+            Some(columns) => columns
+                .iter()
+                .filter_map(|column| column.checked_sub(1))
+                .filter_map(|index| self.attributes.get(index))
+                .map(|found| found.id)
+                .collect(),
+        }
+    }
+
+    fn all_rows(&self, wanted: &BTreeSet<AttrId>) -> DataFusionResult<Vec<Vec<ScalarValue>>> {
         let mut facts: BTreeMap<EntityId, BTreeMap<AttrId, Vec<Value>>> = BTreeMap::new();
+        // Every entity in this namespace still produces a row, so the scan
+        // walks every attribute of the table; only the values of projected
+        // columns are read.
+        let present: BTreeSet<AttrId> = self.attributes.iter().map(|found| found.id).collect();
         for datom in self.db.datoms_at(IndexOrder::Eavt) {
-            if attribute_ids.contains(&datom.a)
+            if !present.contains(&datom.a) {
+                continue;
+            }
+            let entry = facts.entry(datom.e).or_default();
+            if wanted.contains(&datom.a)
                 && let Some(value) = self.readable(datom.e, datom.a, &datom.v)?
             {
-                facts
-                    .entry(datom.e)
-                    .or_default()
-                    .entry(datom.a)
-                    .or_default()
-                    .push(value);
+                entry.entry(datom.a).or_default().push(value);
             }
         }
         facts
             .iter()
-            .map(|(entity, values)| self.make_row(*entity, values))
+            .map(|(entity, values)| self.make_row(*entity, values, wanted))
             .collect()
     }
 
-    fn row_for(&self, entity: EntityId) -> DataFusionResult<Option<Vec<ScalarValue>>> {
+    fn row_for(
+        &self,
+        entity: EntityId,
+        wanted: &BTreeSet<AttrId>,
+    ) -> DataFusionResult<Option<Vec<ScalarValue>>> {
         let mut values: BTreeMap<AttrId, Vec<Value>> = BTreeMap::new();
+        let mut present = false;
         for attribute in &self.attributes {
-            let readable = self
-                .db
-                .values(entity, attribute.id)
+            let stored = self.db.values(entity, attribute.id);
+            if stored.is_empty() {
+                continue;
+            }
+            present = true;
+            if !wanted.contains(&attribute.id) {
+                continue;
+            }
+            let readable = stored
                 .into_iter()
                 .filter_map(|value| self.readable(entity, attribute.id, &value).transpose())
                 .collect::<DataFusionResult<Vec<_>>>()?;
@@ -373,10 +406,10 @@ impl WideTable {
                 values.insert(attribute.id, readable);
             }
         }
-        if values.is_empty() {
-            Ok(None)
+        if present {
+            self.make_row(entity, &values, wanted).map(Some)
         } else {
-            self.make_row(entity, &values).map(Some)
+            Ok(None)
         }
     }
 
@@ -384,10 +417,17 @@ impl WideTable {
         &self,
         entity: EntityId,
         values: &BTreeMap<AttrId, Vec<Value>>,
+        wanted: &BTreeSet<AttrId>,
     ) -> DataFusionResult<Vec<ScalarValue>> {
         let mut row = vec![ScalarValue::UInt64(Some(entity.raw()))];
         for projected in &self.attributes {
-            let stored = values.get(&projected.id).map_or(&[][..], Vec::as_slice);
+            // A column outside the projection is filled with the same null
+            // this row would carry for an absent value; DataFusion drops it.
+            let stored = if wanted.contains(&projected.id) {
+                values.get(&projected.id).map_or(&[][..], Vec::as_slice)
+            } else {
+                &[][..]
+            };
             let data_type = arrow_type(projected.attribute.value_type);
             match projected.attribute.cardinality {
                 Cardinality::One => match stored {
@@ -579,18 +619,103 @@ fn register_system_tables(
     db: &Db,
     read: &ReadContext,
 ) -> Result<(), SqlError> {
-    schema.register_table("datoms".into(), datoms_table(db, read)?)?;
+    schema.register_table("datoms".into(), datoms_table(db, read))?;
     schema.register_table("attributes".into(), attributes_table(db)?)?;
     schema.register_table("idents".into(), idents_table(db)?)?;
     Ok(())
 }
 
-/// `corium_sys.datoms`: the raw fact table.
+/// `corium_sys.datoms`: the raw fact table, materialized when it is scanned.
 ///
-/// This is the one relation that would otherwise route around every column
-/// projection, so the read is applied per datom here exactly as it is in the
-/// wide tables.
-fn datoms_table(db: &Db, read: &ReadContext) -> Result<Arc<dyn TableProvider>, SqlError> {
+/// This is the one relation that routes around every column projection, so the
+/// read is applied per datom here exactly as it is in the wide tables. It is
+/// built lazily for the same reason the wide tables are: a session is
+/// constructed per statement, and a class whose missing-key policy is `error`
+/// must fail a read that actually touches it — not every statement that merely
+/// opens a session.
+#[derive(Debug)]
+struct DatomsTable {
+    db: Db,
+    read: ReadContext,
+    schema: SchemaRef,
+}
+
+impl DatomsTable {
+    fn rows(&self) -> DataFusionResult<Vec<Vec<ScalarValue>>> {
+        let db = &self.db;
+        let mut rows = Vec::new();
+        for datom in db.datoms_at(IndexOrder::Eavt) {
+            let value = match self
+                .read
+                .read(db.schema(), db.interner(), datom.a, datom.e, &datom.v)
+            {
+                Ok(Hydration::Bind(value)) => value,
+                Ok(Hydration::Hide) => continue,
+                Ok(Hydration::Refuse(class)) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "protection class {class} is not readable without its key"
+                    )));
+                }
+                Err(error) => return Err(DataFusionError::Execution(error.to_string())),
+            };
+            let mut row = vec![
+                ScalarValue::UInt64(Some(datom.e.raw())),
+                ScalarValue::UInt64(Some(datom.a.raw())),
+                ScalarValue::Utf8(db.idents().ident(datom.a).map(ToString::to_string)),
+                ScalarValue::Utf8(Some(value_type_name(&value).into())),
+            ];
+            for expected in [
+                ValueType::Bool,
+                ValueType::Long,
+                ValueType::Double,
+                ValueType::Instant,
+                ValueType::Uuid,
+                ValueType::Keyword,
+                ValueType::Str,
+                ValueType::Bytes,
+                ValueType::Ref,
+            ] {
+                if value.has_type(expected) {
+                    row.push(value_scalar(db, &value));
+                } else {
+                    row.push(ScalarValue::try_new_null(&arrow_type(expected))?);
+                }
+            }
+            row.extend([
+                ScalarValue::UInt64(Some(datom.tx.raw())),
+                ScalarValue::UInt64(Some(datom.tx.sequence())),
+                ScalarValue::Boolean(Some(datom.added)),
+            ]);
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+#[async_trait]
+impl TableProvider for DatomsTable {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let rows = self.rows()?;
+        let table = make_mem_table(self.schema.clone(), &rows)?;
+        table.scan(state, projection, &[], None).await
+    }
+}
+
+fn datoms_table(db: &Db, read: &ReadContext) -> Arc<dyn TableProvider> {
     let fields = vec![
         Field::new("e", DataType::UInt64, false),
         Field::new("a", DataType::UInt64, false),
@@ -613,49 +738,11 @@ fn datoms_table(db: &Db, read: &ReadContext) -> Result<Arc<dyn TableProvider>, S
         Field::new("t", DataType::UInt64, false),
         Field::new("added", DataType::Boolean, false),
     ];
-    let mut rows = Vec::new();
-    for datom in db.datoms_at(IndexOrder::Eavt) {
-        let value = match read.read(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
-            Ok(Hydration::Bind(value)) => value,
-            Ok(Hydration::Hide) => continue,
-            Ok(Hydration::Refuse(class)) => {
-                return Err(SqlError::Schema(format!(
-                    "protection class {class} is not readable without its key"
-                )));
-            }
-            Err(error) => return Err(SqlError::Schema(error.to_string())),
-        };
-        let mut row = vec![
-            ScalarValue::UInt64(Some(datom.e.raw())),
-            ScalarValue::UInt64(Some(datom.a.raw())),
-            ScalarValue::Utf8(db.idents().ident(datom.a).map(ToString::to_string)),
-            ScalarValue::Utf8(Some(value_type_name(&value).into())),
-        ];
-        for expected in [
-            ValueType::Bool,
-            ValueType::Long,
-            ValueType::Double,
-            ValueType::Instant,
-            ValueType::Uuid,
-            ValueType::Keyword,
-            ValueType::Str,
-            ValueType::Bytes,
-            ValueType::Ref,
-        ] {
-            if value.has_type(expected) {
-                row.push(value_scalar(db, &value));
-            } else {
-                row.push(ScalarValue::try_new_null(&arrow_type(expected))?);
-            }
-        }
-        row.extend([
-            ScalarValue::UInt64(Some(datom.tx.raw())),
-            ScalarValue::UInt64(Some(datom.tx.sequence())),
-            ScalarValue::Boolean(Some(datom.added)),
-        ]);
-        rows.push(row);
-    }
-    make_table(fields, &rows)
+    Arc::new(DatomsTable {
+        db: db.clone(),
+        read: read.clone(),
+        schema: Arc::new(Schema::new(fields)),
+    })
 }
 
 fn attributes_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {

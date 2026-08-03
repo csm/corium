@@ -389,6 +389,72 @@ async fn peer_server_enforces_relationship_policy() {
     assert_eq!(carol_names.len(), 1, "{carol_names:?}");
 }
 
+/// A view resolves to attribute ids against a schema, so a request binding
+/// several sources must have it resolved against all of them — otherwise a
+/// source whose schema lacks the attribute leaves it visible in the source
+/// that has it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_bound_view_cannot_unhide_an_attribute() {
+    let cluster = Cluster::start().await;
+    install_policy(&cluster).await;
+    let authorizer = Arc::new(SystemDbAuthorizer::new(Arc::new(
+        corium_peer::authz::ConnectionPolicySource::new(Arc::new(
+            cluster.connect(schema::DEFAULT_AUTHZ_DB).await,
+        )),
+    )));
+    authorizer.refresh().await.expect("policy compiles");
+    let service = PeerServerSvc::new(
+        Arc::new(cluster.connect("music").await),
+        PeerServerConfig::default(),
+    )
+    .with_guard(Guard::new(Arc::new(tokens()), authorizer));
+
+    cluster
+        .connect("music")
+        .await
+        .transact(forms(
+            r#"[{:db/id "p" :person/name "Ada" :person/email "ada@example.test"}]"#,
+        ))
+        .await
+        .expect("a person with an email is written");
+
+    let mut request = Request::new(pb::QueryRequest {
+        dbs: vec![
+            pb::DbViewSpec {
+                db: "music".to_owned(),
+                view: Some(pb::db_view_spec::View::AsOf(1)),
+            },
+            pb::DbViewSpec {
+                db: "music".to_owned(),
+                view: None,
+            },
+        ],
+        query: codec::encode_edn(
+            &corium_query::edn::read_one(
+                "[:find ?email :in $old $new :where [$new ?e :person/email ?email]]",
+            )
+            .expect("query parses"),
+        ),
+        args: codec::encode_edn(&Edn::Vector(Vec::new())),
+        fuel: 0,
+    });
+    request
+        .extensions_mut()
+        .insert(Principal::new("static-token", "carol"));
+
+    let rows = rows_of(
+        service
+            .query(request)
+            .await
+            .expect("a multi-source filtered read is servable"),
+    )
+    .await;
+    assert!(
+        rows.is_empty(),
+        "binding an older view must not unhide an attribute: {rows:?}"
+    );
+}
+
 /// The peer server's chunked query stream.
 type QueryChunks = std::pin::Pin<
     Box<dyn tokio_stream::Stream<Item = Result<pb::QueryResultChunk, tonic::Status>> + Send>,

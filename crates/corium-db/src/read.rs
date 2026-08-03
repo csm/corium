@@ -57,12 +57,53 @@ impl AttrVisibility {
     /// a restriction cannot describe is withheld rather than disclosed.
     #[must_use]
     pub fn resolve(schema: &Schema, idents: &Idents, visible: impl Fn(&Keyword) -> bool) -> Self {
-        let hidden = schema
-            .iter()
-            .map(|(attr, _)| *attr)
-            .filter(|attr| idents.ident(*attr).is_none_or(|ident| !visible(ident)))
-            .collect();
-        Self { hidden }
+        let mut view = Self::default();
+        view.add_hidden_from(schema, idents, visible);
+        view
+    }
+
+    /// Resolves `visible` over every database value a read may touch, hiding
+    /// the union of what each of them rejects.
+    ///
+    /// **A view resolves to attribute ids, and ids are only meaningful against
+    /// a schema.** An attribute absent from the schema this was resolved
+    /// against is absent from the hidden set, and therefore visible — so
+    /// resolving against one database value and then applying the result to
+    /// another is a bypass waiting to happen, in exactly the direction that
+    /// discloses. A query may bind several sources, so it resolves against all
+    /// of them and takes the union, which is the conservative direction under
+    /// any schema difference.
+    ///
+    /// Today every view of one database shares its schema, so the union is a
+    /// no-op; that is an implementation detail of [`Db::as_of`](crate::Db::as_of)
+    /// and not a property to depend on, since schema is itself basis-versioned
+    /// data.
+    #[must_use]
+    pub fn resolve_all<'a>(
+        sources: impl IntoIterator<Item = (&'a Schema, &'a Idents)>,
+        visible: impl Fn(&Keyword) -> bool,
+    ) -> Self {
+        let mut view = Self::default();
+        for (schema, idents) in sources {
+            view.add_hidden_from(schema, idents, &visible);
+        }
+        view
+    }
+
+    /// Hides every attribute of one database value that `visible` rejects,
+    /// keeping whatever this view already hides.
+    pub fn add_hidden_from(
+        &mut self,
+        schema: &Schema,
+        idents: &Idents,
+        visible: impl Fn(&Keyword) -> bool,
+    ) {
+        self.hidden.extend(
+            schema
+                .iter()
+                .map(|(attr, _)| *attr)
+                .filter(|attr| idents.ident(*attr).is_none_or(|ident| !visible(ident))),
+        );
     }
 
     /// Whether datoms of `attr` reach this reader.

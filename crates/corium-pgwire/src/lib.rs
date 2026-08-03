@@ -960,6 +960,9 @@ where
         };
         let mut read = ReadContext::open().with_hydrator(hydrator);
         if let Some(view) = &grant.view {
+            // One statement reads one database value, so there is one schema
+            // to resolve ids against; the peer server, whose queries may bind
+            // several views, resolves against all of them.
             read = read.with_visibility(Arc::new(AttrVisibility::resolve(
                 db.schema(),
                 db.idents(),

@@ -643,14 +643,23 @@ Name the key ids on a view and bind it to the relation that may read them:
 A guarded server defaults to **strict** key policy: a principal whose decision
 names no key id hydrates nothing, and its protected values come back redacted,
 hidden, or refused per class policy. A server with authorization disabled keeps
-the old behaviour and hydrates every request with its whole keyring. Two things
-to know:
+the old behaviour and hydrates every request with its whole keyring.
+`--key-policy strict|server-wide` overrides the default on both `peer-server`
+and `postgres-server`; an operator upgrading a guarded, key-holding deployment
+that is not ready to write key grants sets `server-wide` deliberately. Two
+things to know:
 
 - `:authz.binding/unfiltered` grants full *attribute* visibility and **no**
   keys. Keys are named by key id and that binding names none, so a relation
   that must read protected values names them explicitly.
 - Granting a key id a process does not hold does nothing. Policy narrows the
   process's keyring; it never extends it.
+
+`postgres-server` additionally does **not** terminate TLS, and an
+authenticated SQL client sends its bearer token in the PostgreSQL password
+field. Front it with a TLS-terminating proxy or bind it to loopback; it rejects
+`--tls-cert`/`--tls-key` rather than accepting flags it cannot honour, and
+warns at startup when authentication is configured.
 
 > **This is authorization, not cryptography.** A key-holding server still has
 > the plaintext and is choosing not to disclose it, so a compromised or

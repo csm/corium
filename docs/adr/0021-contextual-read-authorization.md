@@ -39,10 +39,14 @@ engine applies both.**
   property of the read rather than of the `Db`; policy visibility is the same
   kind of thing, so they travel together.
 - **The filter is resolved once, into attribute ids.** `AttrVisibility` is
-  computed against one database value's schema when the request arrives, so the
-  per-datom check is a set lookup. It also keeps the dependency edge pointing
-  one way: `ViewFilter` lives in `corium-protocol`, which depends on
-  `corium-query`, so the engine cannot name it.
+  computed when the request arrives, so the per-datom check is a set lookup. It
+  also keeps the dependency edge pointing one way: `ViewFilter` lives in
+  `corium-protocol`, which depends on `corium-query`, so the engine cannot name
+  it. An id is only meaningful against a schema, and an attribute missing from
+  the schema a view was resolved against would be *visible* — so a request
+  binding several sources resolves against all of them and hides the union.
+  Every view of one database happens to share its schema today, but schema is
+  itself basis-versioned data, so that is not a property to depend on.
 - **Policy decides both halves in one place.** `Decision::AllowFiltered` now
   carries a `ReadGrant { view, keys }`. A view definition may name attributes,
   key ids (`:authz.view/key`), or both — `:authz.view/filter-type` became
@@ -97,6 +101,19 @@ engine applies both.**
   must read protected values names them. This is the one genuinely surprising
   corner of the model, and the alternative — letting `unfiltered` reopen every
   class — would defeat strict mode with a single binding.
+- SQL materializes only projected columns, and builds `corium_sys.datoms` when
+  it is scanned rather than when a session opens. Both are performance wins,
+  but the reason they are load-bearing is availability: a session is
+  constructed per statement, so an eager read of a class whose missing-key
+  policy is `error` would fail *every* statement for a keyless principal,
+  including statements touching nothing protected. A `Refuse` must reach only
+  a read that genuinely touches the datom, which is what the datalog engine
+  already did.
+- pgwire does not terminate TLS, and now carries each client's bearer token in
+  the `PostgreSQL` password field. It rejects the TLS flags rather than
+  accepting ones it cannot honour, and warns at startup; a deployment needs a
+  terminating proxy or a loopback bind. Native TLS for that listener is
+  follow-up work.
 - A view-restricted principal cannot write on any surface. That is stricter
   than necessary for a view that touches nothing the write touches, and lifting
   it needs per-attribute write authorization in `corium-tx` rather than a check

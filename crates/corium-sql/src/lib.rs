@@ -277,6 +277,137 @@ mod tests {
 
     use super::*;
 
+    /// A fixture whose `person/secret` is protected by a class that refuses a
+    /// keyless read outright (`:db.protect.missing/error`).
+    fn refusing_fixture() -> Db {
+        use corium_core::{MissingKeyPolicy, ProtectionClass, ProtectionTimeline, Sealed};
+
+        let name = EntityId::from_raw(100);
+        let secret = EntityId::from_raw(101);
+        let class = EntityId::from_raw(90);
+        let mut schema = Schema::default();
+        for (id, value_type) in [(name, ValueType::Str), (secret, ValueType::Str)] {
+            schema.insert(Attribute {
+                id,
+                value_type,
+                cardinality: Cardinality::One,
+                unique: None,
+                is_component: false,
+                indexed: false,
+                no_history: false,
+            });
+        }
+        schema.insert_class(ProtectionClass {
+            id: class,
+            key_id: "file:/nonexistent".to_owned(),
+            algorithm: corium_core::SealAlgorithm::Aes256GcmSiv,
+            scope: corium_core::ProtectionScope::Attribute,
+            padding: None,
+            on_missing_key: MissingKeyPolicy::Error,
+            legacy_plaintext: corium_core::LegacyPlaintextPolicy::Redact,
+            current_epoch: 1,
+        });
+        schema.set_protection(secret, ProtectionTimeline::protected_from(0, class));
+        let mut idents = Idents::default();
+        idents.insert(Keyword::parse("person/name"), name);
+        idents.insert(Keyword::parse("person/secret"), secret);
+        let alice = EntityId::from_raw(1_000);
+        let tx = EntityId::new(Partition::Tx as u32, 1);
+        Db::new(schema)
+            .with_naming(idents, KeywordInterner::default())
+            .with_transaction(
+                1,
+                &[
+                    Datom {
+                        e: alice,
+                        a: name,
+                        v: Value::Str("Alice".into()),
+                        tx,
+                        added: true,
+                    },
+                    Datom {
+                        e: alice,
+                        a: secret,
+                        v: Value::Sealed(Sealed {
+                            class,
+                            epoch: 1,
+                            vtype: ValueType::Str,
+                            body: std::sync::Arc::from(&b"ciphertext"[..]),
+                        }),
+                        tx,
+                        added: true,
+                    },
+                ],
+            )
+    }
+
+    /// The read a strict-key-policy surface gives a principal holding no
+    /// class key: a hydrator with an empty key set, which is what makes the
+    /// class's own missing-key policy apply.
+    fn keyless_read() -> ReadContext {
+        ReadContext::open()
+            .with_hydrator(std::sync::Arc::new(corium_db::protect::Hydrator::default()))
+    }
+
+    #[tokio::test]
+    async fn a_refusing_class_does_not_break_unrelated_statements() {
+        // A keyless session on a database holding one `error`-policy class
+        // must still run every statement that does not read that column.
+        // Building the catalog eagerly, or materializing unprojected columns,
+        // would turn one protected attribute into a dead SQL surface for
+        // every principal without its key.
+        let db = refusing_fixture();
+        let session =
+            SqlSession::with_read(&db, &keyless_read()).expect("a keyless session still opens");
+        let rows = session
+            .query("SELECT name FROM corium.person")
+            .await
+            .expect("planning a statement that avoids the column")
+            .collect()
+            .await
+            .expect("running it");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reading_a_refusing_class_still_fails_loudly() {
+        // The `error` policy exists to be a loud failure rather than a quiet
+        // hole, so a read that genuinely touches the column must still raise.
+        let db = refusing_fixture();
+        let session = SqlSession::with_read(&db, &keyless_read()).expect("session opens");
+        let refused = match session.query("SELECT secret FROM corium.person").await {
+            Err(error) => error,
+            Ok(query) => query
+                .collect()
+                .await
+                .expect_err("reading the protected column refuses"),
+        };
+        assert!(
+            refused.to_string().contains("not readable without its key"),
+            "{refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_system_fact_table_is_read_when_it_is_scanned() {
+        // `corium_sys.datoms` routes around every column projection, so it
+        // refuses — but only when a statement actually scans it, which is why
+        // it is built lazily rather than at session construction.
+        let db = refusing_fixture();
+        let session = SqlSession::with_read(&db, &keyless_read()).expect("session opens");
+        let refused = match session.query("SELECT e FROM corium_sys.datoms").await {
+            Err(error) => error,
+            Ok(query) => query
+                .collect()
+                .await
+                .expect_err("the raw fact table refuses"),
+        };
+        assert!(
+            refused.to_string().contains("not readable without its key"),
+            "{refused}"
+        );
+    }
+
     #[allow(clippy::too_many_lines)]
     fn fixture() -> Db {
         // At or above `FIRST_ATTR_ID`: the low db-partition range belongs to

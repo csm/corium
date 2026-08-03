@@ -221,17 +221,20 @@ impl PeerServerSvc {
         ))
     }
 
-    /// Turns an authorization decision into the read `db` is answered under.
+    /// Turns an authorization decision into the read `dbs` are answered under.
     ///
-    /// The attribute filter is resolved against this database value's own
-    /// schema once per request, so the scan compares attribute ids rather
-    /// than re-deriving idents per datom.
-    async fn read_context(&self, db: &Db, grant: &ReadGrant) -> Result<ReadContext, Status> {
+    /// The attribute filter is resolved to ids once per request, so the scan
+    /// compares ids rather than re-deriving idents per datom. It is resolved
+    /// against **every** database value the request binds, not just the first:
+    /// an id is only meaningful against a schema, so a view resolved against
+    /// one value and applied to another would leave anything missing from the
+    /// first schema visible in the second. A client chooses how many views it
+    /// binds and at which basis, so that is its choice to make, not ours.
+    async fn read_context(&self, dbs: &[Db], grant: &ReadGrant) -> Result<ReadContext, Status> {
         let mut context = ReadContext::open().with_hydrator(self.hydrator_for(grant).await?);
         if let Some(view) = &grant.view {
-            context = context.with_visibility(Arc::new(AttrVisibility::resolve(
-                db.schema(),
-                db.idents(),
+            context = context.with_visibility(Arc::new(AttrVisibility::resolve_all(
+                dbs.iter().map(|db| (db.schema(), db.idents())),
                 |ident| view.attribute_visible(&ident.to_string()),
             )));
         }
@@ -409,11 +412,13 @@ impl PeerServer for PeerServerSvc {
         } else {
             request.fuel.min(self.config.max_fuel)
         };
-        // Every database view the query binds is the one hosted database, so
-        // one read context covers them all.
-        let read = self
-            .read_context(dbs.first().unwrap_or(&self.connection.db()), &grant)
-            .await?;
+        // Resolved against every bound view, so a view bound at another basis
+        // cannot leave an attribute unhidden for the others.
+        let read = if dbs.is_empty() {
+            self.read_context(&[self.connection.db()], &grant).await?
+        } else {
+            self.read_context(&dbs, &grant).await?
+        };
         let started = Instant::now();
         let (result, report) = corium_query::run(
             &parsed,
@@ -457,7 +462,7 @@ impl PeerServer for PeerServerSvc {
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
         let pattern = decode_edn(&request.pattern, "pull pattern")?;
-        let read = self.read_context(&db, &grant).await?;
+        let read = self.read_context(std::slice::from_ref(&db), &grant).await?;
         let eid = resolve_eid(&db, &read, &decode_edn(&request.eid, "entity")?)?;
         let result = corium_query::pull_with(&db, &pattern, eid, &read)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -526,7 +531,7 @@ impl PeerServer for PeerServerSvc {
             .await?;
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
-        let read = self.read_context(&db, &grant).await?;
+        let read = self.read_context(std::slice::from_ref(&db), &grant).await?;
         let order = match request.index.as_str() {
             "eavt" => IndexOrder::Eavt,
             "aevt" => IndexOrder::Aevt,
@@ -660,7 +665,7 @@ impl PeerServer for PeerServerSvc {
         };
         let records = self.connection.tx_range(request.start, end);
         let db = self.connection.db();
-        let read = self.read_context(&db, &grant).await?;
+        let read = self.read_context(std::slice::from_ref(&db), &grant).await?;
         let interner = db.interner();
         let mut txes = Vec::with_capacity(records.len());
         for record in records {

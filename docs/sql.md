@@ -190,13 +190,21 @@ corium postgres-server --listen 127.0.0.1:5432 \
 psql "host=127.0.0.1 port=5432 dbname=people user=alice password=$JWT"
 ```
 
+> **The token travels in cleartext.** `postgres-server` does not terminate
+> TLS — it rejects `--tls-cert`/`--tls-key` rather than accepting flags it
+> cannot honour — so a client's bearer token crosses the wire unencrypted.
+> Run it behind a TLS-terminating proxy, or bind it to loopback. The server
+> prints this warning at startup whenever authentication is configured.
+
 Every statement is then authorized as that principal: `SELECT` needs `Query`,
 DML needs `Transact`, and `SHOW DATABASES` lists only what the principal may
 inspect. Reads are answered through the principal's own view — a column its
 policy hides keeps its declared type and reports `NULL`, and never takes a
 pushed-down predicate — and through its own protection class keys, so one
 key-holding server serves principals with different entitlements from one
-database value. A principal whose view hides attributes may not write. See
+database value. Pass `--key-policy server-wide` to keep the pre-`ADR-0021`
+behaviour of hydrating every authorized caller with the server's whole keyring.
+A principal whose view hides attributes may not write. See
 [ADR-0021](adr/0021-contextual-read-authorization.md) and
 [auth.md](design/auth.md).
 
