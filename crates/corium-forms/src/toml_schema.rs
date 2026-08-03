@@ -38,6 +38,8 @@ pub struct AttributeDefinition {
     pub component: bool,
     /// Whether history storage is disabled for the attribute.
     pub no_history: bool,
+    /// Optional documentation (`:db/doc`).
+    pub doc: Option<String>,
     /// Protection class ident, when the attribute is protected.
     pub protection: Option<Keyword>,
 }
@@ -166,6 +168,9 @@ impl AttributeDefinition {
         }
         if self.no_history {
             pairs.push((kw("db/noHistory"), Edn::Bool(true)));
+        }
+        if let Some(doc) = &self.doc {
+            pairs.push((kw("db/doc"), Edn::Str(doc.clone())));
         }
         if let Some(protection) = &self.protection {
             pairs.push((kw("db/protection"), Edn::Keyword(protection.clone())));
@@ -386,6 +391,8 @@ struct AttributeOptions {
     #[serde(default)]
     no_history: bool,
     #[serde(default)]
+    doc: Option<String>,
+    #[serde(default)]
     protection: Option<String>,
 }
 
@@ -400,6 +407,7 @@ impl RawAttribute {
                 index: false,
                 component: false,
                 no_history: false,
+                doc: None,
                 protection: None,
             },
             Self::Detailed(options) => options,
@@ -614,6 +622,7 @@ fn normalize(
         indexed,
         component: options.component,
         no_history: options.no_history,
+        doc: options.doc,
         protection,
     })
 }
@@ -803,6 +812,36 @@ type = "ref"
                 .get(employees)
                 .expect("employees attribute")
                 .no_history
+        );
+    }
+
+    #[test]
+    fn documentation_reaches_the_edn_form() {
+        let definitions = parse(
+            r#"
+[[attribute]]
+name = "score"
+type = "long"
+doc = "points earned"
+"#,
+        )
+        .expect("schema parses");
+        assert_eq!(
+            definitions.attributes[0].doc.as_deref(),
+            Some("points earned")
+        );
+        assert_eq!(
+            definitions.attributes[0].to_edn().get(&kw("db/doc")),
+            Some(&Edn::Str("points earned".into()))
+        );
+        // Documentation is optional and is not invented for declarations
+        // that omit it.
+        assert_eq!(
+            parse("[[attribute]]\nname = \"n\"\ntype = \"long\"")
+                .expect("schema parses")
+                .attributes[0]
+                .doc,
+            None
         );
     }
 

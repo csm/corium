@@ -17,6 +17,7 @@
 //! also be named by wall clock ([`Db::as_of_instant`], [`Db::since_instant`]).
 
 pub mod bootstrap;
+pub mod impact;
 pub mod protect;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -306,7 +307,7 @@ impl TxInstants {
 /// downloading an index are still future work. Until they land, a peer holds
 /// the whole database — and its whole history — in memory, and durable
 /// storage serves to reconstruct that state rather than to bound it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Db {
     basis_t: u64,
     schema: Schema,
@@ -317,6 +318,29 @@ pub struct Db {
     instants: TxInstants,
     indexes: Arc<OnceLock<[Index; 4]>>,
     stats: Arc<OnceLock<PlannerStats>>,
+    /// Whether `recorded` is the whole log rather than a snapshot's live
+    /// prefix. A value opened from a published current-state snapshot has
+    /// already lost the retractions before that snapshot's basis, so
+    /// historical questions about it can be answered only as a floor.
+    complete_history: bool,
+}
+
+impl Default for Db {
+    fn default() -> Self {
+        Self {
+            basis_t: 0,
+            schema: Schema::default(),
+            recorded: VectorSync::new_sync(),
+            idents: Arc::default(),
+            interner: Arc::default(),
+            view: DbView::default(),
+            instants: TxInstants::default(),
+            indexes: Arc::new(OnceLock::new()),
+            stats: Arc::new(OnceLock::new()),
+            // An empty database has nothing missing from its history.
+            complete_history: true,
+        }
+    }
 }
 
 impl Db {
@@ -383,6 +407,7 @@ impl Db {
             instants,
             indexes: Arc::new(OnceLock::new()),
             stats: Arc::new(OnceLock::new()),
+            complete_history: false,
         }
     }
 
@@ -423,6 +448,17 @@ impl Db {
     #[must_use]
     pub const fn view(&self) -> DbView {
         self.view
+    }
+
+    /// Whether this value carries every fact ever recorded, rather than a
+    /// published snapshot's live prefix plus the log tail replayed onto it.
+    ///
+    /// History views and historical counts are exact only when this holds.
+    /// It is a property of how the value was opened, so replaying more
+    /// transactions onto a snapshot never restores it.
+    #[must_use]
+    pub const fn has_complete_history(&self) -> bool {
+        self.complete_history
     }
 
     /// Every recorded assertion and retraction, in transaction order.

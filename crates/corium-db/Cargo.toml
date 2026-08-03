@@ -14,5 +14,8 @@ corium-crypt = { workspace = true }
 rpds = { workspace = true }
 thiserror = "2"
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

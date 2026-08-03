@@ -88,6 +88,7 @@ The remaining options are:
 | `index` | Boolean | `false` |
 | `component` | Boolean | `false` |
 | `no-history` | Boolean | `false` |
+| `doc` | String documentation (`:db/doc`) | unset |
 | `protection` | A `[protect.<name>]` class, as `"protect/<name>"` | unset |
 
 Use only one of `many` and `cardinality` on a declaration. Unique attributes
@@ -180,3 +181,14 @@ corium db create people --schema schema.toml
 The CLI selects TOML for `.toml` paths. Other extensions retain the existing
 EDN behavior, including a single vector of attribute maps or a sequence of
 bare attribute maps.
+
+## Updating an existing database
+
+`corium schema update` compares the same file with the schema installed in a
+database. It is read-only by default and is documented in
+[Operations](operations.md#schema-updates); the model behind it is
+[schema migrations](design/schema-migrations.md).
+
+```sh
+corium schema update people --schema schema.toml
+```

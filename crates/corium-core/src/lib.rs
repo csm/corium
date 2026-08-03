@@ -5,6 +5,7 @@ pub mod datom;
 pub mod encoding;
 pub mod ids;
 pub mod keyword;
+pub mod migration;
 pub mod schema;
 pub mod value;
 
