@@ -577,3 +577,91 @@ fn a_retraction_may_use_any_form_the_attribute_has_ever_had() {
         }
     );
 }
+
+#[test]
+fn ordinary_transactions_cannot_write_the_schema_vocabulary() {
+    let (db, name, _) = fixture();
+    let tx = EntityId::new(Partition::Tx as u32, 1);
+    let attribute = EntityRef::Id(name);
+    // Every operation shape is refused, so there is no back door into schema
+    // metadata through a retraction or a compare-and-swap.
+    for (written, op) in [
+        (
+            bootstrap::DOC,
+            TxOp::Add(
+                attribute.clone(),
+                bootstrap::DOC,
+                Value::Str(Arc::from("smuggled")),
+            ),
+        ),
+        (
+            bootstrap::DOC,
+            TxOp::Retract(
+                attribute.clone(),
+                bootstrap::DOC,
+                Value::Str(Arc::from("smuggled")),
+            ),
+        ),
+        (
+            bootstrap::INDEX,
+            TxOp::Cas(attribute.clone(), bootstrap::INDEX, None, Value::Bool(true)),
+        ),
+    ] {
+        assert_eq!(
+            prepare(&db, [TxItem::Op(op)], tx, 1_000)
+                .expect_err("schema metadata is not ordinary data"),
+            TxError::SchemaAttribute(written),
+        );
+    }
+}
+
+#[test]
+fn a_retired_attribute_refuses_assertions_and_keeps_retractions() {
+    let (base, name, _) = fixture();
+    let alice = EntityRef::Id(EntityId::new(Partition::User as u32, 1_000));
+    let tx = EntityId::new(Partition::Tx as u32, 1);
+    let stored = prepare(
+        &base,
+        [TxItem::Op(TxOp::Add(
+            alice.clone(),
+            name,
+            Value::Str(Arc::from("Alice")),
+        ))],
+        tx,
+        1_000,
+    )
+    .expect("the attribute still accepts facts");
+    let db = base.with_transaction(1, &stored.datoms);
+
+    let mut retired = db.schema().clone();
+    retired.set_retired(name, true);
+    let db = Db::new(retired).with_transaction(1, &stored.datoms);
+
+    assert_eq!(
+        prepare(
+            &db,
+            [TxItem::Op(TxOp::Add(
+                alice.clone(),
+                name,
+                Value::Str(Arc::from("Alicia")),
+            ))],
+            EntityId::new(Partition::Tx as u32, 2),
+            1_001,
+        )
+        .expect_err("a retired attribute refuses new assertions"),
+        TxError::RetiredAttribute(name),
+    );
+    // The facts it already holds stay readable and stay retractable.
+    let retraction = prepare(
+        &db,
+        [TxItem::Op(TxOp::Retract(
+            alice,
+            name,
+            Value::Str(Arc::from("Alice")),
+        ))],
+        EntityId::new(Partition::Tx as u32, 2),
+        1_001,
+    )
+    .expect("retracting an existing fact stays legal");
+    assert_eq!(retraction.datoms.len(), 1);
+}

@@ -371,6 +371,13 @@ pub enum Action {
     ManageIndex,
     /// Inspect or rotate a database's storage-encryption keys.
     ManageKeys,
+    /// Apply a schema plan to a database.
+    ///
+    /// Deliberately separate from [`Action::Transact`]: an application writer
+    /// that may add facts must not be able to silently broaden the vocabulary
+    /// it writes them under. Admin-class and database-scoped, so the built-in
+    /// defaults grant it to database owners only (`docs/design/auth.md`).
+    AlterSchema,
 }
 
 impl Action {
@@ -391,6 +398,7 @@ impl Action {
                 | Self::GarbageCollect
                 | Self::ManageIndex
                 | Self::ManageKeys
+                | Self::AlterSchema
         )
     }
 }

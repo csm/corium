@@ -86,7 +86,9 @@ fn an_unchanged_schema_plans_nothing() {
     assert!(!plan.has_changes());
     assert!(plan.unmanaged.is_empty());
     assert_eq!(plan.basis_t, db.basis_t());
-    assert_eq!(plan.schema_generation, None);
+    // A database whose schema arrived as the pre-basis creation seed has made
+    // no schema transaction yet, so it sits at generation 0.
+    assert_eq!(plan.schema_generation, Some(0));
 }
 
 #[test]
@@ -583,7 +585,7 @@ fn a_snapshot_backed_value_says_its_history_counts_are_a_floor() {
 }
 
 #[test]
-fn documentation_is_reported_as_untracked_rather_than_planned() {
+fn documentation_is_planned_as_a_metadata_only_change() {
     let db = database(BASE);
     let planned = plan(
         &desired(
@@ -598,17 +600,17 @@ fn documentation_is_reported_as_untracked_rather_than_planned() {
         &options(),
     )
     .expect("plans");
-    assert!(!planned.has_changes());
-    assert!(
-        planned
-            .notes
-            .iter()
-            .any(|note| note.contains(":db/doc differences are not planned")),
-        "{:?}",
-        planned.notes
-    );
-    // The documentation is still part of the desired digest, so a plan made
-    // from a file with docs is not the plan made from one without.
+    let doc = step(&planned, ":person/email#doc");
+    assert_eq!(doc.installed, None);
+    assert_eq!(doc.desired.as_deref(), Some("primary contact"));
+    assert_eq!(doc.summary, "doc added");
+    // Nothing stored is inspected or rewritten to change documentation.
+    assert_eq!(doc.class, ExecutionClass::Additive);
+    assert_eq!(doc.risk, Risk::Low);
+    assert!(doc.acks.is_empty());
+    assert_eq!(planned.steps.len(), 1);
+    // The documentation is part of the desired digest, so a plan made from a
+    // file with docs is not the plan made from one without.
     let without = plan(&desired(BASE), &db, &options()).expect("plans");
     assert_ne!(planned.desired_digest, without.desired_digest);
     assert_ne!(planned.digest(), without.digest());
@@ -910,37 +912,92 @@ fn a_protected_attribute_is_read_as_ever_protected_from_the_installed_timeline()
 }
 
 #[test]
-fn a_declared_protection_class_is_reported_rather_than_silently_dropped() {
-    // :db/protection is not part of the normalized desired model, so a file
-    // that names a class must not read as "no changes".
+fn naming_a_protection_class_plans_a_forward_only_change() {
     let db = database(r"{:db/ident :person/ssn :db/valueType :db.type/string}");
     let protected = desired(
         r"{:db/ident :person/ssn :db/valueType :db.type/string :db/protection :protect/pii}",
     );
-    assert!(protected.declares_protection());
-
     let planned = plan(&protected, &db, &options()).expect("plans");
-    assert!(planned.steps.is_empty());
+    let step = step(&planned, ":person/ssn#protection");
+    assert_eq!(step.installed.as_deref(), Some("none"));
+    assert_eq!(step.desired.as_deref(), Some(":protect/pii"));
+    assert_eq!(step.class, ExecutionClass::ValidateReindex);
+    assert_eq!(step.risk, Risk::High);
+    assert_eq!(step.acks, vec![AckCode::ProtectionForwardOnly]);
+    assert_eq!(step.blocked, None);
     assert!(
-        planned
-            .notes
+        step.notes
             .iter()
-            .any(|note| note.contains(":db/protection is not planned")),
-        "plan notes mention the unplanned class; notes: {:?}",
-        planned.notes
+            .any(|note| note.contains("lookup refs") && note.contains("stop working")),
+        "the plan says plainly what breaks; notes: {:?}",
+        step.notes
     );
 
-    // A file that names no class says nothing about protection.
+    // A file that names no class asks for no protection change.
     let plain = plan(
         &desired(r"{:db/ident :person/ssn :db/valueType :db.type/string}"),
         &db,
         &options(),
     )
     .expect("plans");
+    assert!(plain.steps.is_empty(), "{:?}", plain.steps);
+}
+
+#[test]
+fn protection_cannot_be_combined_with_value_ordered_coverage() {
+    let db = database(
+        r"
+        {:db/ident :person/ssn :db/valueType :db.type/string}
+        {:db/ident :person/manager :db/valueType :db.type/ref}
+        ",
+    );
+    let planned = plan(
+        &desired(
+            r"
+            {:db/ident :person/ssn :db/valueType :db.type/string :db/index true
+             :db/protection :protect/pii}
+            {:db/ident :person/manager :db/valueType :db.type/ref :db/protection :protect/pii}
+            {:db/ident :person/new :db/valueType :db.type/string :db/unique :db.unique/identity
+             :db/protection :protect/pii}
+            ",
+        ),
+        &db,
+        &options(),
+    )
+    .expect("plans");
+    // An indexed attribute, a reference, and a brand-new unique attribute are
+    // all refused for the same reason: ciphertext order is not value order.
+    assert_eq!(
+        step(&planned, ":person/ssn#protection").blocked,
+        Some(BlockedReason::ProtectionConflict)
+    );
+    assert_eq!(
+        step(&planned, ":person/manager#protection").blocked,
+        Some(BlockedReason::ProtectionConflict)
+    );
+    assert_eq!(
+        step(&planned, ":person/new#add").blocked,
+        Some(BlockedReason::ProtectionConflict)
+    );
+}
+
+#[test]
+fn defining_a_protection_class_is_reported_as_create_time_work() {
+    let db = database(r"{:db/ident :person/ssn :db/valueType :db.type/string}");
+    let with_class = desired(
+        r#"
+        {:db.protect/ident :protect/pii :db.protect/key "file:/etc/corium/pii.key"}
+        {:db/ident :person/ssn :db/valueType :db.type/string}
+        "#,
+    );
+    assert!(with_class.declares_classes());
+    let planned = plan(&with_class, &db, &options()).expect("plans");
     assert!(
-        !plain
+        planned
             .notes
             .iter()
-            .any(|note| note.contains(":db/protection"))
+            .any(|note| note.contains("cannot install a class definition")),
+        "notes: {:?}",
+        planned.notes
     );
 }

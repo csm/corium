@@ -2230,6 +2230,7 @@ dependencies = [
  "corium-core",
  "corium-crypt",
  "corium-db",
+ "corium-forms",
  "corium-index",
  "corium-log",
  "corium-protocol",

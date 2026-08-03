@@ -38,6 +38,13 @@ pub struct DesiredAttribute {
     pub no_history: bool,
     /// Documentation.
     pub doc: Option<String>,
+    /// The protection class this attribute's values are sealed under, by class
+    /// ident (`docs/design/encryption.md`).
+    ///
+    /// Absent means the file asks for no protection. Because protection is
+    /// forward-only, that is a request to stop sealing *new* values, never a
+    /// claim that nothing stored is sealed.
+    pub protection: Option<Keyword>,
 }
 
 impl DesiredAttribute {
@@ -69,7 +76,18 @@ impl DesiredAttribute {
         if self.no_history {
             out.push_str(" no-history");
         }
+        if let Some(class) = &self.protection {
+            let _ = write!(out, " protected-{class}");
+        }
         out
+    }
+
+    /// The rendered protection class, or `none`.
+    #[must_use]
+    pub fn protection_name(&self) -> String {
+        self.protection
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), ToString::to_string)
     }
 }
 
@@ -77,7 +95,7 @@ impl DesiredAttribute {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DesiredSchema {
     attrs: BTreeMap<String, DesiredAttribute>,
-    declares_protection: bool,
+    declares_classes: bool,
 }
 
 /// Failure to read a desired schema file.
@@ -124,27 +142,28 @@ impl DesiredSchema {
         }
         Ok(Self {
             attrs,
-            declares_protection: false,
+            declares_classes: false,
         })
     }
 
-    /// Records that the file named a protection class on at least one
-    /// declaration.
+    /// Records that the file *defines* protection classes, not merely that an
+    /// attribute names one.
     ///
-    /// Protection is not part of the normalized model this build plans
-    /// against, so a declared class is neither planned nor folded into
-    /// [`DesiredSchema::digest`]. The planner reports it rather than letting
-    /// the file read as "no changes".
+    /// Naming an installed class on an attribute is an ordinary planned
+    /// change. Defining a class — its key id, algorithm, scope, padding, and
+    /// policies — is create-time work a schema update does not do, so the
+    /// planner reports such a definition instead of silently ignoring it.
     #[must_use]
-    pub const fn with_protection_declared(mut self, declared: bool) -> Self {
-        self.declares_protection = declared;
+    pub const fn with_classes_declared(mut self, declared: bool) -> Self {
+        self.declares_classes = declared;
         self
     }
 
-    /// Whether the file named a protection class this build cannot plan.
+    /// Whether the file defines protection classes a schema update cannot
+    /// install.
     #[must_use]
-    pub const fn declares_protection(&self) -> bool {
-        self.declares_protection
+    pub const fn declares_classes(&self) -> bool {
+        self.declares_classes
     }
 
     /// Parses a hierarchical TOML schema document.
@@ -155,11 +174,7 @@ impl DesiredSchema {
     #[cfg(feature = "toml")]
     pub fn from_toml(input: &str) -> Result<Self, DesiredSchemaError> {
         let definitions = crate::toml_schema::parse(input)?;
-        let declares_protection = !definitions.classes.is_empty()
-            || definitions
-                .attributes
-                .iter()
-                .any(|definition| definition.protection.is_some());
+        let declares_classes = !definitions.classes.is_empty();
         Self::new(
             definitions
                 .attributes
@@ -173,10 +188,11 @@ impl DesiredSchema {
                     is_component: definition.component,
                     no_history: definition.no_history,
                     doc: definition.doc,
+                    protection: definition.protection,
                 })
                 .collect(),
         )
-        .map(|desired| desired.with_protection_declared(declares_protection))
+        .map(|desired| desired.with_classes_declared(declares_classes))
     }
 
     /// Parses Datomic-style EDN attribute maps.
@@ -185,12 +201,17 @@ impl DesiredSchema {
     /// Returns [`DesiredSchemaError`] for malformed attribute definitions.
     pub fn from_edn(forms: &[Edn]) -> Result<Self, DesiredSchemaError> {
         let mut attributes = Vec::with_capacity(forms.len());
-        let mut declares_protection = false;
+        let mut declares_classes = false;
         for form in forms {
-            declares_protection |= form.get(&Edn::keyword("db/protection")).is_some();
+            // A class definition is spelled with `:db.protect/ident`; an
+            // attribute merely referring to one is not.
+            if form.get(&Edn::keyword("db.protect/ident")).is_some() {
+                declares_classes = true;
+                continue;
+            }
             attributes.push(attribute_from_edn(form)?);
         }
-        Self::new(attributes).map(|desired| desired.with_protection_declared(declares_protection))
+        Self::new(attributes).map(|desired| desired.with_classes_declared(declares_classes))
     }
 
     /// Looks up a declaration by rendered ident.
@@ -214,6 +235,68 @@ impl DesiredSchema {
     /// Iterates declarations in canonical ident order.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &DesiredAttribute)> {
         self.attrs.iter()
+    }
+
+    /// Renders the normalized schema as canonical EDN attribute maps.
+    ///
+    /// This is the form `--apply` submits. The transactor recomputes the
+    /// logical plan from these forms rather than trusting the digest the
+    /// client sends: a digest it cannot re-derive is an opaque token, and an
+    /// opaque token is not a precondition.
+    ///
+    /// Round-trips through [`DesiredSchema::from_edn`] to an equal value, so
+    /// the digest either side computes is the same digest.
+    #[must_use]
+    pub fn to_edn(&self) -> Vec<Edn> {
+        self.attrs
+            .values()
+            .map(|attribute| {
+                let mut pairs = vec![
+                    (
+                        Edn::keyword("db/ident"),
+                        Edn::Keyword(attribute.ident.clone()),
+                    ),
+                    (
+                        Edn::keyword("db/valueType"),
+                        Edn::Keyword(Keyword::new(
+                            Some("db.type"),
+                            value_type_name(attribute.value_type),
+                        )),
+                    ),
+                    (
+                        Edn::keyword("db/cardinality"),
+                        Edn::Keyword(Keyword::new(
+                            Some("db.cardinality"),
+                            cardinality_name(attribute.cardinality),
+                        )),
+                    ),
+                ];
+                if let Some(unique) = attribute.unique {
+                    pairs.push((
+                        Edn::keyword("db/unique"),
+                        Edn::Keyword(Keyword::new(Some("db.unique"), unique_name(Some(unique)))),
+                    ));
+                }
+                // Written unconditionally: `false` is a declaration too, and
+                // the reader treats an absent key as `false` only by default.
+                pairs.push((Edn::keyword("db/index"), Edn::Bool(attribute.indexed)));
+                pairs.push((
+                    Edn::keyword("db/isComponent"),
+                    Edn::Bool(attribute.is_component),
+                ));
+                pairs.push((
+                    Edn::keyword("db/noHistory"),
+                    Edn::Bool(attribute.no_history),
+                ));
+                if let Some(doc) = &attribute.doc {
+                    pairs.push((Edn::keyword("db/doc"), Edn::Str(doc.clone())));
+                }
+                if let Some(class) = &attribute.protection {
+                    pairs.push((Edn::keyword("db/protection"), Edn::Keyword(class.clone())));
+                }
+                Edn::Map(pairs)
+            })
+            .collect()
     }
 
     /// The digest of the normalized desired schema.
@@ -248,6 +331,7 @@ impl DesiredSchema {
                 }
                 None => field("none"),
             }
+            field(&attribute.protection_name());
         }
         digest_hex(&canonical)
     }
@@ -316,6 +400,11 @@ fn attribute_from_edn(form: &Edn) -> Result<DesiredAttribute, DesiredSchemaError
         Some(Edn::Str(text)) => Some(text.clone()),
         Some(other) => return Err(bad(":db/doc", other.to_string())),
     };
+    let protection = match form.get(&Edn::keyword("db/protection")) {
+        None => None,
+        Some(Edn::Keyword(class)) => Some(class.clone()),
+        Some(other) => return Err(bad(":db/protection", other.to_string())),
+    };
 
     Ok(DesiredAttribute {
         ident,
@@ -329,6 +418,7 @@ fn attribute_from_edn(form: &Edn) -> Result<DesiredAttribute, DesiredSchemaError
         is_component: boolean("db/isComponent"),
         no_history: boolean("db/noHistory"),
         doc,
+        protection,
     })
 }
 
