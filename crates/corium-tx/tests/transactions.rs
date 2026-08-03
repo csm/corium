@@ -385,3 +385,195 @@ fn transaction_instants_cannot_be_changed_or_retracted() {
     );
     assert_eq!(retract_entity, Err(TxError::InvalidTxInstantOperation));
 }
+
+/// A database whose `:person/ssn` is protected by one class from `t = 0`.
+fn protected_fixture() -> (Db, EntityId, EntityId, EntityId) {
+    use corium_core::{
+        LegacyPlaintextPolicy, MissingKeyPolicy, ProtectionClass, ProtectionScope,
+        ProtectionTimeline, SealAlgorithm,
+    };
+    let class = EntityId::new(Partition::Db as u32, 100);
+    let ssn = EntityId::new(Partition::Db as u32, 101);
+    let name = EntityId::new(Partition::Db as u32, 102);
+    let mut schema = Schema::default();
+    schema.insert(attribute(101, ValueType::Str, Cardinality::One, None));
+    schema.insert(attribute(102, ValueType::Str, Cardinality::One, None));
+    schema.insert_class(ProtectionClass {
+        id: class,
+        key_id: "file:/etc/corium/pii.key".into(),
+        algorithm: SealAlgorithm::Aes256GcmSiv,
+        scope: ProtectionScope::Attribute,
+        padding: None,
+        on_missing_key: MissingKeyPolicy::Redact,
+        legacy_plaintext: LegacyPlaintextPolicy::Redact,
+        current_epoch: 2,
+    });
+    schema.set_protection(ssn, ProtectionTimeline::protected_from(0, class));
+    (Db::new(schema), class, ssn, name)
+}
+
+fn sealed(class: EntityId, epoch: u32, body: &[u8]) -> Value {
+    Value::Sealed(corium_core::Sealed {
+        class,
+        epoch,
+        vtype: ValueType::Str,
+        body: Arc::from(body),
+    })
+}
+
+#[test]
+fn a_keyless_transactor_enforces_the_form_the_attribute_has_now() {
+    let (db, class, ssn, name) = protected_fixture();
+    let tx = EntityId::new(Partition::Tx as u32, 1);
+    let alice = EntityRef::Id(EntityId::new(Partition::User as u32, 1_000));
+    let assert = |value: Value| {
+        prepare(
+            &db,
+            [TxItem::Op(TxOp::Add(alice.clone(), ssn, value))],
+            tx,
+            1_000,
+        )
+    };
+
+    // Plaintext into a protected attribute: a client that does not know about
+    // protection cannot write through it by accident.
+    assert_eq!(
+        assert(Value::Str(Arc::from("123-45-6789")))
+            .expect_err("plaintext must be refused")
+            .to_string(),
+        format!("attribute {ssn} is protected; assertions must be sealed")
+    );
+
+    // The current class at the current epoch is what an assertion must use.
+    assert!(assert(sealed(class, 2, b"body")).is_ok());
+    assert_eq!(
+        assert(sealed(class, 1, b"body")).expect_err("stale epoch must be refused"),
+        TxError::StaleProtectionForm {
+            attr: ssn,
+            expected_class: class,
+            expected_epoch: 2,
+            class,
+            epoch: 1,
+        }
+    );
+    let other = EntityId::new(Partition::Db as u32, 900);
+    assert_eq!(
+        assert(sealed(other, 2, b"body")).expect_err("foreign class must be refused"),
+        TxError::StaleProtectionForm {
+            attr: ssn,
+            expected_class: class,
+            expected_epoch: 2,
+            class: other,
+            epoch: 2,
+        }
+    );
+
+    // A sealed value where the schema says plaintext is equally wrong.
+    assert_eq!(
+        prepare(
+            &db,
+            [TxItem::Op(TxOp::Add(
+                alice,
+                name,
+                sealed(class, 2, b"body")
+            ))],
+            tx,
+            1_000,
+        )
+        .expect_err("sealed into an unprotected attribute must be refused"),
+        TxError::UnexpectedProtection(name)
+    );
+}
+
+#[test]
+fn a_sealed_fact_is_retracted_and_swapped_bytewise() {
+    let (db, class, ssn, _) = protected_fixture();
+    let alice = EntityId::new(Partition::User as u32, 1_000);
+    let value = sealed(class, 2, b"the-ciphertext");
+    let first = prepare(
+        &db,
+        [TxItem::Op(TxOp::Add(
+            EntityRef::Id(alice),
+            ssn,
+            value.clone(),
+        ))],
+        EntityId::new(Partition::Tx as u32, 1),
+        1_000,
+    )
+    .expect("assert a sealed fact");
+    let db = db.with_transaction(1, &first.datoms);
+
+    // Retraction pairs bytewise, with no key anywhere in sight.
+    let retracted = prepare(
+        &db,
+        [TxItem::Op(TxOp::Retract(
+            EntityRef::Id(alice),
+            ssn,
+            value.clone(),
+        ))],
+        EntityId::new(Partition::Tx as u32, 2),
+        1_001,
+    )
+    .expect("retract it");
+    assert_eq!(retracted.datoms.len(), 1);
+    assert!(!retracted.datoms[0].added);
+    assert_eq!(retracted.datoms[0].v, value);
+
+    // :db/cas compares two sealed values byte for byte, which works precisely
+    // because sealing is deterministic.
+    let swapped = prepare(
+        &db,
+        [TxItem::Op(TxOp::Cas(
+            EntityRef::Id(alice),
+            ssn,
+            Some(value.clone()),
+            sealed(class, 2, b"another-ciphertext"),
+        ))],
+        EntityId::new(Partition::Tx as u32, 2),
+        1_001,
+    )
+    .expect("swap it");
+    assert_eq!(swapped.datoms.len(), 2);
+    assert_eq!(
+        prepare(
+            &db,
+            [TxItem::Op(TxOp::Cas(
+                EntityRef::Id(alice),
+                ssn,
+                Some(sealed(class, 2, b"not-the-stored-bytes")),
+                sealed(class, 2, b"new"),
+            ))],
+            EntityId::new(Partition::Tx as u32, 2),
+            1_001,
+        )
+        .expect_err("a mismatched old value must fail"),
+        TxError::CasFailed
+    );
+}
+
+#[test]
+fn a_retraction_may_use_any_form_the_attribute_has_ever_had() {
+    let (db, class, ssn, _) = protected_fixture();
+    let alice = EntityRef::Id(EntityId::new(Partition::User as u32, 1_000));
+    let retract = |value: Value| {
+        prepare(
+            &db,
+            [TxItem::Op(TxOp::Retract(alice.clone(), ssn, value))],
+            EntityId::new(Partition::Tx as u32, 1),
+            1_000,
+        )
+    };
+    // Plaintext asserted before the attribute was protected, and a value
+    // sealed under an older epoch, are both forms the fact may have.
+    assert!(retract(Value::Str(Arc::from("123-45-6789"))).is_ok());
+    assert!(retract(sealed(class, 1, b"older-epoch")).is_ok());
+    // A class the attribute was never sealed under names a form it never had.
+    let other = EntityId::new(Partition::Db as u32, 900);
+    assert_eq!(
+        retract(sealed(other, 2, b"body")).expect_err("foreign class must be refused"),
+        TxError::ForeignProtectionClass {
+            attr: ssn,
+            class: other,
+        }
+    );
+}

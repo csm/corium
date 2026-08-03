@@ -1,7 +1,10 @@
 //! The lazy entity API: map-like navigation over EAVT.
 
 use corium_core::{AttrId, EntityId, IndexOrder, Keyword, Value};
-use corium_db::{Db, key_prefix};
+use corium_db::{Db, key_prefix, protect::Hydrator};
+
+use crate::QueryError;
+use crate::pull::hydrate;
 
 /// A lazy, map-like view of one entity. Nothing is read until asked for;
 /// each access is an index prefix scan against the underlying [`Db`] value.
@@ -9,13 +12,28 @@ use corium_db::{Db, key_prefix};
 pub struct Entity<'a> {
     db: &'a Db,
     id: EntityId,
+    hydrator: Option<&'a Hydrator>,
 }
 
 impl<'a> Entity<'a> {
     /// Wraps an entity id over a database value.
+    ///
+    /// Values on protected attributes come back sealed; use
+    /// [`Entity::with_keys`] to read them as a key holder.
     #[must_use]
     pub const fn new(db: &'a Db, id: EntityId) -> Self {
-        Self { db, id }
+        Self {
+            db,
+            id,
+            hydrator: None,
+        }
+    }
+
+    /// Returns this entity reading through `hydrator`'s key set.
+    #[must_use]
+    pub const fn with_keys(mut self, hydrator: &'a Hydrator) -> Self {
+        self.hydrator = Some(hydrator);
+        self
     }
 
     /// The entity id.
@@ -31,9 +49,25 @@ impl<'a> Entity<'a> {
     }
 
     /// Values of an attribute (empty when absent).
+    ///
+    /// A class whose missing-key policy is `error` reads as absent here;
+    /// [`Entity::try_get`] surfaces it instead.
     #[must_use]
     pub fn get(&self, attr: AttrId) -> Vec<Value> {
-        self.db.values(self.id, attr)
+        self.try_get(attr).unwrap_or_default()
+    }
+
+    /// Values of an attribute, failing when a class asks reads to fail.
+    ///
+    /// # Errors
+    /// Returns [`QueryError::Protected`] when this reader holds no key for a
+    /// value whose class sets `:db.protect.missing/error`.
+    pub fn try_get(&self, attr: AttrId) -> Result<Vec<Value>, QueryError> {
+        self.db
+            .values(self.id, attr)
+            .into_iter()
+            .filter_map(|value| hydrate(self.db, self.hydrator, attr, self.id, &value).transpose())
+            .collect()
     }
 
     /// Values of an attribute by ident keyword.
@@ -65,7 +99,11 @@ impl<'a> Entity<'a> {
         self.get(attr)
             .into_iter()
             .filter_map(|value| match value {
-                Value::Ref(child) => Some(Entity::new(self.db, child)),
+                Value::Ref(child) => Some(Self {
+                    db: self.db,
+                    id: child,
+                    hydrator: self.hydrator,
+                }),
                 _ => None,
             })
             .collect()
@@ -78,7 +116,11 @@ impl<'a> Entity<'a> {
         let prefix = key_prefix(IndexOrder::Vaet, None, Some(attr), Some(&value));
         self.db
             .datoms_prefix(IndexOrder::Vaet, &prefix)
-            .map(|datom| Entity::new(self.db, datom.e))
+            .map(|datom| Entity {
+                db: self.db,
+                id: datom.e,
+                hydrator: self.hydrator,
+            })
             .collect()
     }
 }

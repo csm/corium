@@ -13,6 +13,7 @@ corium-authz = { workspace = true }
 corium-core = { workspace = true }
 corium-crypt = { workspace = true }
 corium-db = { workspace = true }
+corium-forms = { workspace = true }
 corium-log = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }

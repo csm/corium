@@ -4,7 +4,39 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::{EntityId, TotalF64, Value};
+use crate::{EntityId, Keyword, KeywordInterner, KwId, Sealed, TotalF64, Value, ValueType};
+
+/// Encodes a value type as its tag byte in [`ValueType`] declaration order.
+#[must_use]
+pub(crate) fn value_type_tag(value_type: ValueType) -> u8 {
+    match value_type {
+        ValueType::Bool => 0,
+        ValueType::Long => 1,
+        ValueType::Double => 2,
+        ValueType::Instant => 3,
+        ValueType::Uuid => 4,
+        ValueType::Keyword => 5,
+        ValueType::Str => 6,
+        ValueType::Bytes => 7,
+        ValueType::Ref => 8,
+    }
+}
+
+/// Decodes a value type tag byte written by [`value_type_tag`].
+pub(crate) fn value_type_from_tag(tag: u8) -> Result<ValueType, DecodeError> {
+    Ok(match tag {
+        0 => ValueType::Bool,
+        1 => ValueType::Long,
+        2 => ValueType::Double,
+        3 => ValueType::Instant,
+        4 => ValueType::Uuid,
+        5 => ValueType::Keyword,
+        6 => ValueType::Str,
+        7 => ValueType::Bytes,
+        8 => ValueType::Ref,
+        other => return Err(DecodeError::InvalidValueType(other)),
+    })
+}
 
 const BOOL: u8 = 0x10;
 const LONG: u8 = 0x20;
@@ -15,6 +47,7 @@ const KEYWORD: u8 = 0x60;
 const STR: u8 = 0x70;
 const BYTES: u8 = 0x80;
 const REF: u8 = 0x90;
+const SEALED: u8 = 0xA0;
 
 /// Decoding failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -34,6 +67,128 @@ pub enum DecodeError {
     /// A complete value was followed by unexpected bytes.
     #[error("trailing bytes after sortable value")]
     Trailing,
+    /// A sealed value's declared value type byte is not known.
+    #[error("unknown value type tag {0:#x}")]
+    InvalidValueType(u8),
+}
+
+/// Seal plaintext encoding failure.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum SealPlaintextError {
+    /// A sealed value cannot itself be sealed again.
+    #[error("sealed values cannot nest")]
+    Nested,
+    /// The value's keyword id does not resolve in the interner.
+    #[error("unresolvable keyword id {0}")]
+    UnresolvableKeyword(KwId),
+    /// The opened plaintext is not a well-formed value encoding.
+    #[error("malformed seal plaintext: {0}")]
+    Malformed(#[from] DecodeError),
+    /// The opened plaintext does not carry the value type the sealed header
+    /// declares.
+    #[error("seal plaintext holds a {actual:?} where the header declares {expected:?}")]
+    TypeMismatch {
+        /// Type named by the sealed header.
+        expected: ValueType,
+        /// Type actually found in the plaintext.
+        actual: ValueType,
+    },
+}
+
+/// Encodes a value as the plaintext of a sealed value.
+///
+/// This is [`encode_value`] with one difference: a keyword is encoded as its
+/// *text*, under the string tag, rather than as its interner id. Ids are
+/// assigned by the transactor's naming table, and a protected attribute's
+/// vocabulary must never reach it — an id would leak the very value the seal
+/// is meant to hide, and would not survive a reader that interns differently.
+/// [`decode_seal_plaintext`] reverses this using the declared value type.
+///
+/// # Errors
+///
+/// Returns [`SealPlaintextError::Nested`] for an already-sealed value and
+/// [`SealPlaintextError::UnresolvableKeyword`] when a keyword id has no text
+/// in `interner`.
+pub fn encode_seal_plaintext(
+    value: &Value,
+    interner: &KeywordInterner,
+) -> Result<Vec<u8>, SealPlaintextError> {
+    match value {
+        Value::Sealed(_) => Err(SealPlaintextError::Nested),
+        Value::Keyword(id) => {
+            let keyword = interner
+                .resolve(*id)
+                .ok_or(SealPlaintextError::UnresolvableKeyword(*id))?;
+            let mut out = vec![STR];
+            encode_escaped(keyword_text(&keyword).as_bytes(), &mut out);
+            Ok(out)
+        }
+        other => Ok(encode_value(other)),
+    }
+}
+
+/// Decodes plaintext produced by [`encode_seal_plaintext`].
+///
+/// `expected` is the value type from the sealed header, which the AEAD has
+/// already authenticated. Bytes after the first complete value are ignored:
+/// every value encoding is self-delimiting, which is what lets a protection
+/// class pad plaintext to a fixed multiple without recording the true length.
+///
+/// A keyword is re-interned locally ([`KeywordInterner::intern_local`]), so
+/// the durable naming table stays free of the protected vocabulary.
+///
+/// # Errors
+///
+/// Returns [`SealPlaintextError::Malformed`] when the bytes are not a value
+/// encoding, and [`SealPlaintextError::TypeMismatch`] when the value found is
+/// not of the declared type.
+pub fn decode_seal_plaintext(
+    bytes: &[u8],
+    expected: ValueType,
+    interner: &KeywordInterner,
+) -> Result<Value, SealPlaintextError> {
+    let (value, _) = decode_value(bytes)?;
+    if expected == ValueType::Keyword {
+        let Value::Str(text) = value else {
+            return Err(SealPlaintextError::TypeMismatch {
+                expected,
+                actual: value_type_of(&value)?,
+            });
+        };
+        return Ok(Value::Keyword(interner.intern_local(Keyword::parse(&text))));
+    }
+    if value.has_type(expected) {
+        Ok(value)
+    } else {
+        Err(SealPlaintextError::TypeMismatch {
+            expected,
+            actual: value_type_of(&value)?,
+        })
+    }
+}
+
+/// Renders a keyword the way [`Keyword::parse`] reads it back: no leading
+/// colon, namespace and name joined by `/`.
+fn keyword_text(keyword: &Keyword) -> String {
+    keyword.namespace.as_ref().map_or_else(
+        || keyword.name.clone(),
+        |namespace| format!("{namespace}/{}", keyword.name),
+    )
+}
+
+fn value_type_of(value: &Value) -> Result<ValueType, SealPlaintextError> {
+    Ok(match value {
+        Value::Bool(_) => ValueType::Bool,
+        Value::Long(_) => ValueType::Long,
+        Value::Double(_) => ValueType::Double,
+        Value::Instant(_) => ValueType::Instant,
+        Value::Uuid(_) => ValueType::Uuid,
+        Value::Keyword(_) => ValueType::Keyword,
+        Value::Str(_) => ValueType::Str,
+        Value::Bytes(_) => ValueType::Bytes,
+        Value::Ref(_) => ValueType::Ref,
+        Value::Sealed(_) => return Err(SealPlaintextError::Nested),
+    })
 }
 
 /// Trait for types with Corium sortable encodings.
@@ -104,6 +259,13 @@ impl Encodable for Value {
                 out.push(REF);
                 v.encode_into(out);
             }
+            Self::Sealed(v) => {
+                out.push(SEALED);
+                v.class.encode_into(out);
+                out.extend_from_slice(&v.epoch.to_be_bytes());
+                out.push(value_type_tag(v.vtype));
+                encode_escaped(&v.body, out);
+            }
         }
     }
 }
@@ -152,6 +314,21 @@ pub fn decode_value(input: &[u8]) -> Result<(Value, usize), DecodeError> {
                 (Value::Bytes(Arc::from(bytes)), used + 1)
             }
         }
+        SEALED => {
+            let class = EntityId::from_raw(u64::from_be_bytes(array_8(fixed(8)?)));
+            let epoch = u32::from_be_bytes(array_4(rest.get(8..12).ok_or(DecodeError::Truncated)?));
+            let vtype = value_type_from_tag(*rest.get(12).ok_or(DecodeError::Truncated)?)?;
+            let (body, used) = decode_escaped(rest.get(13..).ok_or(DecodeError::Truncated)?)?;
+            (
+                Value::Sealed(Sealed {
+                    class,
+                    epoch,
+                    vtype,
+                    body: Arc::from(body),
+                }),
+                1 + 13 + used,
+            )
+        }
         other => return Err(DecodeError::UnknownTag(other)),
     })
 }
@@ -194,6 +371,12 @@ fn decode_escaped(input: &[u8]) -> Result<(Vec<u8>, usize), DecodeError> {
         }
     }
     Err(DecodeError::Truncated)
+}
+
+fn array_4(bytes: &[u8]) -> [u8; 4] {
+    let mut out = [0; 4];
+    out.copy_from_slice(bytes);
+    out
 }
 
 fn array_8(bytes: &[u8]) -> [u8; 8] {

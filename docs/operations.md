@@ -586,6 +586,44 @@ Two operational consequences worth planning for:
   one, because copying its ciphertext without the key manifest (backup format 2)
   would produce an archive no restore could open.
 
+## Attribute protection
+
+Storage encryption protects the medium. **Attribute protection** protects
+facts from readers: values on an attribute that names a protection class are
+sealed by the writing peer under that class's key, and only a process whose
+keyring resolves that key ever sees them in the clear — not the transactor,
+not a peer without the key, not an operator with storage credentials. Declare
+classes in the create-time schema
+([docs/schema-toml.md](schema-toml.md#protection-classes)); see
+[docs/design/encryption.md](design/encryption.md) and
+[ADR-0018](adr/0018-attribute-protection-classes.md).
+
+Class keys are resolved by identity, exactly like a KEK, and are passed to
+whichever processes should read the class. A process with no class keys is a
+fully working peer: it commits, indexes, syncs, and answers every query that
+does not touch a protected value identically, and protected values come back
+redacted, hidden, or refused according to the class's `on-missing-key` policy.
+
+> **Do not expose a key-holding peer server to clients that are not entitled
+> to every class it holds.** A peer server hydrates every request with its own
+> keyring, whichever principal made it: the per-principal key policy that
+> would narrow this — and seal-through mode, where the server forwards sealed
+> values and the thin client hydrates for itself — are not implemented. The
+> authorization guard gates databases and operations, not classes, so it does
+> not close the gap either. Until they land:
+>
+> - Give a peer server class keys only when **every** client it serves may
+>   read **every** class it holds.
+> - For mixed or less-trusted clients, run the peer server with no class keys
+>   and let entitled applications use an embedded peer (`LocalPeer`) with
+>   their own keyring, where the keys stay in the process that owns them.
+> - Splitting by class means splitting by peer server for now: one per
+>   entitlement group, each holding only its own keys.
+
+Protection is fixed at database creation, like encryption at rest: changing an
+attribute's protection needs a schema-alteration mechanism Corium does not yet
+have, so plan classes before you create the database.
+
 ## Authorization (self-hosted ReBAC)
 
 Servers authorize every request permit-all by default. `--authz-db <name>`

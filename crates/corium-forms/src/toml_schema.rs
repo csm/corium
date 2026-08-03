@@ -7,12 +7,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use corium_core::{Cardinality, Keyword, Unique, ValueType};
+use corium_core::{
+    Cardinality, FIRST_KEY_EPOCH, Keyword, LegacyPlaintextPolicy, MissingKeyPolicy,
+    ProtectionScope, SealAlgorithm, Unique, ValueType,
+};
 use corium_query::edn::Edn;
 use serde::de::value::MapAccessDeserializer;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
+
+use crate::schemaform::MIN_PADDING;
 
 /// One normalized attribute declaration, independent of its source syntax.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +40,91 @@ pub struct AttributeDefinition {
     pub no_history: bool,
     /// Optional documentation (`:db/doc`).
     pub doc: Option<String>,
+    /// Protection class ident, when the attribute is protected.
+    pub protection: Option<Keyword>,
+}
+
+/// One normalized protection-class declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtectionClassDefinition {
+    /// Class name within the `protect` namespace, giving ident `:protect/…`.
+    pub name: String,
+    /// Key identity the class names; it never holds material.
+    pub key_id: String,
+    /// Sealing algorithm.
+    pub algorithm: SealAlgorithm,
+    /// What the sealing context binds.
+    pub scope: ProtectionScope,
+    /// Plaintext padding multiple, in bytes.
+    pub padding: Option<u32>,
+    /// What a reader without the key sees.
+    pub on_missing_key: MissingKeyPolicy,
+    /// How pre-protection plaintext is treated.
+    pub legacy_plaintext: LegacyPlaintextPolicy,
+    /// Epoch new values seal under.
+    pub epoch: u32,
+}
+
+impl ProtectionClassDefinition {
+    /// Returns the canonical class ident, `:protect/<name>`.
+    #[must_use]
+    pub fn ident(&self) -> Keyword {
+        Keyword::new(Some("protect"), &self.name)
+    }
+
+    /// Converts the declaration to the EDN class map `schema_from_edn` reads.
+    #[must_use]
+    pub fn to_edn(&self) -> Edn {
+        let mut pairs = vec![
+            (kw("db.protect/ident"), Edn::Keyword(self.ident())),
+            (kw("db.protect/key"), Edn::Str(self.key_id.clone())),
+            (
+                kw("db.protect/algorithm"),
+                kw(match self.algorithm {
+                    SealAlgorithm::Aes256GcmSiv => "db.protect.alg/aes-256-gcm-siv",
+                }),
+            ),
+            (
+                kw("db.protect/scope"),
+                kw(match self.scope {
+                    ProtectionScope::Attribute => "db.protect.scope/attribute",
+                    ProtectionScope::Entity => "db.protect.scope/entity",
+                }),
+            ),
+            (
+                kw("db.protect/on-missing-key"),
+                kw(match self.on_missing_key {
+                    MissingKeyPolicy::Redact => "db.protect.missing/redact",
+                    MissingKeyPolicy::Hide => "db.protect.missing/hide",
+                    MissingKeyPolicy::Error => "db.protect.missing/error",
+                }),
+            ),
+            (
+                kw("db.protect/legacy-plaintext"),
+                kw(match self.legacy_plaintext {
+                    LegacyPlaintextPolicy::Redact => "db.protect.legacy/redact",
+                    LegacyPlaintextPolicy::PassThrough => "db.protect.legacy/pass-through",
+                }),
+            ),
+        ];
+        if let Some(padding) = self.padding {
+            pairs.push((kw("db.protect/padding"), Edn::Long(i64::from(padding))));
+        }
+        if self.epoch != FIRST_KEY_EPOCH {
+            pairs.push((kw("db.protect/epoch"), Edn::Long(i64::from(self.epoch))));
+        }
+        pairs.sort_unstable();
+        Edn::Map(pairs)
+    }
+}
+
+/// Everything one schema document declares.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SchemaDefinitions {
+    /// Protection classes, in class-name order.
+    pub classes: Vec<ProtectionClassDefinition>,
+    /// Attribute declarations.
+    pub attributes: Vec<AttributeDefinition>,
 }
 
 impl AttributeDefinition {
@@ -81,6 +171,9 @@ impl AttributeDefinition {
         }
         if let Some(doc) = &self.doc {
             pairs.push((kw("db/doc"), Edn::Str(doc.clone())));
+        }
+        if let Some(protection) = &self.protection {
+            pairs.push((kw("db/protection"), Edn::Keyword(protection.clone())));
         }
         pairs.sort_unstable();
         Edn::Map(pairs)
@@ -143,6 +236,37 @@ pub enum TomlSchemaError {
     /// Two entity authoring blocks use the same group name.
     #[error("duplicate entity group {0:?}")]
     DuplicateEntity(String),
+    /// A protection-class option names a value the model does not have.
+    #[error("unknown {field} {value:?} for protection class {class}")]
+    UnknownProtectionOption {
+        /// Class being normalized.
+        class: String,
+        /// Option name.
+        field: &'static str,
+        /// Unknown source value.
+        value: String,
+    },
+    /// A protection class sets a padding below the useful minimum.
+    #[error(
+        "padding {padding} for protection class {class} is below the \
+         {minimum}-byte minimum"
+    )]
+    PaddingTooSmall {
+        /// Class being normalized.
+        class: String,
+        /// Declared padding.
+        padding: i64,
+        /// Smallest padding the model accepts.
+        minimum: i64,
+    },
+    /// An attribute names a protection class the document does not declare.
+    #[error("attribute {ident} names unknown protection class {class:?}")]
+    UnknownProtectionClass {
+        /// Attribute being normalized.
+        ident: String,
+        /// Class it names.
+        class: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +278,28 @@ struct SchemaDocument {
     entities: Vec<EntityDeclaration>,
     #[serde(default, rename = "attribute")]
     attributes: Vec<FlatAttributeDeclaration>,
+    // TOML tables are unordered; a BTreeMap makes class-id allocation
+    // deterministic rather than dependent on parser insertion order.
+    #[serde(default, rename = "protect")]
+    classes: BTreeMap<String, ProtectionClassDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct ProtectionClassDeclaration {
+    key: String,
+    #[serde(default)]
+    algorithm: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    padding: Option<i64>,
+    #[serde(default)]
+    on_missing_key: Option<String>,
+    #[serde(default)]
+    legacy_plaintext: Option<String>,
+    #[serde(default)]
+    epoch: Option<u32>,
 }
 
 const fn default_schema_version() -> u32 {
@@ -246,6 +392,8 @@ struct AttributeOptions {
     no_history: bool,
     #[serde(default)]
     doc: Option<String>,
+    #[serde(default)]
+    protection: Option<String>,
 }
 
 impl RawAttribute {
@@ -260,6 +408,7 @@ impl RawAttribute {
                 component: false,
                 no_history: false,
                 doc: None,
+                protection: None,
             },
             Self::Detailed(options) => options,
         }
@@ -275,10 +424,16 @@ impl RawAttribute {
 /// # Errors
 /// Returns [`TomlSchemaError`] for invalid TOML, unsupported values, invalid
 /// names, conflicting cardinality spellings, or duplicate canonical idents.
-pub fn parse(input: &str) -> Result<Vec<AttributeDefinition>, TomlSchemaError> {
+pub fn parse(input: &str) -> Result<SchemaDefinitions, TomlSchemaError> {
     let document: SchemaDocument = toml::from_str(input)?;
     if document.schema_version != 1 {
         return Err(TomlSchemaError::UnsupportedVersion(document.schema_version));
+    }
+
+    let mut classes = Vec::with_capacity(document.classes.len());
+    for (name, declaration) in document.classes {
+        validate_name("protection class", &name)?;
+        classes.push(normalize_class(name, declaration)?);
     }
 
     let mut definitions = Vec::new();
@@ -310,20 +465,111 @@ pub fn parse(input: &str) -> Result<Vec<AttributeDefinition>, TomlSchemaError> {
         if !seen.insert(ident.clone()) {
             return Err(TomlSchemaError::DuplicateAttribute(ident));
         }
+        if let Some(protection) = &definition.protection
+            && !classes.iter().any(|class| &class.ident() == protection)
+        {
+            return Err(TomlSchemaError::UnknownProtectionClass {
+                ident,
+                class: protection.to_string(),
+            });
+        }
     }
-    Ok(definitions)
+    Ok(SchemaDefinitions {
+        classes,
+        attributes: definitions,
+    })
 }
 
-/// Parses TOML and emits equivalent EDN attribute maps for existing APIs.
+/// Parses TOML and emits equivalent EDN maps for existing APIs.
+///
+/// Classes come first, so their entity ids are stable under later attribute
+/// edits and an attribute may name a class regardless of source order.
 ///
 /// # Errors
 /// Returns the same failures as [`parse`].
 pub fn parse_edn(input: &str) -> Result<Vec<Edn>, TomlSchemaError> {
     parse(input).map(|definitions| {
         definitions
-            .into_iter()
-            .map(|definition| definition.to_edn())
+            .classes
+            .iter()
+            .map(ProtectionClassDefinition::to_edn)
+            .chain(
+                definitions
+                    .attributes
+                    .iter()
+                    .map(AttributeDefinition::to_edn),
+            )
             .collect()
+    })
+}
+
+fn normalize_class(
+    name: String,
+    declaration: ProtectionClassDeclaration,
+) -> Result<ProtectionClassDefinition, TomlSchemaError> {
+    let class = format!(":protect/{name}");
+    let unknown = |field: &'static str, value: String| TomlSchemaError::UnknownProtectionOption {
+        class: class.clone(),
+        field,
+        value,
+    };
+    let algorithm = match declaration.algorithm.as_deref() {
+        None | Some("aes-256-gcm-siv") => SealAlgorithm::Aes256GcmSiv,
+        Some(_) => {
+            return Err(unknown(
+                "algorithm",
+                declaration.algorithm.unwrap_or_default(),
+            ));
+        }
+    };
+    let scope = match declaration.scope.as_deref() {
+        None | Some("attribute") => ProtectionScope::Attribute,
+        Some("entity") => ProtectionScope::Entity,
+        Some(_) => return Err(unknown("scope", declaration.scope.unwrap_or_default())),
+    };
+    let on_missing_key = match declaration.on_missing_key.as_deref() {
+        None | Some("redact") => MissingKeyPolicy::Redact,
+        Some("hide") => MissingKeyPolicy::Hide,
+        Some("error") => MissingKeyPolicy::Error,
+        Some(_) => {
+            return Err(unknown(
+                "on-missing-key",
+                declaration.on_missing_key.unwrap_or_default(),
+            ));
+        }
+    };
+    let legacy_plaintext = match declaration.legacy_plaintext.as_deref() {
+        None | Some("redact") => LegacyPlaintextPolicy::Redact,
+        Some("pass-through") => LegacyPlaintextPolicy::PassThrough,
+        Some(_) => {
+            return Err(unknown(
+                "legacy-plaintext",
+                declaration.legacy_plaintext.unwrap_or_default(),
+            ));
+        }
+    };
+    let padding = match declaration.padding {
+        None => None,
+        Some(padding) => Some(
+            u32::try_from(padding)
+                .ok()
+                .filter(|_| padding >= MIN_PADDING)
+                .ok_or(TomlSchemaError::PaddingTooSmall {
+                    class: class.clone(),
+                    padding,
+                    minimum: MIN_PADDING,
+                })?,
+        ),
+    };
+    Ok(ProtectionClassDefinition {
+        name,
+        key_id: declaration.key,
+        algorithm,
+        scope,
+        padding,
+        on_missing_key,
+        legacy_plaintext,
+        epoch: declaration.epoch.unwrap_or(FIRST_KEY_EPOCH),
     })
 }
 
@@ -366,6 +612,7 @@ fn normalize(
         .transpose()?;
     let indexed = options.index || unique.is_some();
 
+    let protection = options.protection.map(|class| Keyword::parse(&class));
     Ok(AttributeDefinition {
         group,
         name,
@@ -376,6 +623,7 @@ fn normalize(
         component: options.component,
         no_history: options.no_history,
         doc: options.doc,
+        protection,
     })
 }
 
@@ -513,7 +761,7 @@ type = "ref"
 
     #[test]
     fn parses_grouped_and_flat_attributes() {
-        let definitions = parse(SCHEMA).expect("schema parses");
+        let definitions = parse(SCHEMA).expect("schema parses").attributes;
         assert_eq!(definitions.len(), 9);
         assert_eq!(definitions[0].ident().to_string(), ":person/address");
         assert_eq!(definitions[1].ident().to_string(), ":person/age");
@@ -588,6 +836,84 @@ doc = "points earned"
         assert_eq!(
             parse("[[attribute]]\nname = \"n\"\ntype = \"long\"").expect("schema parses")[0].doc,
             None
+        );
+    }
+    fn protection_classes_install_through_the_edn_path() {
+        let toml = r#"
+[protect.pii]
+key = "file:/etc/corium/pii.key"
+padding = 64
+on-missing-key = "hide"
+scope = "entity"
+
+[[attribute]]
+group = "person"
+name = "ssn"
+type = "string"
+protection = "protect/pii"
+"#;
+        let definitions = parse(toml).expect("schema parses");
+        assert_eq!(definitions.classes.len(), 1);
+        assert_eq!(definitions.classes[0].ident().to_string(), ":protect/pii");
+        assert_eq!(
+            definitions.attributes[0].protection,
+            Some(Keyword::new(Some("protect"), "pii"))
+        );
+
+        // Classes come first, so their entity ids do not move when attributes
+        // are added or removed later.
+        let forms = parse_edn(toml).expect("schema parses");
+        let (schema, idents) = schema_from_edn(&forms).expect("schema installs");
+        let ssn = idents
+            .entid(&Keyword::new(Some("person"), "ssn"))
+            .expect("ssn ident");
+        let class = schema.protection_class(ssn).expect("ssn is protected");
+        assert_eq!(class.key_id, "file:/etc/corium/pii.key");
+        assert_eq!(class.padding, Some(64));
+        assert_eq!(class.on_missing_key, MissingKeyPolicy::Hide);
+        assert_eq!(class.scope, ProtectionScope::Entity);
+    }
+
+    #[test]
+    fn rejects_bad_protection_declarations() {
+        let unknown_class = parse(
+            r#"
+[[attribute]]
+name = "ssn"
+type = "string"
+protection = "protect/pii"
+"#,
+        )
+        .expect_err("unknown class must fail");
+        assert_eq!(
+            unknown_class.to_string(),
+            "attribute :ssn names unknown protection class \":protect/pii\""
+        );
+
+        let small = parse(
+            r#"
+[protect.pii]
+key = "file:/k"
+padding = 8
+"#,
+        )
+        .expect_err("small padding must fail");
+        assert_eq!(
+            small.to_string(),
+            "padding 8 for protection class :protect/pii is below the 16-byte minimum"
+        );
+
+        let policy = parse(
+            r#"
+[protect.pii]
+key = "file:/k"
+on-missing-key = "shrug"
+"#,
+        )
+        .expect_err("unknown policy must fail");
+        assert_eq!(
+            policy.to_string(),
+            "unknown on-missing-key \"shrug\" for protection class :protect/pii"
         );
     }
 
@@ -754,7 +1080,8 @@ name = "name"
 type = "string"
 "#,
         )
-        .expect("empty group is authoring-only");
+        .expect("empty group is authoring-only")
+        .attributes;
         assert_eq!(definitions.len(), 1);
 
         let duplicate = parse(

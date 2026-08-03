@@ -107,6 +107,101 @@ pub enum TxError {
     /// explicit assertion on the transaction currently being prepared.
     #[error(":db/txInstant may only be added once to the current transaction entity")]
     InvalidTxInstantOperation,
+    /// A plaintext value was asserted on a protected attribute.
+    ///
+    /// A client that does not understand protection cannot accidentally write
+    /// plaintext into a protected attribute (ADR-0018).
+    #[error("attribute {0} is protected; assertions must be sealed")]
+    UnprotectedValue(EntityId),
+    /// A sealed value was asserted on an attribute that is not protected.
+    #[error("attribute {0} is not protected; assertions must be plaintext")]
+    UnexpectedProtection(EntityId),
+    /// An assertion used a class or epoch that is no longer current.
+    ///
+    /// The writing peer sealed against a schema the transactor has since
+    /// moved past; it retries against the new one rather than storing a value
+    /// in the stale form.
+    #[error(
+        "attribute {attr} is protected by class {expected_class} at epoch \
+         {expected_epoch}; the assertion is sealed under class {class} epoch {epoch}"
+    )]
+    StaleProtectionForm {
+        /// Attribute being asserted on.
+        attr: EntityId,
+        /// Class the schema requires now.
+        expected_class: EntityId,
+        /// Epoch the schema requires now.
+        expected_epoch: u32,
+        /// Class the value names.
+        class: EntityId,
+        /// Epoch the value names.
+        epoch: u32,
+    },
+    /// A retraction or `:db/cas` old value named a class the attribute has
+    /// never been sealed under — a form it never had.
+    #[error("attribute {attr} was never sealed under class {class}")]
+    ForeignProtectionClass {
+        /// Attribute being retracted from.
+        attr: EntityId,
+        /// Class the value names.
+        class: EntityId,
+    },
+}
+
+/// Checks the form an assertion must use on `a`, without holding any key.
+///
+/// Assertions use the form the attribute has *now*: sealed under the current
+/// class and epoch if it is protected, plaintext if it is not. The value type
+/// is checked separately by [`validate`], which reads a sealed value's
+/// declared type from its cleartext header.
+fn validate_assertion_form(db: &Db, a: EntityId, value: &Value) -> Result<(), TxError> {
+    let schema = db.schema();
+    match (schema.protection(a).current(), value) {
+        (Some(expected_class), Value::Sealed(sealed)) => {
+            let expected_epoch = schema
+                .class(expected_class)
+                .map_or(sealed.epoch, |class| class.current_epoch);
+            if sealed.class == expected_class && sealed.epoch == expected_epoch {
+                Ok(())
+            } else {
+                Err(TxError::StaleProtectionForm {
+                    attr: a,
+                    expected_class,
+                    expected_epoch,
+                    class: sealed.class,
+                    epoch: sealed.epoch,
+                })
+            }
+        }
+        (Some(_), _) => Err(TxError::UnprotectedValue(a)),
+        (None, Value::Sealed(_)) => Err(TxError::UnexpectedProtection(a)),
+        (None, _) => Ok(()),
+    }
+}
+
+/// Checks the form a retraction or `:db/cas` old value may use on `a`.
+///
+/// Any form the attribute has ever had is accepted — plaintext, or sealed
+/// under any class in its timeline at any epoch. A fact can only be retracted
+/// by naming the bytes it was asserted as, and those bytes do not change when
+/// the schema does.
+fn validate_historical_form(db: &Db, a: EntityId, value: &Value) -> Result<(), TxError> {
+    let Value::Sealed(sealed) = value else {
+        return Ok(());
+    };
+    if db
+        .schema()
+        .protection(a)
+        .classes()
+        .any(|class| class == sealed.class)
+    {
+        Ok(())
+    } else {
+        Err(TxError::ForeignProtectionClass {
+            attr: a,
+            class: sealed.class,
+        })
+    }
 }
 
 /// Expands and validates transaction input against `db`.
@@ -198,6 +293,7 @@ pub fn prepare(
                     tx_instant_asserted = true;
                 }
                 validate(&working, a, &v)?;
+                validate_assertion_form(&working, a, &v)?;
                 if let Some(attr) = working.schema().get(a) {
                     if attr.unique.is_some()
                         && working.lookup(a, &v).is_some_and(|owner| owner != e)
@@ -234,6 +330,7 @@ pub fn prepare(
                     return Err(TxError::InvalidTxInstantOperation);
                 }
                 validate(&working, a, &v)?;
+                validate_historical_form(&working, a, &v)?;
                 let e = resolve(&entity)?;
                 // Retracting an absent fact is a no-op: no datom recorded.
                 if working.values(e, a).contains(&v) {
@@ -251,6 +348,10 @@ pub fn prepare(
                     return Err(TxError::InvalidTxInstantOperation);
                 }
                 validate(&working, a, &new)?;
+                validate_assertion_form(&working, a, &new)?;
+                if let Some(old) = &old {
+                    validate_historical_form(&working, a, old)?;
+                }
                 let e = resolve(&entity)?;
                 if working
                     .schema()

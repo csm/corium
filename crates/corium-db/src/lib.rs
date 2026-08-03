@@ -18,6 +18,7 @@
 
 pub mod bootstrap;
 pub mod impact;
+pub mod protect;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -86,6 +87,9 @@ pub struct AttrStats {
     pub distinct_values: usize,
     /// Distinct entities carrying this attribute.
     pub distinct_entities: usize,
+    /// Whether the attribute is protected, in which case the planner must
+    /// not use `distinct_values`.
+    pub protected: bool,
 }
 
 /// Whole-view statistics for the query planner.
@@ -108,7 +112,13 @@ impl PlannerStats {
             // Bound entity: at most the entity's datoms; refine by attribute.
             (true, Some(stats)) => (stats.count / stats.distinct_entities.max(1)).max(1),
             (true, None) => (self.total_datoms / self.entity_count.max(1)).max(1),
-            (false, Some(stats)) if v_bound => (stats.count / stats.distinct_values.max(1)).max(1),
+            // A bound value on a protected attribute is treated as unbound
+            // for selectivity. A distinct-*ciphertext* count would be a real
+            // estimate and a real leak, so it is dropped rather than used
+            // (`docs/design/encryption.md`).
+            (false, Some(stats)) if v_bound && !stats.protected => {
+                (stats.count / stats.distinct_values.max(1)).max(1)
+            }
             (false, Some(stats)) => stats.count.max(1),
             // Unknown attribute constant: nothing will match.
             (false, None) if a.is_some() => 1,
@@ -658,19 +668,28 @@ impl Db {
     /// Iterates the AVET index for `a` over the value range `[start, end)`.
     ///
     /// Only indexed/unique attributes appear in AVET.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RangeError::Protected`] for a protected attribute. Sealed
+    /// order is byte order, not value order, so a range over one would return
+    /// silently wrong answers; the design makes it a loud failure instead.
     pub fn index_range<'a>(
         &'a self,
         a: AttrId,
         start: Option<&Value>,
         end: Option<&'a Value>,
-    ) -> impl Iterator<Item = &'a Datom> {
+    ) -> Result<impl Iterator<Item = &'a Datom>, RangeError> {
+        if self.schema.protection(a).ever_protected() {
+            return Err(RangeError::Protected(a));
+        }
         let a_prefix = key_prefix(IndexOrder::Avet, None, Some(a), None);
         let start_key = key_prefix(IndexOrder::Avet, None, Some(a), start);
-        self.indexes()[slot(IndexOrder::Avet)]
+        Ok(self.indexes()[slot(IndexOrder::Avet)]
             .range(start_key..)
             .take_while(move |(key, _)| key.starts_with(&a_prefix))
             .map(|(_, datom)| datom.as_ref())
-            .take_while(move |datom| end.is_none_or(|end| datom.v < *end))
+            .take_while(move |datom| end.is_none_or(|end| datom.v < *end)))
     }
 
     /// Current values for an entity/attribute pair.
@@ -793,6 +812,7 @@ impl Db {
             for (a, entry) in &mut stats.per_attr {
                 entry.distinct_values = values.get(a).map_or(0, BTreeSet::len);
                 entry.distinct_entities = attr_entities.get(a).map_or(0, BTreeSet::len);
+                entry.protected = self.schema.is_protected(*a);
             }
             stats.entity_count = entities.len();
             stats
@@ -922,6 +942,14 @@ pub fn covered(schema: &Schema, order: IndexOrder, datom: &Datom) -> bool {
         IndexOrder::Avet => avet_covered(schema, datom.a),
         IndexOrder::Vaet => matches!(datom.v, Value::Ref(_)),
     }
+}
+
+/// Why a value-ordered index scan is unavailable.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum RangeError {
+    /// The attribute is, or has been, protected.
+    #[error("attribute {0} is protected; sealed values have no value order")]
+    Protected(AttrId),
 }
 
 /// Whether the attribute participates in the AVET covering index.
@@ -1190,6 +1218,7 @@ mod tests {
         );
         let hits: Vec<_> = db
             .index_range(attr(2), Some(&Value::Long(2)), Some(&Value::Long(9)))
+            .expect("an unprotected attribute has a value order")
             .map(|d| d.e)
             .collect();
         assert_eq!(hits, vec![entity(2)]);
