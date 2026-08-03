@@ -1,7 +1,7 @@
 //! Release scenarios for the security boundaries users actually deploy.
 //!
-//! These tests deliberately use signed RS256 JWTs, the self-hosted ReBAC
-//! authorizer, real gRPC servers, real peer hydration, and a PostgreSQL wire
+//! These tests deliberately use signed RS256 JWTs, the self-hosted `ReBAC`
+//! authorizer, real gRPC servers, real peer hydration, and a `PostgreSQL` wire
 //! client. The peer-server and pgwire tests also pin current limitations so
 //! the non-blocking scenario report can surface them without mistaking a
 //! known, fail-safe boundary for a harness failure.
