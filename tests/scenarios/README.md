@@ -23,9 +23,10 @@ signed RS256 JWTs with issuer and audience validation, the self-hosted ReBAC
 authorizer, and real direct-peer, peer-server, and PostgreSQL-wire clients.
 Known product gaps have a separate `LIMITATION` status: they are verified and
 prominent in the report without being confused with a harness failure. The
-schema-update scenario exercises the shipped plan-first CLI and verifies its
-expected additive change. Every scenario is isolated by the runner, so a
-failure does not prevent later scenarios from running.
+schema-update scenario reviews the plan digest, applies the expected additive
+change, verifies the installed attribute, and re-plans to confirm convergence.
+Every scenario is isolated by the runner, so a failure does not prevent later
+scenarios from running.
 
 Build the CLI and install the Python client before running locally:
 
