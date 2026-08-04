@@ -240,15 +240,15 @@ enum Statement {
     Use(String),
     /// `SHOW DATABASES` — list the catalog.
     ShowDatabases,
-    /// PgJDBC's `DatabaseMetaData.getSQLKeywords()` catalog probe.
+    /// `PgJDBC`'s `DatabaseMetaData.getSQLKeywords()` catalog probe.
     SqlKeywords,
-    /// PgJDBC's `Connection.getSchema()` query.
+    /// `PgJDBC`'s `Connection.getSchema()` query.
     CurrentSchema,
     /// Hibernate/PostgreSQL current-catalog introspection.
     CurrentCatalog,
-    /// A scalar PostgreSQL runtime setting requested through JDBC metadata.
+    /// A scalar `PostgreSQL` runtime setting requested through JDBC metadata.
     PgSetting(String),
-    /// PgJDBC's connection-isolation query.
+    /// `PgJDBC`'s connection-isolation query.
     ShowTransactionIsolation,
     /// An ordinary read-only query for `SqlSession`.
     Query,
@@ -286,10 +286,10 @@ type HydratorKey = (String, Option<BTreeSet<String>>);
 /// growing without bound.
 const HYDRATOR_CACHE_CAP: usize = 256;
 
-/// PostgreSQL-specific words returned by PgJDBC on pre-9.0 servers. Newer
+/// PostgreSQL-specific words returned by `PgJDBC` on pre-9.0 servers. Newer
 /// drivers derive the same list from `pg_catalog.pg_get_keywords()`; serving
 /// it directly keeps JDBC metadata bootstrapping independent of a physical
-/// PostgreSQL catalog.
+/// `PostgreSQL` catalog.
 const POSTGRES_SQL_KEYWORDS: &str = "abort,access,aggregate,also,analyse,analyze,backward,bit,cache,checkpoint,class,cluster,comment,concurrently,connection,conversion,copy,csv,database,delimiter,delimiters,disable,do,enable,encoding,encrypted,exclusive,explain,force,forward,freeze,greatest,handler,header,if,ilike,immutable,implicit,index,indexes,inherit,inherits,instead,isnull,least,limit,listen,load,location,lock,mode,move,nothing,notify,notnull,nowait,off,offset,oids,operator,owned,owner,password,prepared,procedural,quote,reassign,recheck,reindex,rename,replace,reset,restrict,returning,rule,setof,share,show,stable,statistics,stdin,stdout,storage,strict,sysid,tablespace,temp,template,truncate,trusted,unencrypted,unlisten,until,vacuum,valid,validator,verbose,volatile";
 
 /// Hydrators shared by every connection, keyed by database and key set.
@@ -566,6 +566,9 @@ where
             self.report_transaction_aborted();
             return Ok(false);
         }
+        if self.write_metadata_statement(&statement, true, &[]) {
+            return Ok(true);
+        }
         match statement {
             Statement::Control(tag) => {
                 self.writer.command_complete(tag);
@@ -608,45 +611,14 @@ where
                     Ok(false)
                 }
             },
-            Statement::SqlKeywords => {
-                self.write_sql_keywords(true, &[]);
-                Ok(true)
+            Statement::SqlKeywords
+            | Statement::CurrentSchema
+            | Statement::CurrentCatalog
+            | Statement::PgSetting(_)
+            | Statement::ShowTransactionIsolation => {
+                unreachable!("metadata statements are handled before dispatch")
             }
-            Statement::CurrentSchema => {
-                self.write_current_schema(true, &[]);
-                Ok(true)
-            }
-            Statement::CurrentCatalog => {
-                self.write_current_catalog(true, &[]);
-                Ok(true)
-            }
-            Statement::PgSetting(name) => {
-                self.write_pg_setting(&name, true, &[]);
-                Ok(true)
-            }
-            Statement::ShowTransactionIsolation => {
-                self.write_transaction_isolation(true, &[]);
-                Ok(true)
-            }
-            Statement::Query => {
-                let scope = match self.scope(None, Action::Query).await {
-                    Ok(scope) => scope,
-                    Err(error) => {
-                        self.report_dispatch(&error);
-                        return Ok(false);
-                    }
-                };
-                match self.run_statement(&scope, sql, &[], true, &[]).await {
-                    Ok(rows) => {
-                        self.writer.command_complete(&command_tag(sql, rows));
-                        Ok(true)
-                    }
-                    Err(error) => {
-                        self.report_dispatch(&Dispatch::Sql(error));
-                        Ok(false)
-                    }
-                }
-            }
+            Statement::Query => self.run_simple_read(sql).await,
             Statement::Mutation => {
                 let Some(database) = self.current_db.clone() else {
                     self.report_dispatch(&Dispatch::NoDatabase);
@@ -673,6 +645,26 @@ where
                         Ok(false)
                     }
                 }
+            }
+        }
+    }
+
+    async fn run_simple_read(&mut self, sql: &str) -> std::io::Result<bool> {
+        let scope = match self.scope(None, Action::Query).await {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.report_dispatch(&error);
+                return Ok(false);
+            }
+        };
+        match self.run_statement(&scope, sql, &[], true, &[]).await {
+            Ok(rows) => {
+                self.writer.command_complete(&command_tag(sql, rows));
+                Ok(true)
+            }
+            Err(error) => {
+                self.report_dispatch(&Dispatch::Sql(error));
+                Ok(false)
             }
         }
     }
@@ -884,6 +876,9 @@ where
             );
             return Ok(());
         }
+        if self.write_metadata_statement(&statement, false, &result_formats) {
+            return Ok(());
+        }
         match statement {
             Statement::Control(tag) => self.writer.command_complete(tag),
             Statement::Begin => {
@@ -907,30 +902,16 @@ where
                     self.fail_dispatch(&error);
                 }
             }
-            Statement::SqlKeywords => self.write_sql_keywords(false, &result_formats),
-            Statement::CurrentSchema => self.write_current_schema(false, &result_formats),
-            Statement::CurrentCatalog => self.write_current_catalog(false, &result_formats),
-            Statement::PgSetting(name) => {
-                self.write_pg_setting(&name, false, &result_formats);
-            }
-            Statement::ShowTransactionIsolation => {
-                self.write_transaction_isolation(false, &result_formats);
+            Statement::SqlKeywords
+            | Statement::CurrentSchema
+            | Statement::CurrentCatalog
+            | Statement::PgSetting(_)
+            | Statement::ShowTransactionIsolation => {
+                unreachable!("metadata statements are handled before dispatch")
             }
             Statement::Query => {
-                let scope = match self.scope(database.as_deref(), Action::Query).await {
-                    Ok(scope) => scope,
-                    Err(error) => {
-                        self.fail_dispatch(&error);
-                        return Ok(());
-                    }
-                };
-                match self
-                    .run_statement(&scope, &sql, &params, false, &result_formats)
-                    .await
-                {
-                    Ok(rows) => self.writer.command_complete(&command_tag(&sql, rows)),
-                    Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
-                }
+                self.run_extended_read(database.as_deref(), &sql, &params, &result_formats)
+                    .await;
             }
             Statement::Mutation => {
                 let Some(database) = database.or_else(|| self.current_db.clone()) else {
@@ -956,6 +937,29 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn run_extended_read(
+        &mut self,
+        database: Option<&str>,
+        sql: &str,
+        params: &[corium_sql::SqlValue],
+        result_formats: &[i16],
+    ) {
+        let scope = match self.scope(database, Action::Query).await {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.fail_dispatch(&error);
+                return;
+            }
+        };
+        match self
+            .run_statement(&scope, sql, params, false, result_formats)
+            .await
+        {
+            Ok(rows) => self.writer.command_complete(&command_tag(sql, rows)),
+            Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
+        }
     }
 
     /// Validates and activates `name` as the connection's database, warming
@@ -996,7 +1000,35 @@ where
         Ok(())
     }
 
-    /// Answers the catalog-function query PgJDBC uses to implement
+    /// Writes one JDBC metadata response and reports whether it was handled.
+    fn write_metadata_statement(
+        &mut self,
+        statement: &Statement,
+        with_row_description: bool,
+        result_formats: &[i16],
+    ) -> bool {
+        match statement {
+            Statement::SqlKeywords => {
+                self.write_sql_keywords(with_row_description, result_formats);
+            }
+            Statement::CurrentSchema => {
+                self.write_current_schema(with_row_description, result_formats);
+            }
+            Statement::CurrentCatalog => {
+                self.write_current_catalog(with_row_description, result_formats);
+            }
+            Statement::PgSetting(name) => {
+                self.write_pg_setting(name, with_row_description, result_formats);
+            }
+            Statement::ShowTransactionIsolation => {
+                self.write_transaction_isolation(with_row_description, result_formats);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Answers the catalog-function query `PgJDBC` uses to implement
     /// `DatabaseMetaData.getSQLKeywords()`.
     fn write_sql_keywords(&mut self, with_row_description: bool, result_formats: &[i16]) {
         if with_row_description {
@@ -1007,7 +1039,7 @@ where
         self.writer.command_complete("SELECT 1");
     }
 
-    /// Answers the query PgJDBC uses to implement `Connection.getSchema()`.
+    /// Answers the query `PgJDBC` uses to implement `Connection.getSchema()`.
     fn write_current_schema(&mut self, with_row_description: bool, result_formats: &[i16]) {
         if with_row_description {
             self.write_row_description(&[current_schema_field()], result_formats);
@@ -1016,7 +1048,7 @@ where
         self.writer.command_complete("SELECT 1");
     }
 
-    /// Answers PostgreSQL current-catalog introspection without requiring a
+    /// Answers `PostgreSQL` current-catalog introspection without requiring a
     /// physical `pg_catalog` database.
     fn write_current_catalog(&mut self, with_row_description: bool, result_formats: &[i16]) {
         if with_row_description {
@@ -1027,7 +1059,7 @@ where
         self.writer.command_complete("SELECT 1");
     }
 
-    /// Answers the small `pg_settings` subset PgJDBC exposes through
+    /// Answers the small `pg_settings` subset `PgJDBC` exposes through
     /// `DatabaseMetaData`.
     fn write_pg_setting(&mut self, name: &str, with_row_description: bool, result_formats: &[i16]) {
         if with_row_description {
