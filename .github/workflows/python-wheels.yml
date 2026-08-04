@@ -16,6 +16,12 @@ on:
       - "crates/corium-client/**"
       - "crates/corium-ffi/**"
       - "crates/corium-python/**"
+      - "crates/corium-store/**"
+      - "crates/corium-store-abi/**"
+      - "crates/corium-store-plugin/**"
+      - "crates/corium-store-postgres/**"
+      - "crates/corium-store-s3/**"
+      - "crates/corium-store-turso/**"
 
 permissions:
   contents: read
@@ -83,8 +89,131 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
+  plugins-linux:
+    needs: release-check
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            build_platform: linux_x86_64
+            wheel_platform: manylinux_2_28_x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            build_platform: linux_aarch64
+            wheel_platform: manylinux_2_28_aarch64
+    runs-on: ${{ matrix.platform.runner }}
+    container:
+      image: ${{ matrix.platform.container }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build storage plugin libraries
+        run: >-
+          cargo build --release --locked
+          --target ${{ matrix.platform.target }}
+          -p corium-store-turso
+          -p corium-store-postgres
+          -p corium-store-s3
+      - name: Build storage plugin wheels
+        run: >-
+          /opt/python/cp310-cp310/bin/python
+          clients/python/scripts/build_plugin_wheels.py
+          --target-directory target/${{ matrix.platform.target }}/release
+          --platform-tag ${{ matrix.platform.build_platform }}
+          --output wheelhouse
+      - name: Apply manylinux tags
+        run: >-
+          auditwheel repair wheelhouse/*.whl
+          --plat ${{ matrix.platform.wheel_platform }}
+          --wheel-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-corium-turso
+          path: dist/corium_turso-*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-corium-postgres
+          path: dist/corium_postgres-*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-corium-s3
+          path: dist/corium_s3-*.whl
+          if-no-files-found: error
+
+  plugins-native:
+    needs: release-check
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            wheel_platform: macosx_11_0_arm64
+            deployment_target: "11.0"
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            wheel_platform: macosx_10_12_x86_64
+            deployment_target: "10.12"
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            wheel_platform: win_amd64
+            deployment_target: ""
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build storage plugin libraries
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform.deployment_target }}
+        run: >-
+          cargo build --release --locked
+          --target ${{ matrix.platform.target }}
+          -p corium-store-turso
+          -p corium-store-postgres
+          -p corium-store-s3
+      - name: Build storage plugin wheels
+        run: >-
+          python clients/python/scripts/build_plugin_wheels.py
+          --target-directory target/${{ matrix.platform.target }}/release
+          --platform-tag ${{ matrix.platform.wheel_platform }}
+          --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-corium-turso
+          path: dist/corium_turso-*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-corium-postgres
+          path: dist/corium_postgres-*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}-corium-s3
+          path: dist/corium_s3-*.whl
+          if-no-files-found: error
+
   smoke:
-    needs: build
+    needs: [build, plugins-linux, plugins-native]
     strategy:
       fail-fast: false
       matrix:

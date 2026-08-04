@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and import the Python engine wheel in a fresh environment."""
+"""Install and import the Python engine and storage plugin wheels."""
 
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ def _python(environment: Path) -> Path:
     return environment / "bin/python"
 
 
-def smoke(wheel_directory: Path) -> None:
+def _install_and_check(
+    wheel_directory: Path, packages: tuple[str, ...], expected: set[str]
+) -> None:
     with tempfile.TemporaryDirectory(prefix="corium-wheel-") as temporary:
         environment = Path(temporary) / "venv"
         venv.EnvBuilder(with_pip=True).create(environment)
@@ -34,14 +36,24 @@ def smoke(wheel_directory: Path) -> None:
             "--no-index",
             "--find-links",
             str(wheel_directory),
-            "corium",
+            *packages,
         )
         code = (
             "import corium; "
             "backends = corium.available_storage_backends(); "
-            "assert 'filesystem' in backends, backends"
+            f"expected = {expected!r}; "
+            "assert expected == backends, (expected, backends)"
         )
         _run(str(python), "-c", code)
+
+
+def smoke(wheel_directory: Path) -> None:
+    _install_and_check(wheel_directory, ("corium",), {"filesystem"})
+    _install_and_check(
+        wheel_directory,
+        ("corium", "corium-postgres", "corium-s3", "corium-turso"),
+        {"filesystem", "postgres", "s3", "turso"},
+    )
 
 
 def main() -> None:

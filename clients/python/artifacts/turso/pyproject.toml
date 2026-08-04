@@ -1,0 +1,22 @@
+[project]
+name = "corium-turso"
+version = "0.1.0"
+description = "Turso direct-storage plugin for the Corium Python client"
+requires-python = ">=3.10"
+dependencies = ["corium==0.1.0"]
+license = { text = "Apache-2.0 OR MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Documentation = "https://github.com/csm/corium/tree/main/clients/python"
+Issues = "https://github.com/csm/corium/issues"
+Repository = "https://github.com/csm/corium"
+
+[project.entry-points."corium.store_plugins"]
+turso = "corium_turso:plugin_path"

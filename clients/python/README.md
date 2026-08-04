@@ -127,16 +127,34 @@ peer = await LocalPeer.connect(
 )
 ```
 
-Filesystem storage is present in the base `corium` artifact. This repository
-does not currently publish official Python packages for Turso, PostgreSQL, or
-S3 plugins. The packaged client supports filesystem direct storage only.
-Remote peer and replay modes remain available for all storage backends.
+Filesystem storage is present in the `corium` package. Install the package for
+the storage backend that the transactor uses:
 
-The loader supports custom plugin packages through the `corium.store_plugins`
-Python entry-point group. At import, the native engine loads each advertised
-library and registers its backend kinds. A missing backend raises a
-`StorageError`. The `available_storage_backends()` function reports the live
-process registry.
+```shell
+python -m pip install corium corium-turso
+# Or install corium-postgres or corium-s3.
+```
+
+Install all packages before the Python process starts. Corium loads each
+installed plugin through the `corium.store_plugins` entry-point group.
+
+Make sure that the required backend is available:
+
+```python
+from corium import available_storage_backends
+
+assert "turso" in available_storage_backends()
+```
+
+Then pass `DirectStorage` to `LocalPeer.connect`, as shown in the first example.
+The transactor supplies the separate read-only configuration for the backend.
+You do not import the plugin package or give Corium a library path.
+
+`available_storage_backends()` reports all loaded backends. A missing backend
+causes a `StorageError` when `LocalPeer` connects.
+
+WARNING: Install plugins only from trusted publishers. A plugin runs native
+code in the Python process and can receive storage credentials.
 
 Filesystem and Turso advertise local paths, so their direct-storage peers must
 run on a host that can reach the same path as the transactor. Corium rejects a
