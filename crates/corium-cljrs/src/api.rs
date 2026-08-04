@@ -6,6 +6,8 @@
 //! native objects; all data crossing the boundary converts once through
 //! [`crate::convert`].
 
+#![allow(clippy::large_enum_variant)]
+
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
