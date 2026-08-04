@@ -30,9 +30,9 @@ corium-log = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
-corium-store-postgres = { workspace = true, optional = true }
-corium-store-s3 = { workspace = true, optional = true }
-corium-store-turso = { workspace = true, optional = true }
+corium-store-postgres = { workspace = true, optional = true, features = ["static-link"] }
+corium-store-s3 = { workspace = true, optional = true, features = ["static-link"] }
+corium-store-turso = { workspace = true, optional = true, features = ["static-link"] }
 corium-tx = { workspace = true }
 async-trait = "0.1"
 aws-config = { version = "1", optional = true }

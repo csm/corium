@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+#[cfg(not(feature = "static-link"))]
 use abi_stable::export_root_module;
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::sabi_trait::TD_Opaque;
@@ -140,7 +141,7 @@ extern "C" fn backends() -> RVec<BackendBox> {
 }
 
 /// Exports the v1 Corium storage root module.
-#[export_root_module]
+#[cfg_attr(not(feature = "static-link"), export_root_module)]
 #[must_use]
 pub fn corium_store_plugin_v1() -> StorePluginModuleRef {
     StorePluginModule {

@@ -45,7 +45,7 @@ corium-query = { workspace = true }
 corium-sql = { workspace = true }
 corium-store = { workspace = true }
 corium-store-plugin = { workspace = true }
-corium-store-s3 = { workspace = true, optional = true }
+corium-store-s3 = { workspace = true, optional = true, features = ["static-link"] }
 corium-store-testkit = { workspace = true }
 corium-transactor = { workspace = true }
 ratatui = { workspace = true }

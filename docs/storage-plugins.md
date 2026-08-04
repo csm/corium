@@ -15,6 +15,17 @@ Use `corium-store-turso` as the reference implementation. A plugin must:
 - declare its transaction-log placement and direct-access capability;
 - never unwind across the ABI boundary.
 
+Build a driver package by itself to produce its loadable `cdylib`, for example:
+
+```sh
+cargo build -p corium-store-turso --release
+```
+
+The bundled hosts enable the driver's `static-link` feature when they compile
+it in. That feature suppresses the common dynamic-loader symbol, which lets one
+host link multiple built-in drivers. Do not enable `static-link` when producing
+a loadable plugin library.
+
 ## Runtime and cancellation
 
 A dynamic driver owns its async runtime. It must spawn I/O work onto that

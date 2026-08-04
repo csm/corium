@@ -10,6 +10,10 @@ description = "PostgreSQL storage backend for Corium"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[features]
+# Suppress the shared ABI loader symbol when this driver is linked into a host.
+static-link = []
+
 [dependencies]
 abi_stable = "0.11.3"
 async-trait = "0.1"

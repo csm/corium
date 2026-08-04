@@ -31,8 +31,8 @@ corium-peer = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
-corium-store-postgres = { workspace = true, optional = true }
-corium-store-turso = { workspace = true, optional = true }
+corium-store-postgres = { workspace = true, optional = true, features = ["static-link"] }
+corium-store-turso = { workspace = true, optional = true, features = ["static-link"] }
 cljrs-env = { workspace = true }
 cljrs-gc = { workspace = true }
 cljrs-interp = { workspace = true }
