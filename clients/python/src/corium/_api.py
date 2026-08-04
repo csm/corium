@@ -6,11 +6,11 @@ import asyncio
 import functools
 import importlib
 import os
-from importlib.metadata import entry_points
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from importlib.metadata import entry_points
 from types import TracebackType
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
