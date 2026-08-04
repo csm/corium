@@ -108,31 +108,38 @@ definite current basis and the underlying storage connection; the backup
 client then leaves the transactor and reads the bounded native log range
 directly.
 
-Schema migration adds two administrative calls:
+Schema migration adds one administrative call:
 
 ```proto
-rpc PlanSchemaUpdate(PlanSchemaUpdateRequest) returns (SchemaUpdatePlan);
-rpc ApplySchemaUpdate(ApplySchemaUpdateRequest) returns (SchemaUpdateResult);
+rpc AlterSchema(AlterSchemaRequest) returns (AlterSchemaResponse);
 ```
 
-`PlanSchemaUpdate` is read-only. It returns the normalized logical steps and the
-installed-schema fingerprint. It also returns the observed basis, stable
-acknowledgement codes, and advisory impact observations. `ApplySchemaUpdate`
-carries the desired schema, `--prune` mode, plan digest, fingerprint, observed
-basis, and supplied acknowledgements. The transactor recomputes the logical
-digest and validates safety preconditions in the writer queue. Advisory counts
-are not part of the digest. The response either records a completed short
-schema transaction or returns the remaining long-job specifications. The CLI
-submits those to the operator service when configured. Otherwise, it executes
-the same job contract in-process. `Catalog` never depends on the operator
-service. The exact messages and stable error codes land with the implementation
-and protocol-version bump described in
-[schema-migrations.md](schema-migrations.md).
+There is no `PlanSchemaUpdate`. Planning is a pure function of a desired schema
+and one immutable database value, and a peer already holds that value, so it
+plans locally against its own `Db` and needs only `Inspect`. Adding a
+round trip would buy nothing and would let the plan disagree with the value the
+operator is looking at.
 
-Published-root and status metadata gain the schema generation plus per-attribute
-AVET readiness basis. A migration-triggered backfill invokes the existing index
-publisher immediately, bypassing interval/tail pacing, and readiness is never
-reported ahead of the root that proves coverage.
+`AlterSchema` carries the *desired schema* as normalized EDN attribute maps —
+not the plan — alongside the plan digest, installed-schema fingerprint,
+observed basis, `--prune` mode, allowances, acknowledgements, and tool version.
+The transactor recomputes the logical plan and its digest from that schema and
+the schema installed under its own writer queue, and refuses unless the digest
+matches. A digest it could not re-derive would be an opaque token rather than a
+precondition. Advisory counts are not part of the digest, so data drift that
+preserves every precondition does not invalidate a plan. The response reports
+the resulting basis, schema generation, the idents installed, and whether
+anything changed at all. `Catalog` never depends on the operator service.
+
+The schema generation is derived per database value rather than carried on the
+wire: peers apply schema datoms in tx reports and converge on it. Carrying it
+*explicitly* — `schema_basis_t` and `schema_generation` on the handshake,
+`schema_generation_after` on tx reports, and the schema generation plus
+per-attribute AVET readiness basis on published-root and status metadata — is
+still proposed, and is what a protocol-version bump would gate so an older peer
+cannot silently install a current schema before replaying older data. The
+forced backfill that bypasses interval/tail pacing belongs with it, as does the
+rule that readiness is never reported ahead of the root that proves coverage.
 
 ### OperatorService (operator tools → operator peer service) *(proposed)*
 

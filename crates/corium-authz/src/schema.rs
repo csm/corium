@@ -66,6 +66,8 @@ pub const VIEW_NAME: &str = "authz.view/name";
 pub const VIEW_FILTER_TYPE: &str = "authz.view/filter-type";
 /// `:authz.view/attribute` — attribute idents the filter names.
 pub const VIEW_ATTRIBUTE: &str = "authz.view/attribute";
+/// `:authz.view/key` — protection class key ids this view permits hydrating.
+pub const VIEW_KEY: &str = "authz.view/key";
 
 /// `:authz.binding/relation` — relation the view is attached to.
 pub const BINDING_RELATION: &str = "authz.binding/relation";
@@ -97,6 +99,7 @@ pub const ATTRIBUTES: &[&str] = &[
     VIEW_NAME,
     VIEW_FILTER_TYPE,
     VIEW_ATTRIBUTE,
+    VIEW_KEY,
     BINDING_RELATION,
     BINDING_OBJECT,
     BINDING_VIEW,
@@ -133,6 +136,7 @@ pub const SCHEMA_EDN: &str = r"
  {:db/ident :authz.view/name              :db/valueType :db.type/string  :db/unique :db.unique/identity}
  {:db/ident :authz.view/filter-type       :db/valueType :db.type/string}
  {:db/ident :authz.view/attribute         :db/valueType :db.type/string  :db/cardinality :db.cardinality/many}
+ {:db/ident :authz.view/key               :db/valueType :db.type/string  :db/cardinality :db.cardinality/many}
 
  {:db/ident :authz.binding/relation       :db/valueType :db.type/string  :db/index true}
  {:db/ident :authz.binding/object         :db/valueType :db.type/string  :db/index true}

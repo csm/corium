@@ -16,11 +16,10 @@ use corium_protocol::txforms::tx_items_from_edn;
 use corium_query::edn::{Edn, read_one};
 use corium_transactor::EmbeddedTransactor;
 
-/// Schema: account attributes plus the `:db/ident` + `:db/fn` pair that
+/// Schema: account attributes plus the `:db/fn` attribute that
 /// makes function entities addressable by keyword.
 const SCHEMA: &str = r"
-[{:db/ident :db/ident :db/valueType :db.type/keyword :db/unique :db.unique/identity}
- {:db/ident :db/fn :db/valueType :db.type/string}
+[{:db/ident :db/fn :db/valueType :db.type/string}
  {:db/ident :acct/name :db/valueType :db.type/string :db/unique :db.unique/identity}
  {:db/ident :acct/balance :db/valueType :db.type/long}]
 ";

@@ -37,6 +37,10 @@ class StorageUnavailable(RuntimeError):
     """A selected storage backend lacks an external prerequisite."""
 
 
+class ScenarioLimitation(RuntimeError):
+    """A scenario verified a known product limitation."""
+
+
 @dataclass
 class ScenarioResult:
     storage: str
@@ -549,6 +553,44 @@ def pgwire_client_access(context: Context) -> str:
     )
 
 
+def security_test(test_name: str) -> str:
+    """Run one independently isolated release-security scenario."""
+
+    return run_command(
+        [
+            "cargo",
+            "test",
+            "--quiet",
+            "-p",
+            "corium-cli",
+            "--features",
+            "oidc",
+            "--test",
+            "scenario_security",
+            test_name,
+            "--",
+            "--exact",
+            "--nocapture",
+        ],
+        timeout=300,
+    )
+
+
+def direct_peer_security(context: Context) -> str:
+    require_server(context)
+    return security_test("direct_peer_real_jwt_authz_and_protected_access")
+
+
+def peer_server_security(context: Context) -> str:
+    require_server(context)
+    return security_test("peer_server_real_jwt_authz_and_per_principal_class_keys")
+
+
+def pgwire_security(context: Context) -> str:
+    require_server(context)
+    return security_test("pgwire_maps_sql_clients_onto_corium_principals")
+
+
 def key_rotation(context: Context) -> str:
     require_server(context)
     rotated = corium(
@@ -573,22 +615,92 @@ def key_rotation(context: Context) -> str:
 
 
 def schema_updates(context: Context) -> str:
-    """Exercise the shipped read-only, plan-first schema update CLI."""
+    """Plan, apply, and verify an additive schema update."""
 
     require_server(context)
-    plan = corium(
+    schema_path = str(REPOSITORY / "tests/scenarios/schema-updated.toml")
+    plan_output = corium(
         context,
         "schema",
         "update",
         context.people_database,
         "--schema",
-        str(REPOSITORY / "tests/scenarios/schema-updated.toml"),
+        schema_path,
+        "--json",
         "--transactor",
         context.transactor_endpoint,
     )
-    if ":person/email" not in plan or "ADDITIVE" not in plan:
-        raise ScenarioFailure(f"schema plan omitted the expected additive change\n{plan}")
-    return plan
+    try:
+        plan = json.loads(plan_output)
+    except json.JSONDecodeError as error:
+        raise ScenarioFailure(f"schema plan was not valid JSON\n{plan_output}") from error
+    expected_change = any(
+        change.get("ident") == ":person/email"
+        and change.get("execution_class") == "additive"
+        for change in plan.get("changes", [])
+    )
+    plan_digest = plan.get("plan_digest")
+    if not plan.get("has_changes") or not expected_change:
+        raise ScenarioFailure(
+            f"schema plan omitted the expected additive change\n{plan_output}"
+        )
+    if not isinstance(plan_digest, str) or not plan_digest.startswith("sha256:"):
+        raise ScenarioFailure(f"schema plan omitted its review digest\n{plan_output}")
+
+    applied_output = corium(
+        context,
+        "schema",
+        "update",
+        context.people_database,
+        "--schema",
+        schema_path,
+        "--apply",
+        "--plan",
+        plan_digest,
+        "--json",
+        "--transactor",
+        context.transactor_endpoint,
+    )
+    try:
+        applied = json.loads(applied_output).get("applied", {})
+    except json.JSONDecodeError as error:
+        raise ScenarioFailure(
+            f"schema apply result was not valid JSON\n{applied_output}"
+        ) from error
+    if not applied.get("changed") or ":person/email" not in applied.get(
+        "installed", []
+    ):
+        raise ScenarioFailure(
+            f"schema apply did not install :person/email\n{applied_output}"
+        )
+
+    converged_output = corium(
+        context,
+        "schema",
+        "update",
+        context.people_database,
+        "--schema",
+        schema_path,
+        "--json",
+        "--transactor",
+        context.transactor_endpoint,
+    )
+    try:
+        converged = json.loads(converged_output)
+    except json.JSONDecodeError as error:
+        raise ScenarioFailure(
+            f"post-apply schema plan was not valid JSON\n{converged_output}"
+        ) from error
+    if converged.get("has_changes") or converged.get("changes"):
+        raise ScenarioFailure(
+            f"schema still reports changes after apply\n{converged_output}"
+        )
+
+    return (
+        f"Reviewed plan {plan_digest}.\n"
+        f"Applied: {applied_output}\n"
+        f"Verified converged plan: {converged_output}"
+    )
 
 
 def python_client_access(context: Context) -> str:
@@ -653,6 +765,9 @@ SCENARIOS: list[Scenario] = [
     ("authz init", authz_init),
     ("encryption init", encryption_init),
     ("attribute protection classes", attribute_protection_classes),
+    ("direct peer JWT, authz, and protected access", direct_peer_security),
+    ("peer server JWT, authz, and protected access", peer_server_security),
+    ("pgwire authz and protected access", pgwire_security),
     ("key rotation", key_rotation),
     ("schema updates", schema_updates),
     ("local peer access", local_peer_access),
@@ -674,6 +789,9 @@ def run_scenarios(context: Context) -> list[ScenarioResult]:
         except subprocess.TimeoutExpired as error:
             detail = f"timed out after {error.timeout}s: {format_command(error.cmd)}"
             status = "FAIL"
+        except ScenarioLimitation as error:
+            detail = str(error) or "known product limitation verified"
+            status = "LIMITATION"
         except Exception as error:  # Every scenario is an isolation boundary.
             detail = str(error) or traceback.format_exc()
             status = "FAIL"
@@ -692,16 +810,17 @@ def run_scenarios(context: Context) -> list[ScenarioResult]:
 
 def markdown_report(results: Sequence[ScenarioResult], generated_at: str) -> str:
     passes = sum(result.status == "PASS" for result in results)
-    failures = sum(result.status == "FAIL" for result in results)
     skips = sum(result.status == "SKIP" for result in results)
+    limitations = sum(result.status == "LIMITATION" for result in results)
+    failures = sum(result.status == "FAIL" for result in results)
     lines = [
         "# Scenario integration report",
         "",
         f"Generated: {generated_at}",
         "",
         (
-            f"Result: **{passes} passed, {failures} failed, {skips} skipped, "
-            f"{len(results)} total**. "
+            f"Result: **{passes} passed, {limitations} known limitations, "
+            f"{failures} failed, {skips} skipped, {len(results)} total**. "
             "Failures are informational and do not change the runner exit code."
         ),
         "",
@@ -709,14 +828,24 @@ def markdown_report(results: Sequence[ScenarioResult], generated_at: str) -> str
         "|---|---|---:|---:|",
     ]
     for result in results:
-        icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}[result.status]
+        icon = {
+            "PASS": "✅",
+            "LIMITATION": "⚠️",
+            "FAIL": "❌",
+            "SKIP": "⏭️",
+        }[result.status]
         lines.append(
             f"| {result.storage} | {result.name} | {icon} {result.status} | "
             f"{result.duration_seconds:.3f}s |"
         )
     lines.extend(["", "## Details", ""])
     for result in results:
-        icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}[result.status]
+        icon = {
+            "PASS": "✅",
+            "LIMITATION": "⚠️",
+            "FAIL": "❌",
+            "SKIP": "⏭️",
+        }[result.status]
         lines.extend(
             [
                 f"### {icon} [{result.storage}] {result.name}",

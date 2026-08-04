@@ -180,12 +180,35 @@ deterministic (AES-256-GCM-SIV with the context in the AAD), which is what
 lets a transactor holding no key keep pairing retractions, superseding
 cardinality-one values, and comparing `:db/cas` bytewise.
 
-Protection is declared in the create-time schema today. Changing an
-attribute's protection needs a schema-alteration mechanism Corium does not yet
-have, and is the largest remaining piece of that work; entity scope, the
+An attribute's protection can now be changed after creation, through the
+declarative schema update below: `:db/protection` is part of the desired
+schema model, and applying a change appends to the attribute's forward-only
+`(t, class)` timeline rather than rewriting it, so every value already sealed
+stays sealed and stays retractable by naming the form it was asserted in. An
+attribute that has ever been protected is permanently ineligible for
+`:db/index` and `:db/unique`. Re-sealing or opening the values already stored
+is separate rewrite work that does not exist yet, as are entity scope, the
 per-principal key policy on the peer server, and the class rotation and shred
-commands are the rest. Backups of an encrypted database and KMS-backed
-keyrings remain to finish layer 1.
+commands. Backups of an encrypted database and KMS-backed keyrings remain to
+finish layer 1.
+
+Schema itself is now basis-versioned data
+([docs/design/schema-migrations.md](docs/design/schema-migrations.md),
+[ADR-0020](docs/adr/0020-planned-schema-migrations.md)). Attribute metadata is
+stored under an engine-owned vocabulary (`:db/valueType`, `:db/cardinality`,
+`:db/unique`, `:db/index`, `:db/isComponent`, `:db/noHistory`, `:db/doc`,
+`:db/protection`, `:db/retired`) on the attribute entity, so a schema change is
+an ordinary transaction that the transactor, every peer, and log replay all
+fold back into the same `Schema`. `corium schema update` stays plan-first — it
+prints a digest-bearing plan and writes nothing without `--apply --plan
+<digest>` — and the transactor recomputes that plan under its writer queue
+rather than trusting the digest as a token. Applying is a separate
+`alter-schema` authority from `Transact`, so an application writer cannot
+broaden the vocabulary it writes under. Additive, index, uniqueness,
+component, no-history, documentation, protection, and retirement changes all
+apply; `rewrite` and `destructive` changes remain refused, and index readiness
+is total on commit only because a peer still rebuilds its covering indexes in
+memory.
 
 Operator-level management is specified as its own surface
 ([docs/design/operator-service.md](docs/design/operator-service.md),

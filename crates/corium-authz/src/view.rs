@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use corium_protocol::authz::ViewFilter;
+use corium_protocol::authz::{KeyGrant, ViewFilter};
 
 use crate::model::{FilterKind, ViewDef};
 
@@ -119,18 +119,35 @@ impl ViewFilter for IntersectionView {
     }
 }
 
-/// Builds the filter a [`ViewDef`] describes.
+/// Builds the attribute filter a [`ViewDef`] describes, if it names one.
+///
+/// A view that only names keys restricts no attribute, so it compiles to no
+/// filter at all rather than to one that admits everything.
 #[must_use]
-pub fn build(definition: &ViewDef) -> Arc<dyn ViewFilter> {
-    match definition.kind {
-        FilterKind::AttributeAllowlist => Arc::new(AttributeAllowlist::new(
+pub fn build(definition: &ViewDef) -> Option<Arc<dyn ViewFilter>> {
+    match definition.kind? {
+        FilterKind::AttributeAllowlist => Some(Arc::new(AttributeAllowlist::new(
             definition.name.clone(),
             &definition.attributes,
-        )),
-        FilterKind::AttributeDenylist => Arc::new(AttributeDenylist::new(
+        ))),
+        FilterKind::AttributeDenylist => Some(Arc::new(AttributeDenylist::new(
             definition.name.clone(),
             &definition.attributes,
-        )),
+        ))),
+    }
+}
+
+/// The key grant a [`ViewDef`] describes.
+///
+/// A view naming no key id imposes no key restriction of its own; what that
+/// means for a request is the serving surface's key policy, not this
+/// function's (`docs/design/encryption.md`).
+#[must_use]
+pub fn key_grant(definition: &ViewDef) -> KeyGrant {
+    if definition.keys.is_empty() {
+        KeyGrant::Unrestricted
+    } else {
+        KeyGrant::only(definition.keys.iter())
     }
 }
 

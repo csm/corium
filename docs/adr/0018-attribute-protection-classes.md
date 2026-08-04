@@ -1,8 +1,10 @@
 # ADR-0018: Attribute-level protection with per-class keys
 
 **Status:** Accepted (2026-07-28); implemented for protection declared at
-database creation (2026-07-31) — schema alteration, entity scope, and the
-operational surface remain, see the status header in the design. Design in
+database creation (2026-07-31); per-principal key policy on the peer server
+and pgwire (2026-08-03, [ADR-0021](0021-contextual-read-authorization.md)) —
+schema alteration, entity scope, `--seal-through`, and the operational surface
+remain, see the status header in the design. Design in
 [`docs/design/encryption.md`](../design/encryption.md). Builds on
 [ADR-0017](0017-encryption-at-rest.md) (storage encryption) and extends the
 visibility model of [ADR-0012](0012-optional-authn-authz.md) /
@@ -99,6 +101,13 @@ it, and are hydrated only by readers whose keyring resolves the class key.
   policy-enforced filter can offer, and it is what makes running a peer in a
   less-trusted environment — or shipping a production restore to staging —
   reasonable.
+- The per-principal `KeyPolicy` this ADR anticipated is implemented on the peer
+  server and pgwire ([ADR-0021](0021-contextual-read-authorization.md)): policy
+  names key ids on `:authz.view/key`, and a serving process hands each request
+  the subset of its own keyring those ids resolve to. Holding a class key is no
+  longer the same as disclosing it — though that half is enforced by the
+  process holding the plaintext, and so is authorization rather than
+  cryptography.
 - The peer interface is unchanged. A keyless peer connects, bootstraps from
   storage, maintains its live index from tx-reports, and answers every query
   that does not depend on a protected value with identical results. Protected

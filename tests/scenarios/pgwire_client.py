@@ -43,12 +43,21 @@ def error_text(body: bytes) -> str:
     return "; ".join(field[1:].decode("utf-8", "replace") for field in fields)
 
 
-def read_until_ready(stream: socket.socket) -> list[list[str | None]]:
+def read_until_ready(
+    stream: socket.socket, password: str | None = None
+) -> list[list[str | None]]:
     rows: list[list[str | None]] = []
     while True:
         message = read_message(stream)
         if message.tag == b"E":
             raise RuntimeError(f"pgwire error: {error_text(message.body)}")
+        if message.tag == b"R":
+            auth_method = struct.unpack("!I", message.body[:4])[0]
+            if auth_method == 3:
+                supplied = password or ""
+                stream.sendall(b"p" + packet(supplied.encode(), b"\0"))
+            elif auth_method != 0:
+                raise RuntimeError(f"unsupported pgwire authentication method: {auth_method}")
         if message.tag == b"D":
             count = struct.unpack("!H", message.body[:2])[0]
             offset = 2

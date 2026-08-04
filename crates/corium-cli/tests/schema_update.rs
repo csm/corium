@@ -153,7 +153,7 @@ fn json_field<'a>(json: &'a str, name: &str) -> &'a str {
 // for several transactors to assert on the same plan.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
-async fn schema_update_plans_reports_and_refuses_to_apply() {
+async fn schema_update_plans_reports_and_applies() {
     let dir = tempfile::tempdir().expect("temp dir");
     let transactor = TransactorProc::spawn(dir.path());
     let mut admin = transactor.wait_ready().await;
@@ -275,7 +275,7 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
         json.contains("\"unmanaged\":[\":legacy/import-id\"]"),
         "{json}"
     );
-    assert!(json.contains("\"apply\":{\"supported\":false"), "{json}");
+    assert!(json.contains("\"apply\":{\"supported\":true}"), "{json}");
     let plan_digest = json_field(json, "plan_digest");
     assert!(plan_digest.starts_with("sha256:"), "{plan_digest}");
     // The human report prints the same digest the JSON does.
@@ -354,8 +354,8 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
         refused.stderr
     );
 
-    // 9. A plan with nothing blocked still cannot be applied in this build,
-    //    and says exactly why.
+    // 9. An unblocked plan applies, and the change is live for a peer that
+    //    was already connected.
     let additive = write(
         dir.path(),
         "additive.toml",
@@ -365,18 +365,73 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
     );
     let additive_json = schema_update(&transactor.endpoint(), &additive, &["--json"]);
     let digest = json_field(additive_json.stdout.trim(), "plan_digest").to_owned();
-    let unsupported = schema_update(
+    let applied = schema_update(
         &transactor.endpoint(),
         &additive,
         &["--apply", "--plan", &digest, "--json"],
     );
-    assert_eq!(unsupported.code, 1);
+    assert_eq!(applied.code, 0, "{} {}", applied.stdout, applied.stderr);
     assert!(
-        unsupported
-            .stdout
-            .contains("\"code\":\"apply-unsupported\""),
+        applied.stdout.contains("\"changed\":true"),
         "{}",
-        unsupported.stdout
+        applied.stdout
+    );
+    assert!(
+        applied
+            .stdout
+            .contains("\"installed\":[\":person/nickname\"]"),
+        "{}",
+        applied.stdout
+    );
+
+    // The peer opened before the change sees the new attribute, and can write
+    // through it — schema travels in the tx report, not only in a handshake.
+    let synced = connection.sync().await.expect("sync");
+    let nickname = synced
+        .idents()
+        .entid(&corium_core::Keyword::new(Some("person"), "nickname"))
+        .expect("the new attribute reached a live peer");
+    assert!(synced.schema().get(nickname).is_some());
+    connection
+        .transact(tx(&format!(
+            "[:db/add {resident} :person/nickname \"Bee\"]"
+        )))
+        .await
+        .expect("the new attribute is immediately writable");
+
+    // Re-applying the same file is a no-op rather than an error.
+    let again = schema_update(
+        &transactor.endpoint(),
+        &additive,
+        &["--apply", "--plan", &digest, "--json"],
+    );
+    assert_eq!(again.code, 0, "{} {}", again.stdout, again.stderr);
+    assert!(
+        again.stdout.contains("\"changed\":false"),
+        "{}",
+        again.stdout
+    );
+
+    // A digest that describes a different plan is refused: the operator would
+    // otherwise be applying a change they never read.
+    let further = write(
+        dir.path(),
+        "further.toml",
+        &format!(
+            "{INSTALLED}\n[[attribute]]\ngroup = \"person\"\nname = \"nickname\"\ntype = \"string\"\n\
+             \n[[attribute]]\ngroup = \"person\"\nname = \"pronouns\"\ntype = \"string\"\n"
+        ),
+    );
+    let stale_apply = schema_update(
+        &transactor.endpoint(),
+        &further,
+        &["--apply", "--plan", &digest, "--json"],
+    );
+    assert_eq!(stale_apply.code, 1);
+    assert!(
+        stale_apply.stdout.contains("\"code\":\"plan-mismatch\""),
+        "{}",
+        stale_apply.stdout
     );
 
     // 10. A malformed file fails with a stable parse code and writes nothing.
@@ -404,9 +459,20 @@ async fn schema_update_plans_reports_and_refuses_to_apply() {
         engine_error.stdout
     );
 
-    // The database is untouched by every one of the runs above.
+    // Exactly one attribute was installed across every run above: the plans
+    // that were only read, refused, or already satisfied wrote nothing.
     let after = connection.sync().await.expect("sync");
-    assert_eq!(after.schema().iter().count(), forms.len() + 1);
+    assert_eq!(
+        after.schema().iter().count(),
+        forms.len() + corium_db::bootstrap::attributes().len() + 1
+    );
+    assert!(
+        after
+            .idents()
+            .entid(&corium_core::Keyword::new(Some("person"), "pronouns"))
+            .is_none(),
+        "the refused plan installed nothing"
+    );
 }
 
 impl std::fmt::Debug for Run {

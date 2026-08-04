@@ -9,26 +9,40 @@ and a storage-aware PostgreSQL-wire server. It contains these scenarios:
 2. authz initialization
 3. encrypted database initialization
 4. attribute protection classes
-5. storage-key rotation
-6. schema updates
-7. embedded/local peer access, including direct storage bootstrap
-8. Python peer-server client access
-9. Java peer-server client access
-10. Rust peer-server client access
-11. PostgreSQL-wire client access
+5. direct-peer JWT authentication, ReBAC authorization, and protected access
+6. peer-server JWT authentication, ReBAC authorization, and protected access
+7. pgwire authorization and protected access
+8. storage-key rotation
+9. schema updates
+10. embedded/local peer access, including direct storage bootstrap
+11. Python peer-server client access
+12. Java peer-server client access
+13. Rust peer-server client access
+14. PostgreSQL-wire client access
 
 The attribute-protection scenario writes through a key-holding embedded peer
 and verifies keyed reads plus the `redact`, `hide`, and `error` missing-key
-policies through a keyless peer. Storage encryption initialization and key
-rotation run once per backend. The schema-update scenario exercises the shipped
-plan-first CLI and verifies its expected additive change. Every scenario is an
-independent report boundary, so a failure does not prevent later scenarios or
-backends from running.
+policies through a keyless peer. The security scenarios use
+signed RS256 JWTs with issuer and audience validation, the self-hosted ReBAC
+authorizer, and real direct-peer, peer-server, and PostgreSQL-wire clients.
+The peer-server and pgwire scenarios put two principals on one key-holding
+server and check that each sees only what policy grants: Alice reads the
+protected value as plaintext, Bob reads the same column of the same database
+value redacted. The pgwire client authenticates with its own bearer token in
+the password field, so a SQL session is a Corium principal.
+
+Known product gaps have a separate `LIMITATION` status: they are verified and
+prominent in the report without being confused with a harness failure. The
+schema-update scenario reviews the plan digest, applies the expected additive
+change, verifies the installed attribute, and re-plans to confirm convergence.
+Storage encryption initialization and key rotation run once per backend. Every
+scenario is an independent report boundary, so a failure does not prevent later
+scenarios or backends from running.
 
 Build the CLI and install the Python client before running locally:
 
 ```sh
-cargo build -p corium-cli --features postgres,turso,s3
+cargo build -p corium-cli --features postgres,turso,s3,oidc
 python3 -m pip install -e clients/python
 python3 tests/scenarios/run.py
 ```

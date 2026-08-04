@@ -4,34 +4,49 @@
 //! Queries execute server-side against the hosted peer's local database
 //! values with per-request fuel and chunked result streams.
 //!
-//! # Protected attributes: one key set for every client
+//! # One database value, one key set, many views
 //!
-//! **A key-holding peer server discloses every class it holds to every client
-//! it serves.** Hydration here uses the hosted connection's own keyring, and
-//! the authorization guard gates *databases and operations*, not protection
-//! classes — so "this server can resolve the PII class key" and "any client
-//! authorized to query this database reads PII" are currently the same
-//! statement.
+//! Every read here is answered under the caller's own
+//! [`ReadContext`]: the attributes the authorization policy lets that
+//! principal see, and the protection classes it lets that principal hydrate.
+//! Two principals querying the same hosted `Db` concurrently get different
+//! answers from the same immutable value, which is the whole point of
+//! deciding identity per request rather than per connection.
 //!
-//! The design's answer is a per-principal `KeyPolicy: Principal → [KeyId]`,
-//! which is where protection meets authorization, together with seal-through
-//! mode (`--seal-through`) where the server forwards sealed values and the
-//! thin client hydrates with its own keyring. Neither is implemented
-//! (`docs/design/encryption.md`, "Peer server, thin clients, SQL").
+//! The key half is the [`KeyPolicy`](docs) of `docs/design/encryption.md`:
+//! policy names key ids, and this server hands each principal the subset of
+//! its own keyring those ids resolve to. **Holding a class key is no longer
+//! the same as disclosing it.** Which principals get keys by default is
+//! [`KeyPolicyMode`]:
 //!
-//! Until they are, the deployment rule is: **give a peer server class keys
-//! only when every client it serves is entitled to every class it holds.**
-//! To serve less-trusted clients, run a peer server with no keyring — it
-//! answers every query that does not touch a protected value identically, and
-//! protected values come back redacted, hidden, or refused per class policy.
+//! * `Strict` — a principal hydrates only the classes its decision names.
+//!   The default whenever a real [`Guard`] is configured. Note that
+//!   `:authz.binding/unfiltered` grants full *attribute* visibility and no
+//!   keys: keys are named by key id, and that binding names none.
+//! * `ServerWide` — every request hydrates with the server's whole keyring.
+//!   The default when authorization is disabled, which is the single-tenant
+//!   and embedded case.
+//!
+//! What is still missing is seal-through mode (`--seal-through`), where the
+//! server forwards sealed values and the thin client hydrates with its own
+//! keyring. Until that lands, a peer server under `Strict` is enforcing key
+//! policy in the process that holds the plaintext — it is authorization, not
+//! cryptography. The cryptographic floor is still a peer server that was
+//! never given the key: it answers every query that does not touch a
+//! protected value identically, and protected values come back redacted,
+//! hidden, or refused per class policy.
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
 use corium_core::{EntityId, IndexOrder};
+use corium_db::protect::Hydrator;
+use corium_db::read::{AttrVisibility, ReadContext};
 use corium_db::{Db, key_prefix};
-use corium_protocol::authz::{self, Access, Action, Guard, IdentityInterceptor, Principal};
+use corium_protocol::authz::{
+    self, Access, Action, Guard, IdentityInterceptor, KeyGrant, KeyPolicyMode, Principal, ReadGrant,
+};
 use corium_protocol::codec;
 use corium_protocol::pb;
 use corium_protocol::pb::peer_server_server::{PeerServer, PeerServerServer};
@@ -43,7 +58,7 @@ use tonic::{Request, Response, Status};
 use crate::Connection;
 use crate::metrics::Metrics;
 
-/// Peer-server execution limits.
+/// Peer-server execution limits and key policy.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerServerConfig {
     /// Fuel ceiling per query (datoms touched).
@@ -52,6 +67,15 @@ pub struct PeerServerConfig {
     pub chunk_size: usize,
     /// Maximum datoms returned by one `Datoms` request.
     pub max_datoms: usize,
+    /// How a principal's key set is chosen, or `None` to derive it from the
+    /// guard: [`KeyPolicyMode::Strict`] when authorization is configured, and
+    /// [`KeyPolicyMode::ServerWide`] when it is not.
+    ///
+    /// Deriving it is what keeps a single-tenant deployment working exactly
+    /// as before while making the multi-tenant one safe by default: a server
+    /// that was told who its callers are should not hand all of them every
+    /// key it holds.
+    pub key_policy: Option<KeyPolicyMode>,
 }
 
 impl Default for PeerServerConfig {
@@ -60,6 +84,7 @@ impl Default for PeerServerConfig {
             max_fuel: 10_000_000,
             chunk_size: 1024,
             max_datoms: 1_000_000,
+            key_policy: None,
         }
     }
 }
@@ -71,7 +96,26 @@ pub struct PeerServerSvc {
     config: PeerServerConfig,
     metrics: Arc<Metrics>,
     guard: Guard,
+    /// Granted key ids → the hydrator that opens exactly those classes.
+    ///
+    /// A hydrator carries a bounded plaintext cache, so building one per
+    /// request would throw that cache away on every call. Principals share a
+    /// hydrator whenever policy grants them the same key ids, which is the
+    /// common case: key sets are per role, not per user.
+    hydrators: std::sync::Mutex<std::collections::HashMap<KeySetKey, Arc<Hydrator>>>,
 }
+
+/// Cache key for a per-principal hydrator: `None` is the server's whole
+/// keyring, `Some(ids)` the classes those key ids resolve to.
+type KeySetKey = Option<std::collections::BTreeSet<String>>;
+
+/// Largest number of distinct key sets one server keeps hydrators for.
+///
+/// Key sets are role-shaped rather than user-shaped, so this is generous; a
+/// policy that somehow mints one per principal clears the map rather than
+/// growing without bound, at the cost of re-deriving from the already
+/// resolved keyring.
+const HYDRATOR_CACHE_CAP: usize = 256;
 
 impl PeerServerSvc {
     /// Hosts `connection` with the given limits and no auth
@@ -85,6 +129,7 @@ impl PeerServerSvc {
             config,
             metrics,
             guard: Guard::disabled(),
+            hydrators: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -101,18 +146,22 @@ impl PeerServerSvc {
         Arc::clone(&self.metrics)
     }
 
-    /// Authorizes `access` for the request's [`Principal`], mapping the guard's
-    /// decision onto a gRPC status. A returned
-    /// [`ViewFilter`](authz::ViewFilter) is rejected for now: the query and
-    /// datom paths do not yet apply one, so honoring a filtered decision by
-    /// returning full data would be an authorization bypass.
-    async fn authorize<T>(&self, request: &Request<T>, access: Access) -> Result<(), Status> {
+    /// Authorizes `access` for the request's [`Principal`], mapping the
+    /// guard's decision onto a gRPC status.
+    ///
+    /// The returned [`ReadGrant`] is what the caller may see; every read path
+    /// turns it into a [`ReadContext`] before touching the database. A
+    /// surface that cannot apply a restriction must refuse it rather than
+    /// answer in full.
+    async fn authorize<T>(
+        &self,
+        request: &Request<T>,
+        access: Access,
+    ) -> Result<ReadGrant, Status> {
         let principal: Principal = authz::principal(request);
         match self.guard.authorize(&principal, &access).await {
-            Ok(None) => Ok(()),
-            Ok(Some(_filter)) => Err(Status::unimplemented(
-                "view filtering is not enforced on this surface yet",
-            )),
+            Ok(None) => Ok(ReadGrant::unrestricted()),
+            Ok(Some(grant)) => Ok(grant),
             Err(error) => Err(error.to_status()),
         }
     }
@@ -122,18 +171,85 @@ impl PeerServerSvc {
         self.connection.db_name().to_owned()
     }
 
-    /// The key set this server opens sealed values with.
-    ///
-    /// The hosted connection's keyring, for every request, whoever made it:
-    /// the principal is not consulted, because there is nothing yet to
-    /// consult it against. See this module's header — a key-holding peer
-    /// server discloses every class it holds to every client it serves, and
-    /// must not be exposed to clients that are not entitled to all of them.
-    async fn hydrator(&self) -> Result<std::sync::Arc<corium_db::protect::Hydrator>, Status> {
-        self.connection
+    /// How this server chooses a principal's key set.
+    fn key_mode(&self) -> KeyPolicyMode {
+        self.config.key_policy.unwrap_or({
+            if self.guard.is_disabled() {
+                KeyPolicyMode::ServerWide
+            } else {
+                KeyPolicyMode::Strict
+            }
+        })
+    }
+
+    /// The key ids `grant` entitles this request to, or `None` for the
+    /// server's whole keyring.
+    fn granted_keys(&self, grant: &ReadGrant) -> KeySetKey {
+        match (&grant.keys, self.key_mode()) {
+            // The policy named key ids: honour exactly those, under either
+            // mode. Naming keys is always a restriction.
+            (KeyGrant::Only(ids), _) => Some(ids.clone()),
+            (KeyGrant::Unrestricted, KeyPolicyMode::ServerWide) => None,
+            // Strict: a decision that names no key grants none.
+            (KeyGrant::Unrestricted, KeyPolicyMode::Strict) => {
+                Some(std::collections::BTreeSet::new())
+            }
+        }
+    }
+
+    /// The hydrator for one principal's key set, built once and shared.
+    async fn hydrator_for(&self, grant: &ReadGrant) -> Result<Arc<Hydrator>, Status> {
+        let wanted = self.granted_keys(grant);
+        if let Some(hit) = self
+            .hydrators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&wanted)
+        {
+            return Ok(Arc::clone(hit));
+        }
+        let full = self
+            .connection
             .hydrator()
             .await
-            .map_err(|error| Status::internal(error.to_string()))
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let hydrator = match &wanted {
+            None => full,
+            Some(allowed) => Arc::new(Hydrator::new(
+                full.keys()
+                    .restrict_to(self.connection.db().schema(), allowed),
+            )),
+        };
+        let mut cache = self
+            .hydrators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= HYDRATOR_CACHE_CAP {
+            cache.clear();
+        }
+        Ok(Arc::clone(
+            cache.entry(wanted).or_insert_with(|| Arc::clone(&hydrator)),
+        ))
+    }
+
+    /// Turns an authorization decision into the read `dbs` are answered under.
+    ///
+    /// The attribute filter is resolved to ids once per request, so the scan
+    /// compares ids rather than re-deriving idents per datom. It is resolved
+    /// against **every** database value the request binds, not just the first:
+    /// an id is only meaningful against a schema, so a view resolved against
+    /// one value and applied to another would leave anything missing from the
+    /// first schema visible in the second. A client chooses how many views it
+    /// binds and at which basis, so that is its choice to make, not ours.
+    async fn read_context(&self, dbs: &[Db], grant: &ReadGrant) -> Result<ReadContext, Status> {
+        let mut context = ReadContext::open().with_hydrator(self.hydrator_for(grant).await?);
+        if let Some(view) = &grant.view {
+            context = context.with_visibility(Arc::new(AttrVisibility::resolve_all(
+                dbs.iter().map(|db| (db.schema(), db.idents())),
+                |ident| view.attribute_visible(&ident.to_string()),
+            )));
+        }
+        Ok(context)
     }
 
     fn view_db(&self, spec: Option<&pb::DbViewSpec>) -> Result<Db, Status> {
@@ -162,7 +278,12 @@ fn decode_edn(bytes: &[u8], what: &str) -> Result<Edn, Status> {
         .map_err(|error| Status::invalid_argument(format!("bad {what}: {error}")))
 }
 
-fn resolve_eid(db: &Db, form: &Edn) -> Result<EntityId, Status> {
+/// Resolves an entity-position form for one reader.
+///
+/// A lookup ref over an attribute the reader cannot see does not resolve:
+/// whether it does is an existence oracle over exactly the attribute the view
+/// withholds.
+fn resolve_eid(db: &Db, read: &ReadContext, form: &Edn) -> Result<EntityId, Status> {
     match form {
         Edn::Long(n) => u64::try_from(*n)
             .map(EntityId::from_raw)
@@ -187,6 +308,11 @@ fn resolve_eid(db: &Db, form: &Edn) -> Result<EntityId, Status> {
                 .ok_or_else(|| Status::invalid_argument("unknown lookup attribute"))?;
             let value = boundary::edn_to_value(Some(db), value_form)
                 .ok_or_else(|| Status::invalid_argument("bad lookup value"))?;
+            if !read.visible(attr) {
+                return Err(Status::permission_denied(format!(
+                    "lookup ref {form} names an attribute this principal cannot see"
+                )));
+            }
             let value = db.schema().get(attr).map_or(value.clone(), |meta| {
                 exec::coerce_for_type(value, meta.value_type)
             });
@@ -211,6 +337,37 @@ fn chunk_stream<T: Send + 'static>(chunks: Vec<T>) -> ChunkStream<T> {
     Box::pin(tokio_stream::iter(chunks.into_iter().map(Ok)))
 }
 
+/// Splits a query result into wire chunks. Scalar and tuple shapes are one
+/// value, so they are always a single chunk.
+fn result_chunks(
+    shape: pb::ResultShape,
+    rows: Vec<Edn>,
+    chunk_size: usize,
+) -> Vec<pb::QueryResultChunk> {
+    if matches!(shape, pb::ResultShape::Tuple | pb::ResultShape::Scalar) {
+        return vec![pb::QueryResultChunk {
+            shape: shape.into(),
+            rows: codec::encode_edn(&rows.into_iter().next().unwrap_or(Edn::Nil)),
+            last: true,
+        }];
+    }
+    let groups: Vec<&[Edn]> = if rows.is_empty() {
+        vec![&[]]
+    } else {
+        rows.chunks(chunk_size.max(1)).collect()
+    };
+    let total = groups.len();
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| pb::QueryResultChunk {
+            shape: shape.into(),
+            rows: codec::encode_edn(&Edn::Vector(group.to_vec())),
+            last: index + 1 == total,
+        })
+        .collect()
+}
+
 #[tonic::async_trait]
 impl PeerServer for PeerServerSvc {
     type QueryStream = ChunkStream<pb::QueryResultChunk>;
@@ -219,7 +376,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::QueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
-        self.authorize(&request, Access::on(Action::Query, self.db_target()))
+        let grant = self
+            .authorize(&request, Access::on(Action::Query, self.db_target()))
             .await?;
         let request = request.into_inner();
         let query_form = decode_edn(&request.query, "query")?;
@@ -265,13 +423,20 @@ impl PeerServer for PeerServerSvc {
         } else {
             request.fuel.min(self.config.max_fuel)
         };
+        // Resolved against every bound view, so a view bound at another basis
+        // cannot leave an attribute unhidden for the others.
+        let read = if dbs.is_empty() {
+            self.read_context(&[self.connection.db()], &grant).await?
+        } else {
+            self.read_context(&dbs, &grant).await?
+        };
         let started = Instant::now();
         let (result, report) = corium_query::run(
             &parsed,
             &inputs,
             ExecOptions {
                 fuel: Some(fuel),
-                hydrator: Some(self.hydrator().await?),
+                read,
                 ..ExecOptions::default()
             },
         )
@@ -291,46 +456,26 @@ impl PeerServer for PeerServerSvc {
             (ast::FindSpec::Scalar(_), value) => (pb::ResultShape::Scalar, vec![value]),
             (_, value) => (pb::ResultShape::Relation, vec![value]),
         };
-        let mut chunks = Vec::new();
-        match shape {
-            pb::ResultShape::Tuple | pb::ResultShape::Scalar => {
-                chunks.push(pb::QueryResultChunk {
-                    shape: shape.into(),
-                    rows: codec::encode_edn(&rows.into_iter().next().unwrap_or(Edn::Nil)),
-                    last: true,
-                });
-            }
-            _ => {
-                let groups: Vec<&[Edn]> = if rows.is_empty() {
-                    vec![&[]]
-                } else {
-                    rows.chunks(self.config.chunk_size.max(1)).collect()
-                };
-                let total = groups.len();
-                for (index, group) in groups.into_iter().enumerate() {
-                    chunks.push(pb::QueryResultChunk {
-                        shape: shape.into(),
-                        rows: codec::encode_edn(&Edn::Vector(group.to_vec())),
-                        last: index + 1 == total,
-                    });
-                }
-            }
-        }
-        Ok(Response::new(chunk_stream(chunks)))
+        Ok(Response::new(chunk_stream(result_chunks(
+            shape,
+            rows,
+            self.config.chunk_size,
+        ))))
     }
 
     async fn pull(
         &self,
         request: Request<pb::PullRequest>,
     ) -> Result<Response<pb::PullResponse>, Status> {
-        self.authorize(&request, Access::on(Action::Pull, self.db_target()))
+        let grant = self
+            .authorize(&request, Access::on(Action::Pull, self.db_target()))
             .await?;
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
         let pattern = decode_edn(&request.pattern, "pull pattern")?;
-        let eid = resolve_eid(&db, &decode_edn(&request.eid, "entity")?)?;
-        let hydrator = self.hydrator().await?;
-        let result = corium_query::pull_with(&db, &pattern, eid, Some(&hydrator))
+        let read = self.read_context(std::slice::from_ref(&db), &grant).await?;
+        let eid = resolve_eid(&db, &read, &decode_edn(&request.eid, "entity")?)?;
+        let result = corium_query::pull_with(&db, &pattern, eid, &read)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(pb::PullResponse {
             result: codec::encode_edn(&result),
@@ -341,8 +486,29 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::TransactRequest>,
     ) -> Result<Response<pb::TransactResponse>, Status> {
-        self.authorize(&request, Access::on(Action::Transact, self.db_target()))
+        let grant = self
+            .authorize(&request, Access::on(Action::Transact, self.db_target()))
             .await?;
+        // Transaction data arrives already encoded and is forwarded to the
+        // transactor as bytes, so this surface cannot tell whether a write
+        // touches an attribute the principal may not read — and a write it
+        // cannot read back is exactly how a view gets probed (`:db/cas` on a
+        // hidden attribute answers a question the read path refuses). A
+        // principal whose view hides attributes is refused rather than
+        // trusted.
+        //
+        // Holding a view is not itself the test: one that hides nothing in
+        // this database restricts nothing, and every surface asks the same
+        // question so one principal gets one answer. A key restriction is
+        // never a reason to refuse either — it hides no attribute, so a writer
+        // that may not hydrate a class can still be told honestly what it did
+        // and did not change.
+        let db = self.connection.db();
+        if grant.hides_attributes(db.schema(), db.idents()) {
+            return Err(Status::permission_denied(
+                "this principal reads through a restricted view and may not transact",
+            ));
+        }
         let request = request.into_inner();
         if request.db != self.connection.db_name() {
             return Err(Status::not_found(format!(
@@ -375,10 +541,12 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::DatomsRequest>,
     ) -> Result<Response<Self::DatomsStream>, Status> {
-        self.authorize(&request, Access::on(Action::Datoms, self.db_target()))
+        let grant = self
+            .authorize(&request, Access::on(Action::Datoms, self.db_target()))
             .await?;
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
+        let read = self.read_context(std::slice::from_ref(&db), &grant).await?;
         let order = match request.index.as_str() {
             "eavt" => IndexOrder::Eavt,
             "aevt" => IndexOrder::Aevt,
@@ -412,14 +580,22 @@ impl PeerServer for PeerServerSvc {
         let mut v = None;
         for (slot, form) in positions.iter().zip(&components) {
             match slot {
-                Slot::E => e = Some(resolve_eid(&db, form)?),
+                Slot::E => e = Some(resolve_eid(&db, &read, form)?),
                 Slot::A => {
-                    a = Some(match form {
+                    let attr = match form {
                         Edn::Keyword(keyword) => db.idents().entid(keyword).ok_or_else(|| {
                             Status::invalid_argument(format!("unknown attribute {keyword}"))
                         })?,
-                        other => resolve_eid(&db, other)?,
-                    });
+                        other => resolve_eid(&db, &read, other)?,
+                    };
+                    // Binding a hidden attribute as a prefix component would
+                    // turn an empty result into a statement about the data.
+                    if !read.visible(attr) {
+                        return Err(Status::permission_denied(
+                            "this principal cannot see that attribute",
+                        ));
+                    }
+                    a = Some(attr);
                 }
                 Slot::V => {
                     let value = boundary::edn_to_value(Some(&db), form)
@@ -441,16 +617,14 @@ impl PeerServer for PeerServerSvc {
                 .unwrap_or(usize::MAX)
                 .min(self.config.max_datoms)
         };
-        // Sealed values are opened with the server's own keys, for whoever
-        // asked — the raw datom stream discloses exactly as much as `query`
-        // and `pull` do. See this module's header.
-        let hydrator = self.hydrator().await?;
+        // The raw datom stream discloses exactly as much as `query` and
+        // `pull` do, and no more: same view, same keys.
         let mut datoms: Vec<corium_core::Datom> = Vec::new();
         for datom in db.datoms_prefix(order, &prefix) {
             if datoms.len() >= limit {
                 break;
             }
-            match hydrator.hydrate(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
+            match read.read(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
                 Ok(corium_db::protect::Hydration::Bind(v)) => {
                     datoms.push(corium_core::Datom { v, ..datom.clone() });
                 }
@@ -488,7 +662,8 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::TxRangeRequest>,
     ) -> Result<Response<Self::TxRangeStream>, Status> {
-        self.authorize(&request, Access::on(Action::TxRange, self.db_target()))
+        let grant = self
+            .authorize(&request, Access::on(Action::TxRange, self.db_target()))
             .await?;
         let request = request.into_inner();
         if request.db != self.connection.db_name() {
@@ -505,13 +680,32 @@ impl PeerServer for PeerServerSvc {
         };
         let records = self.connection.tx_range(request.start, end);
         let db = self.connection.db();
+        let read = self.read_context(std::slice::from_ref(&db), &grant).await?;
         let interner = db.interner();
         let mut txes = Vec::with_capacity(records.len());
         for record in records {
+            // History is read under the same view and keys as the present.
+            // A transaction log that reported facts the current-value read
+            // withholds would be the simplest possible way around the view.
+            let mut datoms = Vec::with_capacity(record.datoms.len());
+            for datom in &record.datoms {
+                match read.read(db.schema(), db.interner(), datom.a, datom.e, &datom.v) {
+                    Ok(corium_db::protect::Hydration::Bind(v)) => {
+                        datoms.push(corium_core::Datom { v, ..datom.clone() });
+                    }
+                    Ok(corium_db::protect::Hydration::Hide) => {}
+                    Ok(corium_db::protect::Hydration::Refuse(class)) => {
+                        return Err(Status::permission_denied(format!(
+                            "protection class {class} is not readable without its key"
+                        )));
+                    }
+                    Err(error) => return Err(Status::internal(error.to_string())),
+                }
+            }
             txes.push(pb::TxReport {
                 t: record.t,
                 tx_instant: record.tx_instant,
-                datoms: codec::encode_datoms(&record.datoms, interner)
+                datoms: codec::encode_datoms(&datoms, interner)
                     .map_err(|error| Status::internal(error.to_string()))?,
             });
         }
@@ -538,7 +732,10 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::DbStatsRequest>,
     ) -> Result<Response<pb::DbStatsResponse>, Status> {
-        self.authorize(&request, Access::on(Action::Inspect, self.db_target()))
+        // Stats are counts over the whole database value, not facts, and the
+        // guard has already decided whether this principal may inspect it.
+        let _grant = self
+            .authorize(&request, Access::on(Action::Inspect, self.db_target()))
             .await?;
         let request = request.into_inner();
         let db = self.view_db(request.db.as_ref())?;
@@ -557,8 +754,24 @@ impl PeerServer for PeerServerSvc {
         &self,
         request: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        self.authorize(&request, Access::on(Action::Subscribe, self.db_target()))
+        let grant = self
+            .authorize(&request, Access::on(Action::Subscribe, self.db_target()))
             .await?;
+        // This stream is the transactor's own, proxied through untouched, so
+        // there is nowhere to apply a view to it. A principal whose view
+        // hides attributes is refused rather than handed the unfiltered log;
+        // the filtered re-streaming that would lift this is not implemented.
+        //
+        // A key restriction needs no refusal here: the transactor holds no
+        // class key, so every protected value on this stream is already
+        // sealed and stays that way.
+        let db = self.connection.db();
+        if grant.hides_attributes(db.schema(), db.idents()) {
+            return Err(Status::permission_denied(
+                "this principal reads through a restricted view; \
+                 Subscribe cannot filter its stream and is refused",
+            ));
+        }
         let request = request.into_inner();
         if request.db != self.connection.db_name() {
             return Err(Status::not_found(format!(
