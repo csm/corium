@@ -14,7 +14,6 @@ import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -26,24 +25,20 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /** A lightweight asynchronous client connected to {@code corium peer-server}. */
-public final class RemotePeer implements AutoCloseable {
+public final class RemotePeer implements Peer {
     public static final int PROTOCOL_VERSION = 1;
 
     private final String databaseName;
     private final ManagedChannel channel;
     private final PeerServerGrpc.PeerServerStub stub;
+    private final DbBackend backend = new RemoteDbBackend(this);
     private volatile boolean closed;
 
     private RemotePeer(Builder builder) {
         this.databaseName = builder.databaseName;
-        URI endpoint = parseEndpoint(builder.endpoint);
-        boolean tls = endpoint.getScheme().equalsIgnoreCase("https");
-        if (builder.token != null && !tls && !builder.allowInsecureToken) {
-            throw new IllegalArgumentException("bearer tokens require an https:// endpoint");
-        }
-        if (!tls && (builder.tlsCa != null || builder.tlsDomain != null)) {
-            throw new IllegalArgumentException("custom TLS options require an https:// endpoint");
-        }
+        URI endpoint = Endpoints.parse(builder.endpoint);
+        boolean tls = Endpoints.tls(List.of(builder.endpoint), builder.token != null,
+                builder.allowInsecureToken, builder.tlsCa, builder.tlsDomain);
 
         int port = endpoint.getPort() >= 0 ? endpoint.getPort() : (tls ? 443 : 80);
         NettyChannelBuilder channelBuilder = NettyChannelBuilder.forAddress(endpoint.getHost(), port);
@@ -74,18 +69,26 @@ public final class RemotePeer implements AutoCloseable {
         return new Builder(endpoint, databaseName);
     }
 
+    @Override
     public String databaseName() { return databaseName; }
 
-    public Db db() {
-        ensureOpen();
-        return new Db(this);
+    @Override
+    public CompletableFuture<Db> db() {
+        return CompletableFuture.completedFuture(currentDb());
     }
 
     /** Remote views are always current, so sync completes with a fresh current view. */
+    @Override
     public CompletableFuture<Db> sync() {
-        return CompletableFuture.completedFuture(db());
+        return db();
     }
 
+    private Db currentDb() {
+        ensureOpen();
+        return new Db(backend, DbView.current(databaseName));
+    }
+
+    @Override
     public CompletableFuture<TxReport> transact(Object transactionData) {
         ensureOpen();
         Corium.TransactRequest request = Corium.TransactRequest.newBuilder()
@@ -105,7 +108,7 @@ public final class RemotePeer implements AutoCloseable {
                 tempids.put((String) key, (Long) value);
             });
             return new TxReport(response.getBasisBefore(), response.getBasisT(),
-                    Instant.ofEpochMilli(response.getTxInstant()), tempids, db());
+                    Instant.ofEpochMilli(response.getTxInstant()), tempids, currentDb());
         }));
         return future;
     }
@@ -216,7 +219,7 @@ public final class RemotePeer implements AutoCloseable {
     }
 
     void ensureOpen() {
-        if (closed) throw new CoriumException("peer is closed");
+        if (closed) throw new CoriumException("peer is closed", ErrorKind.CLOSED, null, null);
     }
 
     @Override
@@ -228,21 +231,6 @@ public final class RemotePeer implements AutoCloseable {
 
     public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
         return channel.awaitTermination(timeout, unit);
-    }
-
-    private static URI parseEndpoint(String value) {
-        try {
-            URI uri = new URI(Objects.requireNonNull(value, "endpoint"));
-            if (!("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme()))
-                    || uri.getHost() == null || uri.getUserInfo() != null || uri.getQuery() != null
-                    || uri.getFragment() != null
-                    || (uri.getPath() != null && !uri.getPath().isEmpty() && !"/".equals(uri.getPath()))) {
-                throw new IllegalArgumentException("endpoint must be an http:// or https:// origin");
-            }
-            return uri;
-        } catch (URISyntaxException error) {
-            throw new IllegalArgumentException("invalid endpoint", error);
-        }
     }
 
     private interface Decoder<I, O> { O decode(I input); }

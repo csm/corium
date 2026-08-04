@@ -34,7 +34,7 @@ final class RemotePeerIntegrationTest {
     void performsTheInitialRemoteApiOverGrpc() {
         try (RemotePeer peer = RemotePeer.builder(
                 "http://127.0.0.1:" + server.getPort(), "people").build()) {
-            Db db = peer.db().asOf(7);
+            Db db = peer.db().join().asOf(7);
             QueryResult names = db.query(Query.findCollection("?name")
                     .where("?entity", ":person/name", "?name")).join();
             assertEquals(QueryResult.Shape.COLLECTION, names.shape());

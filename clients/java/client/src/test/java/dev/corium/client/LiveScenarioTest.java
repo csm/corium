@@ -16,7 +16,7 @@ final class LiveScenarioTest {
         String database = System.getenv().getOrDefault("CORIUM_SCENARIO_DATABASE", "people");
 
         try (RemotePeer peer = RemotePeer.builder(endpoint, database).build()) {
-            DbStats before = peer.db().stats().get(30, TimeUnit.SECONDS);
+            DbStats before = peer.db().join().stats().get(30, TimeUnit.SECONDS);
             TxReport report = peer.transact(java.util.List.of()).get(30, TimeUnit.SECONDS);
             DbStats after = report.dbAfter().stats().get(30, TimeUnit.SECONDS);
 
