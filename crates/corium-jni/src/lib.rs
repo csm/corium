@@ -8,8 +8,23 @@
 //! Composite values cross the boundary as already-encoded bytes, so the Java
 //! codec in `dev.corium.client.CoriumCodec` remains the only Java-side value
 //! mapping for both the local and the remote peer.
+//!
+//! # Panics never cross the boundary
+//!
+//! Every native entry point runs its work inside [`EnvUnowned::with_env`],
+//! which catches unwinding and lets the error policy throw a Java exception, so
+//! a panic on the calling thread — including one from [`runtime`] failing to
+//! start — surfaces as a Java exception instead of aborting the JVM.
+//!
+//! Work that runs after an entry point returns is contained the same way, for
+//! the same reason: a `CompletableFuture` that never settles hangs its caller
+//! forever. Engine panics come back through the task's join handle, and
+//! [`settle`] both guards the delivery itself and falls back to a plain
+//! exception when JNI refuses the categorized one.
 
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -62,50 +77,142 @@ fn initialize(env: &mut Env<'_>) -> JniResult<()> {
     Ok(())
 }
 
+/// Why a Java future is completing exceptionally.
+enum Failure {
+    /// The facade categorized the failure.
+    Ffi(FfiError),
+    /// This adapter, or the engine task it drives, failed outside the facade's
+    /// taxonomy.
+    Native(String),
+}
+
+impl Failure {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Ffi(error) => error_kind(error.kind()),
+            Self::Native(_) => "native",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Ffi(error) => error.message(),
+            Self::Native(message) => message.clone(),
+        }
+    }
+
+    fn grpc_code(&self) -> i32 {
+        match self {
+            Self::Ffi(error) => error.grpc_code().unwrap_or(-1),
+            Self::Native(_) => -1,
+        }
+    }
+}
+
 fn spawn<T, F>(future: Global<JObject<'static>>, task: F, build: Build<T>)
 where
     T: Send + 'static,
     F: Future<Output = Result<T, FfiError>> + Send + 'static,
 {
     runtime().spawn(async move {
-        let outcome = task.await;
+        // The engine future runs as its own task so that Tokio catches a panic
+        // in it and reports it through the join handle. Awaiting it here means
+        // the Java future still settles when the task dies, instead of leaving
+        // a caller blocked in `join()` forever.
+        let outcome = match tokio::spawn(task).await {
+            Ok(result) => result.map_err(Failure::Ffi),
+            Err(error) => Err(Failure::Native(
+                if error.is_panic() {
+                    "the Corium engine panicked"
+                } else {
+                    "the Corium engine task was cancelled"
+                }
+                .to_owned(),
+            )),
+        };
         settle(&future, outcome, build);
     });
 }
 
-fn settle<T>(future: &Global<JObject<'static>>, outcome: Result<T, FfiError>, build: Build<T>) {
+fn settle<T>(future: &Global<JObject<'static>>, outcome: Result<T, Failure>, build: Build<T>) {
     let Some(vm) = JAVA_VM.get() else {
+        report_unsettled("the Java VM is unavailable");
         return;
     };
-    // The attachment is scoped so that a runtime worker never stays attached:
-    // a permanently attached thread counts as a live non-daemon thread and
-    // would keep the JVM from exiting.
-    //
-    // A JNI failure here leaves the Java future pending. Nothing better is
-    // available on an engine thread, so the error is dropped.
-    let _ = vm.attach_current_thread_for_scope(|env| -> JniResult<()> {
-        match outcome {
-            Ok(value) => {
-                let value = build(env, value)?;
-                env.call_method(
-                    future,
-                    jni_str!("complete"),
-                    jni_sig!("(Ljava/lang/Object;)Z"),
-                    &[JValue::Object(&value)],
-                )?;
-            }
-            Err(error) => {
-                let throwable = java_error(env, &error)?;
-                env.call_method(
-                    future,
-                    jni_str!("completeExceptionally"),
-                    jni_sig!("(Ljava/lang/Throwable;)Z"),
-                    &[JValue::Object(&throwable)],
-                )?;
-            }
+    // The attachment is scoped so that a runtime worker never stays attached: a
+    // permanently attached thread counts as a live non-daemon thread and would
+    // keep the JVM from exiting.
+    let delivered = vm.attach_current_thread_for_scope(|env| -> JniResult<()> {
+        // Caught here rather than around the attachment so that a panic never
+        // unwinds through the attach guard.
+        match catch_unwind(AssertUnwindSafe(|| deliver(env, future, outcome, build))) {
+            Ok(result) => result,
+            Err(_) => Err(JniError::JavaException),
         }
-        Ok(())
     });
+    let Err(error) = delivered else {
+        return;
+    };
+    // Last resort: settle with an exception built without the adapter class or
+    // the Corium taxonomy, so the caller sees a diagnosable failure instead of
+    // a future that never completes.
+    let fallback = vm.attach_current_thread_for_scope(|env| -> JniResult<()> {
+        let message = format!("the Corium native adapter could not deliver a result: {error}");
+        let message = env.new_string(&message)?;
+        let throwable = env.new_object(
+            jni_str!("java/lang/RuntimeException"),
+            jni_sig!("(Ljava/lang/String;)V"),
+            &[JValue::Object(&message)],
+        )?;
+        complete_exceptionally(env, future, &throwable)
+    });
+    if let Err(fallback) = fallback {
+        report_unsettled(&fallback.to_string());
+    }
+}
+
+fn deliver<T>(
+    env: &mut Env<'_>,
+    future: &Global<JObject<'static>>,
+    outcome: Result<T, Failure>,
+    build: Build<T>,
+) -> JniResult<()> {
+    match outcome {
+        Ok(value) => {
+            let value = build(env, value)?;
+            env.call_method(
+                future,
+                jni_str!("complete"),
+                jni_sig!("(Ljava/lang/Object;)Z"),
+                &[JValue::Object(&value)],
+            )?;
+        }
+        Err(failure) => {
+            let throwable = java_error(env, &failure)?;
+            complete_exceptionally(env, future, &throwable)?;
+        }
+    }
+    Ok(())
+}
+
+fn complete_exceptionally(
+    env: &mut Env<'_>,
+    future: &Global<JObject<'static>>,
+    throwable: &JObject<'_>,
+) -> JniResult<()> {
+    env.call_method(
+        future,
+        jni_str!("completeExceptionally"),
+        jni_sig!("(Ljava/lang/Throwable;)Z"),
+        &[JValue::Object(throwable)],
+    )
+    .map(|_| ())
+}
+
+/// Reports a result that could not reach Java at all. The Java side is already
+/// unreachable here, so stderr is the only channel left.
+fn report_unsettled(detail: &str) {
+    eprintln!("corium: a native result could not be delivered to Java: {detail}");
 }
 
 fn error_kind(kind: ErrorKind) -> &'static str {
@@ -123,12 +230,12 @@ fn error_kind(kind: ErrorKind) -> &'static str {
     }
 }
 
-fn java_error<'env>(env: &mut Env<'env>, error: &FfiError) -> JniResult<JObject<'env>> {
+fn java_error<'env>(env: &mut Env<'env>, failure: &Failure) -> JniResult<JObject<'env>> {
     let class = NATIVE_CLASS.get().ok_or(JniError::NullPtr(
         "the Corium native adapter is uninitialized",
     ))?;
-    let kind = env.new_string(error_kind(error.kind()))?;
-    let message = env.new_string(error.message())?;
+    let kind = env.new_string(failure.kind())?;
+    let message = env.new_string(failure.message())?;
     env.call_static_method(
         class,
         jni_str!("error"),
@@ -136,15 +243,15 @@ fn java_error<'env>(env: &mut Env<'env>, error: &FfiError) -> JniResult<JObject<
         &[
             JValue::Object(&kind),
             JValue::Object(&message),
-            JValue::Int(error.grpc_code().unwrap_or(-1)),
+            JValue::Int(failure.grpc_code()),
         ],
     )?
     .l()
 }
 
 /// Throws the categorized Corium exception for a synchronous failure.
-fn throw_error(env: &mut Env<'_>, error: &FfiError) -> JniError {
-    let thrown = java_error(env, error)
+fn throw_error(env: &mut Env<'_>, error: FfiError) -> JniError {
+    let thrown = java_error(env, &Failure::Ffi(error))
         .and_then(|throwable| env.cast_local::<JThrowable>(throwable))
         .and_then(|throwable| env.throw(throwable));
     match thrown {
@@ -443,7 +550,7 @@ pub extern "system" fn Java_dev_corium_client_Native_loadStoragePlugin<'local>(
             let path = path.try_to_string(env)?;
             match load_storage_plugin(PathBuf::from(path)) {
                 Ok(backends) => string_array(env, &backends),
-                Err(error) => Err(throw_error(env, &error)),
+                Err(error) => Err(throw_error(env, error)),
             }
         })
         .resolve::<ThrowRuntimeExAndDefault>()
@@ -618,7 +725,7 @@ pub extern "system" fn Java_dev_corium_client_Native_peerTransact<'local>(
             let handle = unsafe { peer_handle(peer) }.clone();
             let forms = match composite(env, &tx_data)? {
                 Ok(forms) => forms,
-                Err(error) => return Err(throw_error(env, &error)),
+                Err(error) => return Err(throw_error(env, error)),
             };
             let future = env.new_global_ref(&future)?;
             spawn(
@@ -706,11 +813,11 @@ pub extern "system" fn Java_dev_corium_client_Native_dbQuery<'local>(
             let handle = unsafe { db_handle(db) }.clone();
             let query = match composite(env, &query)? {
                 Ok(query) => query,
-                Err(error) => return Err(throw_error(env, &error)),
+                Err(error) => return Err(throw_error(env, error)),
             };
             let args = match composite_list(env, &args)? {
                 Ok(args) => args,
-                Err(error) => return Err(throw_error(env, &error)),
+                Err(error) => return Err(throw_error(env, error)),
             };
             let fuel =
                 u64::try_from(fuel).map_err(|_| throw_argument(env, "query fuel is negative"))?;
@@ -747,11 +854,11 @@ pub extern "system" fn Java_dev_corium_client_Native_dbPull<'local>(
             let handle = unsafe { db_handle(db) }.clone();
             let pattern = match composite(env, &pattern)? {
                 Ok(pattern) => pattern,
-                Err(error) => return Err(throw_error(env, &error)),
+                Err(error) => return Err(throw_error(env, error)),
             };
             let entity = match composite(env, &entity)? {
                 Ok(entity) => entity,
-                Err(error) => return Err(throw_error(env, &error)),
+                Err(error) => return Err(throw_error(env, error)),
             };
             let future = env.new_global_ref(&future)?;
             spawn(
@@ -790,7 +897,7 @@ pub extern "system" fn Java_dev_corium_client_Native_dbDatoms<'local>(
             let index = index_for(env, &index)?;
             let components = match composite_list(env, &components)? {
                 Ok(components) => components,
-                Err(error) => return Err(throw_error(env, &error)),
+                Err(error) => return Err(throw_error(env, error)),
             };
             let limit =
                 u64::try_from(limit).map_err(|_| throw_argument(env, "datom limit is negative"))?;

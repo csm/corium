@@ -9,19 +9,14 @@ on:
         type: string
   pull_request:
     paths:
+      # The engine library statically links the whole peer stack, so any crate
+      # can break these jars. Naming a subset would let a change to, say,
+      # corium-db land without ever building them.
       - ".github/workflows/java-native.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "clients/java/**"
-      - "crates/corium-client/**"
-      - "crates/corium-ffi/**"
-      - "crates/corium-jni/**"
-      - "crates/corium-store/**"
-      - "crates/corium-store-abi/**"
-      - "crates/corium-store-plugin/**"
-      - "crates/corium-store-postgres/**"
-      - "crates/corium-store-s3/**"
-      - "crates/corium-store-turso/**"
+      - "crates/**"
 
 permissions:
   contents: read

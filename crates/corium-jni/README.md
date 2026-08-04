@@ -18,6 +18,15 @@ attached would count as a live non-daemon thread and keep the JVM from exiting.
 
 Failures become `dev.corium.client.CoriumException` with the `ErrorKind` that
 `corium-ffi` categorized, so both Java peers report failures identically.
+Failures of the adapter itself — an engine task that panicked, or a delivery
+JNI call that could not be made — carry the `NATIVE` kind.
+
+A future that never settles hangs its caller forever, so every path that could
+strand one is closed. Native entry points run inside `with_env`, which catches
+unwinding and throws instead. Engine panics come back through the task's join
+handle. The delivery itself is guarded, and falls back to a plain
+`RuntimeException` if the categorized one cannot be built; only a JVM that
+refuses both leaves the future pending, and that is reported on stderr.
 
 Peer and database handles are opaque `jlong` pointers. Java owns their
 lifetime: `close()` releases the live peer deterministically, and a

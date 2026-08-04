@@ -22,7 +22,10 @@ public enum ErrorKind {
     FUEL_EXHAUSTED,
     /** The peer was closed. */
     CLOSED,
-    /** The native engine or a storage plugin could not be loaded. */
+    /**
+     * The native engine or a storage plugin could not be loaded, or the engine
+     * failed outside the categories above.
+     */
     NATIVE;
 
     /** Maps a category name reported by the native adapter. */
@@ -37,6 +40,7 @@ public enum ErrorKind {
             case "storage": return STORAGE;
             case "fuel_exhausted": return FUEL_EXHAUSTED;
             case "closed": return CLOSED;
+            case "native": return NATIVE;
             default: return PROTOCOL;
         }
     }
