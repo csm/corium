@@ -61,8 +61,13 @@ impl DbCatalog for TestCatalog {
         let items = tx_items_from_edn(&db, &mut interner, &forms)
             .map_err(|error| CatalogError::Rejected(error.to_string()))?;
         let t = db.basis_t() + 1;
-        let prepared = prepare(&db, items, EntityId::new(Partition::Tx as u32, t), 2_000)
-            .map_err(|error| CatalogError::Rejected(error.to_string()))?;
+        let prepared = prepare(
+            &db,
+            items,
+            EntityId::new(Partition::Tx as u32, t),
+            db.next_user_sequence(),
+        )
+        .map_err(|error| CatalogError::Rejected(error.to_string()))?;
         *db = db.clone().with_transaction(t, &prepared.datoms);
         Ok(CatalogTxResult {
             db_after: db.clone(),
@@ -444,6 +449,93 @@ async fn cardinality_many_renders_as_array_literal() {
 }
 
 #[tokio::test]
+async fn pgjdbc_sql_keywords_metadata_probe_is_supported() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query(
+            "select string_agg(word, ',') from pg_catalog.pg_get_keywords() \
+             where word <> ALL ('{select,from,where}'::text[])",
+        )
+        .await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        response
+            .iter()
+            .map(|message| message.tag)
+            .collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'Z']
+    );
+    let keywords = data_row_values(&response[1].body)[0]
+        .clone()
+        .expect("keyword list");
+    assert!(keywords.contains("returning"));
+    assert!(keywords.contains("vacuum"));
+
+    client.query("SELECT current_schema()").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("current schema row")
+                .body
+        ),
+        vec![Some("corium".to_owned())]
+    );
+
+    client.query("select current_catalog").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("current catalog row")
+                .body
+        ),
+        vec![Some("corium".to_owned())]
+    );
+
+    client
+        .query(
+            "SELECT setting FROM pg_catalog.pg_settings \
+             WHERE name='default_transaction_isolation'",
+        )
+        .await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("pg setting row")
+                .body
+        ),
+        vec![Some("read committed".to_owned())]
+    );
+
+    client.query("SHOW TRANSACTION ISOLATION LEVEL").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("transaction isolation row")
+                .body
+        ),
+        vec![Some("read committed".to_owned())]
+    );
+}
+
+#[tokio::test]
 async fn unsupported_ddl_is_rejected_but_the_session_survives() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
@@ -685,7 +777,7 @@ async fn explicit_transaction_reads_keep_their_first_snapshot() {
 }
 
 #[tokio::test]
-async fn writes_in_explicit_transaction_blocks_are_rejected_without_committing() {
+async fn explicit_transaction_writes_are_visible_and_commit_atomically() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
     client
@@ -694,22 +786,67 @@ async fn writes_in_explicit_transaction_blocks_are_rejected_without_committing()
     client.read_until_ready().await;
 
     client
-        .query("BEGIN; INSERT INTO corium.artist (name) VALUES ('Must Not Commit')")
+        .query(
+            "BEGIN; \
+             INSERT INTO corium.artist (name) VALUES ('First Staged') RETURNING e; \
+             BEGIN; \
+             INSERT INTO corium.artist (name) VALUES ('Second Staged') RETURNING e; \
+             SELECT name FROM corium.artist WHERE name LIKE '% Staged' ORDER BY name; \
+             COMMIT",
+        )
         .await;
     let response = client.read_until_ready().await;
-    assert!(response.iter().any(|message| message.tag == b'E'));
-    assert_eq!(response.last().unwrap().body, vec![b'E']);
+    assert!(!response.iter().any(|message| message.tag == b'E'));
+    assert_eq!(response.last().unwrap().body, vec![b'I']);
+    let returned_ids = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .filter_map(|message| {
+            let values = data_row_values(&message.body);
+            values
+                .first()
+                .and_then(Option::as_deref)
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(returned_ids.len(), 2);
+    assert_ne!(returned_ids[0], returned_ids[1]);
+    let staged_names = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .filter_map(|message| data_row_values(&message.body).into_iter().next().flatten())
+        .filter(|value| value.ends_with(" Staged"))
+        .collect::<Vec<_>>();
+    assert_eq!(staged_names, vec!["First Staged", "Second Staged"]);
 
-    client.query("SELECT 1").await;
-    let response = client.read_until_ready().await;
-    assert_eq!(response.first().unwrap().tag, b'E');
-    assert!(
-        cstrings(&response.first().unwrap().body)
-            .iter()
-            .any(|field| field.contains("25P02"))
-    );
+    client
+        .query("SELECT e, name FROM corium.artist WHERE name LIKE '% Staged' ORDER BY name")
+        .await;
+    let committed = client.read_until_ready().await;
+    let committed_rows = committed
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .map(|message| data_row_values(&message.body))
+        .collect::<Vec<_>>();
+    assert_eq!(committed_rows.len(), 2);
+    let first_id = returned_ids[0].to_string();
+    let second_id = returned_ids[1].to_string();
+    assert_eq!(committed_rows[0][0].as_deref(), Some(first_id.as_str()));
+    assert_eq!(committed_rows[1][0].as_deref(), Some(second_id.as_str()));
+}
 
-    client.query("ROLLBACK").await;
+#[tokio::test]
+async fn rollback_discards_staged_writes() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query("BEGIN; INSERT INTO corium.artist (name) VALUES ('Must Not Commit'); ROLLBACK")
+        .await;
     let response = client.read_until_ready().await;
     assert_eq!(response.last().unwrap().body, vec![b'I']);
 

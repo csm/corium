@@ -327,6 +327,11 @@ impl TxInstants {
 #[derive(Clone, Debug)]
 pub struct Db {
     basis_t: u64,
+    /// Next unallocated user-partition sequence known to this value.
+    ///
+    /// Published snapshots carry this separately because a fully retracted
+    /// entity leaves no live datom from which to reconstruct the allocator.
+    next_user_sequence: u64,
     schema: Schema,
     recorded: VectorSync<Arc<Datom>>,
     idents: Arc<Idents>,
@@ -352,6 +357,7 @@ impl Default for Db {
     fn default() -> Self {
         Self {
             basis_t: 0,
+            next_user_sequence: FIRST_USER_ID,
             schema: Schema::default(),
             recorded: VectorSync::new_sync(),
             idents: Arc::default(),
@@ -398,6 +404,35 @@ impl Db {
     #[must_use]
     pub fn from_current_snapshot(
         basis_t: u64,
+        schema: Schema,
+        idents: Idents,
+        interner: KeywordInterner,
+        datoms: Vec<Datom>,
+    ) -> Self {
+        let next_user_sequence = datoms
+            .iter()
+            .filter(|datom| datom.e.partition() == Partition::User as u32)
+            .map(|datom| datom.e.sequence() + 1)
+            .fold(FIRST_USER_ID, u64::max);
+        Self::from_current_snapshot_with_next_user(
+            basis_t,
+            next_user_sequence,
+            schema,
+            idents,
+            interner,
+            datoms,
+        )
+    }
+
+    /// Creates a current value from a published snapshot and its persisted
+    /// user-entity allocation high-water mark.
+    ///
+    /// `next_user_sequence` is authoritative even when it is higher than all
+    /// live entity ids because deleted entities must never be reallocated.
+    #[must_use]
+    pub fn from_current_snapshot_with_next_user(
+        basis_t: u64,
+        next_user_sequence: u64,
         mut schema: Schema,
         mut idents: Idents,
         interner: KeywordInterner,
@@ -423,6 +458,7 @@ impl Db {
         }
         Self {
             basis_t,
+            next_user_sequence: next_user_sequence.max(FIRST_USER_ID),
             schema,
             recorded: datoms.into_iter().map(Arc::new).collect(),
             idents: Arc::new(idents),
@@ -449,6 +485,12 @@ impl Db {
     #[must_use]
     pub const fn basis_t(&self) -> u64 {
         self.basis_t
+    }
+
+    /// Next unallocated sequence in the default user partition.
+    #[must_use]
+    pub const fn next_user_sequence(&self) -> u64 {
+        self.next_user_sequence
     }
 
     /// Schema at this basis.
@@ -795,6 +837,11 @@ impl Db {
         );
         let mut next = self.clone();
         next.basis_t = t;
+        next.next_user_sequence = datoms
+            .iter()
+            .filter(|datom| datom.e.partition() == Partition::User as u32)
+            .map(|datom| datom.e.sequence() + 1)
+            .fold(self.next_user_sequence, u64::max);
         // Schema effects come first, before a single user datom of the same
         // transaction is indexed. That ordering is what makes a transaction
         // that installs an attribute and immediately uses it legal, and it is
@@ -1392,6 +1439,24 @@ mod tests {
             ],
         );
         assert_eq!(db.tx_instant(1), Some(1_000));
+    }
+
+    #[test]
+    fn snapshot_preserves_allocator_high_water_without_live_entities() {
+        let db = Db::from_current_snapshot_with_next_user(
+            7,
+            4_200,
+            schema(),
+            Idents::default(),
+            KeywordInterner::default(),
+            Vec::new(),
+        );
+        assert_eq!(db.next_user_sequence(), 4_200);
+
+        let advanced =
+            db.with_transaction(8, &[datom(4_500, 1, Value::Str("later".into()), 8, true)]);
+        assert_eq!(advanced.next_user_sequence(), 4_501);
+        assert_eq!(db.next_user_sequence(), 4_200);
     }
 
     #[test]

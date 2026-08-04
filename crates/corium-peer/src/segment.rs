@@ -259,8 +259,9 @@ pub async fn load_current_snapshot(
         .into_iter()
         .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(Db::from_current_snapshot(
+    Ok(Some(Db::from_current_snapshot_with_next_user(
         root.index_basis_t,
+        root.next_entity_id,
         schema,
         idents,
         interner,
@@ -436,6 +437,7 @@ mod tests {
             .expect("load snapshot")
             .expect("published snapshot");
         assert_eq!(db.basis_t(), 37);
+        assert_eq!(db.next_user_sequence(), 1_005);
         assert_eq!(db.datoms(), vec![datom]);
     }
 
@@ -493,6 +495,7 @@ mod tests {
             .expect("load snapshot")
             .expect("published snapshot");
         assert_eq!(db.basis_t(), 37);
+        assert_eq!(db.next_user_sequence(), 1_005);
         assert_eq!(db.datoms(), datoms);
     }
 

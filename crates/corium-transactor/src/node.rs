@@ -971,8 +971,9 @@ impl TransactorNode {
             .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))?;
-        Ok(Db::from_current_snapshot(
+        Ok(Db::from_current_snapshot_with_next_user(
             root.index_basis_t,
+            root.next_entity_id,
             schema.clone(),
             idents.clone(),
             interner.clone(),

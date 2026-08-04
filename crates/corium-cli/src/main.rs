@@ -669,8 +669,8 @@ enum Command {
         /// client a Corium principal.
         #[arg(long)]
         password: Option<String>,
-        /// Enable guarded autocommit INSERT, UPDATE, and DELETE. Without this
-        /// flag the server remains read-only.
+        /// Enable guarded INSERT, UPDATE, and DELETE in autocommit or explicit
+        /// transactions. Without this flag the server remains read-only.
         #[arg(long)]
         allow_writes: bool,
         #[command(flatten)]
@@ -1381,7 +1381,7 @@ async fn run_command(command: Command) -> Result<(), String> {
             };
             tracing::info!(%listen, allow_writes, "postgres server serving");
             let access = if allow_writes {
-                "guarded autocommit writes enabled"
+                "guarded writes enabled"
             } else {
                 "read-only"
             };

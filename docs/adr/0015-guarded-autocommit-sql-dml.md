@@ -2,6 +2,10 @@
 
 **Status:** Accepted (2026-07-24)
 
+**Amended 2026-08-04:** `corium-pgwire` now composes statement plans into a
+provisional transaction value and commits their combined forms atomically.
+The original single-statement `corium-sql` planner contract remains unchanged.
+
 ## Context
 
 ADR-0011 made SQL a read-only peer-local projection, and ADR-0013 exposed it
@@ -48,10 +52,11 @@ The first mutation contract is:
 - `RETURNING` for insert, update, and delete;
 - typed PostgreSQL bind inputs for common scalar types.
 
-Writes in an explicit `BEGIN` block are rejected. This is preferable to
-silently autocommitting them while claiming transaction semantics. DDL,
-schema changes, joined/multi-table mutation forms, upsert/conflict clauses,
-new keyword interning, and multi-statement transactions are deferred.
+The initial implementation rejected writes in an explicit `BEGIN` block rather
+than silently autocommitting them while claiming transaction semantics. The
+2026-08-04 amendment adds real pgwire transaction staging and an atomic
+basis-fenced commit. DDL, schema changes, joined/multi-table mutation forms,
+upsert/conflict clauses, and new keyword interning remain deferred.
 
 PostgreSQL wire authentication remains distinct from Corium authorization.
 The server's configured Corium service principal currently authorizes
@@ -69,5 +74,5 @@ authn/authz work.
 - SQL remains less expressive than native transaction data and Datalog. The
   narrow subset is an adoption interface, while native APIs retain schema,
   temporal, rule, pull, recursive, and entity-oriented capabilities.
-- Atomic multi-statement application workflows still require native
-  transaction data until a real SQL transaction buffer is designed.
+- Pgwire application workflows may atomically compose the supported DML
+  subset; native transaction data remains the broader write interface.
