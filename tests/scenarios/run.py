@@ -564,7 +564,7 @@ def security_test(test_name: str) -> str:
             "-p",
             "corium-cli",
             "--features",
-            "oidc",
+            "postgres,turso,s3,oidc",
             "--test",
             "scenario_security",
             test_name,
