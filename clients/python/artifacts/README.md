@@ -1,22 +1,32 @@
-# Direct-storage plugin packaging
+# Direct-storage plugin packages
 
-This repository does not currently build or publish official Python wrapper
-packages for the Turso, PostgreSQL, or S3 plugins. The base `corium` package
-supports filesystem direct storage. Use remote peer or replay mode for the
-other storage backends.
+Corium publishes `corium-turso`, `corium-postgres`, and `corium-s3`. Each wheel
+contains one storage library and one Python path provider. The base `corium`
+wheel contains the engine and filesystem storage.
 
-The Python loader supports third-party and internal wrapper packages. A
-wrapper package contains a storage shared library and a Python path provider.
-It advertises that provider through the `corium.store_plugins` entry-point
-group. The provider returns the installed path of the shared library.
+Each provider uses the `corium.store_plugins` entry-point group. The Python
+loader calls the provider and loads the returned library path.
 
-The wrapper package is separate from the Rust plugin build. For example, this
-command builds the Turso shared library:
+Build the three storage libraries:
 
 ```shell
-cargo build -p corium-store-turso --release
+cargo build --release \
+  -p corium-store-turso \
+  -p corium-store-postgres \
+  -p corium-store-s3
 ```
 
-This repository does not provide the wrapper project that `maturin` requires.
-The `corium.available_storage_backends()` function reports all registered
-backends. The loader rejects duplicate kinds and incompatible ABI layouts.
+Then build the wheels for the current platform:
+
+```shell
+python clients/python/scripts/build_plugin_wheels.py \
+  --target-directory target/release \
+  --platform-tag macosx_11_0_arm64 \
+  --output dist
+```
+
+Use the correct wheel platform tag for the build host. The release workflow
+builds all supported Linux, macOS, and Windows wheels. It applies the
+`manylinux_2_28` policy to Linux wheels.
+
+The loader rejects duplicate backend kinds and incompatible ABI layouts.

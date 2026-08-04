@@ -1,0 +1,22 @@
+"""Path provider for the official Corium S3 storage plugin."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+_LIBRARY_NAMES = (
+    "libcorium_store_s3.so",
+    "libcorium_store_s3.dylib",
+    "corium_store_s3.dll",
+)
+
+
+def plugin_path() -> Path:
+    """Return the installed storage plugin path."""
+
+    package = Path(__file__).resolve().parent
+    for name in _LIBRARY_NAMES:
+        library = package / name
+        if library.is_file():
+            return library
+    raise RuntimeError("the corium-s3 native library is missing")
