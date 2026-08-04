@@ -2149,6 +2149,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corium-jni"
+version = "0.1.0"
+dependencies = [
+ "corium-ffi",
+ "jni",
+ "tokio",
+]
+
+[[package]]
 name = "corium-log"
 version = "0.1.0"
 dependencies = [
