@@ -18,9 +18,10 @@ use thiserror::Error;
 pub const MIN_PADDING: i64 = 16;
 
 /// Sequence of the first installable attribute entity in the db partition.
-/// Lower sequences are reserved for the engine's own attributes
-/// (`corium_db::bootstrap`).
-pub const FIRST_ATTR_ID: u64 = 100;
+///
+/// Re-exported from [`corium_db`], which owns the reservation because it owns
+/// the engine attributes that sit below it.
+pub use corium_db::FIRST_ATTR_ID;
 
 /// Schema form conversion failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -43,6 +44,15 @@ pub enum SchemaFormError {
     /// Two attributes share one ident.
     #[error("duplicate :db/ident {0}")]
     DuplicateIdent(String),
+    /// A schema file declared an attribute the engine owns.
+    ///
+    /// The schema vocabulary (`:db/ident`, `:db/valueType`, …) and
+    /// `:db/txInstant` are installed in every database by
+    /// [`corium_db::bootstrap`]. Redeclaring one cannot change it and would
+    /// only disagree with it, so it is refused rather than ignored — the same
+    /// rule the schema-update planner applies.
+    #[error("{0} is an engine attribute and cannot be declared by a schema file")]
+    EngineAttribute(String),
     /// A protection class definition is malformed.
     #[error("protection class {ident}: {reason}")]
     BadProtectionClass {
@@ -168,6 +178,12 @@ pub fn schema_from_edn(forms: &[Edn]) -> Result<(Schema, Idents), SchemaFormErro
             )?;
             schema.set_protection(id, ProtectionTimeline::protected_from(0, class_id));
         }
+        // Documentation is part of the pre-basis seed too. Without it, a
+        // schema file that has always carried a `:db/doc` would plan a
+        // documentation change against the database it created.
+        if let Some(Edn::Str(doc)) = form.get(&kw("db/doc")) {
+            schema.set_doc(id, Some(doc.clone()));
+        }
         schema.insert(Attribute {
             id,
             value_type,
@@ -199,8 +215,20 @@ fn register_idents(forms: &[Edn], idents: &mut Idents) -> Result<Vec<EntityId>, 
             .and_then(Edn::as_keyword)
             .ok_or(SchemaFormError::MissingIdent)?
             .clone();
-        if idents.entid(&ident).is_some() {
-            return Err(SchemaFormError::DuplicateIdent(ident.to_string()));
+        // An ident the engine already installed is its own attribute, not a
+        // duplicate of another declaration in this file. Naming the two apart
+        // is what tells an operator whether to rename their attribute or to
+        // delete a line the engine now provides.
+        if let Some(existing) = idents.entid(&ident) {
+            return Err(
+                if existing.partition() == Partition::Db as u32
+                    && existing.sequence() < FIRST_ATTR_ID
+                {
+                    SchemaFormError::EngineAttribute(ident.to_string())
+                } else {
+                    SchemaFormError::DuplicateIdent(ident.to_string())
+                },
+            );
         }
         idents.insert(ident, id);
         ids.push(id);

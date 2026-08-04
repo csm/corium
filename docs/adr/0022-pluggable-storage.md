@@ -1,4 +1,4 @@
-# ADR-0021: Runtime-pluggable storage backends
+# ADR-0022: Runtime-pluggable storage backends
 
 **Status:** Accepted (2026-08-03)
 

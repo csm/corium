@@ -30,29 +30,44 @@ with attributes is a set of attribute additions.
 The decision is recorded in
 [ADR-0020](../adr/0020-planned-schema-migrations.md).
 
-## The implementation gap
+## How schema changes are carried
 
-The intended data model says schema is data and is installed through ordinary
-transactions. The current implementation has only the creation half of that
-model:
+Schema is data, and a schema change is a transaction. The pieces:
 
-- `corium_forms::schemaform::schema_from_edn` assigns attribute ids once when
-  `CreateDatabase` runs.
-- The schema and ident registry are stored in the database metadata root and
-  sent to peers in the subscription handshake.
-- `Db::with_transaction_at` applies datoms against a fixed `Schema`. It does not
-  derive a new schema from schema datoms.
-- When the parent already has cached indexes, `Db::apply_transaction` folds new
-  datoms into those indexes with the parent's schema. Granting AVET coverage
-  without invalidating that fold therefore produces a silently partial
-  index containing only post-change datoms.
-- A reconnect may replace the handshake schema, but a live tx report cannot
-  announce a schema generation or make a peer rebuild affected indexes.
+- `corium_db::bootstrap` installs the **schema vocabulary** — `:db/ident`,
+  `:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
+  `:db/isComponent`, `:db/noHistory`, `:db/doc`, `:db/protection`, and the
+  `:db/retired` marker — in every database, at Datomic's ids where Datomic has
+  the same attribute. An attribute's metadata is stored under these on the
+  attribute entity.
+- `corium_db::schemadatoms::derive` folds those datoms back into a `Schema` and
+  `Idents`. `Db::with_transaction_at` runs it over the whole record *before* it
+  indexes any user datom, so a transaction that installs an attribute and uses
+  it is legal by construction rather than by datom order.
+- Because the derivation lives in `Db`, every holder reaches the same schema
+  from the same log: the transactor deriving a commit, a peer applying a tx
+  report, and recovery replaying the log all converge without a side channel.
+- `Db::apply_transaction` drops the incremental index fold when the schema
+  generation advances. Extending the parent's fold under the parent's schema
+  would leave an attribute that just gained AVET covered for post-change datoms
+  only — a silently partial index that reads as authoritative.
+- `corium_forms::schemaform::schema_from_edn` still assigns ids positionally at
+  `CreateDatabase`, so embedded, WASM, authz-bootstrap, and fixture databases
+  stay reproducible. That schema is the **pre-basis seed**; updates allocate
+  above the durable maximum instead.
 
-A CLI-only diff would consequently be unsafe: it could describe an update but
-there is no atomic, durable, peer-visible operation that performs one. Schema
-transactions and basis-aware schema caches are therefore the first phase of
-the work, not an implementation detail of the command.
+`:db/ident` does double duty, and the two uses are told apart by partition. On
+a `:db.part/db` entity it is schema — the name an attribute is known by — and
+only a schema update may write it. On any other entity it is an ordinary name,
+which is how a database function or an enumerated value is labelled, and
+ordinary transactions keep writing it. Every other vocabulary attribute is
+refused to `Transact` outright, as is the schema-update audit trail: a
+transaction must not be able to claim it was a schema update.
+
+Because the vocabulary is engine-owned, a schema file that *declares* one of
+these attributes is rejected with a distinct `EngineAttribute` error rather
+than a confusing duplicate-ident error. Redeclaring it could not change it and
+could only disagree with it.
 
 ## Desired-schema semantics
 
@@ -122,7 +137,7 @@ semantically low risk.
 
 | Change | Inspection | Planned behavior |
 |---|---|---|
-| Add attribute | ident collision | Allocate a stable db-partition id and install it atomically. No entity-group record is created. |
+| Add attribute | ident collision, protection consistency | Allocate a stable db-partition id above the durable maximum and install it atomically. No entity-group record is created. A declaration combining protection with `index`, `unique`, or `ref` is blocked here, not at commit. |
 | Remove attribute from file | none by default. Live/history counts with `--prune` | Report as unmanaged. With `--prune`, retire it as a high-risk `validate-reindex` change. Never hard-delete it. Optional current-fact cleanup is a separate `rewrite` step. |
 | `cardinality one -> many` | current count for reporting | Online additive change. Existing values already satisfy it. |
 | `cardinality many -> one` | entities having more than one current value | If none conflict, validate and apply. Otherwise require a rewrite with an explicit value-selection policy. Never choose a winner implicitly. |
@@ -163,13 +178,34 @@ the attribute pending and unready. Queries use the correct AEVT fallback. The
 ordinary interval, tail threshold, and deadline never decide correctness.
 
 Protection changes reuse the forward-only model in
-[encryption.md](encryption.md#changing-protection). `:db/protection` cannot
-coexist with `:db/index`, `:db/unique`, or `:db.type/ref`. An attribute that has
-ever held sealed datoms can never later gain index or uniqueness coverage.
-Protecting an indexed or unique attribute retracts those properties in the same
-schema transaction. The plan prominently reports that lookup refs through it
-stop working. The schema cache retains the `(t, class)` protection timeline
-needed to validate historical retractions and CAS operands.
+[encryption.md](encryption.md#changing-protection), and are implemented.
+`:db/protection` is part of the normalized desired model in both syntaxes and
+reaches the desired digest, so a file that names a class is compared against
+the installed timeline rather than reading as "no changes".
+
+Applying one appends to the attribute's timeline at the committing basis
+instead of rewriting it: protecting appends `(t, class)`, unprotecting appends
+`(t, None)`. Nothing already stored is re-sealed, opened, or rewritten. That is
+what keeps a value retractable by naming the bytes it was asserted as, and what
+lets a keyless transactor still decide which forms a later retraction or
+`:db/cas` operand may name. `ever_protected` therefore stays true forever, and
+the attribute is permanently ineligible for `index` or `unique` coverage — even
+after it is unprotected again.
+
+`:db/protection` cannot coexist with `:db/index`, `:db/unique`, or
+`:db.type/ref`, because ciphertext order is not value order. The planner
+enforces this with the `protection-conflict` blocked reason, on a brand-new
+attribute as well as on a change, so a declaration that `CreateDatabase` would
+reject is not silently accepted as an update. The operator drops `:db/index`
+and `:db/unique` from the same declaration; the plan says so. Every protection
+change is a high-risk `validate-reindex` step requiring
+`protection-forward-only`, and the plan reports plainly that lookup refs and
+value-ordered reads through the attribute stop working.
+
+A schema update can point an attribute at an *installed* class. It cannot
+install a class definition — the key identity, algorithm, scope, padding, and
+policies are create-time work — and a file that defines one says so in the plan
+notes rather than having it quietly ignored.
 
 ## Retirement and type changes
 
@@ -369,6 +405,11 @@ corium schema update <db> --schema <path>
   `&&` chains remain useful. `--detailed-exit-code` requests 0 for no change and
   2 for changes planned. Parse, stale-plan, blocked, and apply failures exit 1
   and carry stable JSON error codes when `--json` is set.
+- An `--apply` whose freshly computed plan contains no changes succeeds and
+  reports `changed: false`, whatever `--plan` names. Installing a change is
+  exactly what invalidates the digest that described it, so demanding the
+  digest here would make the command fail the second time it ran. An empty plan
+  writes nothing, so there is nothing for a digest to protect.
 
 `schema` is a deliberate top-level group rather than another `db` verb. Its
 planned surface includes `update`, `status`, `history`, and job inspection.
@@ -389,6 +430,15 @@ VALIDATE-REINDEX
                                                 AVET backfill: 0 current datoms
   ~ :person/address component false -> true    live refs: 8,109
                                                 [ack: component-enable]
+  ~ :person/ssn protection none -> :protect/pii  current datoms: 8,109
+                                                [ack: protection-forward-only]
+                                                note: values written from this
+                                                basis onward are sealed; the
+                                                plaintext already stored keeps
+                                                its form
+                                                note: lookup refs and
+                                                value-ordered reads through this
+                                                attribute stop working
 
 DESTRUCTIVE (blocked)
   ~ :person/age long -> string                  current datoms: 8,109
@@ -413,8 +463,14 @@ service's irreversible two-person approval path.
 
 Every applied schema transaction records requester identity, desired and plan
 digests, CLI/protocol version, execution class, and acknowledgements on the
-transaction entity. Plans may contain samples for diagnosis but audit records
-store counts and digests rather than application values.
+transaction entity, under the `:db.schemaUpdate/*` attributes
+(`requester`, `desiredDigest`, `planDigest`, `observedBasis`, `tool`, and the
+cardinality-many `class` and `ack`). They are ordinary queryable attributes —
+that is the point of keeping the audit trail in the database — but `Transact`
+refuses them, so a transaction cannot claim to have been a schema update. The
+requester is the authenticated principal, never a field the caller supplies.
+Plans may contain samples for diagnosis but audit records store counts and
+digests rather than application values.
 
 ## Failure and concurrency behavior
 
@@ -441,47 +497,51 @@ produces the plan, `corium_core::migration` owns the change/plan types and
 digests, and `corium-cli` renders it. Operator documentation is in
 [operations.md](../operations.md#schema-updates).
 
-- Extract normalized desired attributes from both TOML and EDN without
-  allocating ids.
-- Add a read-only planner and impact analyzer over `Db`.
-- Ship `corium schema update` without `--apply`, stable JSON, fixtures, and
-  property tests for change classification.
-- Report the current implementation limitation clearly: all applies are
-  blocked until schema transactions land.
-- Read the installed protection timeline so an ever-protected attribute is
-  blocked from gaining index or unique coverage, and report a file's
-  `:db/protection` as unplanned rather than dropping it: the class is not part
-  of the normalized desired model yet, so a file that names one must not read
-  as "no changes".
-
 ### Phase 2: transactional additive schema
 
-- Bootstrap the schema vocabulary and add dynamic db-partition id allocation
-  for updates while retaining positional allocation at database creation.
-- Derive basis-versioned schema/id maps from schema datoms in `corium-db`.
-- Persist/stream schema generations through recovery roots, handshakes, and tx
-  reports. Label existing creation metadata as the pre-basis seed without
-  changing basis 0 or application transaction numbers.
-- Add the basis-fenced schema-update RPC, authorization action, audit metadata,
-  and `--apply` for new attributes and one-to-many changes.
+**Implemented.** The vocabulary is bootstrapped, `corium_db::schemadatoms`
+derives basis-versioned schema and ident maps from schema datoms, and
+`corium_forms::apply` compiles a reviewed plan into them. Updates allocate ids
+above the durable maximum while creation keeps its positional allocation.
+`Catalog.AlterSchema` carries the change, `corium_transactor::node` verifies it
+under the writer queue, and `--apply` drives it.
+
+The schema generation is derived per database value and travels implicitly:
+peers reach it by applying tx reports, so a live peer converges on the new
+schema without a protocol change. Carrying the generation *explicitly* through
+recovery roots and the subscription handshake — so a peer that cannot
+understand a generation fails the version check rather than applying data under
+stale rules — is not done, and neither is the handshake's
+`schema_basis_t = from_basis_t` contract. A cold peer still receives the
+current schema snapshot rather than the one effective at its subscription
+basis.
 
 ### Phase 3: validation and indexes
 
-- Add exact duplicate/cardinality impact scans and index readiness state.
-- Make AVET backfill/rebuild resumable and force publication independently of
-  index-policy pacing. Teach query planning and uniqueness validation to
-  respect pending state and readiness basis.
-- Enable index and uniqueness changes plus conflict-free many-to-one changes.
-- Enforce protection timelines and the permanent ever-protected prohibition on
-  later `index`/`unique` coverage.
+**Partly implemented.** Index, uniqueness, component, no-history,
+documentation, and cardinality changes all apply, and the exact duplicate and
+cardinality-conflict scans block the plans they must. The permanent
+ever-protected prohibition on later `index`/`unique` coverage is enforced.
+
+The two-stage requested/ready index state is **not** implemented. It is not yet
+observable: a peer holds the whole database in memory and rebuilds a covering
+index from the log whenever the schema generation advances, so coverage is
+total the moment the change commits, and the uniqueness validator has a correct
+AEVT fallback in `Db::lookup`. That equivalence is a property of the current
+in-memory index, not of the design. Published segment roots do not yet carry
+the schema generation they were built under, so the readiness basis, the
+pending-constraint enforcement, and the forced publication past index-policy
+pacing all remain to build alongside them.
 
 ### Phase 4: retirement and rewrites
 
-- Add attribute retirement while preserving reads and retractions.
-- Add checkpointed current-fact rewrite jobs and the explicit conversion/
-  conflict-resolution interface.
-- Route long jobs through the operator service when configured, keeping the
-  in-process CLI fallback.
+**Partly implemented.** Retirement applies: `--prune` plans it, `:db/retired`
+records it, and `corium-tx` refuses new assertions while keeping every existing
+fact readable and retractable.
+
+Checkpointed current-fact rewrite jobs, the explicit conversion and
+conflict-resolution interface, and routing long jobs through the operator
+service are not built. `rewrite` plans are still refused at apply.
 
 ### Phase 5: explicit rename and excision designs
 

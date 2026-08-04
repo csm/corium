@@ -11,6 +11,27 @@ jobs:
   scenarios:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: corium_scenarios
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d corium_scenarios"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CORIUM_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:5432/corium_scenarios?sslmode=disable
+      CORIUM_TEST_S3_BUCKET: corium-scenarios
+      AWS_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,12 +49,32 @@ jobs:
           cache-dependency-path: clients/java/pom.xml
 
       - name: Build Corium CLI
-        continue-on-error: true
-        run: cargo build -p corium-cli
+        run: cargo build -p corium-cli --features postgres,turso,s3,oidc
 
       - name: Install Python client
         continue-on-error: true
         run: python -m pip install -e clients/python
+
+      - name: Start MinIO
+        run: |
+          docker run --detach --name corium-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" \
+            --env MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            quay.io/minio/minio:latest server /data
+          for attempt in $(seq 1 60); do
+            if curl --silent --fail http://127.0.0.1:9000/minio/health/live; then
+              break
+            fi
+            if test "$attempt" = 60; then
+              docker logs corium-minio
+              exit 1
+            fi
+            sleep 1
+          done
+          docker run --rm --network host \
+            --env MC_HOST_scenario="http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
+            quay.io/minio/mc:latest mb --ignore-existing "scenario/$CORIUM_TEST_S3_BUCKET"
 
       - name: Run scenarios
         run: python tests/scenarios/run.py

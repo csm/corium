@@ -359,6 +359,25 @@ pub enum NodeError {
     /// because the underlying store/log errors are not cloneable.
     #[error("group commit aborted: {0}")]
     GroupCommit(String),
+    /// The plan submitted for apply is not the plan this database produces
+    /// now, so the operator would be applying something they did not read.
+    #[error(
+        "plan {submitted} is stale: the current plan for this schema file is {current}; \
+         review the new plan and re-run"
+    )]
+    StalePlan {
+        /// Digest the caller submitted.
+        submitted: String,
+        /// Digest the transactor computed under its commit queue.
+        current: String,
+    },
+    /// A precondition of the plan no longer holds, or the caller did not
+    /// supply the authority the plan needs. Nothing was changed.
+    #[error("schema update blocked: {0}")]
+    BlockedPlan(String),
+    /// A desired schema that cannot be planned or compiled at all.
+    #[error("schema update rejected: {0}")]
+    SchemaUpdate(String),
 }
 
 struct Naming {
@@ -1218,6 +1237,265 @@ impl TransactorNode {
         self.publish_db_indexes(&state)
             .await
             .map(|(index_basis_t, _)| index_basis_t)
+    }
+
+    /// Applies a reviewed schema plan under the single-writer commit queue.
+    ///
+    /// The caller submits the *desired schema*, not the plan. This method
+    /// recomputes the plan against the schema installed right now and refuses
+    /// unless its digest is the one the caller reviewed, so the digest is a
+    /// precondition rather than an opaque token. Every safety-critical check —
+    /// blocked steps, execution-class allowances, acknowledgement codes — is
+    /// re-run here, beneath `commit`, where no concurrent write can invalidate
+    /// it between the check and the append.
+    ///
+    /// Data-basis drift is deliberately tolerated. A plan is invalidated by a
+    /// schema change or a failed precondition, not by an unrelated write, so a
+    /// busy database can still add an attribute.
+    ///
+    /// Re-applying an already installed schema is a no-op that reports
+    /// `changed: false`, which is what makes the command safe in a pipeline.
+    ///
+    /// # Errors
+    /// Returns [`NodeError::StalePlan`] when the plan digest no longer
+    /// matches, [`NodeError::BlockedPlan`] when a precondition or authority is
+    /// missing, and the usual lease, store, and log failures otherwise.
+    #[allow(clippy::too_many_lines)]
+    pub async fn alter_schema(
+        &self,
+        request: &pb::AlterSchemaRequest,
+        requester: &str,
+    ) -> Result<pb::AlterSchemaResponse, NodeError> {
+        use corium_core::migration::{AckCode, ExecutionClass};
+        use corium_forms::apply::{AuditRecord, audit_datoms, compile};
+        use corium_forms::desired::DesiredSchema;
+        use corium_forms::planner::{PlanOptions, installed_schema, plan_against};
+
+        let state = self.db_state(&request.db).await?;
+        let forms = match codec::decode_edn(&request.desired_schema)? {
+            Edn::Vector(forms) | Edn::List(forms) => forms,
+            other => {
+                return Err(NodeError::BadRequest(format!(
+                    "desired schema must be a vector of attribute maps, got {other}"
+                )));
+            }
+        };
+        let desired = DesiredSchema::from_edn(&forms)
+            .map_err(|error| NodeError::SchemaUpdate(error.to_string()))?;
+        let allowed: BTreeSet<ExecutionClass> = request
+            .allow
+            .iter()
+            .map(|name| {
+                ExecutionClass::parse(name).ok_or_else(|| {
+                    NodeError::BadRequest(format!("unknown execution class {name:?}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let acknowledged: BTreeSet<AckCode> = request
+            .ack
+            .iter()
+            .map(|code| {
+                AckCode::parse(code)
+                    .ok_or_else(|| NodeError::BadRequest(format!("unknown change code {code:?}")))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Everything below runs beneath the writer queue. Ordinary commits
+        // serialize against it, so the schema the plan is verified against is
+        // the schema the transaction is appended onto.
+        let _commit = state.commit.lock().await;
+        if let Some(error) = state.keys_fenced_error() {
+            return Err(error);
+        }
+
+        let mut cursor = state.transactor.batch_cursor();
+        let db = cursor.db().clone();
+        let installed = installed_schema(&db);
+        let options = PlanOptions::new(request.db.clone()).with_prune(request.prune);
+        let planned = plan_against(&desired, &db, &installed, &options)
+            .map_err(|error| NodeError::SchemaUpdate(error.to_string()))?;
+
+        let unchanged = |db: &Db, steps: u32| pb::AlterSchemaResponse {
+            basis_t: db.basis_t(),
+            schema_generation: db.schema_generation(),
+            changed: false,
+            installed_idents: Vec::new(),
+            steps,
+        };
+        // Nothing to do is not a stale plan. Applying a change is exactly what
+        // invalidates the digest that described it, so a re-run finds the
+        // database already matching and must say so rather than refuse.
+        if !planned.has_changes() {
+            return Ok(unchanged(&db, 0));
+        }
+
+        // The digest first: a stale plan must never be partially validated.
+        let current_digest = planned.digest();
+        if request.plan_digest != current_digest {
+            return Err(NodeError::StalePlan {
+                submitted: request.plan_digest.clone(),
+                current: current_digest,
+            });
+        }
+        if !request.installed_fingerprint.is_empty()
+            && request.installed_fingerprint != planned.installed_fingerprint
+        {
+            return Err(NodeError::StalePlan {
+                submitted: request.plan_digest.clone(),
+                current: current_digest,
+            });
+        }
+        if let Some(step) = planned.blocked_steps().next() {
+            return Err(NodeError::BlockedPlan(format!(
+                "{} {}: {}",
+                step.ident,
+                step.summary,
+                step.blocked.map_or_else(
+                    || format!("{} changes cannot be executed", step.class),
+                    |blocked| blocked.message().to_owned()
+                )
+            )));
+        }
+        if let Some(class) = planned
+            .required_allowances()
+            .into_iter()
+            .find(|class| !allowed.contains(class))
+        {
+            return Err(NodeError::BlockedPlan(format!(
+                "this plan requires --allow {class}"
+            )));
+        }
+        if let Some(ack) = planned
+            .required_acks()
+            .into_iter()
+            .find(|ack| !acknowledged.contains(ack))
+        {
+            return Err(NodeError::BlockedPlan(format!(
+                "this plan requires --ack {ack}"
+            )));
+        }
+
+        // Compile against a private copy of the interner: nothing is published
+        // until the transaction is durable, so a failed compile leaves no
+        // half-minted name behind.
+        let mut interner = {
+            let naming = state
+                .naming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            naming.interner.clone()
+        };
+        let tx = corium_core::EntityId::new(corium_core::Partition::Tx as u32, db.basis_t() + 1);
+        let transaction = compile(&planned, &desired, &db, &installed, &mut interner, tx)
+            .map_err(|error| NodeError::SchemaUpdate(error.to_string()))?;
+        if transaction.is_empty() {
+            return Ok(unchanged(&db, 0));
+        }
+        let steps = u32::try_from(planned.steps.len()).unwrap_or(u32::MAX);
+        let installed_idents: Vec<String> = transaction
+            .installed
+            .iter()
+            .map(|(ident, _)| ident.clone())
+            .collect();
+
+        let mut datoms = transaction.datoms;
+        datoms.extend(audit_datoms(
+            &planned,
+            &AuditRecord {
+                requester: requester.to_owned(),
+                tool: request.tool.clone(),
+            },
+            tx,
+        ));
+        // The schema is derived from these datoms, and their keyword values
+        // name keywords just minted, so the value they are applied against has
+        // to carry the interner that knows them.
+        cursor.intern_naming(interner.clone());
+        let prepared = cursor
+            .prepare_datoms(datoms, now_unix_ms())
+            .map_err(|error| NodeError::Transact(error.into()))?;
+
+        // Naming must be durable before the datoms that reference it: recovery
+        // decodes the log against the metadata root, and this transaction's
+        // values name keywords the root does not carry yet. Publishing it is
+        // an unfenced write, so ownership is re-checked first — the same rule
+        // the keyword-interning commit path follows.
+        let (new_schema, new_idents) = {
+            let after = prepared.db_after();
+            (after.schema().clone(), after.idents().clone())
+        };
+
+        if let Err(error) = state.check_lease(self.store.as_ref()).await {
+            if matches!(error, NodeError::Deposed(_)) {
+                self.depose(&state, "write lease lost before schema metadata publish");
+            }
+            return Err(error);
+        }
+        let meta = codec::encode_metadata(&new_schema, &new_idents, &interner);
+        loop {
+            let cas = match self.store.get_root(&meta_root_name(&state.name)).await {
+                Ok(current) => {
+                    self.store
+                        .cas_root(&meta_root_name(&state.name), current.as_deref(), &meta)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match cas {
+                Ok(()) => break,
+                Err(StoreError::CasFailed { .. }) => {}
+                Err(error) => return Err(NodeError::Store(error)),
+            }
+        }
+
+        let record = prepared.record.clone();
+        state.log.append_batch_async(&[record]).await?;
+        let reports = state.transactor.install_batch(cursor, vec![prepared]);
+        state
+            .transactor
+            .update_naming(new_idents.clone(), interner.clone());
+        {
+            let mut naming = state
+                .naming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            naming.schema = new_schema;
+            naming.idents = new_idents;
+            naming.interner = interner.clone();
+        }
+
+        // Post-append fence gates the acknowledgement and the peer stream, as
+        // it does for an ordinary commit: a schema change is acked only if
+        // ownership was intact after it became durable.
+        if let Err(error) = state.check_lease(self.store.as_ref()).await {
+            if matches!(error, NodeError::Deposed(_)) {
+                self.depose(&state, "write lease lost after durable schema append");
+            }
+            return Err(error);
+        }
+
+        let mut basis_t = db.basis_t();
+        let mut schema_generation = db.schema_generation();
+        for report in reports {
+            basis_t = report.db_after.basis_t();
+            schema_generation = report.db_after.schema_generation();
+            let encoded = codec::encode_datoms(&report.tx.datoms, &interner)?;
+            let _ = state
+                .broadcast
+                .send(pb::subscribe_item::Item::Report(pb::TxReport {
+                    t: basis_t,
+                    tx_instant: report.tx_instant,
+                    datoms: encoded,
+                }));
+        }
+        let _ = state.basis.send(basis_t);
+        Ok(pb::AlterSchemaResponse {
+            basis_t,
+            schema_generation,
+            changed: true,
+            installed_idents,
+            steps,
+        })
     }
 
     /// Applies per-database indexing-policy overrides at runtime, returning

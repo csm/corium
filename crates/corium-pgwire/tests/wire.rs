@@ -12,6 +12,10 @@ use corium_core::{
 use corium_db::{Db, Idents};
 use corium_forms::txforms::tx_items_from_edn;
 use corium_pgwire::{CatalogError, CatalogTxResult, DbCatalog, PgWireConfig, serve};
+use corium_protocol::authz::{
+    ActionClass, AttributeAllowlist, Grant, Guard, PolicyAuthorizer, Principal, StaticTokens,
+    ViewFilter,
+};
 use corium_query::edn::Edn;
 use corium_tx::prepare;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -69,9 +73,11 @@ impl DbCatalog for TestCatalog {
 
 /// Builds a small two-artist database mirroring the `corium-sql` fixture.
 fn fixture() -> Db {
-    let name = EntityId::from_raw(10);
-    let tags = EntityId::from_raw(11);
-    let release_year = EntityId::from_raw(12);
+    // At or above `FIRST_ATTR_ID`: the low db-partition range belongs to the
+    // engine's own attributes, and `Db::new` installs them over any schema.
+    let name = EntityId::from_raw(100);
+    let tags = EntityId::from_raw(101);
+    let release_year = EntityId::from_raw(102);
     let mut schema = Schema::default();
     schema.insert(Attribute {
         id: name,
@@ -1024,4 +1030,198 @@ async fn use_switches_the_active_database() {
     client.query("USE nope").await;
     let response = client.read_until_ready().await;
     assert_eq!(response.first().unwrap().tag, b'E');
+}
+
+// ---------------------------------------------------------------------------
+// Identity and authorization: the password field carries a bearer token, and
+// every statement is authorized as the principal it names.
+// ---------------------------------------------------------------------------
+
+/// A guard where `alice-token` reads everything, `bob-token` reads the artist
+/// table without `release-year`, and any other caller holds no role at all.
+fn scenario_guard() -> Guard {
+    let tokens = StaticTokens::new()
+        .with(
+            "alice-token",
+            Principal::new("static-token", "alice").with_role("full"),
+        )
+        .with(
+            "bob-token",
+            Principal::new("static-token", "bob").with_role("redacted"),
+        )
+        .with("carol-token", Principal::new("static-token", "carol"));
+    let redacted: Arc<dyn ViewFilter> = Arc::new(AttributeAllowlist::new([":artist/name"]));
+    let policy = PolicyAuthorizer::new()
+        .grant(
+            "full",
+            Grant::new(
+                [ActionClass::Read, ActionClass::Write],
+                ["corium", "people"],
+            ),
+        )
+        .grant(
+            "redacted",
+            Grant::new([ActionClass::Read, ActionClass::Write], ["corium"])
+                .with_view(Arc::clone(&redacted)),
+        );
+    Guard::new(Arc::new(tokens), Arc::new(policy))
+}
+
+async fn start_guarded_server() -> std::net::SocketAddr {
+    start_server(PgWireConfig {
+        guard: scenario_guard(),
+        ..PgWireConfig::default()
+    })
+    .await
+}
+
+/// Connects, authenticates with `token` in the password field, and selects
+/// `database`.
+async fn connect_as(address: std::net::SocketAddr, token: &str, database: &str) -> Client {
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "irrelevant"), ("database", database)])
+        .await;
+    let request = client.read_message().await;
+    assert_eq!(request.tag, b'R', "server asks for a password");
+    client.password(token).await;
+    client
+}
+
+#[tokio::test]
+async fn a_view_redacts_one_principal_and_not_another() {
+    let address = start_guarded_server().await;
+
+    let mut alice = connect_as(address, "alice-token", "corium").await;
+    alice.read_until_ready().await;
+    alice
+        .query("SELECT name, \"release-year\" FROM corium.artist ORDER BY name")
+        .await;
+    let response = alice.read_until_ready().await;
+    assert_eq!(
+        data_row_values(&response[1].body),
+        vec![Some("Boards of Canada".to_owned()), Some("1998".to_owned())]
+    );
+
+    // Bob runs the identical statement against the identical database value.
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    bob.query("SELECT name, \"release-year\" FROM corium.artist ORDER BY name")
+        .await;
+    let response = bob.read_until_ready().await;
+    assert_eq!(
+        row_description_names(&response[0].body),
+        vec!["name".to_owned(), "release-year".to_owned()],
+        "the column keeps its declared shape"
+    );
+    assert_eq!(
+        data_row_values(&response[1].body),
+        vec![Some("Boards of Canada".to_owned()), None],
+        "a column the view hides reports NULL"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_column_cannot_be_probed_by_a_predicate() {
+    let address = start_guarded_server().await;
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    // If the predicate were pushed into the index, this would report which
+    // artist holds the hidden value even though the projection is NULL.
+    bob.query("SELECT name FROM corium.artist WHERE \"release-year\" = 1998")
+        .await;
+    let response = bob.read_until_ready().await;
+    let rows: Vec<&Message> = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .collect();
+    assert!(rows.is_empty(), "a hidden column matches nothing");
+}
+
+#[tokio::test]
+async fn a_principal_with_no_grant_is_refused() {
+    let address = start_guarded_server().await;
+    let mut carol = connect_as(address, "carol-token", "corium").await;
+    carol.read_until_ready().await;
+    carol.query("SELECT name FROM corium.artist").await;
+    let response = carol.read_until_ready().await;
+    let error = response
+        .iter()
+        .find(|message| message.tag == b'E')
+        .expect("an unauthorized read is refused");
+    let fields = cstrings(&error.body);
+    assert!(
+        fields.iter().any(|field| field == "C42501"),
+        "expected insufficient_privilege, got {fields:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_restricted_session_may_not_write() {
+    let address = start_guarded_server().await;
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    bob.query("UPDATE corium.artist SET name = 'x' WHERE name = 'Tycho'")
+        .await;
+    let response = bob.read_until_ready().await;
+    let error = response
+        .iter()
+        .find(|message| message.tag == b'E')
+        .expect("a restricted principal may not write");
+    assert!(
+        cstrings(&error.body)
+            .iter()
+            .any(|field| field.contains("restricted view")),
+        "{:?}",
+        cstrings(&error.body)
+    );
+}
+
+#[tokio::test]
+async fn show_databases_lists_only_what_the_principal_may_inspect() {
+    let address = start_guarded_server().await;
+
+    let mut alice = connect_as(address, "alice-token", "corium").await;
+    alice.read_until_ready().await;
+    alice.query("SHOW DATABASES").await;
+    let response = alice.read_until_ready().await;
+    let names: Vec<Option<String>> = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .flat_map(|message| data_row_values(&message.body))
+        .collect();
+    assert_eq!(
+        names,
+        vec![Some("corium".to_owned()), Some("people".to_owned())]
+    );
+
+    // Bob's grant covers only `corium`, so the catalog listing says so too.
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    bob.query("SHOW DATABASES").await;
+    let response = bob.read_until_ready().await;
+    let names: Vec<Option<String>> = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .flat_map(|message| data_row_values(&message.body))
+        .collect();
+    assert_eq!(names, vec![Some("corium".to_owned())]);
+}
+
+#[tokio::test]
+async fn an_unknown_token_cannot_connect() {
+    let address = start_guarded_server().await;
+    let mut client = Client::connect(address).await;
+    client.startup(&[("user", "mallory")]).await;
+    assert_eq!(client.read_message().await.tag, b'R');
+    client.password("not-a-real-token").await;
+    let response = client.read_message().await;
+    assert_eq!(response.tag, b'E', "authentication is required");
+    assert!(
+        cstrings(&response.body)
+            .iter()
+            .any(|field| field == "C28000"),
+        "{:?}",
+        cstrings(&response.body)
+    );
 }

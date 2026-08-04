@@ -57,10 +57,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+base64 = "0.22"
+corium-client = { workspace = true }
 proptest = "1"
 rcgen = "0.13"
+ring = "0.17"
+serde_json = "1"
 tempfile = "3"
 tokio-stream = "0.1.18"
+tokio-postgres = "0.7"
 
 [lints]
 workspace = true

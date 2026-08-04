@@ -1,6 +1,9 @@
 # ADR-0020: Plan and apply schema migrations as basis-versioned data
 
-**Status:** Proposed (2026-07-31). Design:
+**Status:** Accepted (2026-08-03). Schema is basis-versioned data, and
+additive, `validate-reindex`, protection, and retirement changes apply through
+`corium schema update --apply`; `rewrite` and `destructive` changes remain
+refused, and the delivery plan records what is left. Design:
 [`docs/design/schema-migrations.md`](../design/schema-migrations.md). Relates
 to [ADR-0009](0009-schema-scope.md), which fixes the supported attribute model,
 [ADR-0018](0018-attribute-protection-classes.md), whose forward-only protection
@@ -10,11 +13,11 @@ long-running migration jobs.
 
 ## Context
 
-Corium accepts a schema only when a database is created. The implementation
-stores the resulting `Schema` and ident registry in creation-time metadata and
-sends that snapshot in a peer handshake. Ordinary transactions neither alter
-the schema cache nor tell connected peers to replace it. This falls short of
-the project's intended model that schema is data and makes a CLI-only update
+Corium accepted a schema only when a database was created. The implementation
+stored the resulting `Schema` and ident registry in creation-time metadata and
+sent that snapshot in a peer handshake. Ordinary transactions neither altered
+the schema cache nor told connected peers to replace it. This fell short of
+the project's intended model that schema is data and made a CLI-only update
 command impossible to implement safely.
 
 Schema differences also have radically different costs. Adding an unused

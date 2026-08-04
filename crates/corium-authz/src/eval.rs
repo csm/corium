@@ -11,7 +11,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use corium_protocol::authz::ViewFilter;
+use corium_protocol::authz::{KeyGrant, ReadGrant};
 
 use crate::model::{ObjectRef, SubjectRef};
 use crate::policy::Policy;
@@ -130,12 +130,12 @@ pub enum Outcome {
         /// Every relation that granted the access.
         matches: Vec<Match>,
     },
-    /// Permitted through a view filter.
+    /// Permitted through a restricted read.
     AllowFiltered {
         /// Every relation that granted the access.
         matches: Vec<Match>,
-        /// The combined filter.
-        filter: Arc<dyn ViewFilter>,
+        /// The combined attribute view and key grant.
+        grant: ReadGrant,
         /// Names of the views that were combined.
         views: Vec<String>,
     },
@@ -231,13 +231,15 @@ pub fn check(policy: &Policy, query: &Query) -> Outcome {
 
 /// Applies the view bindings of every successful path.
 ///
-/// Conservative by construction: filters intersect, and a path that declares
-/// no binding neither widens nor narrows. Only a binding explicitly marked
-/// `:authz.binding/unfiltered` grants full visibility, which is the documented
-/// escape hatch for relations like `owner` that must see everything.
+/// Conservative by construction: filters intersect, key grants intersect, and
+/// a path that declares no binding neither widens nor narrows. Only a binding
+/// explicitly marked `:authz.binding/unfiltered` grants full visibility, which
+/// is the documented escape hatch for relations like `owner` that must see
+/// everything.
 fn combine_views(policy: &Policy, matches: Vec<Match>) -> Outcome {
     let mut filters = Vec::new();
     let mut names = Vec::new();
+    let mut keys = KeyGrant::Unrestricted;
     for found in &matches {
         let Some(binding) = policy.binding_for(&found.relation, &found.object) else {
             continue;
@@ -246,19 +248,25 @@ fn combine_views(policy: &Policy, matches: Vec<Match>) -> Outcome {
             return Outcome::Allow { matches };
         }
         if let Some(name) = &binding.view
-            && let Some(filter) = policy.view(name)
+            && let Some(compiled) = policy.view(name)
         {
-            filters.push(Arc::clone(filter));
+            if let Some(filter) = &compiled.filter {
+                filters.push(Arc::clone(filter));
+            }
+            keys = keys.intersect(compiled.keys.clone());
             names.push(name.clone());
         }
     }
-    match view::combine(filters) {
-        None => Outcome::Allow { matches },
-        Some(filter) => Outcome::AllowFiltered {
-            matches,
-            filter,
-            views: names,
-        },
+    let filter = view::combine(filters);
+    if filter.is_none() && keys.is_unrestricted() {
+        return Outcome::Allow { matches };
+    }
+    let mut grant = ReadGrant::unrestricted().with_keys(keys);
+    grant.view = filter;
+    Outcome::AllowFiltered {
+        matches,
+        grant,
+        views: names,
     }
 }
 

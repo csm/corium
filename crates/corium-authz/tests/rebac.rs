@@ -201,6 +201,77 @@ async fn several_filtered_paths_intersect() {
 }
 
 #[tokio::test]
+async fn a_view_may_name_protection_class_keys() {
+    let policy = r#"
+[{:db/id "p" :authz.permission/object-type "database" :authz.permission/action "read"
+  :authz.permission/relation ["hr" "temp"]}
+ {:db/id "t1" :authz.tuple/subject "user:alice" :authz.tuple/relation "hr"
+  :authz.tuple/object "database:people"}
+ {:db/id "t2" :authz.tuple/subject "user:bob" :authz.tuple/relation "temp"
+  :authz.tuple/object "database:people"}
+ ;; A key-only view: it names no attribute filter, so it restricts nothing
+ ;; except which protection classes may be hydrated.
+ {:db/id "v-hr" :authz.view/name "hr-keys" :authz.view/key ["pii-key"]}
+ ;; A temp reads the same attributes with no key at all.
+ {:db/id "v-temp" :authz.view/name "no-keys" :authz.view/filter-type "attribute-denylist"
+  :authz.view/attribute ["person/notes"]}
+ {:db/id "b1" :authz.binding/relation "hr" :authz.binding/object "database:people"
+  :authz.binding/view "hr-keys"}
+ {:db/id "b2" :authz.binding/relation "temp" :authz.binding/object "database:people"
+  :authz.binding/view "no-keys"}]
+"#;
+    let authorizer = authorizer(policy);
+
+    let alice = authorizer
+        .check(&user("alice"), &Access::on(Action::Query, "people"))
+        .await;
+    let grant = alice.grant().expect("a key grant is a restriction");
+    assert!(grant.keys.allows("pii-key"));
+    assert!(!grant.keys.allows("payroll-key"));
+    assert!(
+        grant.attribute_visible(":person/notes"),
+        "a key-only view restricts no attribute"
+    );
+
+    // Bob's view names attributes and no key, so it imposes no key
+    // restriction of its own; what that means is the surface's key policy.
+    let bob = authorizer
+        .check(&user("bob"), &Access::on(Action::Query, "people"))
+        .await;
+    let grant = bob.grant().expect("bob reads through a view");
+    assert!(grant.keys.is_unrestricted());
+    assert!(!grant.attribute_visible(":person/notes"));
+}
+
+#[tokio::test]
+async fn key_grants_intersect_across_paths() {
+    let policy = r#"
+[{:db/id "p" :authz.permission/object-type "database" :authz.permission/action "read"
+  :authz.permission/relation ["reader-a" "reader-b"]}
+ {:db/id "t1" :authz.tuple/subject "user:alice" :authz.tuple/relation "reader-a"
+  :authz.tuple/object "database:people"}
+ {:db/id "t2" :authz.tuple/subject "user:alice" :authz.tuple/relation "reader-b"
+  :authz.tuple/object "database:people"}
+ {:db/id "v1" :authz.view/name "a" :authz.view/key ["pii-key" "shared-key"]}
+ {:db/id "v2" :authz.view/name "b" :authz.view/key ["payroll-key" "shared-key"]}
+ {:db/id "b1" :authz.binding/relation "reader-a" :authz.binding/object "database:people"
+  :authz.binding/view "a"}
+ {:db/id "b2" :authz.binding/relation "reader-b" :authz.binding/object "database:people"
+  :authz.binding/view "b"}]
+"#;
+    let grant = authorizer(policy)
+        .check(&user("alice"), &Access::on(Action::Query, "people"))
+        .await
+        .grant()
+        .expect("two key grants combine into one");
+    // Conservative, exactly as attribute views combine: holding one more
+    // relation never reveals more than holding it alone.
+    assert!(grant.keys.allows("shared-key"));
+    assert!(!grant.keys.allows("pii-key"));
+    assert!(!grant.keys.allows("payroll-key"));
+}
+
+#[tokio::test]
 async fn catalog_actions_target_the_catalog_object() {
     let policy = r#"
 [{:db/id "p" :authz.permission/object-type "catalog" :authz.permission/action "*"

@@ -27,8 +27,8 @@ use corium_peer::{
 };
 use corium_protocol::auth::{DEFAULT_DEV_TOKEN, client_tls, server_tls};
 use corium_protocol::authz::{
-    ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, Principal,
-    StaticTokens,
+    ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, KeyPolicyMode,
+    Principal, StaticTokens,
 };
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
@@ -305,6 +305,15 @@ struct ServeFlags {
     /// Maximum relation hops one authorization check may walk.
     #[arg(long, default_value_t = 8, requires = "authz_db")]
     authz_max_depth: usize,
+    /// Which protection class keys a caller may hydrate with. `strict` grants
+    /// only the key ids the authorization policy names on `:authz.view/key`;
+    /// `server-wide` grants this process's whole keyring to every authorized
+    /// caller. Defaults to `strict` once authentication is configured, and to
+    /// `server-wide` when it is not — so a single-tenant server is unchanged
+    /// and a server told who its callers are does not hand all of them every
+    /// key it holds.
+    #[arg(long, value_enum)]
+    key_policy: Option<KeyPolicyFlag>,
     /// PEM certificate chain for TLS.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -313,7 +322,35 @@ struct ServeFlags {
     tls_key: Option<PathBuf>,
 }
 
+/// `--key-policy` on a serving command.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum KeyPolicyFlag {
+    /// Hydrate only the classes the policy grants this principal.
+    Strict,
+    /// Hydrate every class this process holds, for every authorized caller.
+    ServerWide,
+}
+
+impl From<KeyPolicyFlag> for KeyPolicyMode {
+    fn from(flag: KeyPolicyFlag) -> Self {
+        match flag {
+            KeyPolicyFlag::Strict => Self::Strict,
+            KeyPolicyFlag::ServerWide => Self::ServerWide,
+        }
+    }
+}
+
 impl ServeFlags {
+    /// Whether TLS material was supplied.
+    fn has_tls(&self) -> bool {
+        self.tls_cert.is_some() || self.tls_key.is_some()
+    }
+
+    /// The chosen key policy, or `None` to derive it from the guard.
+    fn key_policy(&self) -> Option<KeyPolicyMode> {
+        self.key_policy.map(KeyPolicyMode::from)
+    }
+
     fn tls(&self) -> Result<Option<tonic::transport::ServerTlsConfig>, String> {
         match (&self.tls_cert, &self.tls_key) {
             (Some(cert), Some(key)) => server_tls(cert, key)
@@ -623,6 +660,9 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:5432")]
         listen: SocketAddr,
         /// Require this cleartext password from clients (trust when omitted).
+        /// Ignored once authentication is configured: the password field then
+        /// carries each client's own bearer token, which is what makes a SQL
+        /// client a Corium principal.
         #[arg(long)]
         password: Option<String>,
         /// Enable guarded autocommit INSERT, UPDATE, and DELETE. Without this
@@ -630,7 +670,11 @@ enum Command {
         #[arg(long)]
         allow_writes: bool,
         #[command(flatten)]
+        keys: KeyFlags,
+        #[command(flatten)]
         client: ClientFlags,
+        #[command(flatten)]
+        serve: ServeFlags,
     },
     /// Database catalog operations.
     #[command(subcommand)]
@@ -1236,6 +1280,7 @@ async fn run_command(command: Command) -> Result<(), String> {
                 connection,
                 PeerServerConfig {
                     max_fuel,
+                    key_policy: serve.key_policy(),
                     ..PeerServerConfig::default()
                 },
             )
@@ -1258,18 +1303,73 @@ async fn run_command(command: Command) -> Result<(), String> {
             listen,
             password,
             allow_writes,
+            keys,
             client,
+            serve,
         } => {
+            // `ServeFlags` carries TLS material for the gRPC surfaces; the
+            // PostgreSQL front end does not terminate TLS, and accepting the
+            // flags silently would leave an operator believing this wire is
+            // encrypted when it is not.
+            if serve.has_tls() {
+                return Err(
+                    "postgres-server does not terminate TLS: --tls-cert/--tls-key are \
+                            not supported here. Front it with a TLS-terminating proxy."
+                        .into(),
+                );
+            }
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|error| format!("cannot bind {listen}: {error}"))?;
+            // The policy database is read over its own peer connection, the
+            // same way the peer server reads it, so checks stay in-process.
+            let authorizer = match serve.authz()? {
+                Some((authz_db, authz_config)) => {
+                    let authz_config_client = client.connect_config(authz_db.clone()).await?;
+                    let authz_connection =
+                        Arc::new(Connection::connect(authz_config_client).await.map_err(
+                            |error| {
+                                format!(
+                                    "cannot connect to authorization database {authz_db:?}: {error}"
+                                )
+                            },
+                        )?);
+                    Some(
+                        start_authorizer(
+                            Arc::new(corium_peer::authz::ConnectionPolicySource::new(
+                                authz_connection,
+                            )),
+                            authz_config,
+                            &authz_db,
+                        )
+                        .await,
+                    )
+                }
+                None => None,
+            };
+            let guard = serve.guard_with(authorizer).await?;
+            // PostgreSQL has no bearer-token field, so an authenticated client
+            // puts its credential in the password field — in cleartext, on a
+            // connection this process cannot encrypt. Say so once, loudly,
+            // rather than letting a JWT cross the wire unremarked.
+            if !guard.is_disabled() {
+                eprintln!(
+                    "corium postgres-server: WARNING — clients authenticate by sending their \
+                     bearer token in the PostgreSQL password field, and this server does not \
+                     terminate TLS. Run it behind a TLS-terminating proxy, or bind it to \
+                     loopback only."
+                );
+            }
             let catalog = Arc::new(pg_catalog::PeerCatalog::new(
                 client,
                 databases,
                 allow_writes,
+                keys.keyring()?,
             ));
             let pg_config = corium_pgwire::PgWireConfig {
                 password,
+                guard,
+                key_policy: serve.key_policy(),
                 ..corium_pgwire::PgWireConfig::default()
             };
             tracing::info!(%listen, allow_writes, "postgres server serving");

@@ -24,6 +24,7 @@ corium-authz = { workspace = true }
 corium-core = { workspace = true }
 corium-crypt = { workspace = true }
 corium-db = { workspace = true }
+corium-forms = { workspace = true }
 corium-index = { workspace = true }
 corium-log = { workspace = true }
 corium-protocol = { workspace = true }

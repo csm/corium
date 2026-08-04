@@ -203,17 +203,43 @@ Engine attributes such as `:db/txInstant` are never managed by a file.
 
 Parse, plan, stale-plan, and blocked-change failures exit 1 and carry stable
 codes (`parse-error`, `plan-error`, `plan-mismatch`, `allow-required`,
-`ack-required`, `blocked-change`, `apply-unsupported`) when `--json` is set.
+`ack-required`, `blocked-change`, `apply-failed`) when `--json` is set.
 
-> **Not yet implemented:** `--apply` is refused with `apply-unsupported`.
-> Applying a plan needs schema to be basis-versioned data — schema
-> transactions, schema generations carried through recovery roots, handshakes,
-> and tx reports, and an `AlterSchema` authorization action — which this build
-> does not have: attribute metadata is still fixed when a database is created.
-> Planning is complete and exact; every precondition `--apply` can check
-> without writing (the plan digest, blocked changes, allowances,
-> acknowledgements) is still checked, in that order, before the operation is
-> reported as unavailable. The staged delivery is in
+### Applying a plan
+
+Re-run the exact invocation the plan printed, adding `--apply --plan <digest>`
+plus any `--allow` and `--ack` flags it asked for:
+
+```sh
+corium schema update people --schema schema.toml \
+  --apply --plan sha256:91… --allow validate-reindex --ack component-enable
+```
+
+Applying needs the `alter-schema` authority, which is separate from `transact`
+so an application writer cannot broaden its own vocabulary. The transactor
+recomputes the plan from the submitted schema under its writer queue and
+refuses unless the digest matches, so a plan that went stale between review and
+apply is rejected rather than reinterpreted. Ordinary writes in between are
+fine: a plan is invalidated by a schema change or a failed precondition, not by
+data drift.
+
+Re-running an apply that has already landed succeeds and reports
+`changed: false`. Installing a change is what invalidates the digest that
+described it, so the command re-plans, finds nothing to do, and writes nothing
+— safe in a pipeline.
+
+Every applied transaction records who requested it, both digests, the observed
+basis, the tool version, the execution classes, and the acknowledgements on its
+transaction entity, under `:db.schemaUpdate/*`. Those are ordinary queryable
+attributes, so the schema history of a database is a Datalog query.
+
+> **Not yet implemented:** `rewrite` and `destructive` changes are still
+> refused — resolving cardinality conflicts, copying values to a replacement
+> typed attribute, and sweeping current facts are jobs that do not exist yet.
+> Index and uniqueness coverage becomes total the moment the change commits,
+> because a peer rebuilds its covering indexes in memory; the two-stage
+> requested/ready state that published segment roots will need is not built.
+> The staged delivery is in
 > [schema-migrations.md](design/schema-migrations.md#delivery-plan).
 
 ## Index publication pacing and bulk loading
@@ -632,25 +658,62 @@ fully working peer: it commits, indexes, syncs, and answers every query that
 does not touch a protected value identically, and protected values come back
 redacted, hidden, or refused according to the class's `on-missing-key` policy.
 
-> **Do not expose a key-holding peer server to clients that are not entitled
-> to every class it holds.** A peer server hydrates every request with its own
-> keyring, whichever principal made it: the per-principal key policy that
-> would narrow this — and seal-through mode, where the server forwards sealed
-> values and the thin client hydrates for itself — are not implemented. The
-> authorization guard gates databases and operations, not classes, so it does
-> not close the gap either. Until they land:
->
-> - Give a peer server class keys only when **every** client it serves may
->   read **every** class it holds.
-> - For mixed or less-trusted clients, run the peer server with no class keys
->   and let entitled applications use an embedded peer (`LocalPeer`) with
->   their own keyring, where the keys stay in the process that owns them.
-> - Splitting by class means splitting by peer server for now: one per
->   entitlement group, each holding only its own keys.
+A **peer server** and a **pgwire server** serve many principals from one
+process, so which of their keys a given request may use is a policy question.
+Name the key ids on a view and bind it to the relation that may read them:
 
-Protection is fixed at database creation, like encryption at rest: changing an
-attribute's protection needs a schema-alteration mechanism Corium does not yet
-have, so plan classes before you create the database.
+```clojure
+{:authz.view/name "pii-reader" :authz.view/key ["file:/etc/corium/pii.key"]}
+{:authz.binding/relation "hr" :authz.binding/object "database:people"
+ :authz.binding/view "pii-reader"}
+```
+
+A guarded server defaults to **strict** key policy: a principal whose decision
+names no key id hydrates nothing, and its protected values come back redacted,
+hidden, or refused per class policy. A server with authorization disabled keeps
+the old behaviour and hydrates every request with its whole keyring.
+`--key-policy strict|server-wide` overrides the default on both `peer-server`
+and `postgres-server`; an operator upgrading a guarded, key-holding deployment
+that is not ready to write key grants sets `server-wide` deliberately. Two
+things to know:
+
+- `:authz.binding/unfiltered` grants full *attribute* visibility and **no**
+  keys. Keys are named by key id and that binding names none, so a relation
+  that must read protected values names them explicitly.
+- Granting a key id a process does not hold does nothing. Policy narrows the
+  process's keyring; it never extends it.
+
+`postgres-server` additionally does **not** terminate TLS, and an
+authenticated SQL client sends its bearer token in the PostgreSQL password
+field. Front it with a TLS-terminating proxy or bind it to loopback; it rejects
+`--tls-cert`/`--tls-key` rather than accepting flags it cannot honour, and
+warns at startup when authentication is configured.
+
+> **This is authorization, not cryptography.** A key-holding server still has
+> the plaintext and is choosing not to disclose it, so a compromised or
+> misconfigured server defeats it. Seal-through mode — where the server
+> forwards sealed values and the thin client hydrates for itself — is not
+> implemented. For a genuinely less-trusted deployment, run the server with no
+> class keys and let entitled applications use an embedded peer (`LocalPeer`)
+> with their own keyring, where the keys stay in the process that owns them.
+
+Unlike encryption at rest, protection is *not* fixed at database creation:
+`corium schema update` can protect, unprotect, or re-classify an attribute.
+The change is forward-only. Values written from that basis onward take the new
+form; every value already stored keeps the form it had, so protecting an
+attribute does not seal its existing plaintext and unprotecting one does not
+open its existing ciphertext. Sweeping the current values is separate work
+Corium does not do yet.
+
+Two consequences are worth planning for. An attribute that has ever been
+protected can never gain `:db/index` or `:db/unique`, permanently — ciphertext
+order is not value order. And protecting an attribute breaks lookup refs and
+value-ordered reads through it from that basis on. The plan reports both before
+you apply, and requires `--ack protection-forward-only`.
+
+Class *definitions* are still create-time: a schema update can point an
+attribute at an installed class, but not install one, so decide the classes
+themselves before you create the database.
 
 ## Authorization (self-hosted ReBAC)
 

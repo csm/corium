@@ -164,6 +164,18 @@ pub struct Prepared {
     tx_instant: i64,
 }
 
+impl Prepared {
+    /// The database value this transaction produces, before it is durable.
+    ///
+    /// The schema-update path reads the derived schema and ident registry
+    /// from here, because those have to be published to the metadata root
+    /// *before* the datoms that name them are appended.
+    #[must_use]
+    pub const fn db_after(&self) -> &Db {
+        &self.db_after
+    }
+}
+
 /// A cursor for preparing a group-commit batch against an evolving in-memory
 /// value without touching the live one. Each [`Self::prepare`] validates
 /// against the effects of the earlier transactions in the batch (uniqueness,
@@ -226,6 +238,62 @@ impl BatchCursor {
             db_before: before,
             db_after: after,
             tx: prepared,
+            tx_instant,
+        })
+    }
+
+    /// Attaches an updated keyword interner to the cursor's value.
+    ///
+    /// A schema transaction stores keyword *values* — `:db.type/string`, the
+    /// attribute's own ident — and the schema derived from those datoms is
+    /// only as good as the interner that resolves them. Minting the names into
+    /// a private interner and then applying the datoms against a value that
+    /// still holds the older one would silently drop every property whose
+    /// value is a keyword the older interner never saw.
+    pub fn intern_naming(&mut self, interner: KeywordInterner) {
+        let idents = self.db.idents().clone();
+        self.db = self.db.clone().with_naming(idents, interner);
+    }
+
+    /// Prepares a transaction from datoms that are already resolved.
+    ///
+    /// The schema-update path builds its datoms from a reviewed plan: every
+    /// one names a concrete attribute entity and carries a literal value, so
+    /// there is no tempid to allocate, no lookup ref to resolve, and no
+    /// uniqueness or cardinality rule of an *ordinary* transaction to apply.
+    /// Running them through [`Self::prepare`] would not merely be redundant —
+    /// it would refuse them, because `corium-tx` deliberately rejects the
+    /// schema vocabulary as ordinary data.
+    ///
+    /// The preconditions this bypasses are checked before the caller compiles
+    /// the plan, under the same `commit` lock this runs beneath.
+    ///
+    /// # Errors
+    /// Returns [`TxError`] when the transaction's `:db/txInstant` would not
+    /// advance the transaction clock.
+    pub fn prepare_datoms(
+        &mut self,
+        mut datoms: Vec<corium_core::Datom>,
+        now_ms: i64,
+    ) -> Result<Prepared, TxError> {
+        let before = self.db.clone();
+        let t = before.basis_t() + 1;
+        let tx_instant = seal_tx_instant(&mut datoms, t, now_ms, self.last_instant)?;
+        let after = before.clone().with_transaction_at(t, tx_instant, &datoms);
+        self.last_instant = tx_instant;
+        self.db = after.clone();
+        Ok(Prepared {
+            record: TxRecord {
+                t,
+                tx_instant,
+                datoms: datoms.clone(),
+            },
+            db_before: before,
+            db_after: after,
+            tx: PreparedTx {
+                datoms,
+                tempids: std::collections::BTreeMap::new(),
+            },
             tx_instant,
         })
     }
