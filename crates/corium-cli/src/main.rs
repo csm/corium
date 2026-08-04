@@ -16,14 +16,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "s3")]
-use aws_credential_types::{
-    Credentials,
-    provider::{
-        ProvideCredentials, SharedCredentialsProvider, error::CredentialsError,
-        future::ProvideCredentials as ProvideCredentialsFuture,
-    },
-};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
@@ -40,9 +32,9 @@ use corium_protocol::authz::{
 };
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
+use corium_store::{DbRoot, DiscoveredStoreSpec, FsStore, RootStore, StorageConfig};
 #[cfg(feature = "s3")]
-use corium_store::S3ClientConfig;
-use corium_store::{DbRoot, DiscoveredStoreSpec, FsStore, RootStore};
+use corium_store_s3::S3ClientConfig;
 use corium_transactor::node::{NodeConfig, TransactorNode};
 #[cfg(feature = "s3")]
 use corium_transactor::{S3ReadOnlyConfig, S3ReadOnlyCredentials};
@@ -99,14 +91,14 @@ enum StoreKind {
     /// Filesystem under `--data-dir` (blobs, roots, and logs).
     #[default]
     Fs,
-    /// `PostgreSQL` for blobs and roots; the log stays on the local filesystem
-    /// under `--data-dir`. Requires the `postgres` feature.
+    /// `PostgreSQL` for blobs, roots, and transaction logs. Requires the
+    /// `postgres` feature.
     Postgres,
-    /// Turso (embeddable `SQLite`) for blobs and roots; the log stays on the
-    /// local filesystem under `--data-dir`. Requires the `turso` feature.
+    /// Turso (embeddable `SQLite`) for blobs, roots, and transaction logs.
+    /// Requires the `turso` feature.
     Turso,
-    /// S3 (or an S3-compatible service) for blobs and roots; the log stays on
-    /// the local filesystem under `--data-dir`. Requires the `s3` feature.
+    /// S3 (or an S3-compatible service) for blobs, roots, and transaction
+    /// logs. Requires the `s3` feature.
     /// Credentials, region, and endpoint come from the standard AWS
     /// environment (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, `AWS_ENDPOINT_URL`,
     /// etc.).
@@ -204,30 +196,9 @@ impl ClientFlags {
         let storage = info
             .storage
             .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
+        corium_transactor::register_static_storage_backends();
         let spec = DiscoveredStoreSpec::from_connection(storage)
             .map_err(|error| format!("cannot use transactor storage backend: {error}"))?;
-        #[cfg(feature = "s3")]
-        let mut spec = spec;
-        #[cfg(feature = "s3")]
-        if let DiscoveredStoreSpec::S3 {
-            bucket,
-            prefix,
-            client,
-        } = &mut spec
-        {
-            let initial = sdk_credentials(client)?;
-            client.credentials_provider = Some(SharedCredentialsProvider::new(
-                StorageInfoCredentialsProvider {
-                    client: self.clone(),
-                    db: db.clone(),
-                    bucket: bucket.clone(),
-                    prefix: prefix.clone(),
-                    region: client.region.clone(),
-                    endpoint_url: client.endpoint_url.clone(),
-                    initial: std::sync::Mutex::new(Some(initial)),
-                },
-            ));
-        }
         let store = spec
             .open_existing()
             .await
@@ -241,112 +212,6 @@ impl ClientFlags {
             Ok(config.with_storage(storage))
         }
     }
-}
-
-#[cfg(feature = "s3")]
-struct StorageInfoCredentialsProvider {
-    client: ClientFlags,
-    db: String,
-    bucket: String,
-    prefix: String,
-    region: Option<String>,
-    endpoint_url: Option<String>,
-    initial: std::sync::Mutex<Option<Credentials>>,
-}
-
-#[cfg(feature = "s3")]
-impl std::fmt::Debug for StorageInfoCredentialsProvider {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StorageInfoCredentialsProvider")
-            .field("transactor", &self.client.primary())
-            .field("db", &self.db)
-            .field("bucket", &self.bucket)
-            .field("prefix", &self.prefix)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "s3")]
-impl ProvideCredentials for StorageInfoCredentialsProvider {
-    fn provide_credentials<'a>(&'a self) -> ProvideCredentialsFuture<'a>
-    where
-        Self: 'a,
-    {
-        if let Some(credentials) = self
-            .initial
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            return ProvideCredentialsFuture::ready(Ok(credentials));
-        }
-        ProvideCredentialsFuture::new(async move {
-            self.fetch()
-                .await
-                .map_err(|error| CredentialsError::provider_error(std::io::Error::other(error)))
-        })
-    }
-}
-
-#[cfg(feature = "s3")]
-impl StorageInfoCredentialsProvider {
-    async fn fetch(&self) -> Result<Credentials, String> {
-        let mut admin = Admin::connect(
-            &self.client.primary(),
-            self.client.token(),
-            self.client.tls()?,
-        )
-        .await
-        .map_err(|error| format!("cannot connect to transactor: {error}"))?;
-        let storage = admin
-            .get_storage_info(&self.db)
-            .await
-            .map_err(|error| format!("cannot refresh storage info: {error}"))?
-            .storage
-            .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
-        let spec = DiscoveredStoreSpec::from_connection(storage)
-            .map_err(|error| format!("cannot use refreshed storage info: {error}"))?;
-        let DiscoveredStoreSpec::S3 {
-            bucket,
-            prefix,
-            client,
-        } = spec
-        else {
-            return Err(
-                "transactor storage backend changed while refreshing S3 credentials".into(),
-            );
-        };
-        if bucket != self.bucket
-            || prefix != self.prefix
-            || client.region != self.region
-            || client.endpoint_url != self.endpoint_url
-        {
-            return Err(
-                "transactor S3 storage identity changed while refreshing credentials".into(),
-            );
-        }
-        sdk_credentials(&client)
-    }
-}
-
-#[cfg(feature = "s3")]
-fn sdk_credentials(config: &S3ClientConfig) -> Result<Credentials, String> {
-    let access_key_id = config
-        .access_key_id
-        .as_deref()
-        .ok_or_else(|| "S3 storage info omitted the access key id".to_owned())?;
-    let secret_access_key = config
-        .secret_access_key
-        .as_deref()
-        .ok_or_else(|| "S3 storage info omitted the secret access key".to_owned())?;
-    Ok(Credentials::new(
-        access_key_id,
-        secret_access_key,
-        config.session_token.clone(),
-        config.expires_after,
-        "corium-storage-info-refresh",
-    ))
 }
 
 /// Keys a process can resolve, for databases encrypted at rest.
@@ -577,15 +442,27 @@ impl ServeFlags {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
+    /// Inspect and verify runtime storage backends.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
     /// Run a transactor process over a data directory.
     Transactor {
         /// EDN configuration file for storage and read-only discovery
         /// credentials. Explicit CLI flags override file values.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Dynamic storage plugin library to load (repeatable).
+        #[arg(long = "store-plugin")]
+        store_plugins: Vec<PathBuf>,
+        /// Plugin store as `kind:{json configuration}` (compatibility alias
+        /// for the same form accepted by `--store`).
+        #[arg(long, conflicts_with = "store")]
+        plugin_store: Option<String>,
         /// Storage-service backend for blobs and roots.
-        #[arg(long, value_enum)]
-        store: Option<StoreKind>,
+        #[arg(long)]
+        store: Option<String>,
         /// Turso database path for `--store turso` (defaults to
         /// `{data_dir}/store.db`).
         #[arg(long)]
@@ -875,6 +752,21 @@ enum Command {
     },
 }
 
+/// Runtime storage-backend administration.
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// Run the blob/root conformance suite against a live backend.
+    Verify {
+        /// Registered backend kind.
+        kind: String,
+        /// Backend-owned JSON configuration object.
+        config: String,
+        /// Dynamic storage plugin library to load first (repeatable).
+        #[arg(long = "store-plugin")]
+        store_plugins: Vec<PathBuf>,
+    },
+}
+
 #[derive(Subcommand)]
 enum DbCommand {
     /// Create a database (optionally with an EDN or TOML schema file).
@@ -1035,8 +927,37 @@ async fn run_command(command: Command) -> Result<(), String> {
     match command {
         // Dispatched by `run`, which needs its exit code.
         Command::Schema(_) => unreachable!("schema commands are dispatched before this point"),
+        Command::Store {
+            command:
+                StoreCommand::Verify {
+                    kind,
+                    config,
+                    store_plugins,
+                },
+        } => {
+            for path in requested_storage_plugin_paths(store_plugins) {
+                corium_store_plugin::load_storage_plugin(&path)
+                    .map_err(|error| error.to_string())?;
+            }
+            corium_transactor::register_static_storage_backends();
+            let config = StorageConfig::from_json(&config)
+                .map_err(|error| format!("invalid storage configuration: {error}"))?;
+            let backend = corium_store::storage_backend(&kind)
+                .ok_or_else(|| format!("storage backend {kind:?} is not available"))?;
+            let store = backend
+                .open(&config)
+                .await
+                .map_err(|error| error.to_string())?;
+            let report = corium_store_testkit::verify(store)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("storage backend {kind:?} passed {} checks", report.checks);
+            Ok(())
+        }
         Command::Transactor {
             config: config_file,
+            store_plugins,
+            plugin_store,
             store,
             turso_path,
             postgres_url,
@@ -1072,8 +993,24 @@ async fn run_command(command: Command) -> Result<(), String> {
             keys,
             serve,
         } => {
+            for path in requested_storage_plugin_paths(store_plugins) {
+                let loaded = corium_store_plugin::load_storage_plugin(&path)
+                    .map_err(|error| error.to_string())?;
+                tracing::info!(path = %path.display(), backends = ?loaded.backends, version = %loaded.version, "loaded storage plugin");
+            }
             let file = TransactorFileConfig::load(config_file.as_deref())?;
-            let store = store.or(file.store).unwrap_or_default();
+            let inline_store = store
+                .as_deref()
+                .filter(|value| value.contains(':'))
+                .map(plugin_store_spec)
+                .transpose()?;
+            let store = store
+                .as_deref()
+                .filter(|value| !value.contains(':'))
+                .map(parse_store_kind)
+                .transpose()?
+                .or(file.store)
+                .unwrap_or_default();
             let data_dir = data_dir
                 .or(file.data_dir)
                 .ok_or_else(|| "--data-dir or :data-dir in --config is required".to_owned())?;
@@ -1097,16 +1034,22 @@ async fn run_command(command: Command) -> Result<(), String> {
                 s3_read_only_role_duration_seconds.or(file.s3_read_only_role_duration_seconds);
             let s3_read_only_role_external_id =
                 s3_read_only_role_external_id.or(file.s3_read_only_role_external_id);
-            let store_spec = store_spec(
-                store,
-                &data_dir,
-                turso_path,
-                postgres_url,
-                s3_bucket,
-                s3_prefix,
-                s3_region.clone(),
-                s3_endpoint_url.clone(),
-            )?;
+            let store_spec = if let Some(plugin_store) = plugin_store {
+                plugin_store_spec(&plugin_store)?
+            } else if let Some(inline_store) = inline_store {
+                inline_store
+            } else {
+                store_spec(
+                    store,
+                    &data_dir,
+                    turso_path,
+                    postgres_url,
+                    s3_bucket,
+                    s3_prefix,
+                    s3_region.clone(),
+                    s3_endpoint_url.clone(),
+                )?
+            };
             let mut config = NodeConfig::new(data_dir);
             config.store = store_spec;
             config.storage_info = storage_info_config(StorageInfoOptions {
@@ -1736,6 +1679,35 @@ fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig,
 }
 
 /// Resolves the `--store` flag and backend connection options into a [`StoreSpec`].
+fn plugin_store_spec(text: &str) -> Result<StoreSpec, String> {
+    let (kind, json) = text
+        .split_once(':')
+        .ok_or_else(|| "--plugin-store must be kind:{json configuration}".to_owned())?;
+    if kind.is_empty() {
+        return Err("--plugin-store backend kind cannot be empty".into());
+    }
+    let config = StorageConfig::from_json(json)
+        .map_err(|error| format!("invalid --plugin-store JSON: {error}"))?;
+    Ok(StoreSpec::new(kind, config))
+}
+
+fn parse_store_kind(text: &str) -> Result<StoreKind, String> {
+    StoreKind::from_str(text, true).map_err(|_| {
+        format!(
+            "unknown storage backend {text:?}; use mem, fs, postgres, turso, s3, or kind:{{json}}"
+        )
+    })
+}
+
+fn requested_storage_plugin_paths(explicit: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = explicit;
+    paths.extend(corium_store_plugin::environment_plugin_paths());
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    paths
+}
+
+/// Resolves the built-in `--store` flag and backend connection options.
 #[allow(clippy::too_many_arguments)]
 fn store_spec(
     store: StoreKind,
@@ -1748,8 +1720,8 @@ fn store_spec(
     s3_endpoint_url: Option<String>,
 ) -> Result<StoreSpec, String> {
     match store {
-        StoreKind::Mem => Ok(StoreSpec::Memory),
-        StoreKind::Fs => Ok(StoreSpec::Fs),
+        StoreKind::Mem => Ok(StoreSpec::memory()),
+        StoreKind::Fs => Ok(StoreSpec::filesystem()),
         StoreKind::Postgres => postgres_spec(postgres_url),
         StoreKind::Turso => turso_spec(data_dir, turso_path),
         StoreKind::S3 => s3_spec(s3_bucket, s3_prefix, s3_region, s3_endpoint_url),
@@ -1760,7 +1732,7 @@ fn store_spec(
 fn postgres_spec(postgres_url: Option<String>) -> Result<StoreSpec, String> {
     let connection_string = postgres_url
         .ok_or_else(|| "--postgres-url is required with --store postgres".to_owned())?;
-    Ok(StoreSpec::Postgres { connection_string })
+    Ok(StoreSpec::postgres(connection_string))
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -1781,7 +1753,7 @@ fn turso_spec(
         .to_str()
         .ok_or_else(|| format!("turso path is not valid UTF-8: {}", path.display()))?
         .to_owned();
-    Ok(StoreSpec::Turso { path })
+    Ok(StoreSpec::turso(path))
 }
 
 #[cfg(not(feature = "turso"))]
@@ -1800,15 +1772,15 @@ fn s3_spec(
     endpoint_url: Option<String>,
 ) -> Result<StoreSpec, String> {
     let bucket = s3_bucket.ok_or_else(|| "--s3-bucket is required with --store s3".to_owned())?;
-    Ok(StoreSpec::S3 {
+    Ok(StoreSpec::s3(
         bucket,
-        prefix: s3_prefix,
-        client: S3ClientConfig {
+        s3_prefix,
+        &S3ClientConfig {
             region,
             endpoint_url,
             ..S3ClientConfig::default()
         },
-    })
+    ))
 }
 
 #[cfg(not(feature = "s3"))]

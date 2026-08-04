@@ -26,7 +26,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, oneshot, watch};
 use tracing::Instrument;
 
-use crate::backend::{LogBackend, NodeStore, StorageInfoConfig, StoreSpec};
+use crate::backend::{LogBackend, NodeStore, StorageInfoConfig, StoreSpec, open_node_store};
 use crate::keys::{DbCrypto, DbStore, KeyWiringError, reload_db_crypto, resolve_db_crypto};
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
@@ -141,7 +141,7 @@ impl NodeConfig {
     #[must_use]
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
-            store: StoreSpec::Fs,
+            store: StoreSpec::filesystem(),
             storage_info: StorageInfoConfig::default(),
             data_dir,
             owner: format!(
@@ -634,14 +634,14 @@ impl TransactorNode {
     /// be recovered.
     pub async fn open(config: NodeConfig) -> Result<Arc<Self>, NodeError> {
         #[cfg(feature = "s3")]
-        if matches!(config.store, StoreSpec::S3 { .. }) && config.storage_info.s3.is_none() {
+        if config.store.kind() == "s3" && config.storage_info.s3.is_none() {
             tracing::warn!(
                 "S3 read-only credentials are not configured; GetStorageInfo will reject \
                  peer bootstrap and direct-storage backup requests"
             );
         }
         config.storage_info.initialize().await;
-        let store = Arc::new(NodeStore::open(&config.store, &config.data_dir).await?);
+        let store = open_node_store(&config.store, &config.data_dir).await?;
         let log_backend = LogBackend::for_spec(&config.store, &config.data_dir, Arc::clone(&store));
         let node = Arc::new(Self {
             config,

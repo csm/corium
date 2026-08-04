@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and import every compatible wheel combination in fresh venvs."""
+"""Install and import the Python engine wheel in a fresh environment."""
 
 from __future__ import annotations
 
@@ -21,14 +21,11 @@ def _python(environment: Path) -> Path:
     return environment / "bin/python"
 
 
-def smoke(wheel_directory: Path, artifact: str | None) -> None:
+def smoke(wheel_directory: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="corium-wheel-") as temporary:
         environment = Path(temporary) / "venv"
         venv.EnvBuilder(with_pip=True).create(environment)
         python = _python(environment)
-        packages = ["corium"]
-        if artifact is not None:
-            packages.append(f"corium-{artifact}")
         _run(
             str(python),
             "-m",
@@ -37,13 +34,12 @@ def smoke(wheel_directory: Path, artifact: str | None) -> None:
             "--no-index",
             "--find-links",
             str(wheel_directory),
-            *packages,
+            "corium",
         )
-        expected = artifact or "filesystem"
         code = (
             "import corium; "
             "backends = corium.available_storage_backends(); "
-            f"assert {expected!r} in backends, backends"
+            "assert 'filesystem' in backends, backends"
         )
         _run(str(python), "-c", code)
 
@@ -51,16 +47,8 @@ def smoke(wheel_directory: Path, artifact: str | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("wheel_directory", type=Path)
-    parser.add_argument(
-        "--base-only",
-        action="store_true",
-        help="only test the common artifact (used for pull requests)",
-    )
     arguments = parser.parse_args()
-    smoke(arguments.wheel_directory, None)
-    if not arguments.base_only:
-        for artifact in ("turso", "postgres", "s3"):
-            smoke(arguments.wheel_directory, artifact)
+    smoke(arguments.wheel_directory)
 
 
 if __name__ == "__main__":

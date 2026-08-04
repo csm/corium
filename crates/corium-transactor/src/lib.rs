@@ -12,7 +12,10 @@ pub mod server;
 #[cfg(feature = "cljrs")]
 pub mod txfn;
 
-pub use backend::{LogBackend, NodeStore, StorageConnectionError, StorageInfoConfig, StoreSpec};
+pub use backend::{
+    LogBackend, NodeStore, StorageConnectionError, StorageInfoConfig, StoreSpec,
+    register_static_storage_backends,
+};
 #[cfg(feature = "s3")]
 pub use backend::{S3ReadOnlyConfig, S3ReadOnlyCredentials};
 

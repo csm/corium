@@ -5,8 +5,8 @@ compare-and-swap root store, with pluggable backends.
 
 ## What it does
 
-Defines the two traits that make up Corium's passive storage service and ships
-several implementations:
+Defines the two traits that make up Corium's passive storage service, the
+runtime backend registry, and the two dependency-free built-in implementations:
 
 - **`BlobStore`** — immutable, content-addressed segments (index tree nodes,
   log chunks). Write-once, never mutated, safe to cache anywhere:
@@ -17,19 +17,27 @@ several implementations:
 - A local **segment cache** and the index-manifest snapshot format used to
   enumerate a root's reachable blobs (backup, GC, snapshot bootstrap).
 
-Backends:
+Backends are separate delivery units:
 
 - **memory** — ephemeral, for tests and demos.
 - **filesystem** — single-node dev/prod (default).
-- **postgres**, **turso**, **s3** — behind Cargo features of the same name.
+- **postgres** — `corium-store-postgres`.
+- **turso** — `corium-store-turso`, also shipped as the reference dynamic plugin.
+- **s3** — `corium-store-s3`.
+
+Every driver registers a `StorageBackend` factory. Engine code carries only a
+backend kind, redacted JSON configuration, and `Arc<dyn FullStore>`; it does
+not enumerate driver types. A host may link a driver crate and call its
+`register` function, or load an ABI-compatible shared library through
+`corium-store-plugin`.
 
 ## Dependencies
 
 - `corium-core` for shared types; `blake3` for content-address digests;
   `async-trait`, `tokio`/`tokio-stream` for the async trait surface; `fs2` for
   filesystem locking; `thiserror` for errors.
-- Optional (feature-gated): `deadpool-postgres` + `tokio-postgres-rustls`
-  (`postgres`), `turso` (`turso`), `aws-config` + `aws-sdk-s3` (`s3`).
+- Driver dependencies remain in their driver crates. In particular, this core
+  crate has no AWS SDK, PostgreSQL, or Turso dependency.
 
 ## Architecture
 

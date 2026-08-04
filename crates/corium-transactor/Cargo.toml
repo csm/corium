@@ -13,9 +13,9 @@ default = ["cljrs"]
 # GC-less `cljrs-tx` interpreter. Enables the cljrs stack's global `no-gc`
 # mode, which feature-unifies onto every cljrs crate in the same build.
 cljrs = ["dep:cljrs-tx", "dep:cljrs-value"]
-postgres = ["corium-store/postgres"]
-turso = ["corium-store/turso"]
-s3 = ["corium-store/s3", "dep:aws-config", "dep:aws-sdk-sts", "dep:serde_json"]
+postgres = ["dep:corium-store-postgres"]
+turso = ["dep:corium-store-turso"]
+s3 = ["dep:corium-store-s3", "dep:aws-config", "dep:aws-sdk-sts"]
 
 [dependencies]
 cljrs-tx = { workspace = true, features = ["no-gc"], optional = true }
@@ -29,12 +29,15 @@ corium-log = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
+corium-store-postgres = { workspace = true, optional = true }
+corium-store-s3 = { workspace = true, optional = true }
+corium-store-turso = { workspace = true, optional = true }
 corium-tx = { workspace = true }
 async-trait = "0.1"
 aws-config = { version = "1", optional = true }
 aws-sdk-sts = { version = "1", optional = true }
 thiserror = "2"
-serde_json = { version = "1", optional = true }
+serde_json = "1"
 tracing = "0.1"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = "0.1.18"

@@ -1,19 +1,18 @@
-# Optional direct-storage artifacts
+# Optional direct-storage plugins
 
-These are optional native extension distributions for the `corium` package:
+Driver distributions no longer contain a Corium Python extension or engine.
+They contain one storage shared library plus a Python function that returns
+its installed path through the `corium.store_plugins` entry-point group:
 
-| Distribution | Native feature |
+| Distribution | Plugin backend |
 |---|---|
-| `corium` | filesystem only |
 | `corium-turso` | Turso |
 | `corium-postgres` | PostgreSQL |
 | `corium-s3` | S3 |
 
-Install the base `corium` distribution and any optional artifacts you need. Each
-artifact has its own extension-module name, depends on the common package, and
-contains the native full-peer core plus one driver. It does not overwrite the
-base extension, so installation and removal are safe. This keeps a
-remote-only/base installation free of every optional storage dependency.
+Install the base `corium` distribution and any plugins you need. The base
+package discovers their entry points and passes each library path to its native
+loader. Installation and removal do not overwrite the base extension.
 
 Build an artifact from its directory:
 
@@ -21,9 +20,5 @@ Build an artifact from its directory:
 maturin build
 ```
 
-The common package automatically selects an installed artifact that supports
-the storage advertised by the transactor. `corium.available_storage_backends()`
-reports the union of drivers available across installed artifacts. Tagged
-releases build and smoke-test each artifact on the
-same Linux, macOS, and Windows matrix as the common package before publishing
-through PyPI trusted publishing.
+`corium.available_storage_backends()` reports the registered union. The loader
+rejects duplicate kinds and incompatible ABI or type layouts at import time.

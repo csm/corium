@@ -242,7 +242,7 @@ async fn scheduled_gc_sweeps_only_after_configured_retention() {
 async fn process_local_memory_source_is_rejected_explicitly() {
     let dir = tempfile::tempdir().expect("data dir");
     let mut config = NodeConfig::new(dir.path().to_path_buf());
-    config.store = StoreSpec::Memory;
+    config.store = StoreSpec::memory();
     config.gc_interval = None;
     let node = TransactorNode::open(config).await.expect("node");
     assert!(
@@ -264,9 +264,7 @@ async fn native_turso_log_is_backed_up_through_the_same_replay_path() {
     let backup_file = backup_dir.path().join("native.corium");
     let restored = tempfile::tempdir().expect("restore");
     let mut config = NodeConfig::new(source.path().join("node"));
-    config.store = StoreSpec::Turso {
-        path: source.path().join("source.db").display().to_string(),
-    };
+    config.store = StoreSpec::turso(source.path().join("source.db"));
     config.gc_interval = None;
     let node = TransactorNode::open(config).await.expect("turso node");
     let schema = encoded(

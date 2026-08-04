@@ -238,6 +238,7 @@ message StorageConnection {
     PostgreSqlStorage postgres = 3;
     TursoStorage turso = 4;
     S3Storage s3 = 5;
+    PluginStorage plugin = 6;
   }
 }
 
@@ -272,6 +273,12 @@ message S3Storage {
   string endpoint_url = 7;
   // Zero for non-expiring static credentials.
   int64 expires_unix_seconds = 8;
+}
+
+// Open storage connection for a separately installed backend plugin.
+message PluginStorage {
+  string kind = 1;
+  string config_json = 2;
 }
 
 // One storage-key epoch as the manifest records it. No key material is ever

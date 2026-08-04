@@ -1,8 +1,8 @@
 # Pluggable storage backends
 
-**Status:** proposal (not implemented)
+**Status:** implemented (2026-08-03)
 
-## Problem
+## Prior problem
 
 Storage backends are selected at compile time. `corium-store` gates
 `PostgresBlobStore`, `TursoBlobStore`, and `S3BlobStore` behind the

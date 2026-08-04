@@ -9,19 +9,24 @@ description = "Owned facade for Corium language bindings"
 
 [features]
 default = []
-postgres = ["corium-store/postgres"]
-turso = ["corium-store/turso"]
-s3 = ["corium-store/s3", "dep:aws-credential-types"]
+postgres = ["dep:corium-store-postgres"]
+turso = ["dep:corium-store-turso"]
+s3 = ["dep:corium-store-s3", "dep:aws-credential-types"]
 all-storage = ["postgres", "turso", "s3"]
 
 [dependencies]
-aws-credential-types = { version = "1", optional = true }
 corium-client = { workspace = true }
 corium-peer = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
+corium-store-postgres = { workspace = true, optional = true }
+corium-store-s3 = { workspace = true, optional = true }
+corium-store-turso = { workspace = true, optional = true }
+aws-credential-types = { version = "1", optional = true }
+corium-store-plugin = { workspace = true }
 thiserror = "2"
+serde_json = "1"
 tonic = { version = "0.14.5", features = ["tls-ring"] }
 
 [dev-dependencies]
