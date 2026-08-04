@@ -1,16 +1,15 @@
 //! Helpers for exporting a core store through the stable plugin ABI.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::UNIX_EPOCH;
 
 use abi_stable::sabi_trait::TD_Opaque;
 use abi_stable::std_types::{ROption, RResult, RString, RVec};
 use async_ffi::{FfiFuture, FutureExt};
-use corium_store::{BlobId, BlobStore, FullStore, RootStore, StoreError};
+use corium_store::{BlobId, BlobIdStream, BlobStore, FullStore, RootStore, StoreError};
 use corium_store_abi::{
     AbiFuture, AbiResult, ListCursor, ListCursor_TO, ListCursorBox, Store, Store_TO, StoreBox,
 };
@@ -111,14 +110,13 @@ impl Store for StoreAdapter {
 
     fn list_open(&self) -> AbiFuture<ListCursorBox> {
         let store = Arc::clone(&self.store);
+        let runtime = self.runtime;
         spawn(self.runtime, async move {
-            let mut stream = store.list().await?;
-            let mut ids = VecDeque::new();
-            while let Some(id) = stream.next().await {
-                ids.push_back(id?.to_string().into());
-            }
             Ok(ListCursor_TO::from_value(
-                Cursor(Mutex::new(ids)),
+                Cursor {
+                    stream: Arc::new(tokio::sync::Mutex::new(store.list().await?)),
+                    runtime,
+                },
                 TD_Opaque,
             ))
         })
@@ -188,15 +186,148 @@ fn blob_id(id: &RString) -> Result<BlobId, StoreError> {
     })
 }
 
-struct Cursor(Mutex<VecDeque<RString>>);
+struct Cursor {
+    stream: Arc<tokio::sync::Mutex<BlobIdStream>>,
+    runtime: &'static tokio::runtime::Runtime,
+}
 
 impl ListCursor for Cursor {
     fn next(&self, max_items: u32) -> AbiFuture<RVec<RString>> {
-        let mut items = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let batch: Vec<_> = (0..max_items).filter_map(|_| items.pop_front()).collect();
-        async move { RResult::ROk(batch.into()) }.into_ffi()
+        let stream = Arc::clone(&self.stream);
+        spawn(self.runtime, async move {
+            let mut stream = stream.lock().await;
+            let mut batch = Vec::with_capacity(max_items as usize);
+            for _ in 0..max_items {
+                match stream.next().await {
+                    Some(Ok(id)) => batch.push(id.to_string().into()),
+                    Some(Err(error)) => return Err(error),
+                    None => break,
+                }
+            }
+            Ok(batch.into())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use corium_store::{BlobIdStream, BlobStore, RootStore, digest};
+    use tokio_stream::StreamExt as _;
+
+    use super::*;
+
+    struct LazyListStore {
+        yielded: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BlobStore for LazyListStore {
+        async fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
+            Ok(digest(bytes))
+        }
+
+        async fn get(&self, _id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _id: &BlobId) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list(&self) -> Result<BlobIdStream, StoreError> {
+            let yielded = Arc::clone(&self.yielded);
+            let ids = [digest(b"one"), digest(b"two"), digest(b"three")];
+            Ok(Box::pin(tokio_stream::iter(ids).map(move |id| {
+                yielded.fetch_add(1, Ordering::SeqCst);
+                Ok(id)
+            })))
+        }
+    }
+
+    #[async_trait]
+    impl RootStore for LazyListStore {
+        async fn get_root(&self, _name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+            Ok(None)
+        }
+
+        async fn cas_root(
+            &self,
+            _name: &str,
+            _expected: Option<&[u8]>,
+            _new: &[u8],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn delete_root(&self, _name: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn list_roots(&self, _prefix: &str) -> Result<Vec<String>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+        })
+    }
+
+    #[test]
+    fn list_cursor_pulls_only_the_requested_batch() {
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let store = store_box(
+            Arc::new(LazyListStore {
+                yielded: Arc::clone(&yielded),
+            }),
+            runtime(),
+        );
+
+        runtime().block_on(async {
+            let cursor = store.list_open().await.into_result().expect("open cursor");
+            assert_eq!(yielded.load(Ordering::SeqCst), 0);
+
+            let first = cursor.next(2).await.into_result().expect("first batch");
+            assert_eq!(first.len(), 2);
+            assert_eq!(yielded.load(Ordering::SeqCst), 2);
+
+            let second = cursor.next(2).await.into_result().expect("second batch");
+            assert_eq!(second.len(), 1);
+            assert_eq!(yielded.load(Ordering::SeqCst), 3);
+        });
+    }
+
+    struct DropSignal(std::sync::mpsc::Sender<()>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[test]
+    fn dropping_abi_future_aborts_plugin_task() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let future = spawn(runtime(), async move {
+            let _guard = DropSignal(dropped_tx);
+            let _ = started_tx.send(());
+            std::future::pending::<Result<(), StoreError>>().await
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("plugin task started");
+        drop(future);
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("plugin task was aborted");
     }
 }

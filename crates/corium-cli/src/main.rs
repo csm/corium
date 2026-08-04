@@ -497,6 +497,10 @@ enum Command {
         /// for the same form accepted by `--store`).
         #[arg(long, conflicts_with = "store")]
         plugin_store: Option<String>,
+        /// Separately provisioned read-only JSON configuration returned by
+        /// `GetStorageInfo` for a plugin backend.
+        #[arg(long, env = "CORIUM_PLUGIN_READ_ONLY_CONFIG")]
+        plugin_read_only_config: Option<String>,
         /// Storage-service backend for blobs and roots.
         #[arg(long)]
         store: Option<String>,
@@ -1002,6 +1006,7 @@ async fn run_command(command: Command) -> Result<(), String> {
             config: config_file,
             store_plugins,
             plugin_store,
+            plugin_read_only_config,
             store,
             turso_path,
             postgres_url,
@@ -1061,6 +1066,7 @@ async fn run_command(command: Command) -> Result<(), String> {
             let turso_path = turso_path.or(file.turso_path);
             let postgres_url = postgres_url.or(file.postgres_url);
             let postgres_read_only_url = postgres_read_only_url.or(file.postgres_read_only_url);
+            let plugin_read_only_config = plugin_read_only_config.or(file.plugin_read_only_config);
             let s3_bucket = s3_bucket.or(file.s3_bucket);
             let s3_prefix = s3_prefix.or(file.s3_prefix).unwrap_or_default();
             let s3_region = s3_region.or(file.s3_region);
@@ -1098,6 +1104,7 @@ async fn run_command(command: Command) -> Result<(), String> {
             config.store = store_spec;
             config.storage_info = storage_info_config(StorageInfoOptions {
                 postgres_read_only_url,
+                plugin_read_only_config,
                 s3_region,
                 s3_endpoint_url,
                 access_key_id: s3_read_only_access_key_id,
@@ -1559,6 +1566,7 @@ struct TransactorFileConfig {
     turso_path: Option<PathBuf>,
     postgres_url: Option<String>,
     postgres_read_only_url: Option<String>,
+    plugin_read_only_config: Option<String>,
     s3_bucket: Option<String>,
     s3_prefix: Option<String>,
     s3_region: Option<String>,
@@ -1607,6 +1615,9 @@ impl TransactorFileConfig {
                 "postgres-url" => config.postgres_url = Some(config_string(&key, value)?),
                 "postgres-read-only-url" => {
                     config.postgres_read_only_url = Some(config_string(&key, value)?);
+                }
+                "plugin-read-only-config" => {
+                    config.plugin_read_only_config = Some(config_string(&key, value)?);
                 }
                 "s3-bucket" => config.s3_bucket = Some(config_string(&key, value)?),
                 "s3-prefix" => config.s3_prefix = Some(config_string(&key, value)?),
@@ -1674,6 +1685,7 @@ fn config_store(value: &Edn) -> Result<StoreKind, String> {
 #[derive(Default)]
 struct StorageInfoOptions {
     postgres_read_only_url: Option<String>,
+    plugin_read_only_config: Option<String>,
     s3_region: Option<String>,
     s3_endpoint_url: Option<String>,
     access_key_id: Option<String>,
@@ -1689,6 +1701,7 @@ struct StorageInfoOptions {
 fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
     let StorageInfoOptions {
         postgres_read_only_url,
+        plugin_read_only_config,
         s3_region,
         s3_endpoint_url,
         access_key_id,
@@ -1738,6 +1751,7 @@ fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig,
     };
     Ok(StorageInfoConfig {
         postgres_connection_string: postgres_read_only_url,
+        plugin_config: parse_plugin_read_only_config(plugin_read_only_config)?,
         s3: credentials
             .map(|credentials| S3ReadOnlyConfig::new(s3_region, s3_endpoint_url, credentials)),
     })
@@ -1747,6 +1761,7 @@ fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig,
 fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
     let StorageInfoOptions {
         postgres_read_only_url,
+        plugin_read_only_config,
         s3_region,
         s3_endpoint_url,
         access_key_id,
@@ -1775,7 +1790,16 @@ fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig,
     }
     Ok(StorageInfoConfig {
         postgres_connection_string: postgres_read_only_url,
+        plugin_config: parse_plugin_read_only_config(plugin_read_only_config)?,
     })
+}
+
+fn parse_plugin_read_only_config(json: Option<String>) -> Result<Option<StorageConfig>, String> {
+    json.map(|json| {
+        StorageConfig::from_json(&json)
+            .map_err(|error| format!("invalid plugin read-only configuration: {error}"))
+    })
+    .transpose()
 }
 
 /// Resolves the `--store` flag and backend connection options into a [`StoreSpec`].
@@ -2452,6 +2476,7 @@ mod tests {
               :s3-bucket "corium-prod"
               :s3-prefix "tenant/"
               :s3-region "us-west-2"
+              :plugin-read-only-config "{\"token\":\"reader\"}"
               :s3-read-only-role-arn "arn:aws:iam::123456789012:role/corium-reader"
               :s3-read-only-role-duration-seconds 1200
             }"#,
@@ -2465,10 +2490,34 @@ mod tests {
         assert_eq!(config.s3_prefix.as_deref(), Some("tenant/"));
         assert_eq!(config.s3_region.as_deref(), Some("us-west-2"));
         assert_eq!(
+            config.plugin_read_only_config.as_deref(),
+            Some("{\"token\":\"reader\"}")
+        );
+        assert_eq!(
             config.s3_read_only_role_arn.as_deref(),
             Some("arn:aws:iam::123456789012:role/corium-reader")
         );
         assert_eq!(config.s3_read_only_role_duration_seconds, Some(1200));
+    }
+
+    #[test]
+    fn plugin_read_only_config_is_validated() {
+        let config = storage_info_config(StorageInfoOptions {
+            plugin_read_only_config: Some("{\"token\":\"reader\"}".into()),
+            ..StorageInfoOptions::default()
+        })
+        .expect("valid plugin config");
+        assert_eq!(
+            config.plugin_config.expect("plugin config").to_json(),
+            "{\"token\":\"reader\"}"
+        );
+
+        let error = storage_info_config(StorageInfoOptions {
+            plugin_read_only_config: Some("not-json".into()),
+            ..StorageInfoOptions::default()
+        })
+        .expect_err("invalid plugin config");
+        assert!(error.contains("invalid plugin read-only configuration"));
     }
 
     #[test]

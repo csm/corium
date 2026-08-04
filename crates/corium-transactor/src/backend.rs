@@ -163,6 +163,11 @@ pub struct StorageInfoConfig {
     /// Read-only S3 access.
     #[cfg(feature = "s3")]
     pub s3: Option<S3ReadOnlyConfig>,
+    /// Opaque read-only configuration advertised for a plugin backend.
+    ///
+    /// This must be provisioned separately from [`StoreSpec::config`]. Corium
+    /// never derives it from or falls back to the primary read/write config.
+    pub plugin_config: Option<StorageConfig>,
 }
 
 impl fmt::Debug for StorageInfoConfig {
@@ -177,6 +182,7 @@ impl fmt::Debug for StorageInfoConfig {
         );
         #[cfg(feature = "s3")]
         debug.field("s3", &self.s3);
+        debug.field("plugin_config", &self.plugin_config);
         debug.finish()
     }
 }
@@ -335,10 +341,18 @@ impl StoreSpec {
                 let prefix = text("prefix").unwrap_or_default();
                 Backend::S3(read_only.s3_storage(bucket, prefix).await?)
             }
-            kind => Backend::Plugin(pb::PluginStorage {
-                kind: kind.to_owned(),
-                config_json: self.config.to_json(),
-            }),
+            kind => {
+                let config = read_only.plugin_config.as_ref().ok_or_else(|| {
+                    format!(
+                        "storage plugin {kind:?} discovery requires separately configured \
+                         read-only plugin configuration"
+                    )
+                })?;
+                Backend::Plugin(pb::PluginStorage {
+                    kind: kind.to_owned(),
+                    config_json: config.to_json(),
+                })
+            }
         };
         Ok(pb::StorageConnection {
             backend: Some(backend),
@@ -1028,7 +1042,7 @@ impl NativeLogStorage for NativeRootLogStore {
     }
 }
 
-#[cfg(all(test, any(feature = "postgres", feature = "turso", feature = "s3")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use corium_core::{Datom, EntityId, Value};
@@ -1050,8 +1064,7 @@ mod tests {
                 std::path::Path::new("."),
                 &StorageInfoConfig {
                     postgres_connection_string: Some(read_only.into()),
-                    #[cfg(feature = "s3")]
-                    s3: None,
+                    ..StorageInfoConfig::default()
                 },
             )
             .await
@@ -1094,7 +1107,6 @@ mod tests {
             .connection_info(
                 std::path::Path::new("."),
                 &StorageInfoConfig {
-                    postgres_connection_string: None,
                     s3: Some(S3ReadOnlyConfig::new(
                         Some("us-west-2".into()),
                         Some("https://objects.example".into()),
@@ -1104,6 +1116,7 @@ mod tests {
                             session_token: Some("session".into()),
                         },
                     )),
+                    ..StorageInfoConfig::default()
                 },
             )
             .await
@@ -1136,6 +1149,47 @@ mod tests {
                 .expect("temporary credential expiration"),
             1_900_000_000
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_storage_info_never_falls_back_to_primary_config() {
+        let spec = StoreSpec::new(
+            "acme-gcs",
+            StorageConfig::from_value(serde_json::json!({
+                "bucket": "primary",
+                "credential": "PRIMARY_WRITE_SECRET"
+            }))
+            .expect("primary plugin config"),
+        );
+        let missing = spec
+            .connection_info(std::path::Path::new("."), &StorageInfoConfig::default())
+            .await
+            .expect_err("primary config must not be advertised");
+        assert!(missing.contains("separately configured read-only"));
+
+        let info = spec
+            .connection_info(
+                std::path::Path::new("."),
+                &StorageInfoConfig {
+                    plugin_config: Some(
+                        StorageConfig::from_value(serde_json::json!({
+                            "bucket": "primary",
+                            "credential": "READ_ONLY_SECRET"
+                        }))
+                        .expect("read-only plugin config"),
+                    ),
+                    ..StorageInfoConfig::default()
+                },
+            )
+            .await
+            .expect("read-only plugin info");
+        let Some(corium_protocol::pb::storage_connection::Backend::Plugin(plugin)) = info.backend
+        else {
+            panic!("plugin storage info");
+        };
+        assert_eq!(plugin.kind, "acme-gcs");
+        assert!(plugin.config_json.contains("READ_ONLY_SECRET"));
+        assert!(!plugin.config_json.contains("PRIMARY_WRITE_SECRET"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

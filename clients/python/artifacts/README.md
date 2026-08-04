@@ -1,24 +1,22 @@
-# Optional direct-storage plugins
+# Direct-storage plugin packaging
 
-Driver distributions no longer contain a Corium Python extension or engine.
-They contain one storage shared library plus a Python function that returns
-its installed path through the `corium.store_plugins` entry-point group:
+This repository does not currently build or publish official Python wrapper
+packages for the Turso, PostgreSQL, or S3 plugins. The base `corium` package
+supports filesystem direct storage. Use remote peer or replay mode for the
+other storage backends.
 
-| Distribution | Plugin backend |
-|---|---|
-| `corium-turso` | Turso |
-| `corium-postgres` | PostgreSQL |
-| `corium-s3` | S3 |
+The Python loader supports third-party and internal wrapper packages. A
+wrapper package contains a storage shared library and a Python path provider.
+It advertises that provider through the `corium.store_plugins` entry-point
+group. The provider returns the installed path of the shared library.
 
-Install the base `corium` distribution and any plugins you need. The base
-package discovers their entry points and passes each library path to its native
-loader. Installation and removal do not overwrite the base extension.
-
-Build an artifact from its directory:
+The wrapper package is separate from the Rust plugin build. For example, this
+command builds the Turso shared library:
 
 ```shell
-maturin build
+cargo build -p corium-store-turso --release
 ```
 
-`corium.available_storage_backends()` reports the registered union. The loader
-rejects duplicate kinds and incompatible ABI or type layouts at import time.
+This repository does not provide the wrapper project that `maturin` requires.
+The `corium.available_storage_backends()` function reports all registered
+backends. The loader rejects duplicate kinds and incompatible ABI layouts.

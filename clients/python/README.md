@@ -127,18 +127,16 @@ peer = await LocalPeer.connect(
 )
 ```
 
-Filesystem storage is present in the base `corium` artifact. Optional driver
-packages advertise shared libraries through the `corium.store_plugins` Python
-entry-point group. At import, the single native engine loads every advertised
-library and registers its backend kinds. Installing two drivers therefore
-loads two small driver libraries, not two copies of the Corium engine. A
-missing advertised backend raises an actionable `StorageError`, and
-`available_storage_backends()` reports the live process registry.
+Filesystem storage is present in the base `corium` artifact. This repository
+does not currently publish official Python packages for Turso, PostgreSQL, or
+S3 plugins. The packaged client supports filesystem direct storage only.
+Remote peer and replay modes remain available for all storage backends.
 
-The base package contains the only CPython native engine. Driver distributions
-contain their plugin library and a small `plugin_path` provider. Unsupported
-platforms fail installation without falling back to an unverified source
-build.
+The loader supports custom plugin packages through the `corium.store_plugins`
+Python entry-point group. At import, the native engine loads each advertised
+library and registers its backend kinds. A missing backend raises a
+`StorageError`. The `available_storage_backends()` function reports the live
+process registry.
 
 Filesystem and Turso advertise local paths, so their direct-storage peers must
 run on a host that can reach the same path as the transactor. Corium rejects a

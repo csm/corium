@@ -31,9 +31,10 @@ a loadable plugin library.
 A dynamic driver owns its async runtime. It must spawn I/O work onto that
 runtime and return an `async-ffi` future that only awaits a channel. It must
 also tie an abort handle to the returned future so dropping the host future
-cancels the spawned task. The Turso plugin's `AbortOnDrop` adapter demonstrates
-the required pattern. Panics in future drop glue or waker callbacks can abort
-the process, so treat every ABI implementation as panic-free production code.
+cancels the spawned task. Use the shared helpers in
+`corium_store_plugin::export` for this pattern. Panics in future drop glue or
+waker callbacks can abort the process. Thus, ABI implementations must not
+panic.
 
 Each library has its own process globals. Drivers using rustls must install a
 crypto provider inside their own library before starting TLS work.
@@ -44,6 +45,12 @@ Configuration crosses the boundary as JSON and can contain credentials. Its
 Rust debug representation is redacted, but plugin authors must also avoid
 logging secrets. ABI-owned strings and vectors use `abi_stable` containers so
 they are freed by their originating allocator.
+
+The transactor keeps primary and read-only plugin configurations separate.
+Configure discovery with `--plugin-read-only-config`,
+`CORIUM_PLUGIN_READ_ONLY_CONFIG`, or `:plugin-read-only-config` in the EDN
+configuration. Corium returns only this read-only configuration from
+`GetStorageInfo`. If it is absent, discovery fails for the plugin store.
 
 Encryption remains above the storage interface. The engine wraps a plugin
 store with `EncryptedBlobStore`, so the driver receives ciphertext and never

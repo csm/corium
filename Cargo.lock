@@ -2396,10 +2396,10 @@ name = "corium-store-turso"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
- "async-ffi",
  "async-trait",
  "corium-store",
  "corium-store-abi",
+ "corium-store-plugin",
  "serde",
  "serde_json",
  "tempfile",

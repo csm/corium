@@ -63,6 +63,12 @@ missing, storage-aware peer bootstrap and online backup fail explicitly
 instead of falling back to `--postgres-url`. Local filesystem and Turso
 stores need no separate credential configuration.
 
+Plugin stores also require a separate read-only JSON configuration. Supply it
+with `--plugin-read-only-config`, `CORIUM_PLUGIN_READ_ONLY_CONFIG`, or the EDN
+key `:plugin-read-only-config`. Corium never advertises the plugin's primary
+configuration. If the read-only configuration is absent, `GetStorageInfo`
+fails for that plugin store.
+
 The PostgreSQL backend creates `corium_blobs` and `corium_roots` in the
 connection's current schema and stores transaction-log objects as fenced
 root records with `log:` names. It uses the platform certificate store for TLS.
