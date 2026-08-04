@@ -176,12 +176,16 @@ jobs:
           path: dist
       # Loads the engine out of the jar this platform would publish, so a jar
       # the client cannot load fails here rather than after publication.
+      #
+      # The property arguments are quoted because PowerShell, the default shell
+      # on the Windows runner, otherwise splits them at the drive-letter colon
+      # in the workspace path and Maven reads the remainder as a goal.
       - name: Load the platform jar
         run: >-
           mvn -f clients/java/pom.xml --batch-mode
           --projects client
           --activate-profiles native-test
-          -Dcorium.native.jars=${{ github.workspace }}/dist
-          -Dcorium.native.classifier=${{ matrix.platform.classifier }}
+          "-Dcorium.native.jars=${{ github.workspace }}/dist"
+          "-Dcorium.native.classifier=${{ matrix.platform.classifier }}"
           -Dtest=NativeArtifactTest
           test
