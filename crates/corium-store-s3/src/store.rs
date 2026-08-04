@@ -9,7 +9,31 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+use corium_store::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+
+fn backend_error(detail: impl std::fmt::Display) -> StoreError {
+    StoreError::Backend {
+        kind: "s3".into(),
+        detail: detail.to_string(),
+    }
+}
+
+trait ResultExt<T> {
+    fn backend(self) -> Result<T, StoreError>;
+}
+
+impl<T, E: std::fmt::Display> ResultExt<T> for Result<T, E> {
+    fn backend(self) -> Result<T, StoreError> {
+        self.map_err(backend_error)
+    }
+}
+
+fn sdk_error<E>(source: SdkError<E>) -> StoreError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    backend_error(aws_sdk_s3::error::DisplayErrorContext(source))
+}
 
 /// Explicit client settings used for an independently opened S3 store.
 ///
@@ -95,7 +119,7 @@ impl S3BlobStore {
         prefix: impl Into<String>,
         options: &S3ClientConfig,
     ) -> Result<Self, StoreError> {
-        let client = Self::client(options).await?;
+        let client = Self::client(options).await.backend()?;
         Self::from_client(client, bucket, prefix).await
     }
 
@@ -114,7 +138,7 @@ impl S3BlobStore {
         options: &S3ClientConfig,
     ) -> Result<Self, StoreError> {
         Ok(Self {
-            client: Self::client(options).await?,
+            client: Self::client(options).await.backend()?,
             bucket: bucket.into(),
             prefix: normalize_s3_prefix(prefix.into()),
         })
@@ -122,8 +146,8 @@ impl S3BlobStore {
 
     async fn client(options: &S3ClientConfig) -> Result<Client, StoreError> {
         if options.access_key_id.is_some() != options.secret_access_key.is_some() {
-            return Err(StoreError::S3(
-                "S3 access key id and secret access key must be supplied together".into(),
+            return Err(backend_error(
+                "S3 access key id and secret access key must be supplied together",
             ));
         }
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
@@ -183,7 +207,8 @@ impl S3BlobStore {
             .head_bucket()
             .bucket(&store.bucket)
             .send()
-            .await?;
+            .await
+            .backend()?;
         Ok(store)
     }
 
@@ -221,9 +246,9 @@ impl S3BlobStore {
             Ok(output) => {
                 let etag = output
                     .e_tag()
-                    .ok_or_else(|| StoreError::InvalidS3Data(format!("root {name:?} has no ETag")))?
+                    .ok_or_else(|| backend_error(format!("root {name:?} has no ETag")))?
                     .to_owned();
-                let bytes = collect_body(output.body).await?;
+                let bytes = collect_body(output.body).await.backend()?;
                 Ok(Some((bytes, etag)))
             }
             Err(error)
@@ -231,7 +256,7 @@ impl S3BlobStore {
             {
                 Ok(None)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(sdk_error(error)),
         }
     }
 
@@ -261,7 +286,7 @@ impl S3BlobStore {
         match request.send().await {
             Ok(_) => Ok(true),
             Err(error) if is_precondition_conflict(&error, if_match.is_some()) => Ok(false),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(sdk_error(error)),
         }
     }
 
@@ -277,7 +302,7 @@ impl S3BlobStore {
     /// on every exit path.
     ///
     /// # Errors
-    /// Returns [`StoreError::S3`] naming the unenforced precondition, or a
+    /// Returns a backend [`StoreError`] naming the unenforced precondition, or a
     /// store error if the probe itself cannot run.
     pub async fn verify_conditional_writes(&self) -> Result<(), StoreError> {
         let name = format!(
@@ -295,21 +320,23 @@ impl S3BlobStore {
         // create against the now-present key must be refused.
         if !self
             .put_conditional(&key, b"1".to_vec(), None, true)
-            .await?
+            .await
+            .backend()?
         {
-            return Err(StoreError::S3(
-                "conditional-write probe: initial If-None-Match:* create was rejected".into(),
+            return Err(backend_error(
+                "conditional-write probe: initial If-None-Match:* create was rejected",
             ));
         }
         let unenforced = |which: &str| {
-            StoreError::S3(format!(
+            backend_error(format!(
                 "S3 endpoint does not enforce {which} writes; corium root fencing would be \
                  unsafe on it (a deposed writer's publish would not be fenced)"
             ))
         };
         if self
             .put_conditional(&key, b"2".to_vec(), None, true)
-            .await?
+            .await
+            .backend()?
         {
             let _ = self.delete_root(&name).await;
             return Err(unenforced("If-None-Match:* (create-only)"));
@@ -320,23 +347,25 @@ impl S3BlobStore {
         let stale = "\"corium-condwrite-probe-stale-etag\"";
         if self
             .put_conditional(&key, b"3".to_vec(), Some(stale), false)
-            .await?
+            .await
+            .backend()?
         {
             let _ = self.delete_root(&name).await;
             return Err(unenforced("If-Match:<etag> (compare-and-swap)"));
         }
-        let Some((_, etag)) = self.get_root_with_etag(&name).await? else {
-            return Err(StoreError::S3(
-                "conditional-write probe: probe key vanished mid-check".into(),
+        let Some((_, etag)) = self.get_root_with_etag(&name).await.backend()? else {
+            return Err(backend_error(
+                "conditional-write probe: probe key vanished mid-check",
             ));
         };
         if !self
             .put_conditional(&key, b"4".to_vec(), Some(&etag), false)
-            .await?
+            .await
+            .backend()?
         {
             let _ = self.delete_root(&name).await;
-            return Err(StoreError::S3(
-                "conditional-write probe: If-Match with the current etag was rejected".into(),
+            return Err(backend_error(
+                "conditional-write probe: If-Match with the current etag was rejected",
             ));
         }
 
@@ -360,7 +389,7 @@ async fn collect_body(body: ByteStream) -> Result<Vec<u8>, StoreError> {
         .await
         // `ByteStreamError`'s own `Display` is terse ("streaming error"); its
         // real detail lives in `source()`, which `DisplayErrorContext` prints.
-        .map_err(|error| StoreError::S3(aws_sdk_s3::error::DisplayErrorContext(error).to_string()))?
+        .map_err(|error| backend_error(aws_sdk_s3::error::DisplayErrorContext(error).to_string()))?
         .into_bytes()
         .to_vec())
 }
@@ -386,7 +415,7 @@ impl BlobStore for S3BlobStore {
         let id = digest(bytes);
         // Blobs are immutable and content-addressed; skip the upload when
         // this content is already present.
-        if self.contains(&id).await? {
+        if self.contains(&id).await.backend()? {
             return Ok(id);
         }
         let key = self.blob_key(&id);
@@ -396,7 +425,8 @@ impl BlobStore for S3BlobStore {
             .key(&key)
             .body(ByteStream::from(bytes.to_vec()))
             .send()
-            .await?;
+            .await
+            .backend()?;
         Ok(id)
     }
 
@@ -411,7 +441,7 @@ impl BlobStore for S3BlobStore {
             .await
         {
             Ok(output) => {
-                let bytes = collect_body(output.body).await?;
+                let bytes = collect_body(output.body).await.backend()?;
                 if digest(&bytes) != *id {
                     return Err(StoreError::CorruptBlob(id.clone()));
                 }
@@ -422,7 +452,7 @@ impl BlobStore for S3BlobStore {
             {
                 Ok(None)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(sdk_error(error)),
         }
     }
 
@@ -442,7 +472,7 @@ impl BlobStore for S3BlobStore {
             {
                 Ok(false)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(sdk_error(error)),
         }
     }
 
@@ -453,7 +483,8 @@ impl BlobStore for S3BlobStore {
             .bucket(&self.bucket)
             .key(&key)
             .send()
-            .await?;
+            .await
+            .backend()?;
         Ok(())
     }
 
@@ -472,7 +503,7 @@ impl BlobStore for S3BlobStore {
                 let output = match request.send().await {
                     Ok(output) => output,
                     Err(error) => {
-                        let _ = tx.send(Err(StoreError::from(error))).await;
+                        let _ = tx.send(Err(sdk_error(error))).await;
                         return;
                     }
                 };
@@ -483,9 +514,7 @@ impl BlobStore for S3BlobStore {
                     };
                     let Some(id) = BlobId::from_hex(name) else {
                         let _ = tx
-                            .send(Err(StoreError::InvalidS3Data(format!(
-                                "invalid blob key {key:?}"
-                            ))))
+                            .send(Err(backend_error(format!("invalid blob key {key:?}"))))
                             .await;
                         return;
                     };
@@ -514,7 +543,7 @@ impl BlobStore for S3BlobStore {
         {
             Ok(output) => Ok(match output.last_modified() {
                 Some(timestamp) => Some(SystemTime::try_from(*timestamp).map_err(|error| {
-                    StoreError::InvalidS3Data(format!("invalid last-modified timestamp: {error}"))
+                    backend_error(format!("invalid last-modified timestamp: {error}"))
                 })?),
                 None => None,
             }),
@@ -523,7 +552,7 @@ impl BlobStore for S3BlobStore {
             {
                 Ok(None)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(sdk_error(error)),
         }
     }
 }
@@ -533,7 +562,8 @@ impl RootStore for S3BlobStore {
     async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
         Ok(self
             .get_root_with_etag(name)
-            .await?
+            .await
+            .backend()?
             .map(|(bytes, _etag)| bytes))
     }
 
@@ -546,10 +576,14 @@ impl RootStore for S3BlobStore {
         let key = self.root_key(name);
         match expected {
             None => {
-                if self.put_conditional(&key, new.to_vec(), None, true).await? {
+                if self
+                    .put_conditional(&key, new.to_vec(), None, true)
+                    .await
+                    .backend()?
+                {
                     Ok(())
                 } else {
-                    let actual = self.get_root(name).await?;
+                    let actual = self.get_root(name).await.backend()?;
                     Err(StoreError::CasFailed {
                         expected: None,
                         actual,
@@ -557,7 +591,8 @@ impl RootStore for S3BlobStore {
                 }
             }
             Some(expected_bytes) => {
-                let Some((actual_bytes, etag)) = self.get_root_with_etag(name).await? else {
+                let Some((actual_bytes, etag)) = self.get_root_with_etag(name).await.backend()?
+                else {
                     return Err(StoreError::CasFailed {
                         expected: Some(expected_bytes.to_vec()),
                         actual: None,
@@ -571,11 +606,12 @@ impl RootStore for S3BlobStore {
                 }
                 if self
                     .put_conditional(&key, new.to_vec(), Some(&etag), false)
-                    .await?
+                    .await
+                    .backend()?
                 {
                     Ok(())
                 } else {
-                    let actual = self.get_root(name).await?;
+                    let actual = self.get_root(name).await.backend()?;
                     Err(StoreError::CasFailed {
                         expected: Some(expected_bytes.to_vec()),
                         actual,
@@ -592,7 +628,8 @@ impl RootStore for S3BlobStore {
             .bucket(&self.bucket)
             .key(&key)
             .send()
-            .await?;
+            .await
+            .backend()?;
         Ok(())
     }
 
@@ -610,7 +647,7 @@ impl RootStore for S3BlobStore {
             if let Some(token) = continuation.take() {
                 request = request.continuation_token(token);
             }
-            let output = request.send().await?;
+            let output = request.send().await.backend()?;
             for object in output.contents() {
                 if let Some(name) = object.key().and_then(|key| key.strip_prefix(&root_prefix)) {
                     names.push(name.to_owned());

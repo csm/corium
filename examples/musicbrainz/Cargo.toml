@@ -10,8 +10,8 @@ publish = false
 
 [features]
 default = []
-postgres = ["corium-store/postgres"]
-turso = ["corium-store/turso"]
+postgres = ["dep:corium-store-postgres"]
+turso = ["dep:corium-store-turso"]
 
 [[bin]]
 name = "mbrainz-load"
@@ -31,6 +31,8 @@ corium-peer = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
+corium-store-postgres = { workspace = true, optional = true, features = ["static-link"] }
+corium-store-turso = { workspace = true, optional = true, features = ["static-link"] }
 cljrs-env = { workspace = true }
 cljrs-gc = { workspace = true }
 cljrs-interp = { workspace = true }

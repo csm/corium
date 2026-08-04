@@ -2,19 +2,11 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::time::SystemTime;
-#[cfg(feature = "s3")]
-use std::time::{Duration, UNIX_EPOCH};
 
 use corium_protocol::pb;
+use serde_json::json;
 
-#[cfg(feature = "postgres")]
-use crate::PostgresBlobStore;
-#[cfg(feature = "turso")]
-use crate::TursoBlobStore;
-use crate::{BlobId, BlobIdStream, BlobStore, FsStore, RootStore, StoreError};
-#[cfg(feature = "s3")]
-use crate::{S3BlobStore, S3ClientConfig};
+use crate::{ReadStore, StorageConfig, StoreError, storage_backend};
 
 /// Failure translating storage information advertised by a transactor.
 #[derive(Debug, thiserror::Error)]
@@ -23,311 +15,162 @@ pub enum StorageConnectionError {
     #[error("transactor returned no storage backend")]
     Missing,
     /// The backend cannot be opened by another process, lacks required
-    /// read-only credentials, or was omitted from this build.
+    /// read-only credentials, or is not registered in this process.
     #[error("{0}")]
     Unsupported(String),
+    /// The backend configuration on the wire is malformed.
+    #[error("invalid configuration for storage backend {kind:?}: {detail}")]
+    InvalidConfig {
+        /// Backend kind whose configuration was invalid.
+        kind: String,
+        /// Parse or validation detail.
+        detail: String,
+    },
 }
 
-/// A read-only storage-service connection advertised by a transactor.
-///
-/// This is the single protobuf-to-store mapping used by peers, backups, and
-/// language facades. Local paths are resolved to the concrete store root here
-/// so the `{data_dir}/store` convention cannot drift between clients.
+/// A backend-neutral storage-service connection advertised by a transactor.
 #[derive(Clone)]
-pub enum DiscoveredStoreSpec {
-    /// Filesystem blobs and roots under an existing store root.
-    Filesystem {
-        /// Absolute or process-local path to the store root.
-        root: PathBuf,
-    },
-    /// Existing `PostgreSQL` store.
-    #[cfg(feature = "postgres")]
-    Postgres {
-        /// Read-only connection string.
-        connection_string: String,
-    },
-    /// Existing local Turso database.
-    #[cfg(feature = "turso")]
-    Turso {
-        /// Database file path.
-        path: PathBuf,
-    },
-    /// Existing S3 prefix.
-    #[cfg(feature = "s3")]
-    S3 {
-        /// Bucket name.
-        bucket: String,
-        /// Corium key prefix.
-        prefix: String,
-        /// Read-only client configuration.
-        client: S3ClientConfig,
-    },
+pub struct DiscoveredStoreSpec {
+    kind: String,
+    config: StorageConfig,
 }
 
 impl fmt::Debug for DiscoveredStoreSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Filesystem { root } => formatter
-                .debug_struct("Filesystem")
-                .field("root", root)
-                .finish(),
-            #[cfg(feature = "postgres")]
-            Self::Postgres { .. } => formatter
-                .debug_struct("Postgres")
-                .field("connection_string", &"[REDACTED]")
-                .finish(),
-            #[cfg(feature = "turso")]
-            Self::Turso { path } => formatter.debug_struct("Turso").field("path", path).finish(),
-            #[cfg(feature = "s3")]
-            Self::S3 {
-                bucket,
-                prefix,
-                client,
-            } => formatter
-                .debug_struct("S3")
-                .field("bucket", bucket)
-                .field("prefix", prefix)
-                .field("client", client)
-                .finish(),
-        }
+        formatter
+            .debug_struct("DiscoveredStoreSpec")
+            .field("kind", &self.kind)
+            .field("config", &self.config)
+            .finish()
     }
 }
 
 impl DiscoveredStoreSpec {
+    /// Creates a backend-neutral discovered store specification.
+    #[must_use]
+    pub fn new(kind: impl Into<String>, config: StorageConfig) -> Self {
+        Self {
+            kind: kind.into(),
+            config,
+        }
+    }
+
+    /// Backend kind.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Redacted backend configuration.
+    #[must_use]
+    pub const fn config(&self) -> &StorageConfig {
+        &self.config
+    }
+
+    /// Mutable configuration access for host-owned runtime extensions.
+    #[must_use]
+    pub const fn config_mut(&mut self) -> &mut StorageConfig {
+        &mut self.config
+    }
+
+    /// Returns the filesystem store root when this is a filesystem spec.
+    #[must_use]
+    pub fn filesystem_root(&self) -> Option<PathBuf> {
+        (self.kind == "filesystem")
+            .then(|| self.config.get("root")?.as_str().map(PathBuf::from))
+            .flatten()
+    }
+
     /// Decodes storage information returned by `GetStorageInfo`.
     ///
     /// # Errors
-    /// Returns an error for a missing or process-local memory backend,
-    /// missing read-only credentials, or a backend omitted from this build.
+    /// Returns an error for missing, process-local, unavailable, or malformed
+    /// backend information.
     pub fn from_connection(
         connection: pb::StorageConnection,
     ) -> Result<Self, StorageConnectionError> {
         use pb::storage_connection::Backend;
 
-        match connection.backend.ok_or(StorageConnectionError::Missing)? {
-            Backend::Memory(_) => Err(StorageConnectionError::Unsupported(
-                "memory storage is confined to the transactor process".into(),
-            )),
-            Backend::Filesystem(storage) => Ok(Self::Filesystem {
-                root: PathBuf::from(storage.data_dir).join("store"),
-            }),
-            Backend::Postgres(storage) => {
-                #[cfg(feature = "postgres")]
-                {
-                    Ok(Self::Postgres {
-                        connection_string: storage.connection_string,
-                    })
-                }
-                #[cfg(not(feature = "postgres"))]
-                {
-                    let _ = storage;
-                    Err(StorageConnectionError::Unsupported(
-                        "this build lacks PostgreSQL direct-storage support".into(),
-                    ))
-                }
+        let (kind, config) = match connection.backend.ok_or(StorageConnectionError::Missing)? {
+            Backend::Memory(_) => {
+                return Err(StorageConnectionError::Unsupported(
+                    "memory storage is confined to the transactor process".into(),
+                ));
             }
-            Backend::Turso(storage) => {
-                #[cfg(feature = "turso")]
-                {
-                    Ok(Self::Turso {
-                        path: storage.path.into(),
-                    })
-                }
-                #[cfg(not(feature = "turso"))]
-                {
-                    let _ = storage;
-                    Err(StorageConnectionError::Unsupported(
-                        "this build lacks Turso direct-storage support".into(),
-                    ))
-                }
-            }
+            Backend::Filesystem(storage) => (
+                "filesystem".to_owned(),
+                StorageConfig::from_value(json!({
+                    "root": PathBuf::from(storage.data_dir).join("store")
+                })),
+            ),
+            Backend::Postgres(storage) => (
+                "postgres".to_owned(),
+                StorageConfig::from_value(json!({
+                    "connection_string": storage.connection_string
+                })),
+            ),
+            Backend::Turso(storage) => (
+                "turso".to_owned(),
+                StorageConfig::from_value(json!({ "path": storage.path })),
+            ),
             Backend::S3(storage) => {
-                #[cfg(feature = "s3")]
-                {
-                    let access_key_id = nonempty(storage.access_key_id).ok_or_else(|| {
-                        StorageConnectionError::Unsupported(
-                            "S3 storage info omitted the read-only access key id".into(),
-                        )
-                    })?;
-                    let secret_access_key =
-                        nonempty(storage.secret_access_key).ok_or_else(|| {
-                            StorageConnectionError::Unsupported(
-                                "S3 storage info omitted the read-only secret access key".into(),
-                            )
-                        })?;
-                    Ok(Self::S3 {
-                        bucket: storage.bucket,
-                        prefix: storage.prefix,
-                        client: S3ClientConfig {
-                            region: nonempty(storage.region),
-                            endpoint_url: nonempty(storage.endpoint_url),
-                            access_key_id: Some(access_key_id),
-                            secret_access_key: Some(secret_access_key),
-                            session_token: nonempty(storage.session_token),
-                            expires_after: unix_timestamp(storage.expires_unix_seconds),
-                            ..S3ClientConfig::default()
-                        },
-                    })
+                if storage.access_key_id.is_empty() {
+                    return Err(StorageConnectionError::Unsupported(
+                        "S3 storage info omitted the read-only access key id".into(),
+                    ));
                 }
-                #[cfg(not(feature = "s3"))]
-                {
-                    let _ = storage;
-                    Err(StorageConnectionError::Unsupported(
-                        "this build lacks S3 direct-storage support".into(),
-                    ))
+                if storage.secret_access_key.is_empty() {
+                    return Err(StorageConnectionError::Unsupported(
+                        "S3 storage info omitted the read-only secret access key".into(),
+                    ));
                 }
+                (
+                    "s3".to_owned(),
+                    StorageConfig::from_value(json!({
+                        "bucket": storage.bucket,
+                        "prefix": storage.prefix,
+                        "region": nonempty(storage.region),
+                        "endpoint_url": nonempty(storage.endpoint_url),
+                        "access_key_id": storage.access_key_id,
+                        "secret_access_key": storage.secret_access_key,
+                        "session_token": nonempty(storage.session_token),
+                        "expires_unix_seconds": (storage.expires_unix_seconds > 0)
+                            .then_some(storage.expires_unix_seconds),
+                    })),
+                )
             }
+            Backend::Plugin(storage) => {
+                (storage.kind, StorageConfig::from_json(&storage.config_json))
+            }
+        };
+        let config = config.map_err(|error| StorageConnectionError::InvalidConfig {
+            kind: kind.clone(),
+            detail: error.to_string(),
+        })?;
+        if storage_backend(&kind).is_none() {
+            return Err(StorageConnectionError::Unsupported(format!(
+                "storage backend {kind:?} is not available; install and load its plugin"
+            )));
         }
+        Ok(Self { kind, config })
     }
 
     /// Opens the advertised store without creating storage or schema.
     ///
     /// # Errors
-    /// Returns [`StoreError::UnreachableLocalStorage`] before opening a
-    /// filesystem or Turso path that does not already exist. Other errors
-    /// report connection, credential, or backend failures.
-    #[allow(clippy::unused_async)]
+    /// Returns a reachability, configuration, or backend error.
     pub async fn open_existing(self) -> Result<DiscoveredStore, StoreError> {
-        match self {
-            Self::Filesystem { root } => {
-                if !root.join("blobs").is_dir() || !root.join("roots").is_dir() {
-                    return Err(StoreError::UnreachableLocalStorage(root));
-                }
-                Ok(DiscoveredStore::Filesystem(FsStore::open(root)?))
-            }
-            #[cfg(feature = "postgres")]
-            Self::Postgres { connection_string } => Ok(DiscoveredStore::Postgres(
-                PostgresBlobStore::connect_existing(connection_string).await?,
-            )),
-            #[cfg(feature = "turso")]
-            Self::Turso { path } => {
-                if !path.is_file() {
-                    return Err(StoreError::UnreachableLocalStorage(path));
-                }
-                Ok(DiscoveredStore::Turso(
-                    TursoBlobStore::open_existing(path).await?,
-                ))
-            }
-            #[cfg(feature = "s3")]
-            Self::S3 {
-                bucket,
-                prefix,
-                client,
-            } => Ok(DiscoveredStore::S3(
-                S3BlobStore::connect_existing_with_config(bucket, prefix, &client).await?,
-            )),
-        }
+        let backend = storage_backend(&self.kind)
+            .ok_or_else(|| StoreError::BackendUnavailable(self.kind.clone()))?;
+        backend.open_existing(&self.config).await
     }
 }
 
 /// An opened, read-only store discovered through the transactor.
-pub enum DiscoveredStore {
-    /// Existing filesystem store.
-    Filesystem(FsStore),
-    /// Existing `PostgreSQL` store.
-    #[cfg(feature = "postgres")]
-    Postgres(PostgresBlobStore),
-    /// Existing Turso store.
-    #[cfg(feature = "turso")]
-    Turso(TursoBlobStore),
-    /// Existing S3 store.
-    #[cfg(feature = "s3")]
-    S3(S3BlobStore),
-}
+pub type DiscoveredStore = std::sync::Arc<dyn ReadStore>;
 
-impl DiscoveredStore {
-    /// Loads one immutable blob.
-    ///
-    /// # Errors
-    /// Returns an error when the discovered backend cannot read the blob.
-    pub async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
-        match self {
-            Self::Filesystem(store) => store.get(id).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.get(id).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.get(id).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.get(id).await,
-        }
-    }
-
-    /// Lists every immutable blob in the discovered backend.
-    ///
-    /// # Errors
-    /// Returns an error when the discovered backend cannot enumerate blobs.
-    pub async fn list(&self) -> Result<BlobIdStream, StoreError> {
-        match self {
-            Self::Filesystem(store) => store.list().await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.list().await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.list().await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.list().await,
-        }
-    }
-
-    /// Returns the blob's backend modification time, when available.
-    ///
-    /// # Errors
-    /// Returns an error when the discovered backend cannot inspect the blob.
-    pub async fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
-        match self {
-            Self::Filesystem(store) => store.modified_at(id).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.modified_at(id).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.modified_at(id).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.modified_at(id).await,
-        }
-    }
-
-    /// Loads one named root record.
-    ///
-    /// # Errors
-    /// Returns an error when the discovered backend cannot read the root.
-    pub async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        match self {
-            Self::Filesystem(store) => store.get_root(name).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.get_root(name).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.get_root(name).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.get_root(name).await,
-        }
-    }
-
-    /// Lists root names with `prefix`.
-    ///
-    /// # Errors
-    /// Returns an error when the discovered backend cannot enumerate roots.
-    pub async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
-        match self {
-            Self::Filesystem(store) => store.list_roots(prefix).await,
-            #[cfg(feature = "postgres")]
-            Self::Postgres(store) => store.list_roots(prefix).await,
-            #[cfg(feature = "turso")]
-            Self::Turso(store) => store.list_roots(prefix).await,
-            #[cfg(feature = "s3")]
-            Self::S3(store) => store.list_roots(prefix).await,
-        }
-    }
-}
-
-#[cfg(feature = "s3")]
 fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
-}
-
-#[cfg(feature = "s3")]
-fn unix_timestamp(seconds: i64) -> Option<SystemTime> {
-    u64::try_from(seconds)
-        .ok()
-        .filter(|seconds| *seconds > 0)
-        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
 }
 
 #[cfg(test)]
@@ -356,24 +199,14 @@ mod tests {
         assert!(!root.exists());
     }
 
-    #[cfg(feature = "turso")]
-    #[tokio::test]
-    async fn turso_discovery_does_not_create_an_unreachable_database() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("missing.db");
-        let spec = DiscoveredStoreSpec::from_connection(pb::StorageConnection {
-            backend: Some(pb::storage_connection::Backend::Turso(pb::TursoStorage {
-                path: path.to_string_lossy().into_owned(),
-            })),
-        })
-        .expect("Turso spec");
-
-        let error = spec
-            .open_existing()
-            .await
-            .err()
-            .expect("missing database must fail");
-        assert!(matches!(error, StoreError::UnreachableLocalStorage(found) if found == path));
-        assert!(!path.exists());
+    #[test]
+    fn plugin_configuration_is_redacted() {
+        let spec = DiscoveredStoreSpec::new(
+            "acme-gcs",
+            StorageConfig::from_json(r#"{"token":"secret"}"#).expect("config"),
+        );
+        let debug = format!("{spec:?}");
+        assert!(debug.contains("acme-gcs"));
+        assert!(!debug.contains("secret"));
     }
 }

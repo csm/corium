@@ -1,11 +1,10 @@
 //! `PostgreSQL` store integration tests.
 //!
 //! Set `CORIUM_TEST_POSTGRES_URL` to run these against a disposable database.
-#![cfg(feature = "postgres")]
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use corium_store::{BlobStore, PostgresBlobStore, RootStore, StoreError};
+use corium_store::{BlobStore, RootStore, StoreError};
+use corium_store_postgres::PostgresBlobStore;
 use tokio_stream::StreamExt;
 
 #[tokio::test]

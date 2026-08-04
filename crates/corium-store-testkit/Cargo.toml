@@ -1,0 +1,19 @@
+[package]
+name = "corium-store-testkit"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Conformance tests for Corium storage backends"
+
+[dependencies]
+corium-store = { workspace = true }
+thiserror = "2"
+tokio-stream = "0.1.18"
+
+[dev-dependencies]
+tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

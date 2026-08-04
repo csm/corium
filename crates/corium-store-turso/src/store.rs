@@ -7,7 +7,24 @@ use async_trait::async_trait;
 use tokio_stream::wrappers::ReceiverStream;
 use turso::{Builder, Database};
 
-use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+use corium_store::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+
+fn backend_error(detail: impl std::fmt::Display) -> StoreError {
+    StoreError::Backend {
+        kind: "turso".into(),
+        detail: detail.to_string(),
+    }
+}
+
+trait ResultExt<T> {
+    fn backend(self) -> Result<T, StoreError>;
+}
+
+impl<T, E: std::fmt::Display> ResultExt<T> for Result<T, E> {
+    fn backend(self) -> Result<T, StoreError> {
+        self.map_err(backend_error)
+    }
+}
 
 const CREATE_BLOBS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS corium_blobs (
@@ -45,7 +62,7 @@ impl TursoBlobStore {
     /// Returns an error when the path is not UTF-8, the database cannot be
     /// opened, or the blob table cannot be initialized.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let database = Self::open_database(path.as_ref()).await?;
+        let database = Self::open_database(path.as_ref()).await.backend()?;
         Self::from_database(database).await
     }
 
@@ -59,21 +76,22 @@ impl TursoBlobStore {
     /// opened.
     pub async fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Ok(Self {
-            database: Self::open_database(path.as_ref()).await?,
+            database: Self::open_database(path.as_ref()).await.backend()?,
         })
     }
 
     async fn open_database(path: &Path) -> Result<Database, StoreError> {
         let text = path
             .to_str()
-            .ok_or_else(|| StoreError::InvalidTursoPath(path.to_path_buf()))?;
+            .ok_or_else(|| backend_error(format!("database path is not valid UTF-8: {path:?}")))?;
         // Independent transactors and storage-aware peers open the same local
         // database file. Turso requires its multi-process WAL coordinator for
         // that topology; without it a second process is rejected at open.
         let database = Builder::new_local(text)
             .experimental_multiprocess_wal(true)
             .build()
-            .await?;
+            .await
+            .backend()?;
         Ok(database)
     }
 
@@ -86,14 +104,14 @@ impl TursoBlobStore {
     ///
     /// Returns an error when the blob table cannot be initialized.
     pub async fn from_database(database: Database) -> Result<Self, StoreError> {
-        let connection = database.connect()?;
-        connection.execute(CREATE_BLOBS_TABLE, ()).await?;
-        connection.execute(CREATE_ROOTS_TABLE, ()).await?;
+        let connection = database.connect().backend()?;
+        connection.execute(CREATE_BLOBS_TABLE, ()).await.backend()?;
+        connection.execute(CREATE_ROOTS_TABLE, ()).await.backend()?;
         Ok(Self { database })
     }
 
     fn connect(&self) -> Result<turso::Connection, StoreError> {
-        Ok(self.database.connect()?)
+        self.database.connect().backend()
     }
 }
 
@@ -101,24 +119,28 @@ impl TursoBlobStore {
 impl BlobStore for TursoBlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
         let id = digest(bytes);
-        self.connect()?
+        self.connect()
+            .backend()?
             .execute(
                 "INSERT OR IGNORE INTO corium_blobs (id, data) VALUES (?1, ?2)",
                 (id.as_str(), bytes),
             )
-            .await?;
+            .await
+            .backend()?;
         Ok(id)
     }
 
     async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
         let mut rows = self
-            .connect()?
+            .connect()
+            .backend()?
             .query("SELECT data FROM corium_blobs WHERE id = ?1", [id.as_str()])
-            .await?;
-        let Some(row) = rows.next().await? else {
+            .await
+            .backend()?;
+        let Some(row) = rows.next().await.backend()? else {
             return Ok(None);
         };
-        let bytes: Vec<u8> = row.get(0)?;
+        let bytes: Vec<u8> = row.get(0).backend()?;
         if digest(&bytes) != *id {
             return Err(StoreError::CorruptBlob(id.clone()));
         }
@@ -127,24 +149,30 @@ impl BlobStore for TursoBlobStore {
 
     async fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
         let mut rows = self
-            .connect()?
+            .connect()
+            .backend()?
             .query("SELECT 1 FROM corium_blobs WHERE id = ?1", [id.as_str()])
-            .await?;
-        Ok(rows.next().await?.is_some())
+            .await
+            .backend()?;
+        Ok(rows.next().await.backend()?.is_some())
     }
 
     async fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
-        self.connect()?
+        self.connect()
+            .backend()?
             .execute("DELETE FROM corium_blobs WHERE id = ?1", [id.as_str()])
-            .await?;
+            .await
+            .backend()?;
         Ok(())
     }
 
     async fn list(&self) -> Result<BlobIdStream, StoreError> {
         let mut rows = self
-            .connect()?
+            .connect()
+            .backend()?
             .query("SELECT id FROM corium_blobs ORDER BY id", ())
-            .await?;
+            .await
+            .backend()?;
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             loop {
@@ -152,22 +180,20 @@ impl BlobStore for TursoBlobStore {
                     Ok(Some(row)) => row,
                     Ok(None) => return,
                     Err(error) => {
-                        let _ = tx.send(Err(StoreError::Turso(error))).await;
+                        let _ = tx.send(Err(backend_error(error))).await;
                         return;
                     }
                 };
                 let text = match row.get::<String>(0) {
                     Ok(text) => text,
                     Err(error) => {
-                        let _ = tx.send(Err(StoreError::Turso(error))).await;
+                        let _ = tx.send(Err(backend_error(error))).await;
                         return;
                     }
                 };
                 let Some(id) = BlobId::from_hex(&text) else {
                     let _ = tx
-                        .send(Err(StoreError::InvalidTursoData(format!(
-                            "invalid blob id {text:?}"
-                        ))))
+                        .send(Err(backend_error(format!("invalid blob id {text:?}"))))
                         .await;
                     return;
                 };
@@ -181,24 +207,23 @@ impl BlobStore for TursoBlobStore {
 
     async fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
         let mut rows = self
-            .connect()?
+            .connect()
+            .backend()?
             .query(
                 "SELECT created_at_unix_seconds FROM corium_blobs WHERE id = ?1",
                 [id.as_str()],
             )
-            .await?;
-        let Some(row) = rows.next().await? else {
+            .await
+            .backend()?;
+        let Some(row) = rows.next().await.backend()? else {
             return Ok(None);
         };
-        let seconds: i64 = row.get(0)?;
-        let seconds = u64::try_from(seconds).map_err(|_| {
-            StoreError::InvalidTursoData(format!("negative blob timestamp {seconds}"))
-        })?;
+        let seconds: i64 = row.get(0).backend()?;
+        let seconds = u64::try_from(seconds)
+            .map_err(|_| backend_error(format!("negative blob timestamp {seconds}")))?;
         let timestamp = UNIX_EPOCH
             .checked_add(Duration::from_secs(seconds))
-            .ok_or_else(|| {
-                StoreError::InvalidTursoData(format!("blob timestamp is out of range: {seconds}"))
-            })?;
+            .ok_or_else(|| backend_error(format!("blob timestamp is out of range: {seconds}")))?;
         Ok(Some(timestamp))
     }
 }
@@ -211,9 +236,10 @@ impl TursoBlobStore {
     ) -> Result<Option<Vec<u8>>, StoreError> {
         let mut rows = connection
             .query("SELECT data FROM corium_roots WHERE name = ?1", [name])
-            .await?;
-        match rows.next().await? {
-            Some(row) => Ok(Some(row.get::<Vec<u8>>(0)?)),
+            .await
+            .backend()?;
+        match rows.next().await.backend()? {
+            Some(row) => Ok(Some(row.get::<Vec<u8>>(0).backend()?)),
             None => Ok(None),
         }
     }
@@ -222,7 +248,7 @@ impl TursoBlobStore {
 #[async_trait]
 impl RootStore for TursoBlobStore {
     async fn get_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        Self::read_root(&self.connect()?, name).await
+        Self::read_root(&self.connect().backend()?, name).await
     }
 
     async fn cas_root(
@@ -231,12 +257,12 @@ impl RootStore for TursoBlobStore {
         expected: Option<&[u8]>,
         new: &[u8],
     ) -> Result<(), StoreError> {
-        let connection = self.connect()?;
+        let connection = self.connect().backend()?;
         // An immediate transaction takes the write lock up front so the
         // read-compare-write fence is atomic against a concurrent writer.
-        connection.execute("BEGIN IMMEDIATE", ()).await?;
+        connection.execute("BEGIN IMMEDIATE", ()).await.backend()?;
         let result = async {
-            let actual = Self::read_root(&connection, name).await?;
+            let actual = Self::read_root(&connection, name).await.backend()?;
             if actual.as_deref() != expected {
                 return Err(StoreError::CasFailed {
                     expected: expected.map(<[u8]>::to_vec),
@@ -249,12 +275,13 @@ impl RootStore for TursoBlobStore {
                      ON CONFLICT(name) DO UPDATE SET data = excluded.data",
                     (name, new),
                 )
-                .await?;
+                .await
+                .backend()?;
             Ok(())
         }
         .await;
         if result.is_ok() {
-            connection.execute("COMMIT", ()).await?;
+            connection.execute("COMMIT", ()).await.backend()?;
         } else {
             // Roll back the (empty) transaction; the CAS/read error is what
             // the caller cares about, so ignore a rollback failure.
@@ -264,23 +291,26 @@ impl RootStore for TursoBlobStore {
     }
 
     async fn delete_root(&self, name: &str) -> Result<(), StoreError> {
-        self.connect()?
+        self.connect()
+            .backend()?
             .execute("DELETE FROM corium_roots WHERE name = ?1", [name])
-            .await?;
+            .await
+            .backend()?;
         Ok(())
     }
 
     async fn list_roots(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
-        let connection = self.connect()?;
+        let connection = self.connect().backend()?;
         let mut rows = connection
             .query(
                 "SELECT name FROM corium_roots WHERE name >= ?1 ORDER BY name",
                 [prefix],
             )
-            .await?;
+            .await
+            .backend()?;
         let mut names = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let name: String = row.get(0)?;
+        while let Some(row) = rows.next().await.backend()? {
+            let name: String = row.get(0).backend()?;
             if name.starts_with(prefix) {
                 names.push(name);
             } else {

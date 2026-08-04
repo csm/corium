@@ -1,8 +1,8 @@
 # Pluggable storage backends
 
-**Status:** proposal (not implemented)
+**Status:** implemented (2026-08-03)
 
-## Problem
+## Prior problem
 
 Storage backends are selected at compile time. `corium-store` gates
 `PostgresBlobStore`, `TursoBlobStore`, and `S3BlobStore` behind the
@@ -295,6 +295,10 @@ missing plugin and how to install it.
 **Python.** `corium` becomes the only wheel containing the engine, and gains
 the plugin loader. `corium-turso` and friends shrink to a single `.so` plus a
 few lines of Python, advertised through an entry point:
+
+Implementation status: the loader contract is present, but the repository does
+not yet ship these Python wrapper distributions. The current base package
+supports filesystem direct storage only.
 
 ```toml
 [project.entry-points."corium.store_plugins"]

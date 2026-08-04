@@ -1,9 +1,8 @@
 //! Turso blob-store backend conformance tests.
-#![cfg(feature = "turso")]
-
 use std::time::SystemTime;
 
-use corium_store::{BlobStore, RootStore, StoreError, TursoBlobStore};
+use corium_store::{BlobStore, RootStore, StoreError};
+use corium_store_turso::TursoBlobStore;
 use tokio_stream::StreamExt;
 
 #[tokio::test]

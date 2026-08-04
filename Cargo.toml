@@ -4,6 +4,12 @@ members = [
     "crates/corium-core",
     "crates/corium-index",
     "crates/corium-store",
+    "crates/corium-store-abi",
+    "crates/corium-store-plugin",
+    "crates/corium-store-postgres",
+    "crates/corium-store-s3",
+    "crates/corium-store-testkit",
+    "crates/corium-store-turso",
     "crates/corium-log",
     "crates/corium-tx",
     "crates/corium-forms",
@@ -89,6 +95,12 @@ corium-query = { path = "crates/corium-query", version = "0.1.0" }
 corium-sql = { path = "crates/corium-sql", version = "0.1.0" }
 corium-sim = { path = "crates/corium-sim", version = "0.1.0" }
 corium-store = { path = "crates/corium-store", version = "0.1.0" }
+corium-store-abi = { path = "crates/corium-store-abi", version = "0.1.0" }
+corium-store-plugin = { path = "crates/corium-store-plugin", version = "0.1.0" }
+corium-store-postgres = { path = "crates/corium-store-postgres", version = "0.1.0" }
+corium-store-s3 = { path = "crates/corium-store-s3", version = "0.1.0" }
+corium-store-testkit = { path = "crates/corium-store-testkit", version = "0.1.0" }
+corium-store-turso = { path = "crates/corium-store-turso", version = "0.1.0" }
 # default-features off so `corium-cljrs` (GC-mode cljrs) does not inherit the
 # `cljrs` transaction-function runtime, whose `no-gc` flag would feature-unify
 # onto its cljrs stack; binaries opt in via their own `cljrs` feature.

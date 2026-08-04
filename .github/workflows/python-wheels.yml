@@ -58,53 +58,28 @@ jobs:
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             manylinux: "off"
-        distribution:
-          - name: corium
-            directory: clients/python
-            out: ../../dist
-          - name: corium-turso
-            directory: clients/python/artifacts/turso
-            out: ../../../../dist
-          - name: corium-postgres
-            directory: clients/python/artifacts/postgres
-            out: ../../../../dist
-          - name: corium-s3
-            directory: clients/python/artifacts/s3
-            out: ../../../../dist
     runs-on: ${{ matrix.platform.runner }}
     steps:
       - uses: actions/checkout@v4
-        if: >-
-          github.event_name != 'pull_request' ||
-          matrix.distribution.name == 'corium'
         with:
           ref: ${{ inputs.release_ref || github.ref }}
       - uses: actions/setup-python@v5
-        if: >-
-          github.event_name != 'pull_request' ||
-          matrix.distribution.name == 'corium'
         with:
           python-version: "3.10"
-      - name: Build ${{ matrix.distribution.name }}
-        if: >-
-          github.event_name != 'pull_request' ||
-          matrix.distribution.name == 'corium'
+      - name: Build corium
         uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380
         with:
           maturin-version: v1.11.5
           command: build
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
-          working-directory: ${{ matrix.distribution.directory }}
+          working-directory: clients/python
           args: >-
             --release --locked --compatibility pypi -i python3.10
-            --out ${{ matrix.distribution.out }}
+            --out ../../dist
       - uses: actions/upload-artifact@v4
-        if: >-
-          github.event_name != 'pull_request' ||
-          matrix.distribution.name == 'corium'
         with:
-          name: wheels-${{ matrix.platform.target }}-${{ matrix.distribution.name }}
+          name: wheels-${{ matrix.platform.target }}-corium
           path: dist/*.whl
           if-no-files-found: error
 
@@ -137,7 +112,6 @@ jobs:
           pattern: wheels-${{ matrix.platform.target }}-*
           path: dist
           merge-multiple: true
-      - name: Install and import wheel combinations
+      - name: Install and import wheel
         run: >-
           python clients/python/scripts/smoke_wheels.py dist
-          ${{ github.event_name == 'pull_request' && '--base-only' || '' }}

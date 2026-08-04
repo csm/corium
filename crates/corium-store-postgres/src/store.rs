@@ -4,7 +4,24 @@ use async_trait::async_trait;
 use deadpool_postgres::{Config, Pool, Runtime};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
-use crate::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+use corium_store::{BlobId, BlobIdStream, BlobStore, RootStore, StoreError, digest};
+
+fn backend_error(detail: impl std::fmt::Display) -> StoreError {
+    StoreError::Backend {
+        kind: "postgres".into(),
+        detail: detail.to_string(),
+    }
+}
+
+trait ResultExt<T> {
+    fn backend(self) -> Result<T, StoreError>;
+}
+
+impl<T, E: std::fmt::Display> ResultExt<T> for Result<T, E> {
+    fn backend(self) -> Result<T, StoreError> {
+        self.map_err(backend_error)
+    }
+}
 
 const CREATE_BLOBS_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS corium_blobs (
@@ -68,7 +85,7 @@ impl PostgresBlobStore {
         connection_string: impl Into<String>,
     ) -> Result<Self, StoreError> {
         let pool = Self::create_pool(connection_string)?;
-        let _client = pool.get().await?;
+        let _client = pool.get().await.backend()?;
         Ok(Self { pool })
     }
 
@@ -77,13 +94,14 @@ impl PostgresBlobStore {
         // provider. In that case its process-wide choice remains in force.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (tls, _certificate_errors) =
-            tokio_postgres_rustls::MakeRustlsConnect::with_native_certs()
-                .map_err(|errors| StoreError::PostgresTlsRoots(format!("{errors:?}")))?;
+            tokio_postgres_rustls::MakeRustlsConnect::with_native_certs().map_err(|errors| {
+                backend_error(format!("cannot load native TLS roots: {errors:?}"))
+            })?;
         let config = Config {
             url: Some(connection_string.into()),
             ..Config::default()
         };
-        Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
+        config.create_pool(Some(Runtime::Tokio1), tls).backend()
     }
 
     /// Creates a store from an existing `deadpool-postgres` pool.
@@ -97,24 +115,26 @@ impl PostgresBlobStore {
     /// Returns an error when a connection cannot be checked out or the store
     /// tables cannot be initialized.
     pub async fn from_pool(pool: Pool) -> Result<Self, StoreError> {
-        let client = pool.get().await?;
-        client.batch_execute(CREATE_BLOBS_TABLE).await?;
-        client.batch_execute(CREATE_ROOTS_TABLE).await?;
+        let client = pool.get().await.backend()?;
+        client.batch_execute(CREATE_BLOBS_TABLE).await.backend()?;
+        client.batch_execute(CREATE_ROOTS_TABLE).await.backend()?;
         Ok(Self { pool })
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Client, StoreError> {
-        Ok(self.pool.get().await?)
+        self.pool.get().await.backend()
     }
 
     async fn read_root(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let row = self
             .client()
-            .await?
+            .await
+            .backend()?
             .query_opt("SELECT data FROM corium_roots WHERE name = $1", &[&name])
-            .await?;
+            .await
+            .backend()?;
         match row {
-            Some(row) => Ok(Some(row.try_get(0)?)),
+            Some(row) => Ok(Some(row.try_get(0).backend()?)),
             None => Ok(None),
         }
     }
@@ -135,29 +155,33 @@ impl BlobStore for PostgresBlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobId, StoreError> {
         let id = digest(bytes);
         self.client()
-            .await?
+            .await
+            .backend()?
             .execute(
                 "INSERT INTO corium_blobs (id, data) VALUES ($1, $2)
                  ON CONFLICT (id) DO NOTHING",
                 &[&id.as_str(), &bytes],
             )
-            .await?;
+            .await
+            .backend()?;
         Ok(id)
     }
 
     async fn get(&self, id: &BlobId) -> Result<Option<Vec<u8>>, StoreError> {
         let row = self
             .client()
-            .await?
+            .await
+            .backend()?
             .query_opt(
                 "SELECT data FROM corium_blobs WHERE id = $1",
                 &[&id.as_str()],
             )
-            .await?;
+            .await
+            .backend()?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let bytes: Vec<u8> = row.try_get(0)?;
+        let bytes: Vec<u8> = row.try_get(0).backend()?;
         if digest(&bytes) != *id {
             return Err(StoreError::CorruptBlob(id.clone()));
         }
@@ -167,22 +191,26 @@ impl BlobStore for PostgresBlobStore {
     async fn contains(&self, id: &BlobId) -> Result<bool, StoreError> {
         Ok(self
             .client()
-            .await?
+            .await
+            .backend()?
             .query_opt("SELECT 1 FROM corium_blobs WHERE id = $1", &[&id.as_str()])
-            .await?
+            .await
+            .backend()?
             .is_some())
     }
 
     async fn delete(&self, id: &BlobId) -> Result<(), StoreError> {
         self.client()
-            .await?
+            .await
+            .backend()?
             .execute("DELETE FROM corium_blobs WHERE id = $1", &[&id.as_str()])
-            .await?;
+            .await
+            .backend()?;
         Ok(())
     }
 
     async fn list(&self) -> Result<BlobIdStream, StoreError> {
-        let client = self.client().await?;
+        let client = self.client().await.backend()?;
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             let rows = match client
@@ -194,7 +222,7 @@ impl BlobStore for PostgresBlobStore {
             {
                 Ok(rows) => rows,
                 Err(error) => {
-                    let _ = tx.send(Err(StoreError::Postgres(error))).await;
+                    let _ = tx.send(Err(backend_error(error))).await;
                     return;
                 }
             };
@@ -203,22 +231,20 @@ impl BlobStore for PostgresBlobStore {
                 let row = match row {
                     Ok(row) => row,
                     Err(error) => {
-                        let _ = tx.send(Err(StoreError::Postgres(error))).await;
+                        let _ = tx.send(Err(backend_error(error))).await;
                         return;
                     }
                 };
                 let text: String = match row.try_get(0) {
                     Ok(text) => text,
                     Err(error) => {
-                        let _ = tx.send(Err(StoreError::Postgres(error))).await;
+                        let _ = tx.send(Err(backend_error(error))).await;
                         return;
                     }
                 };
                 let Some(id) = BlobId::from_hex(&text) else {
                     let _ = tx
-                        .send(Err(StoreError::InvalidPostgresData(format!(
-                            "invalid blob id {text:?}"
-                        ))))
+                        .send(Err(backend_error(format!("invalid blob id {text:?}"))))
                         .await;
                     return;
                 };
@@ -233,26 +259,23 @@ impl BlobStore for PostgresBlobStore {
     async fn modified_at(&self, id: &BlobId) -> Result<Option<SystemTime>, StoreError> {
         let row = self
             .client()
-            .await?
+            .await
+            .backend()?
             .query_opt(
                 "SELECT created_at_unix_seconds FROM corium_blobs WHERE id = $1",
                 &[&id.as_str()],
             )
-            .await?;
+            .await
+            .backend()?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let seconds: i64 = row.try_get(0)?;
-        let seconds = u64::try_from(seconds).map_err(|_| {
-            StoreError::InvalidPostgresData(format!("negative blob timestamp {seconds}"))
-        })?;
+        let seconds: i64 = row.try_get(0).backend()?;
+        let seconds = u64::try_from(seconds)
+            .map_err(|_| backend_error(format!("negative blob timestamp {seconds}")))?;
         let timestamp = UNIX_EPOCH
             .checked_add(Duration::from_secs(seconds))
-            .ok_or_else(|| {
-                StoreError::InvalidPostgresData(format!(
-                    "blob timestamp is out of range: {seconds}"
-                ))
-            })?;
+            .ok_or_else(|| backend_error(format!("blob timestamp is out of range: {seconds}")))?;
         Ok(Some(timestamp))
     }
 }
@@ -271,21 +294,25 @@ impl RootStore for PostgresBlobStore {
     ) -> Result<(), StoreError> {
         let changed = if let Some(expected) = expected {
             self.client()
-                .await?
+                .await
+                .backend()?
                 .execute(
                     "UPDATE corium_roots SET data = $3 WHERE name = $1 AND data = $2",
                     &[&name, &expected, &new],
                 )
-                .await?
+                .await
+                .backend()?
         } else {
             self.client()
-                .await?
+                .await
+                .backend()?
                 .execute(
                     "INSERT INTO corium_roots (name, data) VALUES ($1, $2)
                      ON CONFLICT (name) DO NOTHING",
                     &[&name, &new],
                 )
-                .await?
+                .await
+                .backend()?
         };
         if changed == 1 {
             Ok(())
@@ -296,9 +323,11 @@ impl RootStore for PostgresBlobStore {
 
     async fn delete_root(&self, name: &str) -> Result<(), StoreError> {
         self.client()
-            .await?
+            .await
+            .backend()?
             .execute("DELETE FROM corium_roots WHERE name = $1", &[&name])
-            .await?;
+            .await
+            .backend()?;
         Ok(())
     }
 
@@ -306,17 +335,19 @@ impl RootStore for PostgresBlobStore {
         let pattern = format!("{}%", escape_like(prefix));
         let rows = self
             .client()
-            .await?
+            .await
+            .backend()?
             .query(
                 "SELECT name FROM corium_roots
                  WHERE name LIKE $1 ESCAPE '\\' ORDER BY name",
                 &[&pattern],
             )
-            .await?;
+            .await
+            .backend()?;
         rows.into_iter()
             .map(|row| row.try_get(0))
             .collect::<Result<_, _>>()
-            .map_err(StoreError::Postgres)
+            .map_err(backend_error)
     }
 }
 

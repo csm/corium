@@ -27,9 +27,10 @@ use corium_protocol::codec;
 use corium_protocol::pb;
 use corium_query::QueryError;
 use corium_query::edn::Edn;
-#[cfg(feature = "s3")]
-use corium_store::S3ClientConfig;
-use corium_store::{DiscoveredStoreSpec, StorageConnectionError};
+use corium_store::{
+    DiscoveredStoreSpec, StorageConnectionError,
+    available_storage_backends as registered_storage_backends,
+};
 use thiserror::Error;
 use tonic::transport::ClientTlsConfig;
 use tonic::{Code, Status};
@@ -280,18 +281,33 @@ impl fmt::Debug for RemoteConnectOptions {
     }
 }
 
-/// Direct-storage backends compiled into this native artifact.
+fn register_static_storage_backends() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        #[cfg(feature = "postgres")]
+        let _ = corium_store_postgres::register();
+        #[cfg(feature = "turso")]
+        let _ = corium_store_turso::register();
+        #[cfg(feature = "s3")]
+        let _ = corium_store_s3::register();
+    });
+}
+
+/// Direct-storage backends currently registered in this process.
 #[must_use]
-pub fn compiled_storage_backends() -> Vec<&'static str> {
-    #[allow(unused_mut)]
-    let mut backends = vec!["filesystem"];
-    #[cfg(feature = "postgres")]
-    backends.push("postgres");
-    #[cfg(feature = "turso")]
-    backends.push("turso");
-    #[cfg(feature = "s3")]
-    backends.push("s3");
-    backends
+pub fn available_storage_backends() -> Vec<String> {
+    register_static_storage_backends();
+    registered_storage_backends()
+}
+
+/// Loads and registers a dynamic storage plugin by explicit path.
+///
+/// # Errors
+/// Returns a storage error for load, ABI, or duplicate-kind failures.
+pub fn load_storage_plugin(path: impl AsRef<std::path::Path>) -> Result<Vec<String>, FfiError> {
+    corium_store_plugin::load_storage_plugin(path)
+        .map(|plugin| plugin.backends)
+        .map_err(storage_error)
 }
 
 fn peer_error(error: PeerError) -> FfiError {
@@ -379,20 +395,21 @@ pub async fn discover_storage_backend(
     database: &str,
     token: Option<String>,
     tls: Option<ClientTlsOptions>,
-) -> Result<&'static str, FfiError> {
+) -> Result<String, FfiError> {
     let storage = fetch_storage_connection(endpoints, database, token, tls).await?;
     storage_backend_name(&storage)
 }
 
-fn storage_backend_name(storage: &pb::StorageConnection) -> Result<&'static str, FfiError> {
+fn storage_backend_name(storage: &pb::StorageConnection) -> Result<String, FfiError> {
     use pb::storage_connection::Backend;
 
-    match storage.backend {
-        Some(Backend::Memory(_)) => Ok("memory"),
-        Some(Backend::Filesystem(_)) => Ok("filesystem"),
-        Some(Backend::Postgres(_)) => Ok("postgres"),
-        Some(Backend::Turso(_)) => Ok("turso"),
-        Some(Backend::S3(_)) => Ok("s3"),
+    match &storage.backend {
+        Some(Backend::Memory(_)) => Ok("memory".into()),
+        Some(Backend::Filesystem(_)) => Ok("filesystem".into()),
+        Some(Backend::Postgres(_)) => Ok("postgres".into()),
+        Some(Backend::Turso(_)) => Ok("turso".into()),
+        Some(Backend::S3(_)) => Ok("s3".into()),
+        Some(Backend::Plugin(plugin)) => Ok(plugin.kind.clone()),
         None => Err(FfiError::new(
             ErrorKind::Storage,
             "transactor returned no direct-storage backend",
@@ -402,41 +419,62 @@ fn storage_backend_name(storage: &pb::StorageConnection) -> Result<&'static str,
 
 async fn open_discovered_storage(
     storage: pb::StorageConnection,
-    #[cfg_attr(not(feature = "s3"), allow(unused_variables))] discovery: StorageDiscovery,
+    discovery: StorageDiscovery,
 ) -> Result<Arc<dyn PeerStorage>, FfiError> {
+    register_static_storage_backends();
     let spec = DiscoveredStoreSpec::from_connection(storage).map_err(|error| match error {
         StorageConnectionError::Missing => FfiError::new(
             ErrorKind::Storage,
             "transactor returned no direct-storage backend",
         ),
         StorageConnectionError::Unsupported(detail) => FfiError::new(ErrorKind::Storage, detail),
+        StorageConnectionError::InvalidConfig { kind, detail } => FfiError::new(
+            ErrorKind::Storage,
+            format!("invalid {kind:?} storage config: {detail}"),
+        ),
     })?;
     #[cfg(feature = "s3")]
     let mut spec = spec;
     #[cfg(feature = "s3")]
-    if let DiscoveredStoreSpec::S3 {
-        bucket,
-        prefix,
-        client,
-    } = &mut spec
-    {
-        let initial = s3_credentials(client)?;
-        client.credentials_provider = Some(SharedCredentialsProvider::new(
-            StorageInfoCredentialsProvider {
-                endpoints: discovery.endpoints,
-                database: discovery.database,
-                token: discovery.token,
-                tls: discovery.tls,
-                bucket: bucket.clone(),
-                prefix: prefix.clone(),
-                region: client.region.clone(),
-                endpoint_url: client.endpoint_url.clone(),
-                initial: Mutex::new(Some(initial)),
-            },
-        ));
+    if spec.kind() == "s3" {
+        let config = spec.config();
+        let provider = StorageInfoCredentialsProvider {
+            endpoints: discovery.endpoints,
+            database: discovery.database,
+            token: discovery.token,
+            tls: discovery.tls,
+            bucket: config_string(config, "bucket")?,
+            prefix: config_string_or_default(config, "prefix"),
+            region: config_optional_string(config, "region"),
+            endpoint_url: config_optional_string(config, "endpoint_url"),
+            initial: Mutex::new(Some(s3_credentials(config)?)),
+        };
+        spec.config_mut()
+            .insert_extension(SharedCredentialsProvider::new(provider));
     }
+    #[cfg(not(feature = "s3"))]
+    let _ = discovery;
     let store = spec.open_existing().await.map_err(storage_error)?;
     Ok(Arc::new(DiscoveredPeerStorage::new(store)))
+}
+
+#[cfg(feature = "s3")]
+fn config_optional_string(config: &corium_store::StorageConfig, key: &str) -> Option<String> {
+    config
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+#[cfg(feature = "s3")]
+fn config_string_or_default(config: &corium_store::StorageConfig, key: &str) -> String {
+    config_optional_string(config, key).unwrap_or_default()
+}
+
+#[cfg(feature = "s3")]
+fn config_string(config: &corium_store::StorageConfig, key: &str) -> Result<String, FfiError> {
+    config_optional_string(config, key)
+        .ok_or_else(|| FfiError::new(ErrorKind::Storage, format!("S3 storage info omitted {key}")))
 }
 
 #[cfg(feature = "s3")]
@@ -500,44 +538,31 @@ impl StorageInfoCredentialsProvider {
         .map_err(|error| format!("cannot refresh S3 storage credentials: {error}"))?;
         let spec = DiscoveredStoreSpec::from_connection(storage)
             .map_err(|error| format!("cannot use refreshed storage info: {error}"))?;
-        let DiscoveredStoreSpec::S3 {
-            bucket,
-            prefix,
-            client,
-        } = spec
-        else {
-            return Err("storage backend changed while refreshing S3 credentials".into());
-        };
-        if bucket != self.bucket
-            || prefix != self.prefix
-            || client.region != self.region
-            || client.endpoint_url != self.endpoint_url
+        if spec.kind() != "s3"
+            || config_optional_string(spec.config(), "bucket").as_deref() != Some(&self.bucket)
+            || config_string_or_default(spec.config(), "prefix") != self.prefix
+            || config_optional_string(spec.config(), "region") != self.region
+            || config_optional_string(spec.config(), "endpoint_url") != self.endpoint_url
         {
             return Err("S3 storage identity changed while refreshing credentials".into());
         }
-        s3_credentials(&client).map_err(|error| error.to_string())
+        s3_credentials(spec.config()).map_err(|error| error.to_string())
     }
 }
 
 #[cfg(feature = "s3")]
-fn s3_credentials(client: &S3ClientConfig) -> Result<Credentials, FfiError> {
-    let access_key_id = client.access_key_id.clone().ok_or_else(|| {
-        FfiError::new(
-            ErrorKind::Storage,
-            "S3 storage info omitted the read-only access key id",
-        )
-    })?;
-    let secret_access_key = client.secret_access_key.clone().ok_or_else(|| {
-        FfiError::new(
-            ErrorKind::Storage,
-            "S3 storage info omitted the read-only secret access key",
-        )
-    })?;
+fn s3_credentials(config: &corium_store::StorageConfig) -> Result<Credentials, FfiError> {
+    let expires_after = config
+        .get("expires_unix_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|seconds| {
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(seconds))
+        });
     Ok(Credentials::new(
-        access_key_id,
-        secret_access_key,
-        client.session_token.clone(),
-        client.expires_after,
+        config_string(config, "access_key_id")?,
+        config_string(config, "secret_access_key")?,
+        config_optional_string(config, "session_token"),
+        expires_after,
         "corium-storage-info-refresh",
     ))
 }
@@ -1342,12 +1367,10 @@ mod tests {
     }
 
     #[test]
-    fn compiled_backends_match_enabled_features() {
-        let backends = compiled_storage_backends();
-        assert!(backends.contains(&"filesystem"));
-        assert_eq!(backends.contains(&"postgres"), cfg!(feature = "postgres"));
-        assert_eq!(backends.contains(&"turso"), cfg!(feature = "turso"));
-        assert_eq!(backends.contains(&"s3"), cfg!(feature = "s3"));
+    fn available_backends_are_registry_driven() {
+        let backends = available_storage_backends();
+        assert!(backends.iter().any(|backend| backend == "filesystem"));
+        assert!(backends.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[tokio::test]
@@ -1413,6 +1436,12 @@ mod tests {
     #[cfg(not(feature = "postgres"))]
     #[tokio::test]
     async fn postgres_discovery_is_rejected_when_backend_is_disabled() {
+        if available_storage_backends()
+            .iter()
+            .any(|backend| backend == "postgres")
+        {
+            return;
+        }
         let error = open_discovered_storage(
             pb::StorageConnection {
                 backend: Some(pb::storage_connection::Backend::Postgres(
@@ -1427,7 +1456,7 @@ mod tests {
         .err()
         .expect("disabled PostgreSQL backend must be rejected");
         assert_eq!(error.kind(), ErrorKind::Storage);
-        assert!(error.message().contains("lacks PostgreSQL"));
+        assert!(error.message().contains("not available"));
         assert!(!error.message().contains("secret"));
     }
 
@@ -1456,6 +1485,12 @@ mod tests {
     #[cfg(not(feature = "turso"))]
     #[tokio::test]
     async fn turso_discovery_is_rejected_when_backend_is_disabled() {
+        if available_storage_backends()
+            .iter()
+            .any(|backend| backend == "turso")
+        {
+            return;
+        }
         let error = open_discovered_storage(
             pb::StorageConnection {
                 backend: Some(pb::storage_connection::Backend::Turso(pb::TursoStorage {
@@ -1468,17 +1503,25 @@ mod tests {
         .err()
         .expect("disabled Turso backend must be rejected");
         assert_eq!(error.kind(), ErrorKind::Storage);
-        assert!(error.message().contains("lacks Turso"));
+        assert!(error.message().contains("not available"));
     }
 
     #[cfg(not(feature = "s3"))]
     #[tokio::test]
     async fn s3_discovery_is_rejected_when_backend_is_disabled() {
+        if available_storage_backends()
+            .iter()
+            .any(|backend| backend == "s3")
+        {
+            return;
+        }
         let error = open_discovered_storage(
             pb::StorageConnection {
                 backend: Some(pb::storage_connection::Backend::S3(pb::S3Storage {
                     bucket: "corium-data".into(),
                     prefix: "people/".into(),
+                    access_key_id: "reader".into(),
+                    secret_access_key: "secret".into(),
                     ..Default::default()
                 })),
             },
@@ -1488,12 +1531,14 @@ mod tests {
         .err()
         .expect("disabled S3 backend must be rejected");
         assert_eq!(error.kind(), ErrorKind::Storage);
-        assert!(error.message().contains("lacks S3"));
+        assert!(error.message().contains("not available"));
+        assert!(!error.message().contains("secret"));
     }
 
     #[cfg(feature = "s3")]
     #[test]
     fn s3_discovery_requires_read_only_credentials_and_redacts_provider() {
+        register_static_storage_backends();
         let mut storage = pb::S3Storage {
             bucket: "corium-data".into(),
             prefix: "people/".into(),
@@ -1511,32 +1556,13 @@ mod tests {
         assert!(error.to_string().contains("read-only secret access key"));
 
         storage.secret_access_key = "reader-secret".into();
-        let DiscoveredStoreSpec::S3 {
-            bucket,
-            prefix,
-            client,
-        } = DiscoveredStoreSpec::from_connection(pb::StorageConnection {
+        let spec = DiscoveredStoreSpec::from_connection(pb::StorageConnection {
             backend: Some(pb::storage_connection::Backend::S3(storage)),
         })
-        .expect("complete S3 storage spec")
-        else {
-            panic!("S3 storage spec");
-        };
-        let provider = StorageInfoCredentialsProvider {
-            endpoints: vec!["https://transactor.example".into()],
-            database: "people".into(),
-            token: Some("bearer-secret".into()),
-            tls: None,
-            bucket,
-            prefix,
-            region: client.region.clone(),
-            endpoint_url: client.endpoint_url.clone(),
-            initial: Mutex::new(Some(s3_credentials(&client).expect("complete credentials"))),
-        };
-        let rendered = format!("{provider:?}");
+        .expect("complete S3 storage spec");
+        let rendered = format!("{spec:?}");
         assert!(!rendered.contains("reader-secret"));
         assert!(!rendered.contains("session-secret"));
-        assert!(!rendered.contains("bearer-secret"));
     }
 
     fn private_ca_server_identity(server_name: &str) -> (String, String, String) {

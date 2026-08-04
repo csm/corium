@@ -13,8 +13,8 @@
 `corium peer-server` hosts peer-local queries for thin clients. Both accept
 TLS and bearer-token flags documented by `corium <command> --help`.
 
-The transactor's blob, root, and transaction-log storage is selected with
-`--store`: `fs` (the default, under `--data-dir`), `mem` (in-memory and
+The transactor's statically linked blob, root, and transaction-log storage is
+selected with `--store`: `fs` (the default, under `--data-dir`), `mem` (in-memory and
 ephemeral — a single process, everything lost on exit; for demos and tests,
 not production), `postgres` (shared PostgreSQL storage at `--postgres-url`,
 requiring a build with `--features postgres`), `turso` (an
@@ -27,6 +27,34 @@ store versioned logs natively in the same backend as their blobs and roots.
 Online backup reads every durable backend; restore and offline GC write a
 filesystem data directory.
 
+A separately built driver can be selected without rebuilding the transactor:
+
+```sh
+corium transactor \
+  --store-plugin /opt/corium/plugins/libcorium_store_turso.so \
+  --store 'turso:{"path":"/srv/corium/store.db"}' \
+  --data-dir /srv/corium
+```
+
+`--store-plugin` is repeatable. `CORIUM_STORE_PLUGINS` may additionally name a
+path-separator-delimited list of library files or directories. Corium does not
+scan the working directory. Loading a storage plugin executes native
+code inside the transactor and gives that code the backend configuration,
+which may contain credentials. Install libraries and their containing
+directories with the same ownership and write restrictions as the transactor
+binary. Never load a plugin from a user-writable directory.
+
+Before deployment, run the live conformance checks against a disposable
+backend namespace:
+
+```sh
+corium store verify turso '{"path":"/tmp/corium-plugin-check.db"}' \
+  --store-plugin /opt/corium/plugins/libcorium_store_turso.so
+```
+
+The loader rejects an incompatible Corium ABI generation or `abi_stable` type
+layout and keeps accepted libraries loaded for the lifetime of the process.
+
 `GetStorageInfo` never returns a service backend's primary write credential.
 For PostgreSQL, configure a separate database role that has `SELECT` on
 `corium_blobs` and `corium_roots`, then pass its URL with
@@ -34,6 +62,12 @@ For PostgreSQL, configure a separate database role that has `SELECT` on
 missing, storage-aware peer bootstrap and online backup fail explicitly
 instead of falling back to `--postgres-url`. Local filesystem and Turso
 stores need no separate credential configuration.
+
+Plugin stores also require a separate read-only JSON configuration. Supply it
+with `--plugin-read-only-config`, `CORIUM_PLUGIN_READ_ONLY_CONFIG`, or the EDN
+key `:plugin-read-only-config`. Corium never advertises the plugin's primary
+configuration. If the read-only configuration is absent, `GetStorageInfo`
+fails for that plugin store.
 
 The PostgreSQL backend creates `corium_blobs` and `corium_roots` in the
 connection's current schema and stores transaction-log objects as fenced

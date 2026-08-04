@@ -19,7 +19,7 @@ except ImportError:
 
 @unittest.skipIf(_corium is None, "native extension is not built")
 class NativeBoundaryTests(unittest.TestCase):
-    def test_native_artifact_reports_compiled_storage_backends(self) -> None:
+    def test_native_engine_reports_available_storage_backends(self) -> None:
         backends = set(_corium._storage_backends())
         self.assertIn("filesystem", backends)
         self.assertTrue(backends.issubset({"filesystem", "postgres", "turso", "s3"}))

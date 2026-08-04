@@ -1,29 +1,22 @@
-# Optional direct-storage artifacts
+# Direct-storage plugin packaging
 
-These are optional native extension distributions for the `corium` package:
+This repository does not currently build or publish official Python wrapper
+packages for the Turso, PostgreSQL, or S3 plugins. The base `corium` package
+supports filesystem direct storage. Use remote peer or replay mode for the
+other storage backends.
 
-| Distribution | Native feature |
-|---|---|
-| `corium` | filesystem only |
-| `corium-turso` | Turso |
-| `corium-postgres` | PostgreSQL |
-| `corium-s3` | S3 |
+The Python loader supports third-party and internal wrapper packages. A
+wrapper package contains a storage shared library and a Python path provider.
+It advertises that provider through the `corium.store_plugins` entry-point
+group. The provider returns the installed path of the shared library.
 
-Install the base `corium` distribution and any optional artifacts you need. Each
-artifact has its own extension-module name, depends on the common package, and
-contains the native full-peer core plus one driver. It does not overwrite the
-base extension, so installation and removal are safe. This keeps a
-remote-only/base installation free of every optional storage dependency.
-
-Build an artifact from its directory:
+The wrapper package is separate from the Rust plugin build. For example, this
+command builds the Turso shared library:
 
 ```shell
-maturin build
+cargo build -p corium-store-turso --release
 ```
 
-The common package automatically selects an installed artifact that supports
-the storage advertised by the transactor. `corium.available_storage_backends()`
-reports the union of drivers available across installed artifacts. Tagged
-releases build and smoke-test each artifact on the
-same Linux, macOS, and Windows matrix as the common package before publishing
-through PyPI trusted publishing.
+This repository does not provide the wrapper project that `maturin` requires.
+The `corium.available_storage_backends()` function reports all registered
+backends. The loader rejects duplicate kinds and incompatible ABI layouts.

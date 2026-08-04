@@ -5,12 +5,11 @@
 //! to run these against a disposable bucket. The bucket is created if absent.
 //! An `AWS_ENDPOINT_URL` implies a LocalStack/MinIO-style target, so the
 //! client is built with path-style addressing in that case.
-#![cfg(feature = "s3")]
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::Client;
-use corium_store::{BlobStore, RootStore, S3BlobStore, StoreError};
+use corium_store::{BlobStore, RootStore, StoreError};
+use corium_store_s3::S3BlobStore;
 use tokio_stream::StreamExt;
 
 async fn test_client() -> Client {

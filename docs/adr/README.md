@@ -26,3 +26,4 @@ reference the old. Format: Context / Decision / Consequences.
 | [0019](0019-operator-peer-service.md) | An operator peer service for management duties | Proposed |
 | [0020](0020-planned-schema-migrations.md) | Plan and apply schema migrations as basis-versioned data | Accepted |
 | [0021](0021-contextual-read-authorization.md) | Contextual read authorization on the peer server and pgwire | Accepted |
+| [0022](0022-pluggable-storage.md) | Runtime-pluggable storage backends | Accepted |
