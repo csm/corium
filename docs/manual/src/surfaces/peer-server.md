@@ -90,8 +90,9 @@ The canonical schema is `crates/corium-protocol/proto/corium.proto`.
 
 Six rules matter to an operator.
 
-- Every transact and subscribe request sends `protocol_version = 1`. A
-  mismatch is `FAILED_PRECONDITION`, never a silent downgrade.
+- Every transact and subscribe request sends a `protocol_version`. This build
+  speaks version 3 and accepts version 1 and later. An unsupported version is
+  `FAILED_PRECONDITION`, never a silent downgrade.
 - Malformed input is `INVALID_ARGUMENT`. An unknown database or entity is
   `NOT_FOUND`. Upstream loss is `UNAVAILABLE`.
 - Query results stream in chunks. A client concatenates them and stops at
@@ -105,13 +106,44 @@ Six rules matter to an operator.
 A client is conformant when it reproduces the behavioral corpus in
 `tests/conformance`.
 
+Version 3 adds the sealed value tag. A client older than version 3 never
+receives a sealed value. An unopened value reaches it as the tagged EDN
+element `#corium/redacted`, which every EDN reader parses.
+
+## Serving many principals
+
+A peer server serves every client from one process and one database value.
+Which facts a client sees is a policy question, not a process question.
+
+- A view hides attributes from a principal. Read
+  [authorization](../security/authorization.md).
+- A key grant decides which protection classes a principal can open. Read
+  [attribute protection](../security/protection.md).
+
+A principal whose view hides attributes cannot `Transact`, and it cannot
+`Subscribe`. Transaction data is opaque bytes by the time authorization runs.
+A subscription proxies the stream of the transactor. Neither call can honor a
+filter, so the server refuses rather than serve unfiltered data.
+
 ## Language clients
 
 | Client | Location |
 |---|---|
 | Rust | `corium-peer`, `corium-client` |
 | Python | [`clients/python`](https://github.com/csm/corium/blob/main/clients/python/README.md) |
+| Java | [`clients/java`](https://github.com/csm/corium/blob/main/clients/java/README.md) |
 | Clojure | `corium-cljrs`, the `corium.api` namespace |
 
-The Python client offers `LocalPeer`, which embeds a full peer, and
-`RemotePeer`, which connects to a peer server. Both satisfy one protocol.
+The Python and Java clients each offer two peers behind one interface.
+
+| Peer | Where it runs |
+|---|---|
+| `LocalPeer` | Embeds a full peer in the process. It indexes and queries in process, and it talks to a transactor directly. |
+| `RemotePeer` | Connects to a peer server over gRPC. |
+
+Both produce the same database values, and every time view works the same way
+on both. Only a remote peer can join across databases in one query.
+
+An embedded peer can also read published segments straight from storage, and
+it can hold its own class keys. Use it where the keys must stay in the
+application process.

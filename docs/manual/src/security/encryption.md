@@ -159,10 +159,15 @@ Both states clear as soon as a load succeeds. The fix is the same for both.
 
 Only the fenced state stops writes while you do this.
 
-## Attribute protection classes
+## The second layer
 
-> **Not implemented.** A second layer is specified, in which values on a
-> protected attribute are sealed with a class key by the writing peer and
-> hydrated only by a reader granted that key. A keyless reader still queries,
-> with protected values redacted. No code implements it. See
-> [ADR-0018](https://github.com/csm/corium/blob/main/docs/adr/0018-attribute-protection-classes.md).
+Storage encryption protects the medium. It does not protect a fact from a
+reader that Corium serves.
+
+The second layer is [attribute protection](protection.md). Values on a
+protected attribute are sealed by the writing peer under a class key. Only a
+process whose keyring resolves that key sees them in the clear.
+
+The two layers are independent. A database can use either, both, or neither.
+`--storage-key` supplies the keys of both, because one process keyring holds
+key-encryption keys and class keys alike.

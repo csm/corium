@@ -15,8 +15,8 @@ output, because it owns the terminal.
 ## Shared flag groups
 
 **Connection flags** apply to `peer-server`, `postgres-server`, every `db`
-subcommand, every `authz` subcommand, every `keys` subcommand, `console`,
-`tui`, and `sql`.
+subcommand, `schema update`, every `authz` subcommand, every `keys`
+subcommand, `console`, `tui`, and `sql`.
 
 | Flag | Environment | Default |
 |---|---|---|
@@ -26,7 +26,8 @@ subcommand, every `authz` subcommand, every `keys` subcommand, `console`,
 | `--tls-domain <name>` | | None |
 | `--peer-bootstrap` | | Off |
 
-**Serving flags** apply to `transactor` and `peer-server`.
+**Serving flags** apply to `transactor`, `peer-server`, and
+`postgres-server`.
 
 | Flag | Environment |
 |---|---|
@@ -40,14 +41,24 @@ subcommand, every `authz` subcommand, every `keys` subcommand, `console`,
 | `--authz-fresh-writes` | |
 | `--authz-break-glass-role <role>` | |
 | `--authz-max-depth <n>` | |
+| `--key-policy strict\|server-wide` | |
 | `--tls-cert <pem>` | |
 | `--tls-key <pem>` | |
 
-**Key flags** apply to `transactor`, `peer-server`, `gc`, and `log`.
+`--key-policy` decides which protection class keys a caller can use. Only
+`peer-server` and `postgres-server` act on it. `postgres-server` rejects
+`--tls-cert` and `--tls-key`, because it does not terminate TLS.
+
+**Key flags** apply to `transactor`, `peer-server`, `postgres-server`, `gc`,
+and `log`.
 
 | Flag | Environment |
 |---|---|
 | `--storage-key <uri>` | `CORIUM_STORAGE_KEY` |
+
+One keyring serves both purposes. It resolves key-encryption keys and
+[protection class keys](../security/protection.md). The flag is repeatable,
+and the environment variable takes a comma-separated list.
 
 ## Servers
 
@@ -56,7 +67,8 @@ subcommand, every `authz` subcommand, every `keys` subcommand, `console`,
 Runs a transactor over a data directory. See
 [the transactor](../running/transactor.md).
 
-Storage flags: `--config`, `--store`, `--data-dir`, `--turso-path`,
+Storage flags: `--config`, `--store`, `--store-plugin`, `--plugin-store`,
+`--plugin-read-only-config`, `--data-dir`, `--turso-path`,
 `--postgres-url`, `--postgres-read-only-url`, `--s3-bucket`, `--s3-prefix`,
 `--s3-region`, `--s3-endpoint-url`, `--s3-read-only-access-key-id`,
 `--s3-read-only-secret-access-key`, `--s3-read-only-session-token`,
@@ -88,6 +100,16 @@ Serves the catalog over the PostgreSQL wire protocol. See
 [SQL shell and PostgreSQL server](../surfaces/sql.md).
 
 Flags: `--database` (repeatable), `--listen`, `--password`, `--allow-writes`.
+
+## Storage administration
+
+### `corium store verify <kind> <config>`
+
+Runs the blob and root conformance suite against a live backend. `<config>` is
+the JSON configuration object of the backend. Flag: `--store-plugin`
+(repeatable). See [storage backends](../running/storage.md#storage-plugins).
+
+**Use a disposable namespace.** The command writes and deletes objects.
 
 ## Catalog
 
@@ -121,6 +143,17 @@ Publishes the indexes now, bypassing pacing.
 Reads or overrides the pacing of one database. Flags: `--interval-ms`,
 `--backoff`, `--tail-threshold`, `--tail-deadline-ms`. With no flags it prints
 the current policy.
+
+## Schema
+
+### `corium schema update <db> --schema <path>`
+
+Compares a schema file with the schema installed in a database and prints the
+plan. It writes nothing without `--apply`. See
+[schema management](../running/schema.md#updating-an-installed-schema).
+
+Flags: `--schema`, `--prune`, `--json`, `--detailed-exit-code`, `--apply`,
+`--plan`, `--allow` (repeatable), `--ack` (repeatable).
 
 ## Authorization
 
@@ -189,5 +222,10 @@ Flags: `--data-dir`, `--db`, `--from`, `--to`, `--storage-key`.
 > **Not implemented.** There is no `corium dump` command. Human, JSON, and EDN
 > export are deferred.
 
-> **Not implemented.** There is no command that alters the schema of an
-> existing database. See [schema management](../running/schema.md).
+> **Not implemented.** `corium schema` has only the `update` subcommand.
+> `status`, `history`, and job inspection are planned and absent.
+
+> **Not implemented.** There is no `corium keys protect`,
+> `corium keys unprotect`, or `corium keys audit`. Protection changes go
+> through `corium schema update`. See
+> [attribute protection](../security/protection.md).

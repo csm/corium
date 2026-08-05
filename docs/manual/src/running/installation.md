@@ -41,6 +41,17 @@ Build a production binary with the backends that you deploy:
 cargo build -p corium-cli --release --features postgres,s3,oidc-discovery
 ```
 
+A backend can also be loaded at run time instead of compiled in. Build the
+driver crate on its own, and give the transactor its library path:
+
+```sh
+cargo build -p corium-store-turso --release
+```
+
+Do not enable the `static-link` feature when you build a loadable library.
+That feature is for a host that links the driver in. See
+[storage plugins](storage.md#storage-plugins).
+
 ## Workspace build note
 
 `corium-cljrs` and the MusicBrainz example are excluded from the default

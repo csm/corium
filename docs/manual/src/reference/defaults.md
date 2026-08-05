@@ -77,6 +77,20 @@
 | Authorization database name | `corium_authz` |
 | `authz init --admin` | `operator` |
 | `authz init --provider` | `static-token` |
+| Attribute protection | Off |
+| `--key-policy` | `strict` when authentication is configured, `server-wide` when it is not |
+| `on-missing-key` (protection class) | `redact` |
+| `legacy-plaintext` (protection class) | `redact` |
+| `scope` (protection class) | `attribute` |
+
+## Schema
+
+| Setting | Default |
+|---|---|
+| `corium schema update` mode | Read-only. `--apply` is needed to write. |
+| Permitted execution class | `additive` only |
+| `--prune` | Off. Absent attributes are reported as unmanaged. |
+| Exit code with changes planned | 0, or 2 with `--detailed-exit-code` |
 
 ## Interactive surfaces
 

@@ -42,6 +42,7 @@
 - [Authentication and TLS](security/authentication.md)
 - [Authorization](security/authorization.md)
 - [Encryption at rest](security/encryption.md)
+- [Attribute protection](security/protection.md)
 
 ---
 

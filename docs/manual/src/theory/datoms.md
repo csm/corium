@@ -91,19 +91,25 @@ values. Index segments therefore compare without decoding.
 > `:db.type/uri`, and `:db.type/symbol` are out of scope for version 1. See
 > [ADR-0009](https://github.com/csm/corium/blob/main/docs/adr/0009-schema-scope.md).
 
-> **Not implemented.** A `Sealed` value variant is specified for attribute
-> protection classes. It carries a value encrypted under a class key. No code
-> implements it. Storage-level encryption is a separate feature, and it does
-> work. See [encryption at rest](../security/encryption.md).
+A stored value has one more shape than the nine above. `Sealed` holds a value
+encrypted under a protection class key. No schema declares it. It appears when
+the writing peer seals a value on a protected attribute, and it sorts after
+every plaintext type. See
+[attribute protection](../security/protection.md).
 
 ## Schema is data
 
 An attribute is an entity in `:db.part/db`, described by datoms. The
 [schema chapter](../running/schema.md) covers the attribute properties.
 
-> **Partly implemented.** The schema of a database is installed when the
-> database is created, and the engine offers no way to change it afterward.
-> The schema chapter states the migration path.
+Because schema is data, a schema change is a transaction. `corium db create`
+installs the first schema. `corium schema update` compares a file with the
+installed schema, and applies the plan you reviewed.
+
+A database also carries a **schema generation**. It is a counter, separate
+from the basis. It advances once for each committed transaction that contains
+a schema change. The basis says when a change happened. The generation says
+whether two database values use the same schema.
 
 ## Excision
 

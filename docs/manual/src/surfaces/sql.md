@@ -72,6 +72,9 @@ List functions come from DataFusion:
 SELECT e, name FROM corium.artist WHERE array_has(tags, 'ambient');
 ```
 
+The shell takes no key flag, so it prints `<redacted>` for a value on a
+[protected attribute](../security/protection.md).
+
 ## The PostgreSQL wire server
 
 ```sh
@@ -92,8 +95,11 @@ psql 'host=127.0.0.1 port=5432 dbname=people' \
 |---|---|---|
 | `--listen <addr>` | `127.0.0.1:5432` | Listen address. |
 | `--database <name>` | All | Restrict the exposed set. Repeatable. |
-| `--password <secret>` | None | Require this cleartext password. |
-| `--allow-writes` | Off | Enable guarded autocommit DML. |
+| `--password <secret>` | None | Require this cleartext password. Ignored once authentication is configured. |
+| `--allow-writes` | Off | Enable guarded DML. |
+
+The server also takes the [connection flags](../running/catalog.md), the
+[serving flags](../security/authentication.md), and `--storage-key`.
 
 Databases are opened lazily and cached. One peer connection is shared by every
 client that uses that database.
@@ -107,14 +113,14 @@ Results support both encodings.
 ## Writes through SQL
 
 `corium postgres-server` is read-only by default. `--allow-writes` enables a
-narrow autocommit DML subset.
+narrow DML subset.
 
 ```sh
 corium postgres-server --listen 127.0.0.1:5432 --allow-writes
 ```
 
-Each statement is one transaction. An expected-basis fence rejects a stale
-read-modify-write plan before it commits.
+In autocommit each statement is one transaction. An expected-basis fence
+rejects a stale read-modify-write plan before it commits.
 
 - Only existing `corium.<namespace>` projections are writable. `corium_sys`,
   the time views, DDL, and schema changes are read-only.
@@ -131,24 +137,81 @@ read-modify-write plan before it commits.
   snapshot. Insert and update rows come from the committed value.
 
 > **Not implemented.** Joined and multi-table mutations, conflict clauses and
-> upserts, ordered or limited mutations, new keyword interning, DDL, and
-> atomic multi-statement transactions are deferred.
+> upserts, ordered or limited mutations, new keyword interning, and DDL are
+> deferred.
 
-An explicit `BEGIN` block tracks transaction status and permits reads. A write
-inside the block is rejected rather than committed silently. `SET`, `RESET`,
-and `DISCARD` are compatibility no-ops.
+## Explicit transactions
+
+An explicit `BEGIN` block pins the database value of its first statement. DML
+is staged against a provisional value, so a later statement in the block reads
+what the earlier ones wrote.
+
+`ROLLBACK` discards the staged forms. `COMMIT` submits them as one atomic
+Corium transaction. A concurrent basis change fails the commit with SQLSTATE
+`40001`, which a client reads as a serialization failure and retries.
+
+`SET`, `RESET`, and `DISCARD` are compatibility no-ops.
+
+## Object-relational mappers
+
+The server answers the PgJDBC metadata probes for SQL keywords, current schema
+and catalog, and transaction isolation. Hibernate therefore selects its
+PostgreSQL dialect on its own.
+
+The runnable
+[`postgres-hibernate`](https://github.com/csm/corium/blob/main/examples/postgres-hibernate/README.md)
+example exercises Hibernate ORM 7.4 with PgJDBC 42.7. It inserts with a
+generated id, reads, updates, runs an HQL query, and deletes. Every step uses
+an ordinary Hibernate transaction.
+
+> **Not implemented.** Broader `pg_catalog` introspection, DDL-based schema
+> management, savepoints, `COPY`, and sequences are absent. Declare the schema
+> with [`corium schema update`](../running/schema.md) rather than with the
+> schema tool of the mapper.
 
 ## Security of the wire server
 
-> **CAUTION: The PostgreSQL wire server does not terminate TLS.** Put a proxy
-> in front of it when transport security is needed. `--password` sends a
-> cleartext password.
-
-> **Partly implemented.** The PostgreSQL login is a wire-server credential
-> only. It does not map to a distinct Corium principal. When writes are
-> enabled, every write uses the single Corium bearer principal that the server
-> was started with, and the transactor authorization gate applies to that
-> principal. Per-user parity is separate work.
+> **CAUTION: The PostgreSQL wire server does not terminate TLS.** It rejects
+> `--tls-cert` and `--tls-key` rather than accept flags it cannot honor. Put a
+> TLS-terminating proxy in front of it, or bind it to loopback.
 
 Restrict the exposed set with `--database` when only some databases must be
 reachable.
+
+### A SQL client is a Corium principal
+
+Set any of `--serve-token`, `--oidc-*`, or `--authz-db`, and the server
+authenticates each client for itself.
+
+PostgreSQL has no bearer-token field, so **the password field carries the
+token of the caller**. The startup `user` is informational.
+
+```sh
+corium postgres-server --listen 127.0.0.1:5432 \
+  --oidc-issuer https://issuer.example --oidc-audience corium \
+  --authz-db corium_authz
+
+psql "host=127.0.0.1 port=5432 dbname=people user=alice password=$JWT"
+```
+
+> **CAUTION: The token crosses the wire in the clear.** The server prints this
+> warning at startup whenever authentication is configured.
+
+Every statement is then authorized as that principal. `SELECT` needs `query`.
+DML needs `transact`. `SHOW DATABASES` lists only what the principal can
+inspect.
+
+Reads are answered through the view of the principal and through its own
+protection class keys. A column that the policy hides keeps its declared type,
+reports `NULL`, and never takes a pushed-down predicate. A principal whose
+view hides attributes cannot write. Read
+[authorization](../security/authorization.md) and
+[attribute protection](../security/protection.md).
+
+`--password` still applies when no authentication flag is set. It is one
+shared secret and it maps to no principal.
+
+> **Partly implemented.** A write still *commits* through the peer connection
+> of the server, so the transactor additionally applies the bearer principal
+> of that connection. Give that connection an identity that can transact every
+> database the server exposes.

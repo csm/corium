@@ -22,7 +22,8 @@ The manual has six parts.
   the database catalog, schema, and index publication.
 - **Client surfaces** covers the console, the dashboard, the SQL shell, the
   PostgreSQL wire server, and the peer server.
-- **Security** covers authentication, authorization, and encryption at rest.
+- **Security** covers authentication, authorization, encryption at rest, and
+  attribute protection.
 - **Availability and data care** covers high availability, backup, restore,
   forks, and garbage collection.
 - **Operations** collects the metrics and the runbooks.

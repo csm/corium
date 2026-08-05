@@ -39,9 +39,10 @@ Content addressing has three operational effects.
 ## The database root
 
 A database is named by its root record in the root store. The root holds the
-database name and id, the basis `t`, the index basis `t`, the eight index
-roots, the log root, the keyword table root, the schema revision, the garbage
-collection epoch, the format version, and the write lease.
+database name and id, the basis `t`, and the index basis `t`. It also holds
+the eight index roots, the log root, and the keyword table root. Last, it
+holds the schema revision, the garbage collection epoch, the format version,
+and the write lease.
 
 The lease lives inside this record. Every lease acquisition, every renewal,
 and every index publication is a compare-and-set on the same bytes. One atomic

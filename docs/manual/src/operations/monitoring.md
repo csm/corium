@@ -64,6 +64,29 @@ The transactor `Status` call carries the same data. The `Metrics` panel of
 [`corium tui`](../surfaces/tui.md) samples it live, and it is the only surface
 that shows lease ownership.
 
+## Auditing schema changes
+
+Every applied schema update records its requester, its digests, its observed
+basis, and its acknowledgements on the transaction entity. Those are ordinary
+attributes, so the schema history of a database is a query.
+
+```clojure
+[:find ?when ?who ?tool
+ :where [?tx :db.schemaUpdate/requester ?who]
+        [?tx :db.schemaUpdate/tool ?tool]
+        [?tx :db/txInstant ?when]]
+```
+
+```text
+[[#inst 1785899778642 "static-token:operator" "corium-cli/0.1.0"]]
+```
+
+The requester is the authenticated principal. A caller never supplies it.
+
+An ordinary transaction cannot write `:db.schemaUpdate/*`, so no transaction
+can claim to have been a schema update. See
+[schema management](../running/schema.md#the-audit-trail).
+
 ## Logging
 
 Tracing is human-readable by default. `--log-format json` writes structured

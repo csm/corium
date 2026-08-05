@@ -46,8 +46,11 @@ Encryption is fixed at creation. See
 
 > **`db create` is idempotent, and it does not update an existing database.**
 > An existing name prints `{:db "people" :created false}`, and the schema file
-> is ignored. Change the schema of a live database with a transaction from a
-> client. See [schema management](schema.md).
+> is ignored.
+
+To change the schema of a database that already exists, use
+`corium schema update`. See
+[schema management](schema.md#updating-an-installed-schema).
 
 ## List databases
 

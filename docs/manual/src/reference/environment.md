@@ -8,9 +8,11 @@ overrides the variable.
 | Variable | Equivalent flag | Used by |
 |---|---|---|
 | `CORIUM_TOKEN` | `--token` | Every client command. |
-| `CORIUM_SERVE_TOKEN` | `--serve-token` | `transactor`, `peer-server`. |
-| `CORIUM_AUTHZ_DB` | `--authz-db` | `transactor`, `peer-server`. |
-| `CORIUM_STORAGE_KEY` | `--storage-key` | `transactor`, `peer-server`, `gc`, `log`. |
+| `CORIUM_SERVE_TOKEN` | `--serve-token` | `transactor`, `peer-server`, `postgres-server`. |
+| `CORIUM_AUTHZ_DB` | `--authz-db` | `transactor`, `peer-server`, `postgres-server`. |
+| `CORIUM_STORAGE_KEY` | `--storage-key` | `transactor`, `peer-server`, `postgres-server`, `gc`, `log`. |
+| `CORIUM_STORE_PLUGINS` | `--store-plugin` | `transactor`, `store verify`. |
+| `CORIUM_PLUGIN_READ_ONLY_CONFIG` | `--plugin-read-only-config` | `transactor`. |
 | `CORIUM_POSTGRES_READ_ONLY_URL` | `--postgres-read-only-url` | `transactor`. |
 | `CORIUM_S3_READ_ONLY_ACCESS_KEY_ID` | `--s3-read-only-access-key-id` | `transactor`. |
 | `CORIUM_S3_READ_ONLY_SECRET_ACCESS_KEY` | `--s3-read-only-secret-access-key` | `transactor`. |
@@ -19,7 +21,12 @@ overrides the variable.
 | `CORIUM_S3_READ_ONLY_ROLE_EXTERNAL_ID` | `--s3-read-only-role-external-id` | `transactor`. |
 
 `CORIUM_STORAGE_KEY` accepts a comma-separated list, because one process can
-hold several keys.
+hold several keys. The same keyring resolves key-encryption keys and
+[protection class keys](../security/protection.md).
+
+`CORIUM_STORE_PLUGINS` accepts a path-separator-delimited list of files and
+directories. Corium searches a directory for platform dynamic libraries only,
+and it never adds the working directory.
 
 ## Rust and AWS variables
 

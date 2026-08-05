@@ -37,7 +37,10 @@ manager usually does not export `HOSTNAME`, so the default becomes
 ## Storage selection
 
 `--store` picks the backend: `mem`, `fs`, `postgres`, `turso`, or `s3`. The
-default is `fs`. Each backend has its own flags and its own Cargo feature. See
+default is `fs`. Each backend has its own flags and its own Cargo feature.
+
+`--store-plugin <path>` loads a storage driver at startup, and
+`--store <kind>:<json>` then selects it. See
 [storage backends](storage.md).
 
 ## Lease and availability
@@ -106,9 +109,12 @@ a transactor outside a private network.
 
 ## Encryption keys
 
-`--storage-key <uri>` names a key-encryption key that this process can
-resolve. The flag is repeatable, because one transactor hosts databases under
-different keys.
+`--storage-key <uri>` names a key that this process can resolve. The flag is
+repeatable, because one transactor hosts databases under different keys.
+
+The same keyring holds key-encryption keys and
+[protection class keys](../security/protection.md). A transactor needs no
+class key: it commits sealed values without opening them.
 
 The process resolves every named key at startup. A misconfigured process
 therefore fails at startup and names the key. See

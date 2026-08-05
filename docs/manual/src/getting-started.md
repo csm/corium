@@ -86,9 +86,11 @@ psql 'host=127.0.0.1 port=5432 dbname=people' \
 Each statement is one transaction. The
 [SQL chapter](surfaces/sql.md) states which statements the write path accepts.
 
-> The Rust, Clojure, and Python clients all transact directly against the
-> transactor. Use them for real data loading. The Python client is documented
-> in [`clients/python`](https://github.com/csm/corium/blob/main/clients/python/README.md).
+> The Rust, Clojure, Python, and Java clients all transact directly against
+> the transactor. Use them for real data loading. See
+> [`clients/python`](https://github.com/csm/corium/blob/main/clients/python/README.md)
+> and
+> [`clients/java`](https://github.com/csm/corium/blob/main/clients/java/README.md).
 
 ## Step 6 — Query the data
 
@@ -127,7 +129,35 @@ Open the dashboard to watch the system live:
 corium tui people
 ```
 
-## Step 7 — Stop the system
+## Step 7 — Change the schema
+
+Add an attribute to `schema.toml`:
+
+```toml
+[entity.attributes]
+name  = { type = "string", unique = "identity", index = true }
+age   = "long"
+email = { type = "string", doc = "primary contact" }
+```
+
+Ask for the plan:
+
+```sh
+corium schema update people --schema schema.toml
+```
+
+The command writes nothing. It prints the plan and the digest of that plan.
+Apply exactly the plan you read:
+
+```sh
+corium schema update people --schema schema.toml --apply --plan <digest>
+```
+
+The last line of the plan is the invocation to run. The
+[schema chapter](running/schema.md) explains the execution classes and the
+acknowledgement codes.
+
+## Step 8 — Stop the system
 
 Press `Ctrl-C` in each terminal. The `mem` store discards the database.
 

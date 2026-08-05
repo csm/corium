@@ -10,6 +10,9 @@ It holds all current datoms.
 **AVET.** The covering index sorted by attribute, value, entity, transaction.
 It holds the datoms of indexed and unique attributes only.
 
+**Acknowledgement code.** A stable, kebab-case name for a schema change whose
+meaning changes, passed back with `--ack`.
+
 **Basis.** The transaction number, written `t`, that a database value covers.
 
 **BLAKE3.** The hash function that addresses blobs.
@@ -20,6 +23,9 @@ It holds the datoms of indexed and unique attributes only.
 
 **Chunk.** A content-defined run of a sorted key stream. A published leaf is
 exactly one chunk.
+
+**Class key.** The key that seals values on the attributes of one protection
+class. A process resolves it through its own keyring.
 
 **Covering index.** An index that holds whole datoms, so an answer needs no
 second lookup.
@@ -39,6 +45,9 @@ It holds all current datoms.
 
 **Epoch (storage key).** One generation of the per-database data key. New
 writes seal under the newest open epoch.
+
+**Execution class.** How much work a schema change needs: `additive`,
+`validate-reindex`, `rewrite`, or `destructive`.
 
 **Fence.** The mechanism that stops a deposed writer. Every root write is a
 compare-and-set on the record that holds the lease.
@@ -61,6 +70,9 @@ durability boundary, while each keeps its own `t` and its own acknowledgement.
 **KEK.** Key-encryption key. It wraps the per-database data key. Corium never
 stores it.
 
+**Key policy.** Whether a serving process hydrates a caller with the class
+keys that policy names (`strict`) or with its whole keyring (`server-wide`).
+
 **Lease.** The right to write one database. It lives in the database root and
 is renewed by compare-and-set.
 
@@ -78,18 +90,34 @@ locally.
 
 **Peer server.** A peer hosted as a standalone process for thin clients.
 
+**Plan digest.** The hash of a schema plan. `--apply` refuses a digest that no
+longer describes the change.
+
 **Principal.** The identity of a request, produced by an identity provider.
+
+**Protection class.** A named key identity and sealing policy. An attribute
+that names one has its values sealed by the writing peer. See
+[attribute protection](../security/protection.md).
 
 **ReBAC.** Relationship-based access control, the authorization model that
 `--authz-db` enables.
 
+**Retirement.** The schema change that refuses new assertions on an attribute
+while keeping its ident, its metadata, and its history readable.
+
 **Root store.** The small, mutable, strongly consistent half of the storage
 service. It is updated only by compare-and-set.
+
+**Schema generation.** A per-database counter that advances once for each
+committed transaction containing a schema change.
 
 **Segment.** An immutable, content-addressed node of an index tree.
 
 **Standby.** A transactor that polls a lease held elsewhere and takes over
 when it lapses.
+
+**Storage plugin.** A dynamic library that registers a storage backend at run
+time. See [storage backends](../running/storage.md#storage-plugins).
 
 **Tempid.** A transaction-local placeholder for an entity id, resolved at
 commit. A collision on a `:db.unique/identity` attribute becomes an upsert.
@@ -99,11 +127,18 @@ basis before, the basis after, the datoms, and the tempid map.
 
 **Transactor.** The single writer for a database.
 
+**Unmanaged attribute.** An installed attribute that the desired schema file
+does not name. `corium schema update` leaves it alone unless `--prune` is
+given.
+
 **Upsert.** Unifying a tempid with an existing entity through a
 `:db.unique/identity` attribute.
 
 **VAET.** The covering index sorted by value, attribute, entity, transaction.
 It holds reference-typed datoms.
+
+**View.** A policy object that hides attributes from a principal, names the
+class keys the principal can use, or both.
 
 **`t`.** The sequence part of a transaction id, and the name of a basis.
 

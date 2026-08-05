@@ -32,6 +32,7 @@ corium transactor --config /etc/corium/transactor.edn
 | `:turso-path` | String | `--turso-path` |
 | `:postgres-url` | String | `--postgres-url` |
 | `:postgres-read-only-url` | String | `--postgres-read-only-url` |
+| `:plugin-read-only-config` | String holding a JSON object | `--plugin-read-only-config` |
 | `:s3-bucket` | String | `--s3-bucket` |
 | `:s3-prefix` | String | `--s3-prefix` |
 | `:s3-region` | String | `--s3-region` |
@@ -47,8 +48,12 @@ corium transactor --config /etc/corium/transactor.edn
 ## What the file does not hold
 
 The file covers storage only. It does not hold the listen address, the owner
-identity, the lease values, the index pacing, the garbage collection schedule,
-the authentication flags, or the storage keys.
+identity, or the lease values. It does not hold the index pacing, the garbage
+collection schedule, the authentication flags, or the storage keys.
+
+`:store` names a built-in backend only. A plugin backend needs
+`--store <kind>:<json>` on the command line, and the file carries no plugin
+paths. See [storage plugins](storage.md#storage-plugins).
 
 Put those on the command line, or in the unit file of the service manager.
 

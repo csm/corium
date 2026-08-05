@@ -103,6 +103,44 @@ The transaction is committed, or it is absent.
 3. Read the data back and decide from the result.
 4. Resubmit only if the write is absent.
 
+## Changing the schema of a live database
+
+Writes continue throughout. Only a blocked change stops the procedure.
+
+1. Edit the schema file. Keep every attribute that must survive, because a
+   file that omits one reports it as unmanaged.
+2. Plan it: `corium schema update <db> --schema <file>`. Nothing is written.
+3. Read every execution class, every count, and every acknowledgement code.
+4. Run the invocation that the last line of the plan prints, and add the path
+   of the schema file.
+5. Confirm the new schema generation in the output of the apply.
+6. Compare `:attributes` in `corium db stats` with the expected count.
+
+A plan is invalidated by a schema change or a failed condition, never by
+ordinary data writes. Re-plan if the digest is refused.
+
+See [schema management](../running/schema.md#updating-an-installed-schema).
+
+## A schema plan is blocked or refused
+
+Read the reason that the plan prints under the change.
+
+| Reason | Meaning | Fix |
+|---|---|---|
+| `value-type-mutation` | A value type cannot change in place. | Follow the replacement-attribute recipe that the plan prints. |
+| `unique-duplicates` | Duplicate values exist. | Retract the duplicates, then plan again. |
+| `cardinality-conflicts` | An entity holds several values where the file asks for one. | Choose a winner per entity and retract the rest. |
+| `ever-protected` | The attribute has been protected at some time. | It can never gain `index` or `unique`. Drop them from the file. |
+| `protection-conflict` | The declaration combines protection with `index`, `unique`, or `ref`. | Drop the conflicting property from the declaration. |
+
+An apply can also fail after a clean plan.
+
+| Error code | Meaning | Fix |
+|---|---|---|
+| `plan-mismatch` | The schema changed between the plan and the apply. | Plan again and read the new plan. |
+| `allow-required` | A change needs `--allow <class>`. | Add the exact allowance the plan names. |
+| `ack-required` | A change needs `--ack <code>`. | Add the exact code the plan names. |
+
 ## Every request is denied
 
 The policy denies, or the policy is unreadable.
