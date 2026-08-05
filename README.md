@@ -88,10 +88,11 @@ processes. Each crate has its own README.
 | [`corium-cli`](crates/corium-cli/README.md) | `corium` binary: launchers, admin commands, console, TUI, SQL shell |
 | [`corium-sim`](crates/corium-sim/README.md) | Deterministic simulation harness for fault-injection tests (not published) |
 
-Language clients live under `clients/`; the
-[`clients/python`](clients/python/README.md) package provides the shared
-asynchronous local/remote Python API, and [`clients/java`](clients/java/README.md)
-provides an asynchronous remote Java API.
+Language clients live under `clients/`; [`clients/python`](clients/python/README.md)
+provides the shared asynchronous local/remote Python API,
+[`clients/java`](clients/java/README.md) provides the Java API, and
+[`clients/clojure`](clients/clojure/README.md) provides synchronous and
+core.async JVM Clojure APIs over the published Java client.
 
 ## Examples
 
