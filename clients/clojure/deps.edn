@@ -5,6 +5,14 @@
  :aliases
  {:test {:extra-paths ["test"]
          :main-opts ["-m" "corium.test-runner"]}
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
+          :ns-default build}
+  :deploy {:extra-deps {slipset/deps-deploy {:mvn/version "0.2.5"}}
+           :exec-fn deps-deploy.deps-deploy/deploy
+           :exec-args {:installer :remote
+                       :artifact "target/corium-clojure.jar"
+                       :pom-file "target/classes/META-INF/maven/dev.corium/corium-clojure/pom.xml"
+                       :sign-releases? false}}
   ;; LocalPeer needs the native engine JAR for the host platform. Select one
   ;; of these aliases in an application; RemotePeer needs none of them.
   :native-linux-x86-64

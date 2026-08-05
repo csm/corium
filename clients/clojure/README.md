@@ -11,6 +11,12 @@ Both namespaces use top-level functions whose first argument is a `Peer` or
 `Db`. Clojure boundary data is translated recursively, so query and transaction
 forms can use ordinary keywords, symbols, lists, vectors, sets, and maps.
 
+Releases use this Clojars coordinate:
+
+```clojure
+dev.corium/corium-clojure {:mvn/version "VERSION"}
+```
+
 ## Remote peer
 
 ```clojure
@@ -71,8 +77,8 @@ clojure -A:native-macos-aarch64
 ```
 
 The project provides aliases for Linux and macOS on x86-64 and AArch64, and
-Windows on x86-64. An application depending on this library should add the
-matching Maven classifier directly, for example:
+Windows on x86-64. If an application depends on this library, add the matching
+Maven classifier directly:
 
 ```clojure
 dev.corium/corium-client$linux-x86_64 {:mvn/version "0.1.81"}
@@ -109,3 +115,19 @@ Both peer types also accept `:token`, `:allow-insecure-token?`, `:tls-ca`
 ```sh
 clojure -M:test
 ```
+
+## Publishing
+
+The main release workflow publishes the Clojure client after it creates the
+release tag. The workflow uses the version from the same Corium release.
+
+Add these secrets to the repository or the `clojars` environment:
+
+- `CLOJARS_USERNAME`: the Clojars account name
+- `CLOJARS_PASSWORD`: a Clojars deploy token
+
+Clojars does not accept an account password for deployment. Use a deploy token
+for `CLOJARS_PASSWORD`.
+
+You can also run the `Publish Clojure client` workflow manually. Enter the Git
+ref and the version without a `v` prefix.

@@ -1,0 +1,97 @@
+name: Publish Clojure client
+
+# Required repository or clojars-environment secrets:
+#   CLOJARS_USERNAME  Clojars account name
+#   CLOJARS_PASSWORD  Clojars deploy token
+
+on:
+  workflow_call:
+    inputs:
+      release_ref:
+        description: Git ref to publish
+        required: true
+        type: string
+      version:
+        description: Version without a v prefix
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Git ref to publish
+        required: true
+        type: string
+      version:
+        description: Version without a v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-clojure-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish dev.corium/corium-clojure
+    runs-on: ubuntu-latest
+    environment:
+      name: clojars
+      url: https://clojars.org/dev.corium/corium-clojure/versions/${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: clients/clojure/deps.edn
+
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+
+      - name: Set release version
+        working-directory: clients/clojure
+        env:
+          VERSION: ${{ inputs.version }}
+        run: python3 scripts/release.py set "$VERSION"
+
+      - name: Run tests
+        working-directory: clients/clojure
+        run: clojure -M:test
+
+      - name: Build JAR and POM
+        working-directory: clients/clojure
+        run: clojure -T:build jar
+
+      - name: Check for an existing release
+        id: release
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          POM_URL="https://repo.clojars.org/dev/corium/corium-clojure/${VERSION}/corium-clojure-${VERSION}.pom"
+          if curl --fail --silent --show-error --output /dev/null "$POM_URL"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "dev.corium/corium-clojure $VERSION is already on Clojars."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to Clojars
+        if: steps.release.outputs.exists != 'true'
+        working-directory: clients/clojure
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
+        run: |
+          if [ -z "$CLOJARS_USERNAME" ] || [ -z "$CLOJARS_PASSWORD" ]; then
+            echo "CLOJARS_USERNAME and CLOJARS_PASSWORD are required." >&2
+            exit 1
+          fi
+          clojure -X:deploy

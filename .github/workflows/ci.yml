@@ -6,6 +6,25 @@ on:
   pull_request:
 
 jobs:
+  clojure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: clients/clojure/deps.edn
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - working-directory: clients/clojure
+        run: clojure -M:test
+      - working-directory: clients/clojure
+        run: clojure -T:build jar
+      - run: python3 clients/clojure/scripts/release.py check
+
   java:
     runs-on: ubuntu-latest
     steps:
