@@ -19,6 +19,7 @@ members = [
     "crates/corium-db",
     "crates/corium-client",
     "crates/corium-ffi",
+    "crates/corium-jni",
     "crates/corium-python",
     "crates/corium-transactor",
     "crates/corium-peer",
@@ -49,6 +50,7 @@ default-members = [
     "crates/corium-pgwire",
     "crates/corium-db",
     "crates/corium-ffi",
+    "crates/corium-jni",
     "crates/corium-python",
     "crates/corium-transactor",
     "crates/corium-peer",
@@ -86,6 +88,7 @@ corium-db = { path = "crates/corium-db", version = "0.1.0" }
 corium-ffi = { path = "crates/corium-ffi", version = "0.1.0" }
 corium-forms = { path = "crates/corium-forms", version = "0.1.0", default-features = false }
 corium-index = { path = "crates/corium-index", version = "0.1.0" }
+corium-jni = { path = "crates/corium-jni", version = "0.1.0" }
 corium-log = { path = "crates/corium-log", version = "0.1.0" }
 corium-peer = { path = "crates/corium-peer", version = "0.1.0" }
 corium-pgwire = { path = "crates/corium-pgwire", version = "0.1.0" }

@@ -726,18 +726,43 @@ def java_client_access(context: Context) -> str:
             "CORIUM_SCENARIO_DATABASE": context.people_database,
         }
     )
-    return run_command(
+    remote = run_command(
         [
             "mvn",
             "-f",
             str(REPOSITORY / "clients/java/pom.xml"),
             "--batch-mode",
+            "-pl",
+            "client",
             "-Dtest=LiveScenarioTest",
             "test",
         ],
         env=env,
         timeout=300,
     )
+    # The in-process peer needs the JNI engine, which the scenario workflow
+    # builds beside the CLI. Skip it, rather than fail, when it is absent.
+    engine = REPOSITORY / "target/debug/libcorium_jni.so"
+    if not engine.is_file():
+        engine = REPOSITORY / "target/debug/libcorium_jni.dylib"
+    if not engine.is_file():
+        return f"{remote}\nIn-process peer skipped: build corium-jni to run it"
+    env["CORIUM_SCENARIO_TRANSACTOR_ENDPOINT"] = context.transactor_endpoint
+    local = run_command(
+        [
+            "mvn",
+            "-f",
+            str(REPOSITORY / "clients/java/pom.xml"),
+            "--batch-mode",
+            "-pl",
+            "client",
+            "-Dtest=LiveLocalPeerScenarioTest",
+            "test",
+        ],
+        env=env,
+        timeout=600,
+    )
+    return f"{remote}\nIn-process Java peer:\n{local}"
 
 
 def rust_client_access(context: Context) -> str:

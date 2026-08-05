@@ -9,10 +9,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKSPACE = ROOT / "Cargo.toml"
-PROJECT = ROOT / "clients/java/pom.xml"
+JAVA = ROOT / "clients/java"
+# The parent declares the release version, and every module repeats it in its
+# `<parent>` block, so one pattern covers the whole reactor.
+PROJECTS = (
+    JAVA / "pom.xml",
+    JAVA / "client/pom.xml",
+    JAVA / "artifacts/turso/pom.xml",
+    JAVA / "artifacts/postgres/pom.xml",
+    JAVA / "artifacts/s3/pom.xml",
+)
 WORKSPACE_VERSION = re.compile(r'(?m)^version = "([^"]+)"$')
 PROJECT_VERSION = re.compile(
-    r"(<artifactId>corium-client</artifactId>\s*<version>)([^<]+)(</version>)"
+    r"(<artifactId>corium-java</artifactId>\s*<version>)([^<]+)(</version>)"
 )
 VALID_VERSION = re.compile(r"[0-9]+(?:\.[0-9A-Za-z]+)+(?:[-+.][0-9A-Za-z.-]+)?")
 
@@ -27,10 +36,19 @@ def _workspace_version() -> str:
 
 
 def _project_version() -> str:
-    match = PROJECT_VERSION.search(PROJECT.read_text())
-    if match is None:
-        raise RuntimeError("Java client version is missing")
-    return match.group(2)
+    versions = {}
+    for project in PROJECTS:
+        match = PROJECT_VERSION.search(project.read_text())
+        if match is None:
+            raise RuntimeError(f"{project} has no corium-java version")
+        versions[project] = match.group(2)
+    distinct = set(versions.values())
+    if len(distinct) != 1:
+        raise SystemExit(
+            "Java modules disagree on the release version:\n"
+            + "\n".join(f"{project}: {version}" for project, version in versions.items())
+        )
+    return distinct.pop()
 
 
 def check(expected_version: str | None = None) -> None:
@@ -62,13 +80,14 @@ def check(expected_version: str | None = None) -> None:
 def set_version(version: str) -> None:
     if VALID_VERSION.fullmatch(version) is None:
         raise SystemExit(f"invalid release version: {version!r}")
-    text = PROJECT.read_text()
-    updated, replacements = PROJECT_VERSION.subn(
-        rf"\g<1>{version}\g<3>", text, count=1
-    )
-    if replacements != 1:
-        raise SystemExit("could not set the Java client version")
-    PROJECT.write_text(updated)
+    for project in PROJECTS:
+        text = project.read_text()
+        updated, replacements = PROJECT_VERSION.subn(
+            rf"\g<1>{version}\g<3>", text, count=1
+        )
+        if replacements != 1:
+            raise SystemExit(f"could not set the version in {project}")
+        project.write_text(updated)
 
 
 def main() -> None:
