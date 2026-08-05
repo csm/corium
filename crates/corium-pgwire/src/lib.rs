@@ -13,9 +13,9 @@
 //! connections.
 //!
 //! Both simple and extended query sub-protocols are supported, including
-//! typed bound inputs and text or binary results. Mutations are
-//! autocommit-only: explicit transaction blocks allow reads but reject writes
-//! until atomic multi-statement transactions are implemented.
+//! typed bound inputs and text or binary results. Explicit transactions pin
+//! one basis, stage mutations against a provisional value, and submit all
+//! accumulated forms atomically at `COMMIT`.
 
 mod protocol;
 mod types;
@@ -24,15 +24,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 
-use corium_core::EntityId;
+use corium_core::{EntityId, Partition};
 use corium_db::Db;
 use corium_db::protect::Hydrator;
 use corium_db::read::{AttrVisibility, ReadContext};
+use corium_forms::txforms::tx_items_from_edn;
 use corium_protocol::authz::{
     Access, Action, Credentials, Guard, KeyGrant, KeyPolicyMode, Principal, ReadGrant,
 };
 use corium_query::edn::Edn;
 use corium_sql::{MutationKind, SqlColumn, SqlError, SqlSession, SqlType};
+use corium_tx::prepare;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -228,8 +230,7 @@ struct PreparedStatement {
 enum Statement {
     /// A stateless control statement accepted as a no-op with this tag.
     Control(&'static str),
-    /// Start an explicit transaction block. Reads are allowed, but writes are
-    /// rejected until true multi-statement transactions are implemented.
+    /// Start an explicit transaction block.
     Begin,
     /// End an explicit transaction block.
     Commit,
@@ -239,6 +240,16 @@ enum Statement {
     Use(String),
     /// `SHOW DATABASES` — list the catalog.
     ShowDatabases,
+    /// `PgJDBC`'s `DatabaseMetaData.getSQLKeywords()` catalog probe.
+    SqlKeywords,
+    /// `PgJDBC`'s `Connection.getSchema()` query.
+    CurrentSchema,
+    /// Hibernate/PostgreSQL current-catalog introspection.
+    CurrentCatalog,
+    /// A scalar `PostgreSQL` runtime setting requested through JDBC metadata.
+    PgSetting(String),
+    /// `PgJDBC`'s connection-isolation query.
+    ShowTransactionIsolation,
     /// An ordinary read-only query for `SqlSession`.
     Query,
     /// `INSERT`, `UPDATE`, or `DELETE`.
@@ -251,6 +262,20 @@ struct Scope {
     read: ReadContext,
 }
 
+/// One explicit transaction's pinned basis and provisionally applied writes.
+///
+/// Each SQL mutation is prepared incrementally against `current`, so later
+/// statements see earlier writes without re-planning the whole transaction.
+/// `COMMIT` submits the accumulated forms as one atomic, basis-guarded Corium
+/// transaction against `base`.
+struct TransactionState {
+    database: String,
+    base: Db,
+    current: Db,
+    forms: Vec<Edn>,
+    next_statement: u64,
+}
+
 /// Cache key for one principal's hydrator: the database, and the key ids the
 /// policy granted (`None` for the process's whole keyring).
 type HydratorKey = (String, Option<BTreeSet<String>>);
@@ -261,6 +286,12 @@ type HydratorKey = (String, Option<BTreeSet<String>>);
 /// policy that somehow mints one per principal clears the map instead of
 /// growing without bound.
 const HYDRATOR_CACHE_CAP: usize = 256;
+
+/// PostgreSQL-specific words returned by `PgJDBC` on pre-9.0 servers. Newer
+/// drivers derive the same list from `pg_catalog.pg_get_keywords()`; serving
+/// it directly keeps JDBC metadata bootstrapping independent of a physical
+/// `PostgreSQL` catalog.
+const POSTGRES_SQL_KEYWORDS: &str = "abort,access,aggregate,also,analyse,analyze,backward,bit,cache,checkpoint,class,cluster,comment,concurrently,connection,conversion,copy,csv,database,delimiter,delimiters,disable,do,enable,encoding,encrypted,exclusive,explain,force,forward,freeze,greatest,handler,header,if,ilike,immutable,implicit,index,indexes,inherit,inherits,instead,isnull,least,limit,listen,load,location,lock,mode,move,nothing,notify,notnull,nowait,off,offset,oids,operator,owned,owner,password,prepared,procedural,quote,reassign,recheck,reindex,rename,replace,reset,restrict,returning,rule,setof,share,show,stable,statistics,stdin,stdout,storage,strict,sysid,tablespace,temp,template,truncate,trusted,unencrypted,unlisten,until,vacuum,valid,validator,verbose,volatile";
 
 /// Hydrators shared by every connection, keyed by database and key set.
 ///
@@ -324,16 +355,11 @@ struct ConnectionSession<R, W, C> {
     /// until the next `Sync`.
     failed: bool,
     /// Whether the client has entered an explicit transaction block.
-    ///
-    /// Corium SQL mutations are autocommit-only for now. Tracking the block
-    /// prevents a `BEGIN; INSERT ...; COMMIT` sequence from appearing atomic
-    /// while actually committing the insert immediately.
     in_transaction: bool,
     /// Whether an error has aborted the current explicit transaction.
     transaction_failed: bool,
-    /// The immutable database value pinned by the first read in the current
-    /// explicit transaction.
-    transaction_db: Option<(String, Db)>,
+    /// The basis pinned by the first statement, plus any provisional writes.
+    transaction: Option<TransactionState>,
 }
 
 impl<R, W, C> ConnectionSession<R, W, C>
@@ -362,7 +388,7 @@ where
             failed: false,
             in_transaction: false,
             transaction_failed: false,
-            transaction_db: None,
+            transaction: None,
         }
     }
 
@@ -535,10 +561,14 @@ where
     /// Runs one simple-protocol statement. Returns `false` when an error was
     /// reported and the rest of the query string should be abandoned.
     async fn run_simple_statement(&mut self, sql: &str) -> std::io::Result<bool> {
+        tracing::debug!(sql, "pgwire simple query");
         let statement = classify(sql);
         if self.transaction_failed && !matches!(&statement, Statement::Rollback) {
             self.report_transaction_aborted();
             return Ok(false);
+        }
+        if self.write_metadata_statement(&statement, true, &[]) {
+            return Ok(true);
         }
         match statement {
             Statement::Control(tag) => {
@@ -550,11 +580,16 @@ where
                 self.writer.command_complete("BEGIN");
                 Ok(true)
             }
-            Statement::Commit => {
-                self.end_transaction();
-                self.writer.command_complete("COMMIT");
-                Ok(true)
-            }
+            Statement::Commit => match self.commit_transaction().await {
+                Ok(()) => {
+                    self.writer.command_complete("COMMIT");
+                    Ok(true)
+                }
+                Err(error) => {
+                    self.report_dispatch(&error);
+                    Ok(false)
+                }
+            },
             Statement::Rollback => {
                 self.end_transaction();
                 self.writer.command_complete("ROLLBACK");
@@ -577,30 +612,15 @@ where
                     Ok(false)
                 }
             },
-            Statement::Query => {
-                let scope = match self.scope(None, Action::Query).await {
-                    Ok(scope) => scope,
-                    Err(error) => {
-                        self.report_dispatch(&error);
-                        return Ok(false);
-                    }
-                };
-                match self.run_statement(&scope, sql, &[], true, &[]).await {
-                    Ok(rows) => {
-                        self.writer.command_complete(&command_tag(sql, rows));
-                        Ok(true)
-                    }
-                    Err(error) => {
-                        self.report_dispatch(&Dispatch::Sql(error));
-                        Ok(false)
-                    }
-                }
+            Statement::SqlKeywords
+            | Statement::CurrentSchema
+            | Statement::CurrentCatalog
+            | Statement::PgSetting(_)
+            | Statement::ShowTransactionIsolation => {
+                unreachable!("metadata statements are handled before dispatch")
             }
+            Statement::Query => self.run_simple_read(sql).await,
             Statement::Mutation => {
-                if self.in_transaction {
-                    self.report_dispatch(&explicit_transaction_write_error());
-                    return Ok(false);
-                }
                 let Some(database) = self.current_db.clone() else {
                     self.report_dispatch(&Dispatch::NoDatabase);
                     return Ok(false);
@@ -626,6 +646,26 @@ where
                         Ok(false)
                     }
                 }
+            }
+        }
+    }
+
+    async fn run_simple_read(&mut self, sql: &str) -> std::io::Result<bool> {
+        let scope = match self.scope(None, Action::Query).await {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.report_dispatch(&error);
+                return Ok(false);
+            }
+        };
+        match self.run_statement(&scope, sql, &[], true, &[]).await {
+            Ok(rows) => {
+                self.writer.command_complete(&command_tag(sql, rows));
+                Ok(true)
+            }
+            Err(error) => {
+                self.report_dispatch(&Dispatch::Sql(error));
+                Ok(false)
             }
         }
     }
@@ -749,6 +789,21 @@ where
             Statement::ShowDatabases => {
                 self.write_row_description(&[database_field()], &result_formats);
             }
+            Statement::SqlKeywords => {
+                self.write_row_description(&[sql_keywords_field()], &result_formats);
+            }
+            Statement::CurrentSchema => {
+                self.write_row_description(&[current_schema_field()], &result_formats);
+            }
+            Statement::CurrentCatalog => {
+                self.write_row_description(&[current_catalog_field()], &result_formats);
+            }
+            Statement::PgSetting(_) => {
+                self.write_row_description(&[pg_setting_field()], &result_formats);
+            }
+            Statement::ShowTransactionIsolation => {
+                self.write_row_description(&[transaction_isolation_field()], &result_formats);
+            }
             Statement::Query if !sql.trim().is_empty() => {
                 let scope = match self.scope(database.as_deref(), Action::Query).await {
                     Ok(scope) => scope,
@@ -813,6 +868,7 @@ where
             self.writer.empty_query_response();
             return Ok(());
         }
+        tracing::debug!(sql, "pgwire extended query");
         let statement = classify(&sql);
         if self.transaction_failed && !matches!(&statement, Statement::Rollback) {
             self.fail_extended(
@@ -821,16 +877,19 @@ where
             );
             return Ok(());
         }
+        if self.write_metadata_statement(&statement, false, &result_formats) {
+            return Ok(());
+        }
         match statement {
             Statement::Control(tag) => self.writer.command_complete(tag),
             Statement::Begin => {
                 self.begin_transaction();
                 self.writer.command_complete("BEGIN");
             }
-            Statement::Commit => {
-                self.end_transaction();
-                self.writer.command_complete("COMMIT");
-            }
+            Statement::Commit => match self.commit_transaction().await {
+                Ok(()) => self.writer.command_complete("COMMIT"),
+                Err(error) => self.fail_dispatch(&error),
+            },
             Statement::Rollback => {
                 self.end_transaction();
                 self.writer.command_complete("ROLLBACK");
@@ -844,27 +903,18 @@ where
                     self.fail_dispatch(&error);
                 }
             }
+            Statement::SqlKeywords
+            | Statement::CurrentSchema
+            | Statement::CurrentCatalog
+            | Statement::PgSetting(_)
+            | Statement::ShowTransactionIsolation => {
+                unreachable!("metadata statements are handled before dispatch")
+            }
             Statement::Query => {
-                let scope = match self.scope(database.as_deref(), Action::Query).await {
-                    Ok(scope) => scope,
-                    Err(error) => {
-                        self.fail_dispatch(&error);
-                        return Ok(());
-                    }
-                };
-                match self
-                    .run_statement(&scope, &sql, &params, false, &result_formats)
-                    .await
-                {
-                    Ok(rows) => self.writer.command_complete(&command_tag(&sql, rows)),
-                    Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
-                }
+                self.run_extended_read(database.as_deref(), &sql, &params, &result_formats)
+                    .await;
             }
             Statement::Mutation => {
-                if self.in_transaction {
-                    self.fail_dispatch(&explicit_transaction_write_error());
-                    return Ok(());
-                }
                 let Some(database) = database.or_else(|| self.current_db.clone()) else {
                     self.fail_dispatch(&Dispatch::NoDatabase);
                     return Ok(());
@@ -888,6 +938,29 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn run_extended_read(
+        &mut self,
+        database: Option<&str>,
+        sql: &str,
+        params: &[corium_sql::SqlValue],
+        result_formats: &[i16],
+    ) {
+        let scope = match self.scope(database, Action::Query).await {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.fail_dispatch(&error);
+                return;
+            }
+        };
+        match self
+            .run_statement(&scope, sql, params, false, result_formats)
+            .await
+        {
+            Ok(rows) => self.writer.command_complete(&command_tag(sql, rows)),
+            Err(error) => self.fail_dispatch(&Dispatch::Sql(error)),
+        }
     }
 
     /// Validates and activates `name` as the connection's database, warming
@@ -928,6 +1001,88 @@ where
         Ok(())
     }
 
+    /// Writes one JDBC metadata response and reports whether it was handled.
+    fn write_metadata_statement(
+        &mut self,
+        statement: &Statement,
+        with_row_description: bool,
+        result_formats: &[i16],
+    ) -> bool {
+        match statement {
+            Statement::SqlKeywords => {
+                self.write_sql_keywords(with_row_description, result_formats);
+            }
+            Statement::CurrentSchema => {
+                self.write_current_schema(with_row_description, result_formats);
+            }
+            Statement::CurrentCatalog => {
+                self.write_current_catalog(with_row_description, result_formats);
+            }
+            Statement::PgSetting(name) => {
+                self.write_pg_setting(name, with_row_description, result_formats);
+            }
+            Statement::ShowTransactionIsolation => {
+                self.write_transaction_isolation(with_row_description, result_formats);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Answers the catalog-function query `PgJDBC` uses to implement
+    /// `DatabaseMetaData.getSQLKeywords()`.
+    fn write_sql_keywords(&mut self, with_row_description: bool, result_formats: &[i16]) {
+        if with_row_description {
+            self.write_row_description(&[sql_keywords_field()], result_formats);
+        }
+        self.writer
+            .data_row(&[Some(POSTGRES_SQL_KEYWORDS.as_bytes().to_vec())]);
+        self.writer.command_complete("SELECT 1");
+    }
+
+    /// Answers the query `PgJDBC` uses to implement `Connection.getSchema()`.
+    fn write_current_schema(&mut self, with_row_description: bool, result_formats: &[i16]) {
+        if with_row_description {
+            self.write_row_description(&[current_schema_field()], result_formats);
+        }
+        self.writer.data_row(&[Some(b"corium".to_vec())]);
+        self.writer.command_complete("SELECT 1");
+    }
+
+    /// Answers `PostgreSQL` current-catalog introspection without requiring a
+    /// physical `pg_catalog` database.
+    fn write_current_catalog(&mut self, with_row_description: bool, result_formats: &[i16]) {
+        if with_row_description {
+            self.write_row_description(&[current_catalog_field()], result_formats);
+        }
+        let database = self.current_db.clone().unwrap_or_default();
+        self.writer.data_row(&[Some(database.into_bytes())]);
+        self.writer.command_complete("SELECT 1");
+    }
+
+    /// Answers the small `pg_settings` subset `PgJDBC` exposes through
+    /// `DatabaseMetaData`.
+    fn write_pg_setting(&mut self, name: &str, with_row_description: bool, result_formats: &[i16]) {
+        if with_row_description {
+            self.write_row_description(&[pg_setting_field()], result_formats);
+        }
+        let value = match name {
+            "default_transaction_isolation" => "read committed",
+            "max_index_keys" => "32",
+            _ => "",
+        };
+        self.writer.data_row(&[Some(value.as_bytes().to_vec())]);
+        self.writer.command_complete("SELECT 1");
+    }
+
+    fn write_transaction_isolation(&mut self, with_row_description: bool, result_formats: &[i16]) {
+        if with_row_description {
+            self.write_row_description(&[transaction_isolation_field()], result_formats);
+        }
+        self.writer.data_row(&[Some(b"read committed".to_vec())]);
+        self.writer.command_complete("SHOW");
+    }
+
     /// Resolves an immutable snapshot for `database`, falling back to the
     /// connection's active database.
     async fn snapshot(&mut self, database: Option<&str>) -> Result<Db, Dispatch> {
@@ -936,16 +1091,22 @@ where
             .or_else(|| self.current_db.clone())
             .ok_or(Dispatch::NoDatabase)?;
         if self.in_transaction {
-            if let Some((pinned_name, pinned)) = &self.transaction_db {
-                if pinned_name != &name {
+            if let Some(transaction) = &self.transaction {
+                if transaction.database != name {
                     return Err(Dispatch::Sql(SqlError::Mutation(
                         "cannot switch databases inside an explicit transaction".into(),
                     )));
                 }
-                return Ok(pinned.clone());
+                return Ok(transaction.current.clone());
             }
             let db = self.catalog.db(&name).await.map_err(Dispatch::Catalog)?;
-            self.transaction_db = Some((name, db.clone()));
+            self.transaction = Some(TransactionState {
+                database: name,
+                base: db.clone(),
+                current: db.clone(),
+                forms: Vec::new(),
+                next_statement: 0,
+            });
             Ok(db)
         } else {
             self.catalog.db(&name).await.map_err(Dispatch::Catalog)
@@ -1113,6 +1274,36 @@ where
             .ok_or_else(|| Dispatch::Sql(SqlError::Mutation("expected a mutation".into())))?;
         let (db_after, tempids) = if mutation.is_empty() {
             (db.clone(), BTreeMap::new())
+        } else if self.in_transaction {
+            let transaction = self.transaction.as_ref().ok_or_else(|| {
+                Dispatch::Sql(SqlError::Mutation(
+                    "explicit transaction has no pinned database".into(),
+                ))
+            })?;
+            if transaction.database != database {
+                return Err(Dispatch::Sql(SqlError::Mutation(
+                    "cannot switch databases inside an explicit transaction".into(),
+                )));
+            }
+            let statement = transaction.next_statement;
+            let (forms, renamed) = namespace_tempids(mutation.forms(), statement);
+            let staged = stage_transaction(&transaction.current, &forms)?;
+            let tempids = renamed
+                .into_iter()
+                .filter_map(|(original, namespaced)| {
+                    staged
+                        .tempids
+                        .get(&namespaced)
+                        .copied()
+                        .map(|entity| (original, entity))
+                })
+                .collect();
+            let db_after = staged.db_after;
+            let transaction = self.transaction.as_mut().expect("transaction pinned above");
+            transaction.current = db_after.clone();
+            transaction.forms.extend(forms);
+            transaction.next_statement += 1;
+            (db_after, tempids)
         } else {
             let result = self
                 .catalog
@@ -1187,16 +1378,47 @@ where
         });
     }
 
+    /// Atomically commits all writes staged by the explicit transaction.
+    async fn commit_transaction(&mut self) -> Result<(), Dispatch> {
+        let pending = self.transaction.as_ref().and_then(|transaction| {
+            (!transaction.forms.is_empty()).then(|| {
+                (
+                    transaction.database.clone(),
+                    transaction.base.basis_t(),
+                    transaction.forms.clone(),
+                )
+            })
+        });
+        let result = match pending {
+            Some((database, basis_t, forms)) => self
+                .catalog
+                .transact(&database, basis_t, forms)
+                .await
+                .map(|_| ())
+                .map_err(Dispatch::Catalog),
+            None => Ok(()),
+        };
+        // PostgreSQL leaves the connection idle after COMMIT succeeds or the
+        // commit itself fails (for example with a serialization error).
+        self.end_transaction();
+        result
+    }
+
     fn begin_transaction(&mut self) {
+        if self.in_transaction {
+            // PostgreSQL warns but keeps the existing transaction. We do not
+            // currently emit NoticeResponse, but must not discard staged DML.
+            return;
+        }
         self.in_transaction = true;
         self.transaction_failed = false;
-        self.transaction_db = None;
+        self.transaction = None;
     }
 
     fn end_transaction(&mut self) {
         self.in_transaction = false;
         self.transaction_failed = false;
-        self.transaction_db = None;
+        self.transaction = None;
     }
 
     fn write_row_description(&mut self, fields: &[FieldDescription], requested: &[i16]) {
@@ -1207,11 +1429,99 @@ where
     }
 }
 
+/// Gives one statement's generated tempids names that remain distinct when
+/// several SQL mutations are submitted as one Corium transaction.
+///
+/// SQL `INSERT` currently emits tempids only as map-form `:db/id` values;
+/// vector operation forms produced by `UPDATE` and `DELETE` use concrete ids.
+fn namespace_tempids(forms: &[Edn], statement: u64) -> (Vec<Edn>, BTreeMap<String, String>) {
+    let db_id = Edn::keyword("db/id");
+    let mut renamed = BTreeMap::new();
+    let forms = forms
+        .iter()
+        .cloned()
+        .map(|form| match form {
+            Edn::Map(mut pairs) => {
+                if let Some((_, Edn::Str(temp))) = pairs.iter_mut().find(|(key, _)| key == &db_id) {
+                    let namespaced = format!("__corium_pgwire_{statement}_{temp}");
+                    renamed.insert(temp.clone(), namespaced.clone());
+                    *temp = namespaced;
+                }
+                Edn::Map(pairs)
+            }
+            other => other,
+        })
+        .collect();
+    (forms, renamed)
+}
+
+/// Applies accumulated forms locally so later statements in the transaction
+/// read their own writes and mutation `RETURNING` rows can be produced before
+/// the durable commit.
+fn stage_transaction(db: &Db, forms: &[Edn]) -> Result<CatalogTxResult, Dispatch> {
+    let mut interner = db.interner().clone();
+    let items = tx_items_from_edn(db, &mut interner, forms)
+        .map_err(|error| Dispatch::Sql(SqlError::Mutation(error.to_string())))?;
+    let t = db.basis_t() + 1;
+    let tx = EntityId::new(Partition::Tx as u32, t);
+    let prepared = prepare(db, items, tx, db.next_user_sequence())
+        .map_err(|error| Dispatch::Sql(SqlError::Mutation(error.to_string())))?;
+    Ok(CatalogTxResult {
+        db_after: db.clone().with_transaction(t, &prepared.datoms),
+        tempids: prepared.tempids,
+    })
+}
+
 /// The `RowDescription` field for the `SHOW DATABASES` result column.
 fn database_field() -> FieldDescription {
     let type_oid = types::type_oid(&SqlType::Text);
     FieldDescription {
         name: "database".to_owned(),
+        type_oid,
+        type_len: types::type_len(type_oid),
+    }
+}
+
+fn sql_keywords_field() -> FieldDescription {
+    let type_oid = types::type_oid(&SqlType::Text);
+    FieldDescription {
+        name: "string_agg".to_owned(),
+        type_oid,
+        type_len: types::type_len(type_oid),
+    }
+}
+
+fn current_schema_field() -> FieldDescription {
+    let type_oid = types::type_oid(&SqlType::Text);
+    FieldDescription {
+        name: "current_schema".to_owned(),
+        type_oid,
+        type_len: types::type_len(type_oid),
+    }
+}
+
+fn current_catalog_field() -> FieldDescription {
+    let type_oid = types::type_oid(&SqlType::Text);
+    FieldDescription {
+        name: "current_catalog".to_owned(),
+        type_oid,
+        type_len: types::type_len(type_oid),
+    }
+}
+
+fn pg_setting_field() -> FieldDescription {
+    let type_oid = types::type_oid(&SqlType::Text);
+    FieldDescription {
+        name: "setting".to_owned(),
+        type_oid,
+        type_len: types::type_len(type_oid),
+    }
+}
+
+fn transaction_isolation_field() -> FieldDescription {
+    let type_oid = types::type_oid(&SqlType::Text);
+    FieldDescription {
+        name: "transaction_isolation".to_owned(),
         type_oid,
         type_len: types::type_len(type_oid),
     }
@@ -1244,12 +1554,6 @@ fn dispatch_error_fields(error: &Dispatch) -> (&'static str, String) {
         Dispatch::Sql(error) => (sqlstate_for(error), error.to_string()),
         Dispatch::Denied(reason) => ("42501", reason.clone()),
     }
-}
-
-fn explicit_transaction_write_error() -> Dispatch {
-    Dispatch::Sql(SqlError::Mutation(
-        "writes inside explicit transaction blocks are not supported; use autocommit".to_owned(),
-    ))
 }
 
 /// Chooses a `SQLSTATE` code for a SQL error.
@@ -1431,6 +1735,21 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// Classifies a statement so `USE`, `SHOW DATABASES`, and no-op control
 /// statements are handled before reaching `SqlSession`.
 fn classify(sql: &str) -> Statement {
+    if is_transaction_isolation_probe(sql) {
+        return Statement::ShowTransactionIsolation;
+    }
+    if is_sql_keywords_probe(sql) {
+        return Statement::SqlKeywords;
+    }
+    if is_current_schema_probe(sql) {
+        return Statement::CurrentSchema;
+    }
+    if is_current_catalog_probe(sql) {
+        return Statement::CurrentCatalog;
+    }
+    if let Some(name) = pg_setting_probe(sql) {
+        return Statement::PgSetting(name);
+    }
     let mut words = sql.split_whitespace();
     let first = words.next().unwrap_or("").to_ascii_uppercase();
     match first.as_str() {
@@ -1451,6 +1770,42 @@ fn classify(sql: &str) -> Statement {
         "INSERT" | "UPDATE" | "DELETE" => Statement::Mutation,
         _ => Statement::Query,
     }
+}
+
+fn is_sql_keywords_probe(sql: &str) -> bool {
+    let sql = sql.to_ascii_lowercase();
+    sql.trim_start().starts_with("select") && sql.contains("from pg_catalog.pg_get_keywords()")
+}
+
+fn is_current_schema_probe(sql: &str) -> bool {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    sql.eq_ignore_ascii_case("select current_schema()")
+}
+
+fn is_current_catalog_probe(sql: &str) -> bool {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    sql.eq_ignore_ascii_case("select current_catalog")
+        || sql.eq_ignore_ascii_case("select current_catalog()")
+        || sql.eq_ignore_ascii_case("select current_database()")
+}
+
+fn pg_setting_probe(sql: &str) -> Option<String> {
+    let sql = sql.to_ascii_lowercase();
+    if !sql.contains("from pg_catalog.pg_settings") {
+        return None;
+    }
+    let name = sql.split_once("where name=")?.1.trim();
+    Some(
+        name.trim_end_matches(';')
+            .trim()
+            .trim_matches('\'')
+            .to_owned(),
+    )
+}
+
+fn is_transaction_isolation_probe(sql: &str) -> bool {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    sql.eq_ignore_ascii_case("show transaction isolation level")
 }
 
 /// Extracts the database name from a `USE <database>` statement.

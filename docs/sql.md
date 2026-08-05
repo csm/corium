@@ -57,9 +57,11 @@ The initial writable subset is intentionally narrow:
   pre-commit snapshot; insert and update rows come from the committed value.
 
 Joined and multi-table mutations, conflict clauses/upserts, ordered or limited
-mutations, new keyword interning, DDL, and atomic multi-statement transactions
-are deferred. This is relational mutation over Corium's projection, not an
-attempt to make entity namespace membership into a table ownership rule.
+mutations, new keyword interning, and DDL are deferred. The planning API still
+produces one statement at a time; `corium-pgwire` can compose those plans into
+one atomic explicit transaction. This is relational mutation over Corium's
+projection, not an attempt to make entity namespace membership into a table
+ownership rule.
 
 ## Relational projection
 
@@ -158,10 +160,19 @@ and binary input encodings, including ISO 8601 `timestamptz` text with an
 explicit UTC offset. Results support both text and binary encodings. Array
 inputs are not yet supported.
 
-Explicit `BEGIN` blocks track transaction status and permit reads, but writes
-inside them are rejected instead of silently autocommitting. Use one
-autocommit DML statement per transaction until multi-statement transaction
-support lands. `SET`, `RESET`, and `DISCARD` remain compatibility no-ops.
+Explicit `BEGIN` blocks pin the first database snapshot. DML is staged against
+a provisional value, so later reads and writes see earlier changes;
+`ROLLBACK` discards the forms and `COMMIT` submits them through one guarded
+Corium transaction. A concurrent basis change fails the commit with SQLSTATE
+`40001`. `SET`, `RESET`, and `DISCARD` remain compatibility no-ops.
+
+Hibernate ORM 7.4 with PgJDBC 42.7 is exercised by the runnable
+[`postgres-hibernate`](../examples/postgres-hibernate/README.md) example. It
+performs generated-id insert, entity reads, dirty update, HQL query, and delete
+through ordinary Hibernate transactions, with automatic PostgreSQL dialect
+detection. The server answers the PgJDBC metadata probes that bootstrap this
+path. Broader `pg_catalog` introspection, DDL-based schema management,
+savepoints, COPY, sequences, and array bind inputs are not yet implemented.
 
 `corium postgres-server` is read-only by default. Pass `--allow-writes` to
 enable the mutation path explicitly:

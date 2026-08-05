@@ -259,8 +259,9 @@ pub async fn load_current_snapshot(
         .into_iter()
         .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(Db::from_current_snapshot(
+    Ok(Some(Db::from_current_snapshot_with_next_user(
         root.index_basis_t,
+        root.next_entity_id,
         schema,
         idents,
         interner,
@@ -386,7 +387,7 @@ impl<S: BlobStore + RootStore> SegmentSource<S> {
 
 #[cfg(test)]
 mod tests {
-    use corium_core::{EntityId, KeywordInterner, Value};
+    use corium_core::{EntityId, KeywordInterner, Partition, Value};
     use corium_db::Idents;
     use corium_store::{MemoryStore, RootStore};
 
@@ -396,7 +397,7 @@ mod tests {
     async fn loads_published_eavt_snapshot() {
         let store = MemoryStore::default();
         let datom = Datom {
-            e: EntityId::from_raw(1_001),
+            e: EntityId::new(Partition::User as u32, 1_001),
             a: EntityId::from_raw(101),
             v: Value::Str("snapshot".into()),
             tx: EntityId::from_raw(37),
@@ -415,7 +416,8 @@ mod tests {
             owner_endpoint: String::new(),
             index_basis_t: 37,
             roots: Some([id.clone(), id.clone(), id.clone(), id]),
-            next_entity_id: 1_005,
+            // Legacy roots did not persist an allocator hint.
+            next_entity_id: 0,
             last_tx_instant: 0,
             key_manifest_version: 0,
         };
@@ -436,6 +438,7 @@ mod tests {
             .expect("load snapshot")
             .expect("published snapshot");
         assert_eq!(db.basis_t(), 37);
+        assert_eq!(db.next_user_sequence(), 1_002);
         assert_eq!(db.datoms(), vec![datom]);
     }
 
@@ -493,6 +496,7 @@ mod tests {
             .expect("load snapshot")
             .expect("published snapshot");
         assert_eq!(db.basis_t(), 37);
+        assert_eq!(db.next_user_sequence(), 1_005);
         assert_eq!(db.datoms(), datoms);
     }
 
