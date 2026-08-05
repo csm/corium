@@ -14,9 +14,6 @@ postgres = ["corium-ffi/postgres"]
 turso = ["corium-ffi/turso"]
 s3 = ["corium-ffi/s3"]
 all-storage = ["postgres", "turso", "s3"]
-artifact-postgres = ["postgres"]
-artifact-turso = ["turso"]
-artifact-s3 = ["s3"]
 
 [lib]
 name = "_corium"

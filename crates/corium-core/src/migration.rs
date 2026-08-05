@@ -303,6 +303,11 @@ pub enum BlockedReason {
     /// An attribute that has ever been protected can never gain AVET
     /// coverage: its sealed datoms cannot be ordered by value.
     EverProtected,
+    /// A declaration asks for protection alongside something protected datoms
+    /// cannot have. Ciphertext order is not value order, so a protected
+    /// attribute is absent from AVET and VAET: it can be neither indexed nor
+    /// unique, and a `ref` can never be protected at all (ADR-0018).
+    ProtectionConflict,
 }
 
 impl BlockedReason {
@@ -314,6 +319,7 @@ impl BlockedReason {
             Self::UniqueDuplicates => "unique-duplicates",
             Self::CardinalityConflicts => "cardinality-conflicts",
             Self::EverProtected => "ever-protected",
+            Self::ProtectionConflict => "protection-conflict",
         }
     }
 
@@ -328,6 +334,9 @@ impl BlockedReason {
             }
             Self::EverProtected => {
                 "an attribute that has ever been protected can never gain index or unique coverage"
+            }
+            Self::ProtectionConflict => {
+                "a protected attribute cannot be indexed, unique, or a reference"
             }
         }
     }
@@ -623,6 +632,8 @@ pub struct InstalledAttribute {
     pub doc: Option<String>,
     /// Whether the attribute has been retired.
     pub retired: bool,
+    /// The protection class sealing new values now, by class ident.
+    pub protection: Option<String>,
     /// Whether the attribute has ever held sealed datoms. Permanent: an
     /// ever-protected attribute can never later gain index or unique coverage.
     pub ever_protected: bool,
@@ -653,10 +664,19 @@ impl InstalledAttribute {
         if self.no_history {
             out.push_str(" no-history");
         }
+        if let Some(class) = &self.protection {
+            let _ = write!(out, " protected-{class}");
+        }
         if self.retired {
             out.push_str(" retired");
         }
         out
+    }
+
+    /// The rendered protection class, or `none`.
+    #[must_use]
+    pub fn protection_name(&self) -> String {
+        self.protection.clone().unwrap_or_else(|| "none".to_owned())
     }
 }
 
@@ -748,6 +768,7 @@ impl InstalledSchema {
             canonical.field(flag(attr.no_history));
             canonical.optional(attr.doc.as_deref());
             canonical.field(flag(attr.retired));
+            canonical.optional(attr.protection.as_deref());
             canonical.field(flag(attr.ever_protected));
             canonical.field(flag(attr.engine));
         }
@@ -865,6 +886,7 @@ mod tests {
             no_history: false,
             doc: None,
             retired: false,
+            protection: None,
             ever_protected: false,
             engine: false,
         }
@@ -978,6 +1000,7 @@ mod tests {
             |attr| attr.no_history = true,
             |attr| attr.doc = Some("who".to_owned()),
             |attr| attr.retired = true,
+            |attr| attr.protection = Some(":protect/pii".to_owned()),
             |attr| attr.ever_protected = true,
             |attr| attr.engine = true,
             |attr| attr.id = attr_with_sequence(101),

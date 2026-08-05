@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use corium_core::{EntityId, IndexOrder};
-use corium_db::{Db as DbValue, key_prefix};
+use corium_db::{Db as DbValue, key_prefix, read::ReadContext};
 use corium_peer::{ConnectConfig, Connection};
 use corium_query::edn::Edn;
 use corium_query::{ExecOptions, QInput, QueryError, ast, boundary, exec};
@@ -155,7 +155,7 @@ impl DbBackend for LocalDbBackend {
             &inputs,
             ExecOptions {
                 fuel,
-                hydrator: Some(self.hydrator().await?),
+                read: ReadContext::open().with_hydrator(self.hydrator().await?),
                 ..ExecOptions::default()
             },
         )?;
@@ -165,13 +165,8 @@ impl DbBackend for LocalDbBackend {
     async fn pull(&self, view: View, pattern: Edn, eid: Edn) -> Result<Edn, ClientError> {
         let db = self.resolve(view);
         let entity = resolve_eid(&db, &eid)?;
-        let hydrator = self.hydrator().await?;
-        Ok(corium_query::pull_with(
-            &db,
-            &pattern,
-            entity,
-            Some(&hydrator),
-        )?)
+        let read = ReadContext::open().with_hydrator(self.hydrator().await?);
+        Ok(corium_query::pull_with(&db, &pattern, entity, &read)?)
     }
 
     async fn datoms(

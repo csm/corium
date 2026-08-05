@@ -24,4 +24,6 @@ reference the old. Format: Context / Decision / Consequences.
 | [0017](0017-encryption-at-rest.md) | Envelope encryption at rest for every durable artifact | Proposed |
 | [0018](0018-attribute-protection-classes.md) | Attribute-level protection with per-class keys | Proposed |
 | [0019](0019-operator-peer-service.md) | An operator peer service for management duties | Proposed |
-| [0020](0020-planned-schema-migrations.md) | Plan and apply schema migrations as basis-versioned data | Proposed |
+| [0020](0020-planned-schema-migrations.md) | Plan and apply schema migrations as basis-versioned data | Accepted |
+| [0021](0021-contextual-read-authorization.md) | Contextual read authorization on the peer server and pgwire | Accepted |
+| [0022](0022-pluggable-storage.md) | Runtime-pluggable storage backends | Accepted |

@@ -57,9 +57,11 @@ The initial writable subset is intentionally narrow:
   pre-commit snapshot; insert and update rows come from the committed value.
 
 Joined and multi-table mutations, conflict clauses/upserts, ordered or limited
-mutations, new keyword interning, DDL, and atomic multi-statement transactions
-are deferred. This is relational mutation over Corium's projection, not an
-attempt to make entity namespace membership into a table ownership rule.
+mutations, new keyword interning, and DDL are deferred. The planning API still
+produces one statement at a time; `corium-pgwire` can compose those plans into
+one atomic explicit transaction. This is relational mutation over Corium's
+projection, not an attempt to make entity namespace membership into a table
+ownership rule.
 
 ## Relational projection
 
@@ -158,10 +160,19 @@ and binary input encodings, including ISO 8601 `timestamptz` text with an
 explicit UTC offset. Results support both text and binary encodings. Array
 inputs are not yet supported.
 
-Explicit `BEGIN` blocks track transaction status and permit reads, but writes
-inside them are rejected instead of silently autocommitting. Use one
-autocommit DML statement per transaction until multi-statement transaction
-support lands. `SET`, `RESET`, and `DISCARD` remain compatibility no-ops.
+Explicit `BEGIN` blocks pin the first database snapshot. DML is staged against
+a provisional value, so later reads and writes see earlier changes;
+`ROLLBACK` discards the forms and `COMMIT` submits them through one guarded
+Corium transaction. A concurrent basis change fails the commit with SQLSTATE
+`40001`. `SET`, `RESET`, and `DISCARD` remain compatibility no-ops.
+
+Hibernate ORM 7.4 with PgJDBC 42.7 is exercised by the runnable
+[`postgres-hibernate`](../examples/postgres-hibernate/README.md) example. It
+performs generated-id insert, entity reads, dirty update, HQL query, and delete
+through ordinary Hibernate transactions, with automatic PostgreSQL dialect
+detection. The server answers the PgJDBC metadata probes that bootstrap this
+path. Broader `pg_catalog` introspection, DDL-based schema management,
+savepoints, COPY, sequences, and array bind inputs are not yet implemented.
 
 `corium postgres-server` is read-only by default. Pass `--allow-writes` to
 enable the mutation path explicitly:
@@ -170,18 +181,47 @@ enable the mutation path explicitly:
 corium postgres-server --listen 127.0.0.1:5432 --allow-writes
 ```
 
-Pass `--password` to require a cleartext password; TLS is not terminated by the
-server, so front it with a proxy when transport security is needed. The SQL
-dialect is DataFusion's, not PostgreSQL's — wire compatibility does not imply
-`pg_catalog` or dialect compatibility. See
+Pass `--password` to require one shared cleartext password. TLS is not
+terminated by the server, so front it with a proxy when transport security is
+needed. The SQL dialect is DataFusion's, not PostgreSQL's — wire compatibility
+does not imply `pg_catalog` or dialect compatibility. See
 [ADR-0013](adr/0013-postgres-wire-interface.md).
 
-When writes are enabled, the CLI server's catalog uses its cached
-`corium-peer` connection, so its configured Corium bearer principal and the
-transactor's authorization gate apply. The PostgreSQL login is currently only
-a wire-server credential; it is not mapped to a distinct Corium principal.
-Per-user authn/authz parity, TLS termination, and PostgreSQL role/catalog
-semantics remain separate work.
+### Authentication and authorization
+
+`postgres-server` takes the same `--serve-token`, `--oidc-*`, and `--authz-db`
+flags as `peer-server`. Once any of them is set, **the password field carries
+the caller's own bearer token** — `PostgreSQL` has no separate token field —
+and the startup `user` is informational:
+
+```console
+corium postgres-server --listen 127.0.0.1:5432 \
+  --oidc-issuer https://issuer.example --oidc-audience corium \
+  --authz-db corium.authz --storage-key file:/etc/corium/pii.key
+psql "host=127.0.0.1 port=5432 dbname=people user=alice password=$JWT"
+```
+
+> **The token travels in cleartext.** `postgres-server` does not terminate
+> TLS — it rejects `--tls-cert`/`--tls-key` rather than accepting flags it
+> cannot honour — so a client's bearer token crosses the wire unencrypted.
+> Run it behind a TLS-terminating proxy, or bind it to loopback. The server
+> prints this warning at startup whenever authentication is configured.
+
+Every statement is then authorized as that principal: `SELECT` needs `Query`,
+DML needs `Transact`, and `SHOW DATABASES` lists only what the principal may
+inspect. Reads are answered through the principal's own view — a column its
+policy hides keeps its declared type and reports `NULL`, and never takes a
+pushed-down predicate — and through its own protection class keys, so one
+key-holding server serves principals with different entitlements from one
+database value. Pass `--key-policy server-wide` to keep the pre-`ADR-0021`
+behaviour of hydrating every authorized caller with the server's whole keyring.
+A principal whose view hides attributes may not write. See
+[ADR-0021](adr/0021-contextual-read-authorization.md) and
+[auth.md](design/auth.md).
+
+Writes still *commit* through the catalog's own `corium-peer` connection, so
+the transactor additionally applies that connection's bearer principal. TLS
+termination and PostgreSQL role/catalog semantics remain separate work.
 
 ## Engine choice and tradeoffs
 

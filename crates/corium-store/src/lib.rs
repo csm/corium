@@ -1,7 +1,6 @@
 //! Content-addressed blob and fenced root stores for immutable index segments.
 //!
-//! Enable the `postgres`, `turso`, or `s3` Cargo feature to use
-//! [`PostgresBlobStore`], [`TursoBlobStore`], or [`S3BlobStore`], respectively.
+//! Backends are selected at runtime through the process-wide storage registry.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -25,6 +24,13 @@ pub use segment_cache::{SegmentCache, SegmentCacheConfig, SegmentCacheMetrics, S
 mod discovery;
 pub use discovery::{DiscoveredStore, DiscoveredStoreSpec, StorageConnectionError};
 
+mod registry;
+pub use registry::{
+    BackendCapabilities, FullStore, LogPlacement, ReadStore, StorageBackend, StorageConfig,
+    StorageRegistrationError, available_storage_backends, register_storage_backend,
+    register_storage_backends, storage_backend,
+};
+
 mod encrypted_store;
 pub use encrypted_store::EncryptedBlobStore;
 
@@ -40,19 +46,6 @@ pub use snapshot::{
     INDEX_MANIFEST_MAGIC, chunk_segment_keys, decode_index_manifest, decode_segment_keys,
     encode_index_manifest, encode_segment_chunk, index_blob_children, is_index_manifest,
 };
-
-#[cfg(feature = "postgres")]
-mod postgres_store;
-#[cfg(feature = "postgres")]
-pub use postgres_store::PostgresBlobStore;
-#[cfg(feature = "turso")]
-mod turso_store;
-#[cfg(feature = "turso")]
-pub use turso_store::TursoBlobStore;
-#[cfg(feature = "s3")]
-mod s3_store;
-#[cfg(feature = "s3")]
-pub use s3_store::{S3BlobStore, S3ClientConfig, normalize_s3_prefix};
 
 /// A content identifier for immutable blobs.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -147,68 +140,29 @@ pub enum StoreError {
     /// A blocking store worker failed before returning its result.
     #[error("store blocking task failed: {0}")]
     BlockingTask(String),
+    /// A backend kind is not registered in this process.
+    #[error("storage backend {0:?} is not available; install or load its plugin")]
+    BackendUnavailable(String),
+    /// Backend configuration is malformed or incomplete.
+    #[error("invalid storage configuration for {kind:?}: {detail}")]
+    InvalidBackendConfig {
+        /// Backend kind whose configuration was rejected.
+        kind: String,
+        /// Backend-provided diagnostic.
+        detail: String,
+    },
+    /// A backend-specific operation failed.
+    #[error("storage backend {kind:?} failed: {detail}")]
+    Backend {
+        /// Backend kind reporting the failure.
+        kind: String,
+        /// Backend-provided diagnostic.
+        detail: String,
+    },
     /// A local path advertised by a transactor is not reachable from this
     /// process. Direct-storage peers must be co-located with local backends.
     #[error("the transactor's local storage at {0} is not reachable from this process")]
     UnreachableLocalStorage(PathBuf),
-    /// `PostgreSQL` database failure.
-    #[cfg(feature = "postgres")]
-    #[error("PostgreSQL store failed: {0}")]
-    Postgres(#[from] deadpool_postgres::tokio_postgres::Error),
-    /// `PostgreSQL` connection-pool checkout failure.
-    #[cfg(feature = "postgres")]
-    #[error("PostgreSQL connection pool failed: {0}")]
-    PostgresPool(#[from] deadpool_postgres::PoolError),
-    /// `PostgreSQL` connection-pool configuration failure.
-    #[cfg(feature = "postgres")]
-    #[error("PostgreSQL connection pool configuration failed: {0}")]
-    PostgresPoolCreate(#[from] deadpool_postgres::CreatePoolError),
-    /// No native certificate roots were available for `PostgreSQL` TLS.
-    #[cfg(feature = "postgres")]
-    #[error("cannot load native certificate roots for PostgreSQL TLS: {0}")]
-    PostgresTlsRoots(String),
-    /// `PostgreSQL` returned invalid store data.
-    #[cfg(feature = "postgres")]
-    #[error("PostgreSQL store contains invalid data: {0}")]
-    InvalidPostgresData(String),
-    /// Turso database failure.
-    #[cfg(feature = "turso")]
-    #[error("Turso blob store failed: {0}")]
-    Turso(#[from] turso::Error),
-    /// A filesystem path cannot be passed to Turso.
-    #[cfg(feature = "turso")]
-    #[error("Turso database path is not valid UTF-8: {0:?}")]
-    InvalidTursoPath(PathBuf),
-    /// Turso returned invalid blob-store data.
-    #[cfg(feature = "turso")]
-    #[error("Turso blob store contains invalid data: {0}")]
-    InvalidTursoData(String),
-    /// S3 request failure.
-    #[cfg(feature = "s3")]
-    #[error("S3 store failed: {0}")]
-    S3(String),
-    /// S3 returned invalid store data.
-    #[cfg(feature = "s3")]
-    #[error("S3 store contains invalid data: {0}")]
-    InvalidS3Data(String),
-}
-
-/// Converts any S3 SDK operation error into [`StoreError::S3`]. Generic over
-/// the operation's modeled error type so every `?` on an S3 SDK call
-/// converts without a per-operation `From` impl.
-///
-/// Formats with [`DisplayErrorContext`](aws_sdk_s3::error::DisplayErrorContext)
-/// rather than `SdkError`'s own terse `Display` (e.g. "service error"), which
-/// drops the underlying S3 error code and message (`AccessDenied`,
-/// `NoSuchBucket`, etc.) that operators need to diagnose a failure.
-#[cfg(feature = "s3")]
-impl<E> From<aws_sdk_s3::error::SdkError<E>> for StoreError
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    fn from(error: aws_sdk_s3::error::SdkError<E>) -> Self {
-        StoreError::S3(aws_sdk_s3::error::DisplayErrorContext(error).to_string())
-    }
 }
 
 /// Asynchronous stream of blob identifiers produced by [`BlobStore::list`].

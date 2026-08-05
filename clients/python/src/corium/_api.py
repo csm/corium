@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from importlib.metadata import entry_points
 from types import TracebackType
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
@@ -396,30 +397,32 @@ class _BasePeer(Peer):
 
 @functools.cache
 def _native_modules() -> tuple[Any, ...]:
-    module_names = (
-        "corium._corium_turso",
-        "corium._corium_postgres",
-        "corium._corium_s3",
-        "corium._corium",
-    )
-    found: list[Any] = []
-    for module_name in module_names:
-        try:
-            found.append(importlib.import_module(module_name))
-        except ModuleNotFoundError as error:
-            if error.name != module_name:
-                raise NativeExtensionError(
-                    f"the native extension {module_name} failed to load"
-                ) from error
-        except ImportError as error:
+    module_name = "corium._corium"
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as error:
+        if error.name != module_name:
             raise NativeExtensionError(
                 f"the native extension {module_name} failed to load"
             ) from error
-    if found:
-        return tuple(found)
-    raise NativeExtensionError(
-        "the Corium native extension is not installed for this platform"
-    )
+        raise NativeExtensionError(
+            "the Corium native extension is not installed for this platform"
+        ) from error
+    except ImportError as error:
+        raise NativeExtensionError(
+            f"the native extension {module_name} failed to load"
+        ) from error
+
+    for entry_point in entry_points(group="corium.store_plugins"):
+        try:
+            provider = entry_point.load()
+            path = provider() if callable(provider) else provider
+            module._load_storage_plugin(os.fspath(path))
+        except Exception as error:
+            raise NativeExtensionError(
+                f"the storage plugin {entry_point.name} failed to load"
+            ) from error
+    return (module,)
 
 
 def _native_module() -> Any:
@@ -429,13 +432,9 @@ def _native_module() -> Any:
 
 
 def available_storage_backends() -> frozenset[str]:
-    """Return direct-storage backends provided by installed native artifacts."""
+    """Return direct-storage backends registered in the native engine."""
 
-    return frozenset(
-        backend
-        for module in _native_modules()
-        for backend in module._storage_backends()
-    )
+    return frozenset(_native_module()._storage_backends())
 
 
 def _tls_from_endpoints(
@@ -526,8 +525,7 @@ class LocalPeer(_BasePeer):
                 else None
             ),
         }
-        modules = _native_modules()
-        module = modules[0]
+        module = _native_module()
         if storage is not None:
             storage_backend = await module._discover_storage_backend(
                 endpoint_list,
@@ -537,18 +535,9 @@ class LocalPeer(_BasePeer):
                 tls_ca=tls_ca,
                 tls_domain=tls_domain,
             )
-            module = next(
-                (
-                    candidate
-                    for candidate in modules
-                    if storage_backend in candidate._storage_backends()
-                ),
-                None,
-            )
-            if module is None:
+            if storage_backend not in module._storage_backends():
                 raise StorageError(
-                    "no installed Corium native artifact supports "
-                    f"{storage_backend} direct storage"
+                    f"storage plugin {storage_backend!r} is not installed"
                 )
         backend = await module.connect_local(endpoint_list, **options)
         return cls(backend)

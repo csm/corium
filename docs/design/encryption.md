@@ -31,13 +31,12 @@ keyring resolves. What is **not** implemented, and why:
   sealing under it refuses rather than silently binding the wrong subject. It
   needs `ReserveEntityIds`, local upsert pre-resolution, and the
   `expected_basis_t` retry loop described below.
-- **Surfaces**: per-principal `KeyPolicy` on the peer server,
-  `--seal-through`, SQL predicate *rewriting* (SQL gets the safe defaults
-  instead: `NULL` for an unhydrated value, and no pushdown on a protected
-  column), and the thin-client v3 contract document. **A key-holding peer
-  server currently discloses every class it holds to every client it serves**
-  — see the warning under [Peer server, thin clients,
-  SQL](#peer-server-thin-clients-sql) before deploying one.
+- **Surfaces**: `--seal-through`, SQL predicate *rewriting* (SQL gets the safe
+  defaults instead: `NULL` for an unhydrated value, and no pushdown on a
+  protected column), and the thin-client v3 contract document. The
+  per-principal `KeyPolicy` **is** implemented on the peer server and pgwire
+  ([ADR-0021](../adr/0021-contextual-read-authorization.md)): a key-holding
+  server hands each request only the classes policy grants it.
 - **Operations**: class rotation and shred commands, metrics, and audit
   events.
 
@@ -100,10 +99,12 @@ else, and layer 2 never has to care where the datom is eventually written.
 | Query-authorized insider (`Allow` from the authorizer) | plaintext | protected unless granted the key |
 | Network interception | TLS | TLS + sealed |
 
-The insider row holds as written for a peer — a process is granted a class key
-or it is not. It does **not** hold today for a client of a *hosted* peer
-server: there is no per-principal key policy yet, so such a client inherits
-every class the server holds. See [Peer server, thin clients,
+The insider row holds for a peer by construction — a process is granted a class
+key or it is not. For a client of a *hosted* peer server or pgwire server it
+holds by policy: the surface resolves a per-principal key set per request, so a
+client reads only the classes the policy grants it, even when the server holds
+more. That is enforcement by the process holding the plaintext rather than by
+mathematics; see [Peer server, thin clients,
 SQL](#peer-server-thin-clients-sql).
 
 Explicit non-goals. None of this hides:
@@ -820,25 +821,47 @@ raises — it never matches by accident.
 
 - **Peer server holding keys.** Hydrates per request. The key set for a request
   comes from a `KeyPolicy: Principal → [KeyId]`, which is where this meets
-  authorization: the ReBAC policy can name key ids the same way it names view
+  authorization: the ReBAC policy names key ids the same way it names view
   filters. Plaintext then travels to the thin client over TLS.
 
-  > **Not implemented — read this before giving a peer server class keys.**
-  > The `KeyPolicy` is deferred. A peer server today hydrates every request
-  > with its *own* keyring, whichever principal made it, and the
-  > authorization guard gates databases and operations rather than protection
-  > classes. So **"this peer server can resolve the PII class key" and "every
-  > client authorized to query this database reads PII" are the same
-  > statement** — through `Query`, `Pull`, and the raw `Datoms` stream alike.
-  >
-  > Until the `KeyPolicy` and `--seal-through` land, the deployment rule is:
-  > **give a peer server class keys only when every client it serves is
-  > entitled to every class it holds.** A peer server started with no keyring
-  > is the safe configuration for mixed or less-trusted clients — it answers
-  > every query that does not touch a protected value identically, and
-  > protected values come back redacted, hidden, or refused per class policy.
-  > An embedded peer (`LocalPeer`, the `corium-client` fluent API) is not
-  > affected: its keyring belongs to the one application process holding it.
+  A view carries the key ids it grants on `:authz.view/key`, and the filter
+  type is optional, so a view may restrict attributes, keys, or both:
+
+  ```clojure
+  ;; A key-only view: restricts no attribute, grants one class key.
+  {:authz.view/name "pii-reader" :authz.view/key ["kms:corium/pii"]}
+  {:authz.binding/relation "hr" :authz.binding/object "database:people"
+   :authz.binding/view "pii-reader"}
+  ```
+
+  Key grants combine across successful paths the same conservative way view
+  filters do — by intersection — so holding one more relation never widens a
+  key set. The serving process then hands the request the subset of *its own*
+  keyring those ids resolve to: policy can never grant a key the process does
+  not hold.
+
+  What a decision that names no key means is the surface's **key policy mode**:
+
+  | Mode | A decision naming no key id | Default when |
+  |---|---|---|
+  | `strict` | grants no class key | a `Guard` is configured |
+  | `server-wide` | grants the process's whole keyring | authorization is disabled |
+
+  Deriving the default from the guard is what keeps a single-tenant or
+  embedded deployment working exactly as before while making the multi-tenant
+  one safe by default. Note that `:authz.binding/unfiltered` grants full
+  *attribute* visibility and no keys: keys are named by key id, and that
+  binding names none — a relation that must read protected values names them.
+
+  > **This is authorization, not cryptography.** A peer server under `strict`
+  > still holds the plaintext; it is choosing not to disclose it. The
+  > cryptographic floor is a process that was never given the key, which is
+  > still the right configuration for a genuinely less-trusted peer server:
+  > it answers every query that does not touch a protected value identically,
+  > and protected values come back redacted, hidden, or refused per class
+  > policy. An embedded peer (`LocalPeer`, the `corium-client` fluent API) is
+  > not affected either way: its keyring belongs to the one application
+  > process holding it.
 - **Peer server in seal-through mode** (`--seal-through`). Returns sealed values
   and lets the thin client hydrate with its own keyring — end-to-end protection
   for languages using the thin protocol, at the cost of client-side key
@@ -847,10 +870,14 @@ raises — it never matches by accident.
   sealed value gets `FAILED_PRECONDITION` rather than bytes it cannot name.
 - **SQL / pgwire.** A protected column keeps its declared type and reports
   `NULL` when unhydrated. The planner refuses pushdown of any predicate over a
-  protected column, and rewrites `=` to a sealed-bytes comparison when the
-  session holds the key and the class is attribute-scoped. `corium sql` prints
-  `<redacted>`. Session key sets come from the same `KeyPolicy` as the peer
-  server.
+  protected column — otherwise a `WHERE` clause would answer the question the
+  `NULL` projection refuses — and will rewrite `=` to a sealed-bytes comparison
+  when the session holds the key and the class is attribute-scoped (not yet
+  implemented). `corium sql` prints `<redacted>`. Session key sets come from the
+  same `KeyPolicy` as the peer server, resolved per statement from the SQL
+  session's own principal: `PostgreSQL` has no bearer-token field, so the
+  password carries the caller's token (see
+  [ADR-0021](../adr/0021-contextual-read-authorization.md)).
 
 ### Class key rotation and crypto-shredding
 
@@ -1041,8 +1068,9 @@ altered.
    protect|unprotect|audit`, and the resumable, chunked sweep.
 6. **Entity scope.** `ReserveEntityIds`, local upsert pre-resolution, the
    `expected_basis_t` fence, and its retry loop.
-7. **Surfaces.** Peer server `KeyPolicy` and `--seal-through`, thin-client
-   protocol v3, SQL/pgwire redaction and pushdown rules, schema-TOML fields.
+7. **Surfaces.** Peer server and pgwire `KeyPolicy` (done), `--seal-through`,
+   thin-client protocol v3, SQL/pgwire redaction and pushdown rules,
+   schema-TOML fields.
 8. **Operations.** Rotation, shredding, metrics, audit events, and the
    operations-guide runbook.
 

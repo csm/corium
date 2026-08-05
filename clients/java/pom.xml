@@ -5,10 +5,11 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>dev.corium</groupId>
-  <artifactId>corium-client</artifactId>
+  <artifactId>corium-java</artifactId>
   <version>0.1.0-SNAPSHOT</version>
-  <name>Corium Java client</name>
-  <description>Asynchronous remote Java client for Corium</description>
+  <packaging>pom</packaging>
+  <name>Corium Java client parent</name>
+  <description>Aggregator for the Corium Java client and its storage plugins</description>
   <url>https://github.com/csm/corium</url>
 
   <licenses>
@@ -39,80 +40,106 @@
     <tag>HEAD</tag>
   </scm>
 
+  <modules>
+    <module>client</module>
+    <module>artifacts/turso</module>
+    <module>artifacts/postgres</module>
+    <module>artifacts/s3</module>
+  </modules>
+
   <properties>
     <maven.compiler.release>11</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <grpc.version>1.73.0</grpc.version>
     <protobuf.version>3.25.8</protobuf.version>
     <junit.version>5.13.1</junit.version>
+    <!-- Both default to the repository root, which is two levels above this
+         reactor's root pom. `dist` holds the per-platform native jars built by
+         scripts/build_native_jars.py, which the `native` profile attaches, and
+         `target/debug` is where tests look for a locally built engine and
+         storage plugins instead of those jars. -->
+    <corium.native.jars>${session.executionRootDirectory}/../../dist</corium.native.jars>
+    <corium.native.directory>${session.executionRootDirectory}/../../target/debug</corium.native.directory>
   </properties>
 
-  <dependencies>
-    <dependency>
-      <groupId>io.grpc</groupId>
-      <artifactId>grpc-netty-shaded</artifactId>
-      <version>${grpc.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.grpc</groupId>
-      <artifactId>grpc-protobuf</artifactId>
-      <version>${grpc.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>io.grpc</groupId>
-      <artifactId>grpc-stub</artifactId>
-      <version>${grpc.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>javax.annotation</groupId>
-      <artifactId>javax.annotation-api</artifactId>
-      <version>1.3.2</version>
-    </dependency>
-    <dependency>
-      <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter</artifactId>
-      <version>${junit.version}</version>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>dev.corium</groupId>
+        <artifactId>corium-client</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>${junit.version}</version>
+        <scope>test</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <build>
-    <extensions>
-      <extension>
-        <groupId>kr.motd.maven</groupId>
-        <artifactId>os-maven-plugin</artifactId>
-        <version>1.7.1</version>
-      </extension>
-    </extensions>
-    <plugins>
-      <plugin>
-        <groupId>org.xolstice.maven.plugins</groupId>
-        <artifactId>protobuf-maven-plugin</artifactId>
-        <version>0.6.1</version>
-        <configuration>
-          <protoSourceRoot>${project.basedir}/../../crates/corium-protocol/proto</protoSourceRoot>
-          <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
-          <pluginId>grpc-java</pluginId>
-          <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
-        </configuration>
-        <executions>
-          <execution>
-            <goals>
-              <goal>compile</goal>
-              <goal>compile-custom</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.3</version>
-        <configuration>
-          <useModulePath>false</useModulePath>
-        </configuration>
-      </plugin>
-    </plugins>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.5.3</version>
+          <configuration>
+            <useModulePath>false</useModulePath>
+            <systemPropertyVariables>
+              <corium.native.directory>${corium.native.directory}</corium.native.directory>
+            </systemPropertyVariables>
+          </configuration>
+        </plugin>
+        <!-- Modules that ship native libraries declare this plugin inside
+             their own `native` profile; the per-platform jars themselves are
+             assembled by scripts/build_native_jars.py. -->
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>build-helper-maven-plugin</artifactId>
+          <version>3.6.0</version>
+          <executions>
+            <execution>
+              <id>attach-native-jars</id>
+              <phase>package</phase>
+              <goals>
+                <goal>attach-artifact</goal>
+              </goals>
+              <configuration>
+                <artifacts>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-linux-x86_64.jar</file>
+                    <type>jar</type>
+                    <classifier>linux-x86_64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-linux-aarch64.jar</file>
+                    <type>jar</type>
+                    <classifier>linux-aarch64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-macos-x86_64.jar</file>
+                    <type>jar</type>
+                    <classifier>macos-x86_64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-macos-aarch64.jar</file>
+                    <type>jar</type>
+                    <classifier>macos-aarch64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-windows-x86_64.jar</file>
+                    <type>jar</type>
+                    <classifier>windows-x86_64</classifier>
+                  </artifact>
+                </artifacts>
+              </configuration>
+            </execution>
+          </executions>
+        </plugin>
+      </plugins>
+    </pluginManagement>
   </build>
 
   <profiles>

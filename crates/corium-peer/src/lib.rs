@@ -1128,6 +1128,24 @@ impl Admin {
         Ok(response.into_inner().index_basis_t)
     }
 
+    /// Applies a reviewed schema plan to `db`.
+    ///
+    /// The *desired schema* is submitted, not the plan: the transactor
+    /// recomputes the plan under its commit queue and refuses unless the
+    /// digest matches `plan_digest`, so a plan that has gone stale is
+    /// rejected rather than silently re-interpreted. See
+    /// `docs/design/schema-migrations.md`.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] when the plan is stale, a precondition or
+    /// acknowledgement is missing, or the transport fails.
+    pub async fn alter_schema(
+        &mut self,
+        request: pb::AlterSchemaRequest,
+    ) -> Result<pb::AlterSchemaResponse, PeerError> {
+        Ok(self.client.alter_schema(request).await?.into_inner())
+    }
+
     /// Overrides `db`'s index-publication pacing at runtime; `None` fields
     /// are left unchanged, so an all-`None` update reads the current
     /// policy. Returns the policy now in effect.

@@ -1,29 +1,32 @@
-# Optional direct-storage artifacts
+# Direct-storage plugin packages
 
-These are optional native extension distributions for the `corium` package:
+Corium publishes `corium-turso`, `corium-postgres`, and `corium-s3`. Each wheel
+contains one storage library and one Python path provider. The base `corium`
+wheel contains the engine and filesystem storage.
 
-| Distribution | Native feature |
-|---|---|
-| `corium` | filesystem only |
-| `corium-turso` | Turso |
-| `corium-postgres` | PostgreSQL |
-| `corium-s3` | S3 |
+Each provider uses the `corium.store_plugins` entry-point group. The Python
+loader calls the provider and loads the returned library path.
 
-Install the base `corium` distribution and any optional artifacts you need. Each
-artifact has its own extension-module name, depends on the common package, and
-contains the native full-peer core plus one driver. It does not overwrite the
-base extension, so installation and removal are safe. This keeps a
-remote-only/base installation free of every optional storage dependency.
-
-Build an artifact from its directory:
+Build the three storage libraries:
 
 ```shell
-maturin build
+cargo build --release \
+  -p corium-store-turso \
+  -p corium-store-postgres \
+  -p corium-store-s3
 ```
 
-The common package automatically selects an installed artifact that supports
-the storage advertised by the transactor. `corium.available_storage_backends()`
-reports the union of drivers available across installed artifacts. Tagged
-releases build and smoke-test each artifact on the
-same Linux, macOS, and Windows matrix as the common package before publishing
-through PyPI trusted publishing.
+Then build the wheels for the current platform:
+
+```shell
+python clients/python/scripts/build_plugin_wheels.py \
+  --target-directory target/release \
+  --platform-tag macosx_11_0_arm64 \
+  --output dist
+```
+
+Use the correct wheel platform tag for the build host. The release workflow
+builds all supported Linux, macOS, and Windows wheels. It applies the
+`manylinux_2_28` policy to Linux wheels.
+
+The loader rejects duplicate backend kinds and incompatible ABI layouts.

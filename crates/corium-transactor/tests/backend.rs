@@ -43,7 +43,7 @@ fn tx() -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mem_backend_runs_the_full_create_transact_read_path() {
     let mut config = NodeConfig::new(std::path::PathBuf::from("/nonexistent-mem-node"));
-    config.store = StoreSpec::Memory;
+    config.store = StoreSpec::memory();
     // A mem node touches no filesystem, so a bogus data_dir is harmless.
     let node = TransactorNode::open(config).await.expect("open mem node");
 
@@ -78,7 +78,7 @@ async fn mem_backend_runs_the_full_create_transact_read_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expected_basis_rejects_a_stale_transaction_before_commit() {
     let mut config = NodeConfig::new(std::path::PathBuf::from("/nonexistent-mem-node"));
-    config.store = StoreSpec::Memory;
+    config.store = StoreSpec::memory();
     let node = TransactorNode::open(config).await.expect("open mem node");
     assert!(
         node.create_db("mbrainz", &schema(), None)

@@ -1,5 +1,5 @@
-//! `corium schema update`: plan a declarative schema change, and (once schema
-//! transactions land) apply the exact plan that was reviewed.
+//! `corium schema update`: plan a declarative schema change, and apply the
+//! exact plan that was reviewed.
 //!
 //! The command is plan-first by design. Reading a schema file is not
 //! permission to remove data, collapse cardinality, or reinterpret values:
@@ -80,17 +80,13 @@ const ERROR_PLAN_MISMATCH: &str = "plan-mismatch";
 const ERROR_ALLOW_REQUIRED: &str = "allow-required";
 const ERROR_ACK_REQUIRED: &str = "ack-required";
 const ERROR_BLOCKED_CHANGE: &str = "blocked-change";
-const ERROR_APPLY_UNSUPPORTED: &str = "apply-unsupported";
+const ERROR_APPLY: &str = "apply-failed";
 
-/// Why `--apply` cannot run yet.
-///
-/// Schema is not basis-versioned data in this build: attribute metadata is
-/// fixed when a database is created, so there is no atomic, durable,
-/// peer-visible operation that changes it. Planning is exact and useful
-/// without that; applying would not be.
-const APPLY_UNSUPPORTED: &str = "applying a schema plan requires transactional schema changes, \
-     which this build does not have: attribute metadata is fixed at database creation. Plan \
-     output is complete and safe to review; re-run without --apply.";
+/// The tool identity recorded in every applied schema transaction's audit
+/// trail, alongside the requester the transactor takes from the connection.
+fn tool_version() -> String {
+    format!("corium-cli/{}", env!("CARGO_PKG_VERSION"))
+}
 
 /// A failure carrying the stable code its JSON rendering reports.
 #[derive(Debug)]
@@ -158,13 +154,42 @@ async fn run_update(args: UpdateArgs) -> Result<ExitCode, CommandError> {
 
     if args.apply {
         // Every precondition this side can check is checked first, so an
-        // operator learns about a stale plan or a missing acknowledgement even
-        // while the operation itself is unavailable.
+        // operator learns about a stale plan or a missing acknowledgement
+        // without a round trip. The transactor re-checks all of them under its
+        // commit queue regardless: these checks are for the operator, not for
+        // safety.
         check_apply(&plan, args.plan.as_deref(), &allowed, &acknowledged)?;
-        return Err(CommandError::new(
-            ERROR_APPLY_UNSUPPORTED,
-            APPLY_UNSUPPORTED,
-        ));
+        let mut admin = corium_peer::Admin::connect(
+            &args.client.primary(),
+            args.client.token(),
+            args.client
+                .tls()
+                .map_err(|error| CommandError::new(ERROR_CONNECT, error))?,
+        )
+        .await
+        .map_err(|error| CommandError::new(ERROR_CONNECT, error.to_string()))?;
+        let applied = admin
+            .alter_schema(corium_protocol::pb::AlterSchemaRequest {
+                db: args.db.clone(),
+                desired_schema: corium_protocol::codec::encode_edn(
+                    &corium_query::edn::Edn::Vector(desired.to_edn()),
+                ),
+                plan_digest: plan.digest(),
+                installed_fingerprint: plan.installed_fingerprint.clone(),
+                observed_basis_t: plan.basis_t,
+                prune: args.prune,
+                allow: args.allow.clone(),
+                ack: args.ack.clone(),
+                tool: tool_version(),
+            })
+            .await
+            .map_err(|error| CommandError::new(ERROR_APPLY, error.to_string()))?;
+        if args.json {
+            println!("{}", render_applied_json(&plan, &applied));
+        } else {
+            print!("{}", render_applied_human(&plan, &applied));
+        }
+        return Ok(ExitCode::SUCCESS);
     }
 
     if args.json {
@@ -190,6 +215,14 @@ fn check_apply(
     allowed: &BTreeSet<ExecutionClass>,
     acknowledged: &BTreeSet<AckCode>,
 ) -> Result<(), CommandError> {
+    // An empty plan writes nothing, so there is nothing for a digest to
+    // protect. Insisting on the digest here would make the command fail the
+    // second time it ran — installing a schema change *is* what invalidates
+    // the digest that installed it — and re-running must be a no-op, not an
+    // error, for the command to be usable in a pipeline.
+    if !plan.has_changes() {
+        return Ok(());
+    }
     let digest = plan.digest();
     match requested_digest {
         Some(requested) if requested == digest => {}
@@ -413,7 +446,6 @@ pub(crate) fn render_human(plan: &SchemaPlan) -> String {
                 }
             );
         }
-        let _ = writeln!(out, "Note: {APPLY_UNSUPPORTED}");
     } else {
         let _ = writeln!(out, "No changes. Nothing was written.");
     }
@@ -509,10 +541,67 @@ pub(crate) fn render_json(plan: &SchemaPlan) -> String {
         plan.required_acks().iter().map(|ack| ack.as_str()),
     );
 
-    out.push_str(",\"apply\":{\"supported\":false");
-    push_string_field(&mut out, "reason", APPLY_UNSUPPORTED);
+    out.push_str(",\"apply\":{\"supported\":true}");
     out.push('}');
-    out.push('}');
+    out
+}
+
+/// Renders the outcome of an apply as the human report.
+#[must_use]
+pub(crate) fn render_applied_human(
+    plan: &SchemaPlan,
+    applied: &corium_protocol::pb::AlterSchemaResponse,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if applied.changed {
+        let _ = writeln!(
+            out,
+            "Applied {} change(s) to {} at basis {} (schema-generation {}).",
+            applied.steps, plan.database, applied.basis_t, applied.schema_generation
+        );
+        for ident in &applied.installed_idents {
+            let _ = writeln!(out, "  + {ident}");
+        }
+    } else {
+        // Re-applying a plan whose changes are already installed is a no-op,
+        // not a failure: that is what makes the command safe to re-run.
+        let _ = writeln!(
+            out,
+            "No changes: {} already matches this schema at basis {} \
+             (schema-generation {}).",
+            plan.database, applied.basis_t, applied.schema_generation
+        );
+    }
+    out
+}
+
+/// Renders the outcome of an apply as the versioned JSON contract.
+#[must_use]
+pub(crate) fn render_applied_json(
+    plan: &SchemaPlan,
+    applied: &corium_protocol::pb::AlterSchemaResponse,
+) -> String {
+    let mut out = String::new();
+    out.push_str("{\"version\":");
+    out.push_str(&PLAN_FORMAT_VERSION.to_string());
+    push_string_field(&mut out, "database", &plan.database);
+    push_string_field(&mut out, "plan_digest", &plan.digest());
+    out.push_str(",\"applied\":{\"changed\":");
+    out.push_str(if applied.changed { "true" } else { "false" });
+    out.push_str(",\"basis_t\":");
+    out.push_str(&applied.basis_t.to_string());
+    out.push_str(",\"schema_generation\":");
+    out.push_str(&applied.schema_generation.to_string());
+    out.push_str(",\"steps\":");
+    out.push_str(&applied.steps.to_string());
+    out.push_str(",\"installed\":");
+    push_string_array(
+        &mut out,
+        applied.installed_idents.iter().map(String::as_str),
+    );
+    out.push_str("}}");
     out
 }
 
@@ -779,7 +868,7 @@ mod tests {
         assert!(json.contains("\"unmanaged\":[\":legacy/import-id\"]"));
         assert!(json.contains("\"required_allowances\":[\"validate-reindex\"]"));
         assert!(json.contains("\"required_acks\":[\"component-enable\"]"));
-        assert!(json.contains("\"apply\":{\"supported\":false"));
+        assert!(json.contains("\"apply\":{\"supported\":true}"));
     }
 
     #[test]
@@ -858,9 +947,48 @@ mod tests {
             check_apply(&plan, Some(&plan.digest()), &allowed, &acknowledged).is_ok(),
             "a fully authorized plan passes its local preconditions"
         );
-        // The operation itself is still unavailable in this build; the plan
-        // and the JSON contract both say so with a stable code.
-        assert!(APPLY_UNSUPPORTED.contains("transactional schema changes"));
+    }
+
+    #[test]
+    fn an_applied_plan_reports_what_it_installed() {
+        let plan = sample_plan();
+        let applied = corium_protocol::pb::AlterSchemaResponse {
+            basis_t: 419,
+            schema_generation: 4,
+            changed: true,
+            installed_idents: vec![":person/email".to_owned()],
+            steps: 2,
+        };
+        let human = render_applied_human(&plan, &applied);
+        assert!(
+            human.contains("Applied 2 change(s) to people at basis 419 (schema-generation 4)"),
+            "{human}"
+        );
+        assert!(human.contains("  + :person/email"), "{human}");
+
+        let json = render_applied_json(&plan, &applied);
+        assert!(json.contains("\"changed\":true"), "{json}");
+        assert!(json.contains("\"basis_t\":419"), "{json}");
+        assert!(json.contains("\"schema_generation\":4"), "{json}");
+        assert!(json.contains("\"installed\":[\":person/email\"]"), "{json}");
+    }
+
+    #[test]
+    fn re_applying_an_installed_schema_reports_no_change() {
+        let plan = sample_plan();
+        let applied = corium_protocol::pb::AlterSchemaResponse {
+            basis_t: 419,
+            schema_generation: 4,
+            changed: false,
+            installed_idents: Vec::new(),
+            steps: 0,
+        };
+        // Idempotence is the point: re-running the command in a pipeline must
+        // not read as a failure.
+        assert!(
+            render_applied_human(&plan, &applied).contains("No changes: people already matches"),
+        );
+        assert!(render_applied_json(&plan, &applied).contains("\"changed\":false"));
     }
 
     #[test]

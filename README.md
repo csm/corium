@@ -84,6 +84,7 @@ processes. Each crate has its own README.
 | [`corium-peer`](crates/corium-peer/README.md) | Peer library: connection, tx-report handling, segment cache, peer server |
 | [`corium-client`](crates/corium-client/README.md) | Fluent async Datomic-style API over the peer library and peer-server gRPC; typesafe Datalog/Pull builders |
 | [`corium-ffi`](crates/corium-ffi/README.md) | Owned, runtime-neutral facade for native language bindings |
+| [`corium-jni`](crates/corium-jni/README.md) | JNI adapter that runs an in-process peer for the Java client |
 | [`corium-cljrs`](crates/corium-cljrs/README.md) | Clojurust bindings: value conversion, `corium.api`, `:db/fn` sandbox host |
 | [`corium-cli`](crates/corium-cli/README.md) | `corium` binary: launchers, admin commands, console, TUI, SQL shell |
 | [`corium-sim`](crates/corium-sim/README.md) | Deterministic simulation harness for fault-injection tests (not published) |

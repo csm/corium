@@ -23,11 +23,22 @@ pub fn to_status(error: &NodeError) -> Status {
         | NodeError::BadRequest(_)
         | NodeError::Codec(_)
         | NodeError::TxForm(_)
+        // A desired schema that cannot be planned at all is a bad request in
+        // the same sense a malformed schema form is.
+        | NodeError::SchemaUpdate(_)
         | NodeError::SchemaForm(_) => Status::invalid_argument(error.to_string()),
-        NodeError::BasisMismatch { .. } => Status::aborted(error.to_string()),
+        // A plan the database has moved past is retryable after a replan, so
+        // it aborts rather than failing outright — as a stale basis does.
+        NodeError::BasisMismatch { .. } | NodeError::StalePlan { .. } => {
+            Status::aborted(error.to_string())
+        }
         NodeError::Deposed(_)
         | NodeError::Standby { .. }
         | NodeError::UnsupportedFormat { .. }
+        // A plan whose precondition or authority is missing describes the
+        // database's state, not a malformed request: the caller resolves the
+        // violation or supplies the flag it was told to.
+        | NodeError::BlockedPlan(_)
         // A missing or unresolvable key is an operator misconfiguration, not
         // a transient fault: the caller must fix the deployment, not retry.
         | NodeError::Keys(_)
@@ -146,17 +157,61 @@ pub(crate) fn subscription_stream(
 pub struct TransactorSvc(pub Arc<TransactorNode>, pub Guard);
 
 /// Authorizes `access` for the request's [`Principal`], mapping the guard's
-/// decision onto a gRPC status. A returned [`ViewFilter`](authz::ViewFilter) is
-/// rejected for now: no transactor/catalog surface applies one yet, so honoring
-/// a filtered decision by returning full data would be an authorization bypass.
+/// decision onto a gRPC status.
+///
+/// A decision carrying an attribute [`ViewFilter`](authz::ViewFilter) is
+/// rejected: no transactor or catalog surface applies one, so honouring it by
+/// returning full data would be an authorization bypass.
+///
+/// A decision that only restricts *keys* is honoured by doing nothing, which
+/// is correct rather than lenient: the transactor holds no class key, so every
+/// protected value it accepts, logs, indexes, and hands back is already sealed.
+/// There is nothing here for a key policy to withhold.
 async fn authorize(guard: &Guard, principal: &Principal, access: Access) -> Result<(), Status> {
     match guard.authorize(principal, &access).await {
         Ok(None) => Ok(()),
-        Ok(Some(_filter)) => Err(Status::unimplemented(
+        Ok(Some(grant)) if grant.view.is_none() => Ok(()),
+        Ok(Some(_)) => Err(Status::unimplemented(
             "view filtering is not enforced on this surface yet",
         )),
         Err(error) => Err(error.to_status()),
     }
+}
+
+/// Authorizes a write against `database`, refusing a principal whose view
+/// actually hides one of its attributes.
+///
+/// Holding a view is not the test — one that hides nothing restricts nothing —
+/// and asking the same question the peer server and SQL ask is what keeps one
+/// principal under one policy from getting three different answers. The schema
+/// is resolved only for a principal the policy already allowed *and* handed a
+/// view, so a denied caller never causes a database to be opened.
+async fn authorize_write(
+    node: &TransactorNode,
+    guard: &Guard,
+    principal: &Principal,
+    database: &str,
+) -> Result<(), Status> {
+    let access = Access::on(Action::Transact, database);
+    let grant = match guard.authorize(principal, &access).await {
+        Ok(None) => return Ok(()),
+        Ok(Some(grant)) => grant,
+        Err(error) => return Err(error.to_status()),
+    };
+    if grant.view.is_none() {
+        return Ok(());
+    }
+    let state = node
+        .db_state(database)
+        .await
+        .map_err(|error| to_status(&error))?;
+    let db = state.db();
+    if grant.hides_attributes(db.schema(), db.idents()) {
+        return Err(Status::unimplemented(
+            "view filtering is not enforced on this surface yet",
+        ));
+    }
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -168,12 +223,7 @@ impl Transactor for TransactorSvc {
         let principal = authz::principal(&request);
         let request = request.into_inner();
         check_version(request.protocol_version)?;
-        authorize(
-            &self.1,
-            &principal,
-            Access::on(Action::Transact, &request.db),
-        )
-        .await?;
+        authorize_write(&self.0, &self.1, &principal, &request.db).await?;
         self.0
             .transact_at(&request.db, &request.tx_data, request.expected_basis_t)
             .await
@@ -529,6 +579,31 @@ impl Catalog for CatalogSvc {
             .await
             .map_err(|error| to_status(&error))?;
         Ok(Response::new(pb::RewrapKeysResponse {}))
+    }
+
+    async fn alter_schema(
+        &self,
+        request: Request<pb::AlterSchemaRequest>,
+    ) -> Result<Response<pb::AlterSchemaResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        // `AlterSchema`, not `Transact`: a writer that may add facts must not
+        // be able to broaden the vocabulary it writes them under.
+        authorize(
+            &self.1,
+            &principal,
+            Access::on(Action::AlterSchema, &request.db),
+        )
+        .await?;
+        // The requester recorded in the audit trail is the authenticated
+        // identity, never a field the caller supplies.
+        let requester = format!("{}:{}", principal.provider, principal.subject);
+        let response = self
+            .0
+            .alter_schema(&request, &requester)
+            .await
+            .map_err(|error| to_status(&error))?;
+        Ok(Response::new(response))
     }
 }
 

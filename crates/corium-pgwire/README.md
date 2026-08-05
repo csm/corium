@@ -38,14 +38,17 @@ one.
   semicolon-separated statements.
 - The **extended** query sub-protocol (`Parse`/`Bind`/`Describe`/`Execute`/
   `Sync`/`Close`/`Flush`) with typed bound input parameters.
-- Results use the **text** wire format. Common scalar input parameters accept
-  text or binary format; array and text-timestamp inputs and binary results
-  remain unsupported.
-- `INSERT`, `UPDATE`, and `DELETE` over existing namespace projections,
-  including `RETURNING`, execute as guarded autocommit statements. Concurrent
-  basis changes are reported as serialization failures.
-- Explicit transaction blocks track PostgreSQL's transaction status and allow
-  reads, but reject writes until atomic multi-statement transactions exist.
+- Common scalar input parameters and results support PostgreSQL text or binary
+  format. Array inputs remain unsupported.
+- `INSERT`, `UPDATE`, and `DELETE` over existing namespace projections support
+  `RETURNING` in autocommit or explicit transactions. Concurrent basis changes
+  are reported as serialization failures.
+- Explicit transactions pin their first snapshot, expose staged writes to
+  later statements, discard them on `ROLLBACK`, and submit one atomic Corium
+  transaction on `COMMIT`.
+- PgJDBC metadata probes for SQL keywords, current schema/catalog, and
+  transaction isolation are supported so Hibernate can select its PostgreSQL
+  dialect automatically.
 - `SET`, `RESET`, and `DISCARD` are accepted as compatibility no-ops.
 - `USE <database>` switches the active database and `SHOW DATABASES` lists the
   catalog.
@@ -74,8 +77,8 @@ support both text and binary formats; array parameters remain unsupported.
 
 ## Dependencies
 
-- `corium-sql`, `corium-db`, `corium-core` — the database and its SQL
-  projection.
+- `corium-sql`, `corium-db`, `corium-core`, `corium-forms`, `corium-tx` — the
+  database, SQL projection, and provisional transaction preparation.
 - `tokio` — the async TCP server and framing I/O.
 - `async-trait` — the `DbCatalog` trait; `thiserror`, `tracing`.
 

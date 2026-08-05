@@ -4,11 +4,13 @@
 //! converts owned boundary values, adapts facade futures to `asyncio`, and
 //! exposes opaque backend objects consumed by that Python layer.
 
+use std::path::PathBuf;
+
 use corium_core::TotalF64;
 use corium_ffi::{
     ClientTlsOptions, CompositeValue, DbHandle, DirectStorageOptions, ErrorKind, FfiError, Index,
     LocalConnectOptions, PeerHandle, RemoteConnectOptions, SegmentCacheOptions,
-    compiled_storage_backends, discover_storage_backend,
+    available_storage_backends, discover_storage_backend, load_storage_plugin,
 };
 use corium_protocol::codec;
 use corium_query::edn::Edn;
@@ -20,13 +22,6 @@ use pyo3::types::{
 };
 
 const RESERVED_TAGS: [&str; 4] = ["bytes", "eid", "inst", "uuid"];
-
-#[cfg(any(
-    all(feature = "artifact-turso", any(feature = "postgres", feature = "s3")),
-    all(feature = "artifact-postgres", any(feature = "turso", feature = "s3")),
-    all(feature = "artifact-s3", any(feature = "turso", feature = "postgres")),
-))]
-compile_error!("a corium-python artifact must enable exactly one storage backend");
 
 struct PythonRuntime {
     keyword: Py<PyAny>,
@@ -342,8 +337,13 @@ fn connect_local(
 }
 
 #[pyfunction]
-fn _storage_backends() -> Vec<&'static str> {
-    compiled_storage_backends()
+fn _storage_backends() -> Vec<String> {
+    available_storage_backends()
+}
+
+#[pyfunction]
+fn _load_storage_plugin(path: PathBuf) -> PyResult<Vec<String>> {
+    load_storage_plugin(path).map_err(ffi_error)
 }
 
 #[pyfunction]
@@ -688,37 +688,15 @@ fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(connect_local, module)?)?;
     module.add_function(wrap_pyfunction!(_roundtrip, module)?)?;
     module.add_function(wrap_pyfunction!(_storage_backends, module)?)?;
+    module.add_function(wrap_pyfunction!(_load_storage_plugin, module)?)?;
     module.add_function(wrap_pyfunction!(_discover_storage_backend, module)?)?;
     module.add_class::<PythonPeer>()?;
     module.add_class::<PythonDb>()?;
     Ok(())
 }
 
-#[cfg(not(any(
-    feature = "artifact-turso",
-    feature = "artifact-postgres",
-    feature = "artifact-s3"
-)))]
 #[pymodule]
 fn _corium(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    register_module(module)
-}
-
-#[cfg(feature = "artifact-turso")]
-#[pymodule]
-fn _corium_turso(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    register_module(module)
-}
-
-#[cfg(feature = "artifact-postgres")]
-#[pymodule]
-fn _corium_postgres(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    register_module(module)
-}
-
-#[cfg(feature = "artifact-s3")]
-#[pymodule]
-fn _corium_s3(module: &Bound<'_, PyModule>) -> PyResult<()> {
     register_module(module)
 }
 

@@ -1,0 +1,19 @@
+[package]
+name = "corium-store-plugin"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "Dynamic storage plugin loader for Corium"
+
+[dependencies]
+abi_stable = "0.11.3"
+async-ffi = { version = "0.5.1", features = ["abi_stable"] }
+async-trait = "0.1"
+corium-store = { workspace = true }
+corium-store-abi = { workspace = true }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "sync"] }
+tokio-stream = "0.1.18"
+thiserror = "2"
+tracing = "0.1"

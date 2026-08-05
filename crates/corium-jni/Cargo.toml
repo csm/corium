@@ -1,0 +1,29 @@
+[package]
+name = "corium-jni"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+description = "JNI adapter for the Corium Java client"
+publish = false
+
+[features]
+default = []
+postgres = ["corium-ffi/postgres"]
+turso = ["corium-ffi/turso"]
+s3 = ["corium-ffi/s3"]
+all-storage = ["postgres", "turso", "s3"]
+
+[lib]
+name = "corium_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+corium-ffi = { workspace = true }
+jni = "0.22.4"
+tokio = { version = "1.53.0", features = ["rt-multi-thread"] }
+
+# This crate implements JNI entry points, so it opts out of the workspace's
+# `unsafe_code = "forbid"` lint alongside `corium-store-abi` and
+# `corium-store-plugin`.

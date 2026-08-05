@@ -16,14 +16,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "s3")]
-use aws_credential_types::{
-    Credentials,
-    provider::{
-        ProvideCredentials, SharedCredentialsProvider, error::CredentialsError,
-        future::ProvideCredentials as ProvideCredentialsFuture,
-    },
-};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
@@ -35,14 +27,14 @@ use corium_peer::{
 };
 use corium_protocol::auth::{DEFAULT_DEV_TOKEN, client_tls, server_tls};
 use corium_protocol::authz::{
-    ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, Principal,
-    StaticTokens,
+    ActionClass, AllowAll, Authorizer, CompositeProvider, Guard, IdentityProvider, KeyPolicyMode,
+    Principal, StaticTokens,
 };
 use corium_protocol::codec;
 use corium_query::edn::{Edn, read_all};
+use corium_store::{DbRoot, DiscoveredStoreSpec, FsStore, RootStore, StorageConfig};
 #[cfg(feature = "s3")]
-use corium_store::S3ClientConfig;
-use corium_store::{DbRoot, DiscoveredStoreSpec, FsStore, RootStore};
+use corium_store_s3::S3ClientConfig;
 use corium_transactor::node::{NodeConfig, TransactorNode};
 #[cfg(feature = "s3")]
 use corium_transactor::{S3ReadOnlyConfig, S3ReadOnlyCredentials};
@@ -99,14 +91,14 @@ enum StoreKind {
     /// Filesystem under `--data-dir` (blobs, roots, and logs).
     #[default]
     Fs,
-    /// `PostgreSQL` for blobs and roots; the log stays on the local filesystem
-    /// under `--data-dir`. Requires the `postgres` feature.
+    /// `PostgreSQL` for blobs, roots, and transaction logs. Requires the
+    /// `postgres` feature.
     Postgres,
-    /// Turso (embeddable `SQLite`) for blobs and roots; the log stays on the
-    /// local filesystem under `--data-dir`. Requires the `turso` feature.
+    /// Turso (embeddable `SQLite`) for blobs, roots, and transaction logs.
+    /// Requires the `turso` feature.
     Turso,
-    /// S3 (or an S3-compatible service) for blobs and roots; the log stays on
-    /// the local filesystem under `--data-dir`. Requires the `s3` feature.
+    /// S3 (or an S3-compatible service) for blobs, roots, and transaction
+    /// logs. Requires the `s3` feature.
     /// Credentials, region, and endpoint come from the standard AWS
     /// environment (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, `AWS_ENDPOINT_URL`,
     /// etc.).
@@ -204,30 +196,9 @@ impl ClientFlags {
         let storage = info
             .storage
             .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
+        corium_transactor::register_static_storage_backends();
         let spec = DiscoveredStoreSpec::from_connection(storage)
             .map_err(|error| format!("cannot use transactor storage backend: {error}"))?;
-        #[cfg(feature = "s3")]
-        let mut spec = spec;
-        #[cfg(feature = "s3")]
-        if let DiscoveredStoreSpec::S3 {
-            bucket,
-            prefix,
-            client,
-        } = &mut spec
-        {
-            let initial = sdk_credentials(client)?;
-            client.credentials_provider = Some(SharedCredentialsProvider::new(
-                StorageInfoCredentialsProvider {
-                    client: self.clone(),
-                    db: db.clone(),
-                    bucket: bucket.clone(),
-                    prefix: prefix.clone(),
-                    region: client.region.clone(),
-                    endpoint_url: client.endpoint_url.clone(),
-                    initial: std::sync::Mutex::new(Some(initial)),
-                },
-            ));
-        }
         let store = spec
             .open_existing()
             .await
@@ -241,112 +212,6 @@ impl ClientFlags {
             Ok(config.with_storage(storage))
         }
     }
-}
-
-#[cfg(feature = "s3")]
-struct StorageInfoCredentialsProvider {
-    client: ClientFlags,
-    db: String,
-    bucket: String,
-    prefix: String,
-    region: Option<String>,
-    endpoint_url: Option<String>,
-    initial: std::sync::Mutex<Option<Credentials>>,
-}
-
-#[cfg(feature = "s3")]
-impl std::fmt::Debug for StorageInfoCredentialsProvider {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StorageInfoCredentialsProvider")
-            .field("transactor", &self.client.primary())
-            .field("db", &self.db)
-            .field("bucket", &self.bucket)
-            .field("prefix", &self.prefix)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "s3")]
-impl ProvideCredentials for StorageInfoCredentialsProvider {
-    fn provide_credentials<'a>(&'a self) -> ProvideCredentialsFuture<'a>
-    where
-        Self: 'a,
-    {
-        if let Some(credentials) = self
-            .initial
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            return ProvideCredentialsFuture::ready(Ok(credentials));
-        }
-        ProvideCredentialsFuture::new(async move {
-            self.fetch()
-                .await
-                .map_err(|error| CredentialsError::provider_error(std::io::Error::other(error)))
-        })
-    }
-}
-
-#[cfg(feature = "s3")]
-impl StorageInfoCredentialsProvider {
-    async fn fetch(&self) -> Result<Credentials, String> {
-        let mut admin = Admin::connect(
-            &self.client.primary(),
-            self.client.token(),
-            self.client.tls()?,
-        )
-        .await
-        .map_err(|error| format!("cannot connect to transactor: {error}"))?;
-        let storage = admin
-            .get_storage_info(&self.db)
-            .await
-            .map_err(|error| format!("cannot refresh storage info: {error}"))?
-            .storage
-            .ok_or_else(|| "transactor returned no storage backend".to_owned())?;
-        let spec = DiscoveredStoreSpec::from_connection(storage)
-            .map_err(|error| format!("cannot use refreshed storage info: {error}"))?;
-        let DiscoveredStoreSpec::S3 {
-            bucket,
-            prefix,
-            client,
-        } = spec
-        else {
-            return Err(
-                "transactor storage backend changed while refreshing S3 credentials".into(),
-            );
-        };
-        if bucket != self.bucket
-            || prefix != self.prefix
-            || client.region != self.region
-            || client.endpoint_url != self.endpoint_url
-        {
-            return Err(
-                "transactor S3 storage identity changed while refreshing credentials".into(),
-            );
-        }
-        sdk_credentials(&client)
-    }
-}
-
-#[cfg(feature = "s3")]
-fn sdk_credentials(config: &S3ClientConfig) -> Result<Credentials, String> {
-    let access_key_id = config
-        .access_key_id
-        .as_deref()
-        .ok_or_else(|| "S3 storage info omitted the access key id".to_owned())?;
-    let secret_access_key = config
-        .secret_access_key
-        .as_deref()
-        .ok_or_else(|| "S3 storage info omitted the secret access key".to_owned())?;
-    Ok(Credentials::new(
-        access_key_id,
-        secret_access_key,
-        config.session_token.clone(),
-        config.expires_after,
-        "corium-storage-info-refresh",
-    ))
 }
 
 /// Keys a process can resolve, for databases encrypted at rest.
@@ -440,6 +305,15 @@ struct ServeFlags {
     /// Maximum relation hops one authorization check may walk.
     #[arg(long, default_value_t = 8, requires = "authz_db")]
     authz_max_depth: usize,
+    /// Which protection class keys a caller may hydrate with. `strict` grants
+    /// only the key ids the authorization policy names on `:authz.view/key`;
+    /// `server-wide` grants this process's whole keyring to every authorized
+    /// caller. Defaults to `strict` once authentication is configured, and to
+    /// `server-wide` when it is not — so a single-tenant server is unchanged
+    /// and a server told who its callers are does not hand all of them every
+    /// key it holds.
+    #[arg(long, value_enum)]
+    key_policy: Option<KeyPolicyFlag>,
     /// PEM certificate chain for TLS.
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -448,7 +322,35 @@ struct ServeFlags {
     tls_key: Option<PathBuf>,
 }
 
+/// `--key-policy` on a serving command.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum KeyPolicyFlag {
+    /// Hydrate only the classes the policy grants this principal.
+    Strict,
+    /// Hydrate every class this process holds, for every authorized caller.
+    ServerWide,
+}
+
+impl From<KeyPolicyFlag> for KeyPolicyMode {
+    fn from(flag: KeyPolicyFlag) -> Self {
+        match flag {
+            KeyPolicyFlag::Strict => Self::Strict,
+            KeyPolicyFlag::ServerWide => Self::ServerWide,
+        }
+    }
+}
+
 impl ServeFlags {
+    /// Whether TLS material was supplied.
+    fn has_tls(&self) -> bool {
+        self.tls_cert.is_some() || self.tls_key.is_some()
+    }
+
+    /// The chosen key policy, or `None` to derive it from the guard.
+    fn key_policy(&self) -> Option<KeyPolicyMode> {
+        self.key_policy.map(KeyPolicyMode::from)
+    }
+
     fn tls(&self) -> Result<Option<tonic::transport::ServerTlsConfig>, String> {
         match (&self.tls_cert, &self.tls_key) {
             (Some(cert), Some(key)) => server_tls(cert, key)
@@ -577,15 +479,31 @@ impl ServeFlags {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
+    /// Inspect and verify runtime storage backends.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
     /// Run a transactor process over a data directory.
     Transactor {
         /// EDN configuration file for storage and read-only discovery
         /// credentials. Explicit CLI flags override file values.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Dynamic storage plugin library to load (repeatable).
+        #[arg(long = "store-plugin")]
+        store_plugins: Vec<PathBuf>,
+        /// Plugin store as `kind:{json configuration}` (compatibility alias
+        /// for the same form accepted by `--store`).
+        #[arg(long, conflicts_with = "store")]
+        plugin_store: Option<String>,
+        /// Separately provisioned read-only JSON configuration returned by
+        /// `GetStorageInfo` for a plugin backend.
+        #[arg(long, env = "CORIUM_PLUGIN_READ_ONLY_CONFIG")]
+        plugin_read_only_config: Option<String>,
         /// Storage-service backend for blobs and roots.
-        #[arg(long, value_enum)]
-        store: Option<StoreKind>,
+        #[arg(long)]
+        store: Option<String>,
         /// Turso database path for `--store turso` (defaults to
         /// `{data_dir}/store.db`).
         #[arg(long)]
@@ -746,14 +664,21 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:5432")]
         listen: SocketAddr,
         /// Require this cleartext password from clients (trust when omitted).
+        /// Ignored once authentication is configured: the password field then
+        /// carries each client's own bearer token, which is what makes a SQL
+        /// client a Corium principal.
         #[arg(long)]
         password: Option<String>,
-        /// Enable guarded autocommit INSERT, UPDATE, and DELETE. Without this
-        /// flag the server remains read-only.
+        /// Enable guarded INSERT, UPDATE, and DELETE in autocommit or explicit
+        /// transactions. Without this flag the server remains read-only.
         #[arg(long)]
         allow_writes: bool,
         #[command(flatten)]
+        keys: KeyFlags,
+        #[command(flatten)]
         client: ClientFlags,
+        #[command(flatten)]
+        serve: ServeFlags,
     },
     /// Database catalog operations.
     #[command(subcommand)]
@@ -872,6 +797,21 @@ enum Command {
         to: u64,
         #[command(flatten)]
         keys: KeyFlags,
+    },
+}
+
+/// Runtime storage-backend administration.
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// Run the blob/root conformance suite against a live backend.
+    Verify {
+        /// Registered backend kind.
+        kind: String,
+        /// Backend-owned JSON configuration object.
+        config: String,
+        /// Dynamic storage plugin library to load first (repeatable).
+        #[arg(long = "store-plugin")]
+        store_plugins: Vec<PathBuf>,
     },
 }
 
@@ -1035,8 +975,38 @@ async fn run_command(command: Command) -> Result<(), String> {
     match command {
         // Dispatched by `run`, which needs its exit code.
         Command::Schema(_) => unreachable!("schema commands are dispatched before this point"),
+        Command::Store {
+            command:
+                StoreCommand::Verify {
+                    kind,
+                    config,
+                    store_plugins,
+                },
+        } => {
+            for path in requested_storage_plugin_paths(store_plugins) {
+                corium_store_plugin::load_storage_plugin(&path)
+                    .map_err(|error| error.to_string())?;
+            }
+            corium_transactor::register_static_storage_backends();
+            let config = StorageConfig::from_json(&config)
+                .map_err(|error| format!("invalid storage configuration: {error}"))?;
+            let backend = corium_store::storage_backend(&kind)
+                .ok_or_else(|| format!("storage backend {kind:?} is not available"))?;
+            let store = backend
+                .open(&config)
+                .await
+                .map_err(|error| error.to_string())?;
+            let report = corium_store_testkit::verify(store)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("storage backend {kind:?} passed {} checks", report.checks);
+            Ok(())
+        }
         Command::Transactor {
             config: config_file,
+            store_plugins,
+            plugin_store,
+            plugin_read_only_config,
             store,
             turso_path,
             postgres_url,
@@ -1072,14 +1042,31 @@ async fn run_command(command: Command) -> Result<(), String> {
             keys,
             serve,
         } => {
+            for path in requested_storage_plugin_paths(store_plugins) {
+                let loaded = corium_store_plugin::load_storage_plugin(&path)
+                    .map_err(|error| error.to_string())?;
+                tracing::info!(path = %path.display(), backends = ?loaded.backends, version = %loaded.version, "loaded storage plugin");
+            }
             let file = TransactorFileConfig::load(config_file.as_deref())?;
-            let store = store.or(file.store).unwrap_or_default();
+            let inline_store = store
+                .as_deref()
+                .filter(|value| value.contains(':'))
+                .map(plugin_store_spec)
+                .transpose()?;
+            let store = store
+                .as_deref()
+                .filter(|value| !value.contains(':'))
+                .map(parse_store_kind)
+                .transpose()?
+                .or(file.store)
+                .unwrap_or_default();
             let data_dir = data_dir
                 .or(file.data_dir)
                 .ok_or_else(|| "--data-dir or :data-dir in --config is required".to_owned())?;
             let turso_path = turso_path.or(file.turso_path);
             let postgres_url = postgres_url.or(file.postgres_url);
             let postgres_read_only_url = postgres_read_only_url.or(file.postgres_read_only_url);
+            let plugin_read_only_config = plugin_read_only_config.or(file.plugin_read_only_config);
             let s3_bucket = s3_bucket.or(file.s3_bucket);
             let s3_prefix = s3_prefix.or(file.s3_prefix).unwrap_or_default();
             let s3_region = s3_region.or(file.s3_region);
@@ -1097,20 +1084,27 @@ async fn run_command(command: Command) -> Result<(), String> {
                 s3_read_only_role_duration_seconds.or(file.s3_read_only_role_duration_seconds);
             let s3_read_only_role_external_id =
                 s3_read_only_role_external_id.or(file.s3_read_only_role_external_id);
-            let store_spec = store_spec(
-                store,
-                &data_dir,
-                turso_path,
-                postgres_url,
-                s3_bucket,
-                s3_prefix,
-                s3_region.clone(),
-                s3_endpoint_url.clone(),
-            )?;
+            let store_spec = if let Some(plugin_store) = plugin_store {
+                plugin_store_spec(&plugin_store)?
+            } else if let Some(inline_store) = inline_store {
+                inline_store
+            } else {
+                store_spec(
+                    store,
+                    &data_dir,
+                    turso_path,
+                    postgres_url,
+                    s3_bucket,
+                    s3_prefix,
+                    s3_region.clone(),
+                    s3_endpoint_url.clone(),
+                )?
+            };
             let mut config = NodeConfig::new(data_dir);
             config.store = store_spec;
             config.storage_info = storage_info_config(StorageInfoOptions {
                 postgres_read_only_url,
+                plugin_read_only_config,
                 s3_region,
                 s3_endpoint_url,
                 access_key_id: s3_read_only_access_key_id,
@@ -1293,6 +1287,7 @@ async fn run_command(command: Command) -> Result<(), String> {
                 connection,
                 PeerServerConfig {
                     max_fuel,
+                    key_policy: serve.key_policy(),
                     ..PeerServerConfig::default()
                 },
             )
@@ -1315,23 +1310,78 @@ async fn run_command(command: Command) -> Result<(), String> {
             listen,
             password,
             allow_writes,
+            keys,
             client,
+            serve,
         } => {
+            // `ServeFlags` carries TLS material for the gRPC surfaces; the
+            // PostgreSQL front end does not terminate TLS, and accepting the
+            // flags silently would leave an operator believing this wire is
+            // encrypted when it is not.
+            if serve.has_tls() {
+                return Err(
+                    "postgres-server does not terminate TLS: --tls-cert/--tls-key are \
+                            not supported here. Front it with a TLS-terminating proxy."
+                        .into(),
+                );
+            }
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|error| format!("cannot bind {listen}: {error}"))?;
+            // The policy database is read over its own peer connection, the
+            // same way the peer server reads it, so checks stay in-process.
+            let authorizer = match serve.authz()? {
+                Some((authz_db, authz_config)) => {
+                    let authz_config_client = client.connect_config(authz_db.clone()).await?;
+                    let authz_connection =
+                        Arc::new(Connection::connect(authz_config_client).await.map_err(
+                            |error| {
+                                format!(
+                                    "cannot connect to authorization database {authz_db:?}: {error}"
+                                )
+                            },
+                        )?);
+                    Some(
+                        start_authorizer(
+                            Arc::new(corium_peer::authz::ConnectionPolicySource::new(
+                                authz_connection,
+                            )),
+                            authz_config,
+                            &authz_db,
+                        )
+                        .await,
+                    )
+                }
+                None => None,
+            };
+            let guard = serve.guard_with(authorizer).await?;
+            // PostgreSQL has no bearer-token field, so an authenticated client
+            // puts its credential in the password field — in cleartext, on a
+            // connection this process cannot encrypt. Say so once, loudly,
+            // rather than letting a JWT cross the wire unremarked.
+            if !guard.is_disabled() {
+                eprintln!(
+                    "corium postgres-server: WARNING — clients authenticate by sending their \
+                     bearer token in the PostgreSQL password field, and this server does not \
+                     terminate TLS. Run it behind a TLS-terminating proxy, or bind it to \
+                     loopback only."
+                );
+            }
             let catalog = Arc::new(pg_catalog::PeerCatalog::new(
                 client,
                 databases,
                 allow_writes,
+                keys.keyring()?,
             ));
             let pg_config = corium_pgwire::PgWireConfig {
                 password,
+                guard,
+                key_policy: serve.key_policy(),
                 ..corium_pgwire::PgWireConfig::default()
             };
             tracing::info!(%listen, allow_writes, "postgres server serving");
             let access = if allow_writes {
-                "guarded autocommit writes enabled"
+                "guarded writes enabled"
             } else {
                 "read-only"
             };
@@ -1516,6 +1566,7 @@ struct TransactorFileConfig {
     turso_path: Option<PathBuf>,
     postgres_url: Option<String>,
     postgres_read_only_url: Option<String>,
+    plugin_read_only_config: Option<String>,
     s3_bucket: Option<String>,
     s3_prefix: Option<String>,
     s3_region: Option<String>,
@@ -1564,6 +1615,9 @@ impl TransactorFileConfig {
                 "postgres-url" => config.postgres_url = Some(config_string(&key, value)?),
                 "postgres-read-only-url" => {
                     config.postgres_read_only_url = Some(config_string(&key, value)?);
+                }
+                "plugin-read-only-config" => {
+                    config.plugin_read_only_config = Some(config_string(&key, value)?);
                 }
                 "s3-bucket" => config.s3_bucket = Some(config_string(&key, value)?),
                 "s3-prefix" => config.s3_prefix = Some(config_string(&key, value)?),
@@ -1631,6 +1685,7 @@ fn config_store(value: &Edn) -> Result<StoreKind, String> {
 #[derive(Default)]
 struct StorageInfoOptions {
     postgres_read_only_url: Option<String>,
+    plugin_read_only_config: Option<String>,
     s3_region: Option<String>,
     s3_endpoint_url: Option<String>,
     access_key_id: Option<String>,
@@ -1646,6 +1701,7 @@ struct StorageInfoOptions {
 fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
     let StorageInfoOptions {
         postgres_read_only_url,
+        plugin_read_only_config,
         s3_region,
         s3_endpoint_url,
         access_key_id,
@@ -1695,6 +1751,7 @@ fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig,
     };
     Ok(StorageInfoConfig {
         postgres_connection_string: postgres_read_only_url,
+        plugin_config: parse_plugin_read_only_config(plugin_read_only_config)?,
         s3: credentials
             .map(|credentials| S3ReadOnlyConfig::new(s3_region, s3_endpoint_url, credentials)),
     })
@@ -1704,6 +1761,7 @@ fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig,
 fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig, String> {
     let StorageInfoOptions {
         postgres_read_only_url,
+        plugin_read_only_config,
         s3_region,
         s3_endpoint_url,
         access_key_id,
@@ -1732,10 +1790,48 @@ fn storage_info_config(options: StorageInfoOptions) -> Result<StorageInfoConfig,
     }
     Ok(StorageInfoConfig {
         postgres_connection_string: postgres_read_only_url,
+        plugin_config: parse_plugin_read_only_config(plugin_read_only_config)?,
     })
 }
 
+fn parse_plugin_read_only_config(json: Option<String>) -> Result<Option<StorageConfig>, String> {
+    json.map(|json| {
+        StorageConfig::from_json(&json)
+            .map_err(|error| format!("invalid plugin read-only configuration: {error}"))
+    })
+    .transpose()
+}
+
 /// Resolves the `--store` flag and backend connection options into a [`StoreSpec`].
+fn plugin_store_spec(text: &str) -> Result<StoreSpec, String> {
+    let (kind, json) = text
+        .split_once(':')
+        .ok_or_else(|| "--plugin-store must be kind:{json configuration}".to_owned())?;
+    if kind.is_empty() {
+        return Err("--plugin-store backend kind cannot be empty".into());
+    }
+    let config = StorageConfig::from_json(json)
+        .map_err(|error| format!("invalid --plugin-store JSON: {error}"))?;
+    Ok(StoreSpec::new(kind, config))
+}
+
+fn parse_store_kind(text: &str) -> Result<StoreKind, String> {
+    StoreKind::from_str(text, true).map_err(|_| {
+        format!(
+            "unknown storage backend {text:?}; use mem, fs, postgres, turso, s3, or kind:{{json}}"
+        )
+    })
+}
+
+fn requested_storage_plugin_paths(explicit: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = explicit;
+    paths.extend(corium_store_plugin::environment_plugin_paths());
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    paths
+}
+
+/// Resolves the built-in `--store` flag and backend connection options.
 #[allow(clippy::too_many_arguments)]
 fn store_spec(
     store: StoreKind,
@@ -1748,8 +1844,8 @@ fn store_spec(
     s3_endpoint_url: Option<String>,
 ) -> Result<StoreSpec, String> {
     match store {
-        StoreKind::Mem => Ok(StoreSpec::Memory),
-        StoreKind::Fs => Ok(StoreSpec::Fs),
+        StoreKind::Mem => Ok(StoreSpec::memory()),
+        StoreKind::Fs => Ok(StoreSpec::filesystem()),
         StoreKind::Postgres => postgres_spec(postgres_url),
         StoreKind::Turso => turso_spec(data_dir, turso_path),
         StoreKind::S3 => s3_spec(s3_bucket, s3_prefix, s3_region, s3_endpoint_url),
@@ -1760,7 +1856,7 @@ fn store_spec(
 fn postgres_spec(postgres_url: Option<String>) -> Result<StoreSpec, String> {
     let connection_string = postgres_url
         .ok_or_else(|| "--postgres-url is required with --store postgres".to_owned())?;
-    Ok(StoreSpec::Postgres { connection_string })
+    Ok(StoreSpec::postgres(connection_string))
 }
 
 #[cfg(not(feature = "postgres"))]
@@ -1781,7 +1877,7 @@ fn turso_spec(
         .to_str()
         .ok_or_else(|| format!("turso path is not valid UTF-8: {}", path.display()))?
         .to_owned();
-    Ok(StoreSpec::Turso { path })
+    Ok(StoreSpec::turso(path))
 }
 
 #[cfg(not(feature = "turso"))]
@@ -1800,15 +1896,15 @@ fn s3_spec(
     endpoint_url: Option<String>,
 ) -> Result<StoreSpec, String> {
     let bucket = s3_bucket.ok_or_else(|| "--s3-bucket is required with --store s3".to_owned())?;
-    Ok(StoreSpec::S3 {
+    Ok(StoreSpec::s3(
         bucket,
-        prefix: s3_prefix,
-        client: S3ClientConfig {
+        s3_prefix,
+        &S3ClientConfig {
             region,
             endpoint_url,
             ..S3ClientConfig::default()
         },
-    })
+    ))
 }
 
 #[cfg(not(feature = "s3"))]
@@ -2380,6 +2476,7 @@ mod tests {
               :s3-bucket "corium-prod"
               :s3-prefix "tenant/"
               :s3-region "us-west-2"
+              :plugin-read-only-config "{\"token\":\"reader\"}"
               :s3-read-only-role-arn "arn:aws:iam::123456789012:role/corium-reader"
               :s3-read-only-role-duration-seconds 1200
             }"#,
@@ -2393,10 +2490,34 @@ mod tests {
         assert_eq!(config.s3_prefix.as_deref(), Some("tenant/"));
         assert_eq!(config.s3_region.as_deref(), Some("us-west-2"));
         assert_eq!(
+            config.plugin_read_only_config.as_deref(),
+            Some("{\"token\":\"reader\"}")
+        );
+        assert_eq!(
             config.s3_read_only_role_arn.as_deref(),
             Some("arn:aws:iam::123456789012:role/corium-reader")
         );
         assert_eq!(config.s3_read_only_role_duration_seconds, Some(1200));
+    }
+
+    #[test]
+    fn plugin_read_only_config_is_validated() {
+        let config = storage_info_config(StorageInfoOptions {
+            plugin_read_only_config: Some("{\"token\":\"reader\"}".into()),
+            ..StorageInfoOptions::default()
+        })
+        .expect("valid plugin config");
+        assert_eq!(
+            config.plugin_config.expect("plugin config").to_json(),
+            "{\"token\":\"reader\"}"
+        );
+
+        let error = storage_info_config(StorageInfoOptions {
+            plugin_read_only_config: Some("not-json".into()),
+            ..StorageInfoOptions::default()
+        })
+        .expect_err("invalid plugin config");
+        assert!(error.contains("invalid plugin read-only configuration"));
     }
 
     #[test]

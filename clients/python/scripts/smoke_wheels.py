@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install and import every compatible wheel combination in fresh venvs."""
+"""Install and import the Python engine and storage plugin wheels."""
 
 from __future__ import annotations
 
@@ -21,14 +21,13 @@ def _python(environment: Path) -> Path:
     return environment / "bin/python"
 
 
-def smoke(wheel_directory: Path, artifact: str | None) -> None:
+def _install_and_check(
+    wheel_directory: Path, packages: tuple[str, ...], expected: set[str]
+) -> None:
     with tempfile.TemporaryDirectory(prefix="corium-wheel-") as temporary:
         environment = Path(temporary) / "venv"
         venv.EnvBuilder(with_pip=True).create(environment)
         python = _python(environment)
-        packages = ["corium"]
-        if artifact is not None:
-            packages.append(f"corium-{artifact}")
         _run(
             str(python),
             "-m",
@@ -39,28 +38,29 @@ def smoke(wheel_directory: Path, artifact: str | None) -> None:
             str(wheel_directory),
             *packages,
         )
-        expected = artifact or "filesystem"
         code = (
             "import corium; "
             "backends = corium.available_storage_backends(); "
-            f"assert {expected!r} in backends, backends"
+            f"expected = {expected!r}; "
+            "assert expected == backends, (expected, backends)"
         )
         _run(str(python), "-c", code)
+
+
+def smoke(wheel_directory: Path) -> None:
+    _install_and_check(wheel_directory, ("corium",), {"filesystem"})
+    _install_and_check(
+        wheel_directory,
+        ("corium", "corium-postgres", "corium-s3", "corium-turso"),
+        {"filesystem", "postgres", "s3", "turso"},
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("wheel_directory", type=Path)
-    parser.add_argument(
-        "--base-only",
-        action="store_true",
-        help="only test the common artifact (used for pull requests)",
-    )
     arguments = parser.parse_args()
-    smoke(arguments.wheel_directory, None)
-    if not arguments.base_only:
-        for artifact in ("turso", "postgres", "s3"):
-            smoke(arguments.wheel_directory, artifact)
+    smoke(arguments.wheel_directory)
 
 
 if __name__ == "__main__":
