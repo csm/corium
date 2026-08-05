@@ -33,6 +33,7 @@ jobs:
     needs: ci
     outputs:
       release_ref: ${{ steps.release.outputs.release_ref }}
+      version: ${{ steps.release.outputs.version }}
     permissions:
       contents: write
     steps:
@@ -56,8 +57,10 @@ jobs:
           echo "Publishing version: $VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "release_ref=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           cargo release version "$VERSION" --execute --no-confirm
           python3 clients/python/scripts/release.py set "$VERSION"
+          python3 clients/java/scripts/release.py set "$VERSION"
           echo "--- Workspace Cargo.toml ---"
           cat Cargo.toml
           echo ""
@@ -98,6 +101,58 @@ jobs:
           cargo publish --workspace \
             --no-verify \
             "${EXCLUDE[@]}"
+
+  java-native:
+    name: "Build Java native jars"
+    needs: publish
+    permissions:
+      contents: read
+    uses: ./.github/workflows/java-native.yml
+    with:
+      release_ref: ${{ needs.publish.outputs.release_ref }}
+
+  java-publish:
+    name: "Publish Java client to Maven Central"
+    runs-on: ubuntu-latest
+    needs: [publish, java-native]
+    environment:
+      name: maven-central
+      url: https://central.sonatype.com/artifact/dev.corium/corium-client/${{ needs.publish.outputs.version }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.publish.outputs.release_ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: java-native-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: clients/java/pom.xml
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_TOKEN
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Publish to Maven Central
+        run: >-
+          mvn -f clients/java/pom.xml --batch-mode
+          --activate-profiles release,native
+          -Dcorium.native.jars=${{ github.workspace }}/dist
+          deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_CENTRAL_TOKEN }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
 
   python-wheels:
     name: "Build Python wheels"

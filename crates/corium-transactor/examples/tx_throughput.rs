@@ -187,8 +187,8 @@ fn num_cpus() -> usize {
 
 fn build_store_spec(args: &Args) -> Result<StoreSpec, String> {
     match args.store.as_str() {
-        "mem" => Ok(StoreSpec::Memory),
-        "fs" => Ok(StoreSpec::Fs),
+        "mem" => Ok(StoreSpec::memory()),
+        "fs" => Ok(StoreSpec::filesystem()),
         "turso" => {
             #[cfg(feature = "turso")]
             {
@@ -196,7 +196,7 @@ fn build_store_spec(args: &Args) -> Result<StoreSpec, String> {
                     .turso_path
                     .clone()
                     .ok_or("turso backend needs --path <file>")?;
-                Ok(StoreSpec::Turso { path })
+                Ok(StoreSpec::turso(path))
             }
             #[cfg(not(feature = "turso"))]
             Err("rebuild with `--features turso` to use the turso backend".into())
@@ -208,7 +208,7 @@ fn build_store_spec(args: &Args) -> Result<StoreSpec, String> {
                     .postgres_url
                     .clone()
                     .ok_or("postgres backend needs --postgres-url or CORIUM_BENCH_POSTGRES_URL")?;
-                Ok(StoreSpec::Postgres { connection_string })
+                Ok(StoreSpec::postgres(connection_string))
             }
             #[cfg(not(feature = "postgres"))]
             Err("rebuild with `--features postgres` to use the postgres backend".into())
@@ -221,11 +221,11 @@ fn build_store_spec(args: &Args) -> Result<StoreSpec, String> {
                     .clone()
                     .ok_or("s3 backend needs --s3-bucket or CORIUM_BENCH_S3_BUCKET")?;
                 let prefix = args.s3_prefix.clone().unwrap_or_default();
-                Ok(StoreSpec::S3 {
+                Ok(StoreSpec::s3(
                     bucket,
                     prefix,
-                    client: corium_store::S3ClientConfig::default(),
-                })
+                    &corium_store_s3::S3ClientConfig::default(),
+                ))
             }
             #[cfg(not(feature = "s3"))]
             Err("rebuild with `--features s3` to use the s3 backend".into())
@@ -465,9 +465,12 @@ async fn run(args: Args) -> Result<(), String> {
     // accepts but ignores them would silently break lease safety, so confirm
     // enforcement before trusting an unfamiliar (self-hosted) target.
     #[cfg(feature = "s3")]
-    if matches!(spec, StoreSpec::S3 { .. }) {
-        use corium_transactor::NodeStore;
-        if let NodeStore::S3(s3) = node.store().as_ref() {
+    if spec.kind() == "s3" {
+        if let Some(s3) = node
+            .store()
+            .as_any()
+            .downcast_ref::<corium_store_s3::S3BlobStore>()
+        {
             eprintln!("verifying S3 conditional-write enforcement…");
             s3.verify_conditional_writes()
                 .await

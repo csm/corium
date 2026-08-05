@@ -1,7 +1,11 @@
 /target/
 docs/manual/book/
+/artifacts/scenarios/
 examples/postgres-jdbc/target/
 /.idea/
 examples/musicbrainz/data/logs/
 examples/musicbrainz/data/store.db
 examples/musicbrainz/data/store.db-wal
+# Release and scenario helper scripts run in place, outside clients/python.
+__pycache__/
+*.py[cod]

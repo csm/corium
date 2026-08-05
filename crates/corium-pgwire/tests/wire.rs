@@ -12,6 +12,10 @@ use corium_core::{
 use corium_db::{Db, Idents};
 use corium_forms::txforms::tx_items_from_edn;
 use corium_pgwire::{CatalogError, CatalogTxResult, DbCatalog, PgWireConfig, serve};
+use corium_protocol::authz::{
+    ActionClass, AttributeAllowlist, Grant, Guard, PolicyAuthorizer, Principal, StaticTokens,
+    ViewFilter,
+};
 use corium_query::edn::Edn;
 use corium_tx::prepare;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -57,8 +61,13 @@ impl DbCatalog for TestCatalog {
         let items = tx_items_from_edn(&db, &mut interner, &forms)
             .map_err(|error| CatalogError::Rejected(error.to_string()))?;
         let t = db.basis_t() + 1;
-        let prepared = prepare(&db, items, EntityId::new(Partition::Tx as u32, t), 2_000)
-            .map_err(|error| CatalogError::Rejected(error.to_string()))?;
+        let prepared = prepare(
+            &db,
+            items,
+            EntityId::new(Partition::Tx as u32, t),
+            db.next_user_sequence(),
+        )
+        .map_err(|error| CatalogError::Rejected(error.to_string()))?;
         *db = db.clone().with_transaction(t, &prepared.datoms);
         Ok(CatalogTxResult {
             db_after: db.clone(),
@@ -69,9 +78,11 @@ impl DbCatalog for TestCatalog {
 
 /// Builds a small two-artist database mirroring the `corium-sql` fixture.
 fn fixture() -> Db {
-    let name = EntityId::from_raw(10);
-    let tags = EntityId::from_raw(11);
-    let release_year = EntityId::from_raw(12);
+    // At or above `FIRST_ATTR_ID`: the low db-partition range belongs to the
+    // engine's own attributes, and `Db::new` installs them over any schema.
+    let name = EntityId::from_raw(100);
+    let tags = EntityId::from_raw(101);
+    let release_year = EntityId::from_raw(102);
     let mut schema = Schema::default();
     schema.insert(Attribute {
         id: name,
@@ -438,6 +449,93 @@ async fn cardinality_many_renders_as_array_literal() {
 }
 
 #[tokio::test]
+async fn pgjdbc_sql_keywords_metadata_probe_is_supported() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query(
+            "select string_agg(word, ',') from pg_catalog.pg_get_keywords() \
+             where word <> ALL ('{select,from,where}'::text[])",
+        )
+        .await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        response
+            .iter()
+            .map(|message| message.tag)
+            .collect::<Vec<_>>(),
+        vec![b'T', b'D', b'C', b'Z']
+    );
+    let keywords = data_row_values(&response[1].body)[0]
+        .clone()
+        .expect("keyword list");
+    assert!(keywords.contains("returning"));
+    assert!(keywords.contains("vacuum"));
+
+    client.query("SELECT current_schema()").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("current schema row")
+                .body
+        ),
+        vec![Some("corium".to_owned())]
+    );
+
+    client.query("select current_catalog").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("current catalog row")
+                .body
+        ),
+        vec![Some("corium".to_owned())]
+    );
+
+    client
+        .query(
+            "SELECT setting FROM pg_catalog.pg_settings \
+             WHERE name='default_transaction_isolation'",
+        )
+        .await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("pg setting row")
+                .body
+        ),
+        vec![Some("read committed".to_owned())]
+    );
+
+    client.query("SHOW TRANSACTION ISOLATION LEVEL").await;
+    let response = client.read_until_ready().await;
+    assert_eq!(
+        data_row_values(
+            &response
+                .iter()
+                .find(|message| message.tag == b'D')
+                .expect("transaction isolation row")
+                .body
+        ),
+        vec![Some("read committed".to_owned())]
+    );
+}
+
+#[tokio::test]
 async fn unsupported_ddl_is_rejected_but_the_session_survives() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
@@ -679,7 +777,7 @@ async fn explicit_transaction_reads_keep_their_first_snapshot() {
 }
 
 #[tokio::test]
-async fn writes_in_explicit_transaction_blocks_are_rejected_without_committing() {
+async fn explicit_transaction_writes_are_visible_and_commit_atomically() {
     let address = start_server(PgWireConfig::default()).await;
     let mut client = Client::connect(address).await;
     client
@@ -688,22 +786,67 @@ async fn writes_in_explicit_transaction_blocks_are_rejected_without_committing()
     client.read_until_ready().await;
 
     client
-        .query("BEGIN; INSERT INTO corium.artist (name) VALUES ('Must Not Commit')")
+        .query(
+            "BEGIN; \
+             INSERT INTO corium.artist (name) VALUES ('First Staged') RETURNING e; \
+             BEGIN; \
+             INSERT INTO corium.artist (name) VALUES ('Second Staged') RETURNING e; \
+             SELECT name FROM corium.artist WHERE name LIKE '% Staged' ORDER BY name; \
+             COMMIT",
+        )
         .await;
     let response = client.read_until_ready().await;
-    assert!(response.iter().any(|message| message.tag == b'E'));
-    assert_eq!(response.last().unwrap().body, vec![b'E']);
+    assert!(!response.iter().any(|message| message.tag == b'E'));
+    assert_eq!(response.last().unwrap().body, vec![b'I']);
+    let returned_ids = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .filter_map(|message| {
+            let values = data_row_values(&message.body);
+            values
+                .first()
+                .and_then(Option::as_deref)
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(returned_ids.len(), 2);
+    assert_ne!(returned_ids[0], returned_ids[1]);
+    let staged_names = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .filter_map(|message| data_row_values(&message.body).into_iter().next().flatten())
+        .filter(|value| value.ends_with(" Staged"))
+        .collect::<Vec<_>>();
+    assert_eq!(staged_names, vec!["First Staged", "Second Staged"]);
 
-    client.query("SELECT 1").await;
-    let response = client.read_until_ready().await;
-    assert_eq!(response.first().unwrap().tag, b'E');
-    assert!(
-        cstrings(&response.first().unwrap().body)
-            .iter()
-            .any(|field| field.contains("25P02"))
-    );
+    client
+        .query("SELECT e, name FROM corium.artist WHERE name LIKE '% Staged' ORDER BY name")
+        .await;
+    let committed = client.read_until_ready().await;
+    let committed_rows = committed
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .map(|message| data_row_values(&message.body))
+        .collect::<Vec<_>>();
+    assert_eq!(committed_rows.len(), 2);
+    let first_id = returned_ids[0].to_string();
+    let second_id = returned_ids[1].to_string();
+    assert_eq!(committed_rows[0][0].as_deref(), Some(first_id.as_str()));
+    assert_eq!(committed_rows[1][0].as_deref(), Some(second_id.as_str()));
+}
 
-    client.query("ROLLBACK").await;
+#[tokio::test]
+async fn rollback_discards_staged_writes() {
+    let address = start_server(PgWireConfig::default()).await;
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "postgres"), ("database", "corium")])
+        .await;
+    client.read_until_ready().await;
+
+    client
+        .query("BEGIN; INSERT INTO corium.artist (name) VALUES ('Must Not Commit'); ROLLBACK")
+        .await;
     let response = client.read_until_ready().await;
     assert_eq!(response.last().unwrap().body, vec![b'I']);
 
@@ -1024,4 +1167,198 @@ async fn use_switches_the_active_database() {
     client.query("USE nope").await;
     let response = client.read_until_ready().await;
     assert_eq!(response.first().unwrap().tag, b'E');
+}
+
+// ---------------------------------------------------------------------------
+// Identity and authorization: the password field carries a bearer token, and
+// every statement is authorized as the principal it names.
+// ---------------------------------------------------------------------------
+
+/// A guard where `alice-token` reads everything, `bob-token` reads the artist
+/// table without `release-year`, and any other caller holds no role at all.
+fn scenario_guard() -> Guard {
+    let tokens = StaticTokens::new()
+        .with(
+            "alice-token",
+            Principal::new("static-token", "alice").with_role("full"),
+        )
+        .with(
+            "bob-token",
+            Principal::new("static-token", "bob").with_role("redacted"),
+        )
+        .with("carol-token", Principal::new("static-token", "carol"));
+    let redacted: Arc<dyn ViewFilter> = Arc::new(AttributeAllowlist::new([":artist/name"]));
+    let policy = PolicyAuthorizer::new()
+        .grant(
+            "full",
+            Grant::new(
+                [ActionClass::Read, ActionClass::Write],
+                ["corium", "people"],
+            ),
+        )
+        .grant(
+            "redacted",
+            Grant::new([ActionClass::Read, ActionClass::Write], ["corium"])
+                .with_view(Arc::clone(&redacted)),
+        );
+    Guard::new(Arc::new(tokens), Arc::new(policy))
+}
+
+async fn start_guarded_server() -> std::net::SocketAddr {
+    start_server(PgWireConfig {
+        guard: scenario_guard(),
+        ..PgWireConfig::default()
+    })
+    .await
+}
+
+/// Connects, authenticates with `token` in the password field, and selects
+/// `database`.
+async fn connect_as(address: std::net::SocketAddr, token: &str, database: &str) -> Client {
+    let mut client = Client::connect(address).await;
+    client
+        .startup(&[("user", "irrelevant"), ("database", database)])
+        .await;
+    let request = client.read_message().await;
+    assert_eq!(request.tag, b'R', "server asks for a password");
+    client.password(token).await;
+    client
+}
+
+#[tokio::test]
+async fn a_view_redacts_one_principal_and_not_another() {
+    let address = start_guarded_server().await;
+
+    let mut alice = connect_as(address, "alice-token", "corium").await;
+    alice.read_until_ready().await;
+    alice
+        .query("SELECT name, \"release-year\" FROM corium.artist ORDER BY name")
+        .await;
+    let response = alice.read_until_ready().await;
+    assert_eq!(
+        data_row_values(&response[1].body),
+        vec![Some("Boards of Canada".to_owned()), Some("1998".to_owned())]
+    );
+
+    // Bob runs the identical statement against the identical database value.
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    bob.query("SELECT name, \"release-year\" FROM corium.artist ORDER BY name")
+        .await;
+    let response = bob.read_until_ready().await;
+    assert_eq!(
+        row_description_names(&response[0].body),
+        vec!["name".to_owned(), "release-year".to_owned()],
+        "the column keeps its declared shape"
+    );
+    assert_eq!(
+        data_row_values(&response[1].body),
+        vec![Some("Boards of Canada".to_owned()), None],
+        "a column the view hides reports NULL"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_column_cannot_be_probed_by_a_predicate() {
+    let address = start_guarded_server().await;
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    // If the predicate were pushed into the index, this would report which
+    // artist holds the hidden value even though the projection is NULL.
+    bob.query("SELECT name FROM corium.artist WHERE \"release-year\" = 1998")
+        .await;
+    let response = bob.read_until_ready().await;
+    let rows: Vec<&Message> = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .collect();
+    assert!(rows.is_empty(), "a hidden column matches nothing");
+}
+
+#[tokio::test]
+async fn a_principal_with_no_grant_is_refused() {
+    let address = start_guarded_server().await;
+    let mut carol = connect_as(address, "carol-token", "corium").await;
+    carol.read_until_ready().await;
+    carol.query("SELECT name FROM corium.artist").await;
+    let response = carol.read_until_ready().await;
+    let error = response
+        .iter()
+        .find(|message| message.tag == b'E')
+        .expect("an unauthorized read is refused");
+    let fields = cstrings(&error.body);
+    assert!(
+        fields.iter().any(|field| field == "C42501"),
+        "expected insufficient_privilege, got {fields:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_restricted_session_may_not_write() {
+    let address = start_guarded_server().await;
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    bob.query("UPDATE corium.artist SET name = 'x' WHERE name = 'Tycho'")
+        .await;
+    let response = bob.read_until_ready().await;
+    let error = response
+        .iter()
+        .find(|message| message.tag == b'E')
+        .expect("a restricted principal may not write");
+    assert!(
+        cstrings(&error.body)
+            .iter()
+            .any(|field| field.contains("restricted view")),
+        "{:?}",
+        cstrings(&error.body)
+    );
+}
+
+#[tokio::test]
+async fn show_databases_lists_only_what_the_principal_may_inspect() {
+    let address = start_guarded_server().await;
+
+    let mut alice = connect_as(address, "alice-token", "corium").await;
+    alice.read_until_ready().await;
+    alice.query("SHOW DATABASES").await;
+    let response = alice.read_until_ready().await;
+    let names: Vec<Option<String>> = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .flat_map(|message| data_row_values(&message.body))
+        .collect();
+    assert_eq!(
+        names,
+        vec![Some("corium".to_owned()), Some("people".to_owned())]
+    );
+
+    // Bob's grant covers only `corium`, so the catalog listing says so too.
+    let mut bob = connect_as(address, "bob-token", "corium").await;
+    bob.read_until_ready().await;
+    bob.query("SHOW DATABASES").await;
+    let response = bob.read_until_ready().await;
+    let names: Vec<Option<String>> = response
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .flat_map(|message| data_row_values(&message.body))
+        .collect();
+    assert_eq!(names, vec![Some("corium".to_owned())]);
+}
+
+#[tokio::test]
+async fn an_unknown_token_cannot_connect() {
+    let address = start_guarded_server().await;
+    let mut client = Client::connect(address).await;
+    client.startup(&[("user", "mallory")]).await;
+    assert_eq!(client.read_message().await.tag, b'R');
+    client.password("not-a-real-token").await;
+    let response = client.read_message().await;
+    assert_eq!(response.tag, b'E', "authentication is required");
+    assert!(
+        cstrings(&response.body)
+            .iter()
+            .any(|field| field == "C28000"),
+        "{:?}",
+        cstrings(&response.body)
+    );
 }

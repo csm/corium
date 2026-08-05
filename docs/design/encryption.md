@@ -1,16 +1,46 @@
 # Encryption at Rest and Attribute Protection
 
-Status: **layer 1 implemented, layer 2 not started.** The storage-encryption
-primitives, the blob-store decorator, log-record payload encryption, the
-`keys:<db>` key manifest (with storage format 4), and the process wiring —
-`--storage-key` on the transactor, peer server, and offline commands;
-`corium db create --storage-key`; `corium keys status|rotate|rewrap` — are
-implemented. Remaining in layer 1: backup format 2 (until then `corium backup`
-refuses an encrypted database rather than writing an archive no restore could
-open) and KMS-backed keyrings (a key identity resolves through `file:` or
-`env:` today; `awskms:`, `gcpkms:`, and `vault:` are recognized as key sources
-and rejected as unresolvable). Attribute protection is unimplemented. This
-document specifies two independent layers
+Status: **layer 1 implemented; layer 2 implemented for protection declared at
+database creation.** The storage-encryption primitives, the blob-store
+decorator, log-record payload encryption, the `keys:<db>` key manifest (with
+storage format 4), and the process wiring — `--storage-key` on the transactor,
+peer server, and offline commands; `corium db create --storage-key`;
+`corium keys status|rotate|rewrap` — are implemented. Remaining in layer 1:
+backup format 2 (until then `corium backup` refuses an encrypted database
+rather than writing an archive no restore could open) and KMS-backed keyrings
+(a key identity resolves through `file:` or `env:` today; `awskms:`,
+`gcpkms:`, and `vault:` are recognized as key sources and rejected as
+unresolvable).
+
+Layer 2 is implemented end to end for the shape of protection Corium's schema
+can express today. A class declared in the create-time schema
+(`:db.protect/ident` in EDN, `[protect.<name>]` in TOML) protects an attribute
+from `t = 0`; the writing peer seals, the transactor validates the cleartext
+header and commits with no key, and a reader hydrates exactly the classes its
+keyring resolves. What is **not** implemented, and why:
+
+- **Protection changes** — protecting, unprotecting, or re-classifying a
+  populated attribute, the acknowledgement datom, the sweep, and
+  `corium keys protect|unprotect|audit`. Corium's schema is create-time and
+  immutable: attributes are not entities, and there is no alteration path to
+  hang a forward-only change on. That mechanism is the prerequisite, and the
+  single largest remaining piece. Everything downstream of it is already
+  written against a per-attribute protection *timeline* rather than a single
+  class, so alterations append to it rather than reshaping anything.
+- **Entity scope.** Classes parse and store `:db.protect.scope/entity`, and
+  sealing under it refuses rather than silently binding the wrong subject. It
+  needs `ReserveEntityIds`, local upsert pre-resolution, and the
+  `expected_basis_t` retry loop described below.
+- **Surfaces**: `--seal-through`, SQL predicate *rewriting* (SQL gets the safe
+  defaults instead: `NULL` for an unhydrated value, and no pushdown on a
+  protected column), and the thin-client v3 contract document. The
+  per-principal `KeyPolicy` **is** implemented on the peer server and pgwire
+  ([ADR-0021](../adr/0021-contextual-read-authorization.md)): a key-holding
+  server hands each request only the classes policy grants it.
+- **Operations**: class rotation and shred commands, metrics, and audit
+  events.
+
+This document specifies two independent layers
 — envelope encryption of every durable artifact
 ([ADR-0017](../adr/0017-encryption-at-rest.md)) and per-attribute protection
 classes keyed by separate data keys
@@ -68,6 +98,14 @@ else, and layer 2 never has to care where the datom is eventually written.
 | Thin client / SQL session without the class key | plaintext | protected |
 | Query-authorized insider (`Allow` from the authorizer) | plaintext | protected unless granted the key |
 | Network interception | TLS | TLS + sealed |
+
+The insider row holds for a peer by construction — a process is granted a class
+key or it is not. For a client of a *hosted* peer server or pgwire server it
+holds by policy: the surface resolves a per-principal key set per request, so a
+client reads only the classes the policy grants it, even when the server holds
+more. That is enforcement by the process holding the plaintext rather than by
+mathematics; see [Peer server, thin clients,
+SQL](#peer-server-thin-clients-sql).
 
 Explicit non-goals. None of this hides:
 
@@ -445,9 +483,18 @@ pub struct Sealed {
 pub enum Value { /* … */ Sealed(Sealed) }
 ```
 
-Encoded as `0xA0 ‖ class ‖ epoch ‖ vtype ‖ len ‖ body`, self-delimiting like
-every other value encoding, so `Datom::key`, `key_components`, and
-`Datom::from_key` need no structural change.
+Encoded as `0xA0 ‖ class ‖ epoch ‖ vtype ‖ body`, self-delimiting like every
+other value encoding — the body uses the same zero-escaped framing as `Str`
+and `Bytes` — so `Datom::key`, `key_components`, and `Datom::from_key` need no
+structural change. The wire codec carries the same fields under tag `0xA6`,
+because `0xA0` is `LIST` in its tag space; sending one needs protocol v3.
+
+A **keyword** value seals its text under the string tag. Reading one back
+therefore needs a keyword id the transactor never assigned, so the interner
+keeps a reader-local overlay above `FIRST_LOCAL_KW_ID`: local ids never reach
+storage or the wire (keywords travel by name in both), and a keyword the
+reader already knows durably keeps its durable id, so a hydrated value and a
+query literal still compare equal.
 
 Sealing:
 
@@ -746,6 +793,9 @@ from the same `Db`.
 - The **query cache** keys on a fingerprint of the hydration key set alongside
   the query and basis, for the same reason the deferred `ViewFilter` work must:
   a result computed with a key must never be served to a caller without it.
+  Corium's query cache is parse-only — it holds parsed queries, not results —
+  so there is nothing to key yet. The requirement lands with the first result
+  cache.
 
 When a value cannot be hydrated, the class's `:db.protect/on-missing-key`
 decides, and a request may narrow (never widen) it:
@@ -771,8 +821,47 @@ raises — it never matches by accident.
 
 - **Peer server holding keys.** Hydrates per request. The key set for a request
   comes from a `KeyPolicy: Principal → [KeyId]`, which is where this meets
-  authorization: the ReBAC policy can name key ids the same way it names view
+  authorization: the ReBAC policy names key ids the same way it names view
   filters. Plaintext then travels to the thin client over TLS.
+
+  A view carries the key ids it grants on `:authz.view/key`, and the filter
+  type is optional, so a view may restrict attributes, keys, or both:
+
+  ```clojure
+  ;; A key-only view: restricts no attribute, grants one class key.
+  {:authz.view/name "pii-reader" :authz.view/key ["kms:corium/pii"]}
+  {:authz.binding/relation "hr" :authz.binding/object "database:people"
+   :authz.binding/view "pii-reader"}
+  ```
+
+  Key grants combine across successful paths the same conservative way view
+  filters do — by intersection — so holding one more relation never widens a
+  key set. The serving process then hands the request the subset of *its own*
+  keyring those ids resolve to: policy can never grant a key the process does
+  not hold.
+
+  What a decision that names no key means is the surface's **key policy mode**:
+
+  | Mode | A decision naming no key id | Default when |
+  |---|---|---|
+  | `strict` | grants no class key | a `Guard` is configured |
+  | `server-wide` | grants the process's whole keyring | authorization is disabled |
+
+  Deriving the default from the guard is what keeps a single-tenant or
+  embedded deployment working exactly as before while making the multi-tenant
+  one safe by default. Note that `:authz.binding/unfiltered` grants full
+  *attribute* visibility and no keys: keys are named by key id, and that
+  binding names none — a relation that must read protected values names them.
+
+  > **This is authorization, not cryptography.** A peer server under `strict`
+  > still holds the plaintext; it is choosing not to disclose it. The
+  > cryptographic floor is a process that was never given the key, which is
+  > still the right configuration for a genuinely less-trusted peer server:
+  > it answers every query that does not touch a protected value identically,
+  > and protected values come back redacted, hidden, or refused per class
+  > policy. An embedded peer (`LocalPeer`, the `corium-client` fluent API) is
+  > not affected either way: its keyring belongs to the one application
+  > process holding it.
 - **Peer server in seal-through mode** (`--seal-through`). Returns sealed values
   and lets the thin client hydrate with its own keyring — end-to-end protection
   for languages using the thin protocol, at the cost of client-side key
@@ -781,10 +870,14 @@ raises — it never matches by accident.
   sealed value gets `FAILED_PRECONDITION` rather than bytes it cannot name.
 - **SQL / pgwire.** A protected column keeps its declared type and reports
   `NULL` when unhydrated. The planner refuses pushdown of any predicate over a
-  protected column, and rewrites `=` to a sealed-bytes comparison when the
-  session holds the key and the class is attribute-scoped. `corium sql` prints
-  `<redacted>`. Session key sets come from the same `KeyPolicy` as the peer
-  server.
+  protected column — otherwise a `WHERE` clause would answer the question the
+  `NULL` projection refuses — and will rewrite `=` to a sealed-bytes comparison
+  when the session holds the key and the class is attribute-scoped (not yet
+  implemented). `corium sql` prints `<redacted>`. Session key sets come from the
+  same `KeyPolicy` as the peer server, resolved per statement from the SQL
+  session's own principal: `PostgreSQL` has no bearer-token field, so the
+  password carries the caller's token (see
+  [ADR-0021](../adr/0021-contextual-read-authorization.md)).
 
 ### Class key rotation and crypto-shredding
 
@@ -949,6 +1042,10 @@ records key grants, rotations, and shreds.
 
 ## Implementation plan
 
+Steps 1–4 are done; 5–8 remain, in that order. Step 5 gates the rest of the
+protection story, because everything it covers presumes a schema that can be
+altered.
+
 1. **`corium-crypt`.** Primitives, `KeyId`/`SecretKey`/`Keyring`,
    `StaticKeyring`, deterministic sealing, derivation, zeroization. Pure
    library, property-tested in isolation.
@@ -971,8 +1068,9 @@ records key grants, rotations, and shreds.
    protect|unprotect|audit`, and the resumable, chunked sweep.
 6. **Entity scope.** `ReserveEntityIds`, local upsert pre-resolution, the
    `expected_basis_t` fence, and its retry loop.
-7. **Surfaces.** Peer server `KeyPolicy` and `--seal-through`, thin-client
-   protocol v3, SQL/pgwire redaction and pushdown rules, schema-TOML fields.
+7. **Surfaces.** Peer server and pgwire `KeyPolicy` (done), `--seal-through`,
+   thin-client protocol v3, SQL/pgwire redaction and pushdown rules,
+   schema-TOML fields.
 8. **Operations.** Rotation, shredding, metrics, audit events, and the
    operations-guide runbook.
 

@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{AttrId, EntityId, IndexOrder, Value, ValueType};
-use corium_db::{Db, avet_covered, key_prefix};
+use corium_db::{Db, avet_covered, key_prefix, protect::Hydration, read::ReadContext};
 
 use crate::QueryError;
 use crate::ast::{BindTarget, Binding, Clause, Pattern, RuleDef, Term, Var};
@@ -41,6 +41,7 @@ pub struct ExecCtx<'a> {
     fuel: Cell<u64>,
     rule_state: RefCell<RuleState>,
     extern_call: Option<crate::ExternCall>,
+    read: ReadContext,
 }
 
 impl<'a> ExecCtx<'a> {
@@ -58,6 +59,7 @@ impl<'a> ExecCtx<'a> {
             fuel: Cell::new(u64::MAX),
             rule_state: RefCell::new(RuleState::default()),
             extern_call: None,
+            read: ReadContext::open(),
         }
     }
 
@@ -69,6 +71,52 @@ impl<'a> ExecCtx<'a> {
     /// Installs the resolver consulted for non-native call clause names.
     pub fn set_extern_call(&mut self, extern_call: crate::ExternCall) {
         self.extern_call = Some(extern_call);
+    }
+
+    /// Installs the view and key set this execution reads under.
+    pub fn set_read(&mut self, read: ReadContext) {
+        self.read = read;
+    }
+
+    /// The view and key set this execution reads under.
+    pub const fn read(&self) -> &ReadContext {
+        &self.read
+    }
+
+    /// Resolves one scanned value for this reader.
+    ///
+    /// `Ok(None)` means the datom does not reach this reader at all — the
+    /// view hides its attribute, or the class asked for it to be hidden — so
+    /// the caller drops it. Under an unrestricted read every value passes
+    /// through as it stands, which for a protected attribute means the sealed
+    /// form: exactly what a reader with no keys would see.
+    fn hydrate(
+        &self,
+        db: &Db,
+        a: AttrId,
+        e: EntityId,
+        value: &Value,
+    ) -> Result<Option<Value>, QueryError> {
+        match self.read.read(db.schema(), db.interner(), a, e, value) {
+            Ok(Hydration::Bind(value)) => Ok(Some(value)),
+            Ok(Hydration::Hide) => Ok(None),
+            Ok(Hydration::Refuse(class)) => Err(QueryError::Protected(class)),
+            Err(error) => Err(QueryError::Type(error.to_string())),
+        }
+    }
+
+    /// The first value of `attr` on `e` that reaches this reader, if any.
+    ///
+    /// The direct-access builtins (`get-else`, `missing?`) go to EAVT rather
+    /// than through a scan, so they resolve values here to stay consistent
+    /// with what a scan of the same attribute would have produced.
+    fn first_value(&self, db: &Db, e: EntityId, attr: AttrId) -> Result<Option<Value>, QueryError> {
+        for value in db.values(e, attr) {
+            if let Some(value) = self.hydrate(db, attr, e, &value)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     /// Evaluates a call clause: the native set first, then the extern
@@ -329,7 +377,7 @@ fn resolve_term(
                 Spec::Bound(coerce(value.clone()))
             })),
         Term::Const(form) => match position {
-            Position::E | Position::Tx => match entity_const(db, form)? {
+            Position::E | Position::Tx => match entity_const(db, ctx.read(), form)? {
                 Some(e) => Ok(Spec::Bound(Value::Ref(e))),
                 None => Ok(Spec::NoMatch),
             },
@@ -346,7 +394,7 @@ fn resolve_term(
             },
             Position::V => match const_value(db, form) {
                 Some(value) => Ok(Spec::Bound(coerce(value))),
-                None => match entity_const(db, form)? {
+                None => match entity_const(db, ctx.read(), form)? {
                     Some(e) => Ok(Spec::Bound(Value::Ref(e))),
                     None => Ok(Spec::NoMatch),
                 },
@@ -357,7 +405,12 @@ fn resolve_term(
 
 /// Resolves an entity-position constant: id, tagged id, ident keyword, or
 /// lookup ref `[attr value]`.
-fn entity_const(db: &Db, form: &Edn) -> Result<Option<EntityId>, QueryError> {
+///
+/// A lookup ref over an attribute `read` hides does not resolve. The value
+/// itself would never come back, but whether the ref resolves is an existence
+/// oracle over exactly the attribute the view withholds, so it reports
+/// nothing rather than reporting truthfully.
+fn entity_const(db: &Db, read: &ReadContext, form: &Edn) -> Result<Option<EntityId>, QueryError> {
     match form {
         Edn::Long(_) | Edn::Tagged(_, _) => match const_value(db, form) {
             Some(Value::Ref(e)) => Ok(Some(e)),
@@ -379,6 +432,9 @@ fn entity_const(db: &Db, form: &Edn) -> Result<Option<EntityId>, QueryError> {
             let Some(value) = const_value(db, value_form) else {
                 return Ok(None);
             };
+            if !read.visible(attr) {
+                return Ok(None);
+            }
             let value = db.schema().get(attr).map_or(value.clone(), |meta| {
                 coerce_for_type(value, meta.value_type)
             });
@@ -463,10 +519,16 @@ fn eval_pattern(
         for datom in db.datoms_prefix(choice.order, &prefix) {
             ctx.spend(1)?;
             ctx.scanned.set(ctx.scanned.get() + 1);
+            // Hydration happens here, at scan output, so predicates,
+            // functions, aggregates, sorting, and pull all see plaintext with
+            // no further changes.
+            let Some(value) = ctx.hydrate(db, datom.a, datom.e, &datom.v)? else {
+                continue;
+            };
             let fields = [
                 (Position::E, Value::Ref(datom.e)),
                 (Position::A, Value::Ref(datom.a)),
-                (Position::V, datom.v.clone()),
+                (Position::V, value),
                 (Position::Tx, Value::Ref(datom.tx)),
                 (Position::Added, Value::Bool(datom.added)),
             ];
@@ -700,28 +762,32 @@ fn eval_get_else(
     let value_type = db.schema().get(attr).map(|meta| meta.value_type);
     let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
-        let entity = entity_arg(db, &frame, entity_term)?;
-        let value = entity
-            .and_then(|e| db.values(e, attr).into_iter().next())
-            .map_or_else(
-                || match default_term {
-                    Term::Const(form) => {
-                        let value = const_value(db, form).ok_or_else(|| {
-                            QueryError::Type(format!("bad get-else default {form}"))
-                        })?;
-                        Ok(match value_type {
-                            Some(t) => coerce_for_type(value, t),
-                            None => value,
-                        })
-                    }
-                    Term::Var(var) => frame
-                        .get(var)
-                        .cloned()
-                        .ok_or_else(|| QueryError::Unbound(var.clone())),
-                    Term::Blank => Err(QueryError::Parse("get-else default cannot be _".into())),
-                },
-                Ok,
-            )?;
+        let entity = entity_arg(db, ctx.read(), &frame, entity_term)?;
+        // Read through the same seam the scan uses: `get-else` reaches EAVT
+        // directly, so without this it would report values the view hides and
+        // hand back sealed bytes the scan would have opened or dropped.
+        let value = match entity {
+            Some(e) => ctx.first_value(db, e, attr)?,
+            None => None,
+        };
+        let value = value.map_or_else(
+            || match default_term {
+                Term::Const(form) => {
+                    let value = const_value(db, form)
+                        .ok_or_else(|| QueryError::Type(format!("bad get-else default {form}")))?;
+                    Ok(match value_type {
+                        Some(t) => coerce_for_type(value, t),
+                        None => value,
+                    })
+                }
+                Term::Var(var) => frame
+                    .get(var)
+                    .cloned()
+                    .ok_or_else(|| QueryError::Unbound(var.clone())),
+                Term::Blank => Err(QueryError::Parse("get-else default cannot be _".into())),
+            },
+            Ok,
+        )?;
         bind_result(&frame, binding, CallResult::Scalar(value), &mut out)?;
     }
     Ok(out)
@@ -742,8 +808,14 @@ fn eval_missing(
     let attr = attr_const(ctx, db, attr_term)?;
     let mut out = Vec::with_capacity(frames.len());
     for frame in frames {
-        let entity = entity_arg(db, &frame, entity_term)?;
-        let missing = entity.is_none_or(|e| db.values(e, attr).is_empty());
+        let entity = entity_arg(db, ctx.read(), &frame, entity_term)?;
+        // A value this reader cannot see reads as absent, so `missing?` says
+        // the same thing the scan does. Answering from the raw index instead
+        // would turn it into an existence oracle over a hidden attribute.
+        let missing = match entity {
+            Some(e) => ctx.first_value(db, e, attr)?.is_none(),
+            None => true,
+        };
         if missing {
             out.push(frame);
         }
@@ -783,7 +855,12 @@ fn attr_const(ctx: &ExecCtx<'_>, db: &Db, term: &Term) -> Result<AttrId, QueryEr
     }
 }
 
-fn entity_arg(db: &Db, frame: &Frame, term: &Term) -> Result<Option<EntityId>, QueryError> {
+fn entity_arg(
+    db: &Db,
+    read: &ReadContext,
+    frame: &Frame,
+    term: &Term,
+) -> Result<Option<EntityId>, QueryError> {
     match term {
         Term::Var(var) => {
             let value = frame
@@ -791,7 +868,7 @@ fn entity_arg(db: &Db, frame: &Frame, term: &Term) -> Result<Option<EntityId>, Q
                 .ok_or_else(|| QueryError::Unbound(var.clone()))?;
             Ok(to_entity(value))
         }
-        Term::Const(form) => entity_const(db, form),
+        Term::Const(form) => entity_const(db, read, form),
         Term::Blank => Err(QueryError::Parse("entity argument cannot be _".into())),
     }
 }

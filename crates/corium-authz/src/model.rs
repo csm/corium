@@ -171,16 +171,27 @@ impl FilterKind {
     }
 }
 
-/// A named, reusable [`ViewFilter`](corium_protocol::authz::ViewFilter)
-/// definition.
+/// A named, reusable restriction on what a reader sees: an attribute
+/// [`ViewFilter`](corium_protocol::authz::ViewFilter), a set of protection
+/// class keys it may hydrate, or both.
+///
+/// Both parts are optional, and a view that sets neither restricts nothing.
+/// Keeping keys here rather than in a parallel vocabulary is deliberate: a
+/// deployment says "what this relation may read" in one place, even though
+/// the two halves are enforced by completely different mechanisms
+/// (`docs/design/auth.md`, "Relationship to encryption").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewDef {
     /// Name bindings refer to.
     pub name: String,
-    /// What the filter does.
-    pub kind: FilterKind,
+    /// What the attribute filter does, or `None` for no attribute
+    /// restriction — a view that only names keys.
+    pub kind: Option<FilterKind>,
     /// Attribute idents (e.g. `:person/email`) the filter names.
     pub attributes: Vec<String>,
+    /// Protection class key ids this view permits hydrating. Empty imposes no
+    /// key restriction of its own; see [`KeyGrant`](corium_protocol::authz::KeyGrant).
+    pub keys: Vec<String>,
 }
 
 /// Attaches a view (or explicit full visibility) to a successful relation on
@@ -239,6 +250,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::GarbageCollect => "garbage-collect",
         Action::ManageIndex => "manage-index",
         Action::ManageKeys => "manage-keys",
+        Action::AlterSchema => "alter-schema",
     }
 }
 
@@ -246,7 +258,7 @@ pub fn action_name(action: Action) -> &'static str {
 /// `corium authz check`, which takes the action to test on the command line.
 #[must_use]
 pub fn action_from_name(name: &str) -> Option<Action> {
-    const ACTIONS: [Action; 14] = [
+    const ACTIONS: [Action; 15] = [
         Action::Query,
         Action::Pull,
         Action::Datoms,
@@ -261,6 +273,7 @@ pub fn action_from_name(name: &str) -> Option<Action> {
         Action::GarbageCollect,
         Action::ManageIndex,
         Action::ManageKeys,
+        Action::AlterSchema,
     ];
     ACTIONS
         .into_iter()
@@ -285,6 +298,7 @@ pub fn action_names() -> Vec<&'static str> {
         Action::GarbageCollect,
         Action::ManageIndex,
         Action::ManageKeys,
+        Action::AlterSchema,
     ]
     .into_iter()
     .map(action_name)
@@ -346,7 +360,8 @@ mod tests {
             let action = action_from_name(name).expect("every listed name parses");
             assert_eq!(action_name(action), name);
         }
-        assert_eq!(action_names().len(), 14);
+        assert_eq!(action_names().len(), 15);
+        assert_eq!(action_name(Action::AlterSchema), "alter-schema");
         assert!(action_from_name("nonsense").is_none());
     }
 }

@@ -1,0 +1,213 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dev.corium</groupId>
+  <artifactId>corium-java</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+  <name>Corium Java client parent</name>
+  <description>Aggregator for the Corium Java client and its storage plugins</description>
+  <url>https://github.com/csm/corium</url>
+
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/license/mit</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <name>Casey Marshall</name>
+      <email>casey@metastatic.org</email>
+      <url>https://github.com/csm</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/csm/corium.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/csm/corium.git</developerConnection>
+    <url>https://github.com/csm/corium</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <modules>
+    <module>client</module>
+    <module>artifacts/turso</module>
+    <module>artifacts/postgres</module>
+    <module>artifacts/s3</module>
+  </modules>
+
+  <properties>
+    <maven.compiler.release>11</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <grpc.version>1.73.0</grpc.version>
+    <protobuf.version>3.25.8</protobuf.version>
+    <junit.version>5.13.1</junit.version>
+    <!-- Both default to the repository root, which is two levels above this
+         reactor's root pom. `dist` holds the per-platform native jars built by
+         scripts/build_native_jars.py, which the `native` profile attaches, and
+         `target/debug` is where tests look for a locally built engine and
+         storage plugins instead of those jars. -->
+    <corium.native.jars>${session.executionRootDirectory}/../../dist</corium.native.jars>
+    <corium.native.directory>${session.executionRootDirectory}/../../target/debug</corium.native.directory>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>dev.corium</groupId>
+        <artifactId>corium-client</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>${junit.version}</version>
+        <scope>test</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.5.3</version>
+          <configuration>
+            <useModulePath>false</useModulePath>
+            <systemPropertyVariables>
+              <corium.native.directory>${corium.native.directory}</corium.native.directory>
+            </systemPropertyVariables>
+          </configuration>
+        </plugin>
+        <!-- Modules that ship native libraries declare this plugin inside
+             their own `native` profile; the per-platform jars themselves are
+             assembled by scripts/build_native_jars.py. -->
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>build-helper-maven-plugin</artifactId>
+          <version>3.6.0</version>
+          <executions>
+            <execution>
+              <id>attach-native-jars</id>
+              <phase>package</phase>
+              <goals>
+                <goal>attach-artifact</goal>
+              </goals>
+              <configuration>
+                <artifacts>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-linux-x86_64.jar</file>
+                    <type>jar</type>
+                    <classifier>linux-x86_64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-linux-aarch64.jar</file>
+                    <type>jar</type>
+                    <classifier>linux-aarch64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-macos-x86_64.jar</file>
+                    <type>jar</type>
+                    <classifier>macos-x86_64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-macos-aarch64.jar</file>
+                    <type>jar</type>
+                    <classifier>macos-aarch64</classifier>
+                  </artifact>
+                  <artifact>
+                    <file>${corium.native.jars}/${project.artifactId}-${project.version}-windows-x86_64.jar</file>
+                    <type>jar</type>
+                    <classifier>windows-x86_64</classifier>
+                  </artifact>
+                </artifacts>
+              </configuration>
+            </execution>
+          </executions>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.4.0</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.12.0</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.8</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <gpgArguments>
+                <arg>--pinentry-mode</arg>
+                <arg>loopback</arg>
+              </gpgArguments>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.11.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+              <ignorePublishedComponents>true</ignorePublishedComponents>
+              <deploymentName>${project.groupId}:${project.artifactId}:${project.version}</deploymentName>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

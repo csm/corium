@@ -107,6 +107,118 @@ pub enum TxError {
     /// explicit assertion on the transaction currently being prepared.
     #[error(":db/txInstant may only be added once to the current transaction entity")]
     InvalidTxInstantOperation,
+    /// A plaintext value was asserted on a protected attribute.
+    ///
+    /// A client that does not understand protection cannot accidentally write
+    /// plaintext into a protected attribute (ADR-0018).
+    #[error("attribute {0} is protected; assertions must be sealed")]
+    UnprotectedValue(EntityId),
+    /// A sealed value was asserted on an attribute that is not protected.
+    #[error("attribute {0} is not protected; assertions must be plaintext")]
+    UnexpectedProtection(EntityId),
+    /// An assertion used a class or epoch that is no longer current.
+    ///
+    /// The writing peer sealed against a schema the transactor has since
+    /// moved past; it retries against the new one rather than storing a value
+    /// in the stale form.
+    #[error(
+        "attribute {attr} is protected by class {expected_class} at epoch \
+         {expected_epoch}; the assertion is sealed under class {class} epoch {epoch}"
+    )]
+    StaleProtectionForm {
+        /// Attribute being asserted on.
+        attr: EntityId,
+        /// Class the schema requires now.
+        expected_class: EntityId,
+        /// Epoch the schema requires now.
+        expected_epoch: u32,
+        /// Class the value names.
+        class: EntityId,
+        /// Epoch the value names.
+        epoch: u32,
+    },
+    /// An ordinary transaction touched the schema vocabulary.
+    ///
+    /// Attribute metadata is data, but it is not data a `Transact` may write:
+    /// changing it is an administrative action with its own plan, its own
+    /// preconditions, and its own `alter-schema` authority
+    /// (`docs/design/schema-migrations.md`). Letting a writer assert
+    /// `:db/valueType` would be exactly the silent broadening that separation
+    /// exists to prevent.
+    #[error("attribute {0} is schema metadata; use a schema update to change it")]
+    SchemaAttribute(EntityId),
+    /// A new fact was asserted on a retired attribute.
+    ///
+    /// Retirement is forward-only and refuses assertions alone: every existing
+    /// fact stays readable, and retracting one stays legal, because an
+    /// immutable database cannot make an attribute disappear from history.
+    #[error("attribute {0} is retired and refuses new assertions")]
+    RetiredAttribute(EntityId),
+    /// A retraction or `:db/cas` old value named a class the attribute has
+    /// never been sealed under — a form it never had.
+    #[error("attribute {attr} was never sealed under class {class}")]
+    ForeignProtectionClass {
+        /// Attribute being retracted from.
+        attr: EntityId,
+        /// Class the value names.
+        class: EntityId,
+    },
+}
+
+/// Checks the form an assertion must use on `a`, without holding any key.
+///
+/// Assertions use the form the attribute has *now*: sealed under the current
+/// class and epoch if it is protected, plaintext if it is not. The value type
+/// is checked separately by [`validate`], which reads a sealed value's
+/// declared type from its cleartext header.
+fn validate_assertion_form(db: &Db, a: EntityId, value: &Value) -> Result<(), TxError> {
+    let schema = db.schema();
+    match (schema.protection(a).current(), value) {
+        (Some(expected_class), Value::Sealed(sealed)) => {
+            let expected_epoch = schema
+                .class(expected_class)
+                .map_or(sealed.epoch, |class| class.current_epoch);
+            if sealed.class == expected_class && sealed.epoch == expected_epoch {
+                Ok(())
+            } else {
+                Err(TxError::StaleProtectionForm {
+                    attr: a,
+                    expected_class,
+                    expected_epoch,
+                    class: sealed.class,
+                    epoch: sealed.epoch,
+                })
+            }
+        }
+        (Some(_), _) => Err(TxError::UnprotectedValue(a)),
+        (None, Value::Sealed(_)) => Err(TxError::UnexpectedProtection(a)),
+        (None, _) => Ok(()),
+    }
+}
+
+/// Checks the form a retraction or `:db/cas` old value may use on `a`.
+///
+/// Any form the attribute has ever had is accepted — plaintext, or sealed
+/// under any class in its timeline at any epoch. A fact can only be retracted
+/// by naming the bytes it was asserted as, and those bytes do not change when
+/// the schema does.
+fn validate_historical_form(db: &Db, a: EntityId, value: &Value) -> Result<(), TxError> {
+    let Value::Sealed(sealed) = value else {
+        return Ok(());
+    };
+    if db
+        .schema()
+        .protection(a)
+        .classes()
+        .any(|class| class == sealed.class)
+    {
+        Ok(())
+    } else {
+        Err(TxError::ForeignProtectionClass {
+            attr: a,
+            class: sealed.class,
+        })
+    }
 }
 
 /// Expands and validates transaction input against `db`.
@@ -197,7 +309,9 @@ pub fn prepare(
                     }
                     tx_instant_asserted = true;
                 }
-                validate(&working, a, &v)?;
+                validate(&working, e, a, &v)?;
+                validate_not_retired(&working, a)?;
+                validate_assertion_form(&working, a, &v)?;
                 if let Some(attr) = working.schema().get(a) {
                     if attr.unique.is_some()
                         && working.lookup(a, &v).is_some_and(|owner| owner != e)
@@ -233,8 +347,9 @@ pub fn prepare(
                 if a == bootstrap::TX_INSTANT {
                     return Err(TxError::InvalidTxInstantOperation);
                 }
-                validate(&working, a, &v)?;
                 let e = resolve(&entity)?;
+                validate(&working, e, a, &v)?;
+                validate_historical_form(&working, a, &v)?;
                 // Retracting an absent fact is a no-op: no datom recorded.
                 if working.values(e, a).contains(&v) {
                     datoms.push(Datom {
@@ -250,8 +365,13 @@ pub fn prepare(
                 if a == bootstrap::TX_INSTANT {
                     return Err(TxError::InvalidTxInstantOperation);
                 }
-                validate(&working, a, &new)?;
                 let e = resolve(&entity)?;
+                validate(&working, e, a, &new)?;
+                validate_not_retired(&working, a)?;
+                validate_assertion_form(&working, a, &new)?;
+                if let Some(old) = &old {
+                    validate_historical_form(&working, a, old)?;
+                }
                 if working
                     .schema()
                     .get(a)
@@ -291,6 +411,15 @@ pub fn prepare(
                 if facts.iter().any(|(_, a, _)| *a == bootstrap::TX_INSTANT) {
                     return Err(TxError::InvalidTxInstantOperation);
                 }
+                // Retracting an attribute entity would uninstall an attribute
+                // whose facts are still stored and still have to be decoded.
+                // Schema removal is retirement, which keeps the metadata.
+                if let Some((_, a, _)) = facts
+                    .iter()
+                    .find(|(e, a, _)| !writable_by_transaction(*e, *a))
+                {
+                    return Err(TxError::SchemaAttribute(*a));
+                }
                 datoms.extend(facts.into_iter().map(|(e, a, v)| Datom {
                     e,
                     a,
@@ -305,10 +434,48 @@ pub fn prepare(
     Ok(PreparedTx { datoms, tempids })
 }
 
-fn validate(db: &Db, a: EntityId, value: &Value) -> Result<(), TxError> {
+fn validate(db: &Db, e: EntityId, a: EntityId, value: &Value) -> Result<(), TxError> {
+    if !writable_by_transaction(e, a) {
+        return Err(TxError::SchemaAttribute(a));
+    }
     let attr = db.schema().get(a).ok_or(TxError::UnknownAttribute(a))?;
     if !value.has_type(attr.value_type) {
         return Err(TxError::TypeMismatch(a));
+    }
+    Ok(())
+}
+
+/// Whether an ordinary transaction may write `a` on `e`.
+///
+/// `:db/ident` does double duty. On an attribute entity it is schema — the
+/// name an attribute is known by — and changing it belongs to a schema update.
+/// On any other entity it is an ordinary name: how a database function or an
+/// enumerated value is labelled, and how Datomic-shaped data has always spelt
+/// it. The two are told apart by partition, because `:db.part/db` is where
+/// schema entities live.
+///
+/// Every other vocabulary attribute describes an attribute and is refused
+/// outright, as is the schema-update audit trail: a transaction must not be
+/// able to claim it was a schema update.
+fn writable_by_transaction(e: EntityId, a: EntityId) -> bool {
+    if bootstrap::is_audit_attribute(a) {
+        return false;
+    }
+    if !bootstrap::is_schema_attribute(a) {
+        return true;
+    }
+    a == bootstrap::IDENT && e.partition() != Partition::Db as u32
+}
+
+/// Checks that `a` still accepts new facts.
+///
+/// Only assertions are gated. A retired attribute keeps every fact it holds,
+/// and retracting one — including through `:db/cas` — stays legal, which is
+/// what makes retirement a usable step in cutting an application over to a
+/// replacement attribute.
+fn validate_not_retired(db: &Db, a: EntityId) -> Result<(), TxError> {
+    if db.schema().is_retired(a) {
+        return Err(TxError::RetiredAttribute(a));
     }
     Ok(())
 }

@@ -23,7 +23,7 @@ use corium_store::{
 };
 use thiserror::Error;
 
-use crate::{LogBackend, StoreSpec};
+use crate::LogBackend;
 
 /// Binary backup container version written by this release.
 pub const BACKUP_FORMAT_VERSION: u32 = 1;
@@ -143,9 +143,9 @@ impl BackupSource {
         let storage = info
             .storage
             .ok_or_else(|| BackupError::Invalid("transactor returned no storage backend".into()))?;
+        crate::backend::register_static_storage_backends();
         let store =
             DiscoveredStoreSpec::from_connection(storage).map_err(storage_connection_error)?;
-        StoreSpec::from_discovered(&store).map_err(storage_connection_error)?;
         Ok(Self {
             store,
             basis_t: info.basis_t,
@@ -165,6 +165,9 @@ fn storage_connection_error(error: StorageConnectionError) -> BackupError {
             BackupError::Invalid("transactor returned no storage backend".into())
         }
         StorageConnectionError::Unsupported(detail) => BackupError::UnsupportedSource(detail),
+        StorageConnectionError::InvalidConfig { kind, detail } => {
+            BackupError::UnsupportedSource(format!("invalid {kind:?} storage config: {detail}"))
+        }
     }
 }
 

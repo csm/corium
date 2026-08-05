@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -114,6 +115,7 @@ class FakeNative:
         self.advertised_backend = advertised_backend
         self.discovery_error = discovery_error
         self.discovery_calls: list[tuple[Any, ...]] = []
+        self.plugin_paths: list[str] = []
 
     async def connect_local(
         self, endpoints: list[str], **options: Any
@@ -127,6 +129,10 @@ class FakeNative:
 
     def _storage_backends(self) -> list[str]:
         return self.backends
+
+    def _load_storage_plugin(self, path: str) -> list[str]:
+        self.plugin_paths.append(path)
+        return ["turso"]
 
     async def _discover_storage_backend(
         self, endpoints: list[str], **options: Any
@@ -158,32 +164,28 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report.tempids, {"ada": 42})
             self.assertEqual(await report.db_after.basis_t(), 7)
 
-    async def test_local_direct_storage_selects_the_advertised_artifact(self) -> None:
-        unsupported = FakeNative(["filesystem", "turso"], advertised_backend="s3")
-        supported = FakeNative(["filesystem", "s3"])
+    async def test_local_direct_storage_uses_the_loaded_plugin(self) -> None:
+        native = FakeNative(["filesystem", "s3"], advertised_backend="s3")
 
-        with patch.object(
-            api, "_native_modules", return_value=(unsupported, supported)
-        ):
+        with patch.object(api, "_native_module", return_value=native):
             peer = await LocalPeer.connect(
                 "http://127.0.0.1:4334",
                 database="people",
                 storage=DirectStorage(),
             )
 
-        self.assertEqual(len(unsupported.discovery_calls), 1)
-        self.assertEqual(len(unsupported.calls), 0)
-        self.assertEqual(len(supported.calls), 1)
+        self.assertEqual(len(native.discovery_calls), 1)
+        self.assertEqual(len(native.calls), 1)
         await peer.close()
 
     async def test_local_direct_storage_requires_a_supporting_artifact(self) -> None:
         native = FakeNative(["filesystem", "turso"], advertised_backend="s3")
 
         with (
-            patch.object(api, "_native_modules", return_value=(native,)),
+            patch.object(api, "_native_module", return_value=native),
             self.assertRaisesRegex(
                 StorageError,
-                "no installed Corium native artifact supports s3 direct storage",
+                "storage plugin 's3' is not installed",
             ),
         ):
             await LocalPeer.connect(
@@ -200,7 +202,7 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
         native = FakeNative(discovery_error=discovery_error)
 
         with (
-            patch.object(api, "_native_modules", return_value=(native,)),
+            patch.object(api, "_native_module", return_value=native),
             self.assertRaises(ConnectionFailedError) as raised,
         ):
             await LocalPeer.connect(
@@ -399,28 +401,42 @@ class PeerApiTests(unittest.IsolatedAsyncioTestCase):
             ):
                 api._native_module()
 
-    def test_installed_native_artifacts_are_all_available(self) -> None:
-        turso = FakeNative(["filesystem", "turso"])
-        s3 = FakeNative(["filesystem", "s3"])
-
-        def import_one(module_name: str) -> object:
-            if module_name == "corium._corium_turso":
-                return turso
-            if module_name == "corium._corium_s3":
-                return s3
-            raise ModuleNotFoundError(name=module_name)
+    def test_one_native_engine_reports_all_loaded_plugins(self) -> None:
+        native = FakeNative(["filesystem", "turso", "s3"])
 
         with patch.object(
-            importlib, "import_module", side_effect=import_one
+            importlib, "import_module", return_value=native
         ) as import_module:
-            self.assertIs(api._native_module(), turso)
-            self.assertIs(api._native_module(), turso)
-            self.assertEqual(api._native_modules(), (turso, s3))
-            self.assertEqual(
-                available_storage_backends(),
-                frozenset({"filesystem", "turso", "s3"}),
-            )
-            self.assertEqual(import_module.call_count, 4)
+            with patch.object(api, "entry_points", return_value=[]):
+                self.assertIs(api._native_module(), native)
+                self.assertIs(api._native_module(), native)
+                self.assertEqual(api._native_modules(), (native,))
+                self.assertEqual(
+                    available_storage_backends(),
+                    frozenset({"filesystem", "turso", "s3"}),
+                )
+                self.assertEqual(import_module.call_count, 1)
+
+    def test_storage_entry_points_load_into_the_one_engine(self) -> None:
+        native = FakeNative()
+
+        class EntryPoint:
+            name = "turso"
+
+            @staticmethod
+            def load() -> Any:
+                return lambda: Path("/plugins/libcorium_store_turso.so")
+
+        with (
+            patch.object(importlib, "import_module", return_value=native),
+            patch.object(api, "entry_points", return_value=[EntryPoint()]),
+        ):
+            self.assertIs(api._native_module(), native)
+
+        self.assertEqual(
+            native.plugin_paths,
+            [os.fspath(Path("/plugins/libcorium_store_turso.so"))],
+        )
 
 
 class ValueAndTimeTests(unittest.IsolatedAsyncioTestCase):

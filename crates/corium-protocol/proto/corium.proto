@@ -6,6 +6,10 @@ syntax = "proto3";
 
 package corium.v1;
 
+// Keep generated Java types stable for the published dev.corium client.
+option java_package = "dev.corium.protocol.v1";
+option java_outer_classname = "Corium";
+
 // ---------------------------------------------------------------------------
 // Shared messages
 // ---------------------------------------------------------------------------
@@ -234,6 +238,7 @@ message StorageConnection {
     PostgreSqlStorage postgres = 3;
     TursoStorage turso = 4;
     S3Storage s3 = 5;
+    PluginStorage plugin = 6;
   }
 }
 
@@ -268,6 +273,12 @@ message S3Storage {
   string endpoint_url = 7;
   // Zero for non-expiring static credentials.
   int64 expires_unix_seconds = 8;
+}
+
+// Open storage connection for a separately installed backend plugin.
+message PluginStorage {
+  string kind = 1;
+  string config_json = 2;
 }
 
 // One storage-key epoch as the manifest records it. No key material is ever
@@ -343,6 +354,48 @@ message GetStorageInfoResponse {
   StorageConnection storage = 2;
 }
 
+// Applies a reviewed schema plan (`docs/design/schema-migrations.md`).
+//
+// The desired schema travels as normalized EDN attribute maps, not as the
+// plan: the transactor recomputes the logical plan and its digest from this
+// schema and the schema installed under its own commit queue. A digest it
+// could not re-derive would be an opaque token rather than a precondition.
+message AlterSchemaRequest {
+  string db = 1;
+  // Normalized desired schema: an EDN vector of attribute maps.
+  bytes desired_schema = 2;
+  // The digest the reviewed plan printed. The apply is refused unless the
+  // transactor's freshly computed plan has the same one.
+  string plan_digest = 3;
+  // Fingerprint of the installed schema the plan was computed against.
+  string installed_fingerprint = 4;
+  // Basis the plan observed. Advisory: data drift that preserves every
+  // precondition does not invalidate a plan.
+  uint64 observed_basis_t = 5;
+  // Whether installed attributes absent from the file are retired.
+  bool prune = 6;
+  // Execution classes the caller permits, by stable name.
+  repeated string allow = 7;
+  // Acknowledgement codes the caller supplied, by stable code.
+  repeated string ack = 8;
+  // Tool and version submitting the change, recorded in the audit trail.
+  string tool = 9;
+}
+
+message AlterSchemaResponse {
+  // Basis after the schema transaction, or the unchanged basis when the
+  // desired schema was already installed.
+  uint64 basis_t = 1;
+  // Schema generation after the change.
+  uint64 schema_generation = 2;
+  // False when the database already matched the desired schema.
+  bool changed = 3;
+  // Idents of the attributes this transaction installed, in plan order.
+  repeated string installed_idents = 4;
+  // Number of steps applied.
+  uint32 steps = 5;
+}
+
 service Catalog {
   rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
   rpc DeleteDatabase(DeleteDatabaseRequest) returns (DeleteDatabaseResponse);
@@ -363,6 +416,8 @@ service Catalog {
   rpc RotateStorageKey(RotateStorageKeyRequest) returns (RotateStorageKeyResponse);
   // Re-wrap every data key under another key-encryption key.
   rpc RewrapKeys(RewrapKeysRequest) returns (RewrapKeysResponse);
+  // Apply a reviewed schema plan under the single-writer commit queue.
+  rpc AlterSchema(AlterSchemaRequest) returns (AlterSchemaResponse);
 }
 
 // ---------------------------------------------------------------------------

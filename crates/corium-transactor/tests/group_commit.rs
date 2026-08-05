@@ -58,7 +58,7 @@ async fn mem_node() -> Arc<TransactorNode> {
 
 async fn mem_node_with_batch(max_commit_batch: Option<usize>) -> Arc<TransactorNode> {
     let mut config = NodeConfig::new(std::path::PathBuf::from("/nonexistent-mem-node"));
-    config.store = StoreSpec::Memory;
+    config.store = StoreSpec::memory();
     if let Some(max) = max_commit_batch {
         config.max_commit_batch = max;
     }

@@ -9,6 +9,7 @@
 
 pub mod authz;
 pub mod metrics;
+pub mod seal;
 pub mod segment;
 pub mod server;
 
@@ -18,7 +19,10 @@ use std::time::Duration;
 
 use corium_core::{Datom, EntityId, KeywordInterner, Schema};
 use corium_crypt::Keyring;
-use corium_db::{Db, Idents, bootstrap};
+use corium_db::{
+    Db, Idents, bootstrap,
+    protect::{ClassKeys, Hydrator},
+};
 use corium_log::TxRecord;
 use corium_protocol::auth::TokenInterceptor;
 use corium_protocol::codec::{self, CodecError};
@@ -59,6 +63,27 @@ pub enum PeerError {
     /// The connection background task has stopped.
     #[error("connection closed")]
     Closed,
+    /// A transaction form could not be expanded far enough to seal it.
+    #[error(transparent)]
+    TxForm(#[from] corium_forms::txforms::TxFormError),
+    /// The transaction writes a protected attribute whose key this peer
+    /// cannot resolve.
+    ///
+    /// The whole transaction is refused: writing is never partial.
+    #[error("cannot seal for protection class {0}: this peer holds no key for it")]
+    MissingKey(EntityId),
+    /// Sealing failed for a reason other than a missing key.
+    #[error(transparent)]
+    Protection(corium_db::protect::ProtectError),
+}
+
+impl From<corium_db::protect::ProtectError> for PeerError {
+    fn from(error: corium_db::protect::ProtectError) -> Self {
+        match error {
+            corium_db::protect::ProtectError::MissingKey { class, .. } => Self::MissingKey(class),
+            other => Self::Protection(other),
+        }
+    }
 }
 
 /// Connection configuration.
@@ -93,9 +118,10 @@ pub struct ConnectConfig {
     /// Optional direct blob/root storage used to bootstrap from the newest
     /// published index before subscribing to the transaction-log tail.
     storage: Option<Arc<dyn PeerStorage>>,
-    /// Keys this peer can resolve. Needed only for a storage-aware peer
-    /// reading an encrypted database: everything arriving over the wire is
-    /// already plaintext.
+    /// Keys this peer can resolve: the storage key of a database encrypted
+    /// at rest, and the protection-class keys it seals and hydrates attribute
+    /// values with. A peer server hydrates every request with these,
+    /// whichever principal made it.
     keyring: Option<Arc<dyn Keyring>>,
     segment_cache_metrics: Option<SegmentCacheMetricsHandle>,
 }
@@ -182,11 +208,27 @@ impl ConnectConfig {
         Ok(self)
     }
 
-    /// Supplies the keys this peer can resolve.
+    /// Supplies the keys this peer can resolve: both the storage key of a
+    /// database encrypted at rest and the protection-class keys it seals and
+    /// hydrates attribute values with.
     ///
-    /// Only a storage-aware peer needs them, and only for a database that is
-    /// encrypted at rest: without direct storage every datom arrives over the
-    /// wire already decrypted by the transactor's peers.
+    /// A storage key is needed only by a storage-aware peer — without direct
+    /// storage every datom arrives over the wire already decrypted by the
+    /// transactor's peers. Class keys are needed by any peer that writes or
+    /// reads a protected attribute, storage-aware or not, because sealing
+    /// happens before tx-data leaves the peer and hydration after it arrives.
+    ///
+    /// A class whose key this keyring cannot resolve is not an error: the
+    /// peer reads its values under the class's missing-key policy, which is
+    /// what an intentionally keyless peer looks like.
+    ///
+    /// # Hosting other clients
+    ///
+    /// Keys given here are the ones [`crate::server::PeerServerSvc`] hydrates
+    /// *every* request with, for every principal it serves — there is no
+    /// per-principal key policy yet. Handing a keyring to a connection that a
+    /// peer server will host is therefore a decision about every client of
+    /// that server; see the header of [`crate::server`].
     #[must_use]
     pub fn with_keyring(mut self, keyring: Arc<dyn Keyring>) -> Self {
         self.keyring = Some(keyring);
@@ -249,6 +291,8 @@ struct Inner {
     /// Server-advertised heartbeat interval (ms); 0 disables the
     /// heartbeat-silence timeout.
     heartbeat_ms: std::sync::atomic::AtomicU64,
+    /// Class keys resolved from `config.keyring`, once.
+    hydrator: tokio::sync::OnceCell<Arc<Hydrator>>,
 }
 
 impl Inner {
@@ -359,6 +403,7 @@ impl Connection {
             client: Mutex::new(client),
             endpoint_index: std::sync::atomic::AtomicUsize::new(index),
             heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            hydrator: tokio::sync::OnceCell::new(),
             config,
         });
         let handshake_basis = pump_handshake(&inner, &mut stream).await?;
@@ -465,6 +510,7 @@ impl Connection {
         forms: Vec<Edn>,
         expected_basis_t: Option<u64>,
     ) -> Result<TxResult, PeerError> {
+        let forms = self.seal_protected(forms).await?;
         let tx_data = codec::encode_edn(&Edn::Vector(forms));
         let deadline = tokio::time::Instant::now() + self.inner.config.failover_timeout;
         let response = loop {
@@ -490,8 +536,54 @@ impl Connection {
         })
     }
 
+    /// The key set this connection reads protected values with.
+    ///
+    /// Resolution is async and happens once: a class key is stable for the
+    /// life of a connection, and schema is fixed at database creation. The
+    /// hydrator also carries the connection's bounded plaintext cache, so
+    /// repeated scans of the same values stay off the AEAD path.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] when a class names a malformed key identity. A
+    /// key that is merely absent is not an error: it is what a keyless peer
+    /// looks like.
+    pub async fn hydrator(&self) -> Result<Arc<Hydrator>, PeerError> {
+        self.inner
+            .hydrator
+            .get_or_try_init(|| async {
+                let keys = match &self.inner.config.keyring {
+                    Some(keyring) => ClassKeys::resolve(self.db().schema(), keyring.as_ref())
+                        .await
+                        .map_err(|error| PeerError::Protocol(error.to_string()))?,
+                    None => ClassKeys::default(),
+                };
+                Ok(Arc::new(Hydrator::new(keys)))
+            })
+            .await
+            .cloned()
+    }
+
+    /// Seals every value written to a protected attribute, against the
+    /// schema at this peer's current basis.
+    ///
+    /// A protection change committed between here and the transactor's own
+    /// validation rejects the transaction rather than storing a value in the
+    /// stale form; the caller retries against the new schema.
+    async fn seal_protected(&self, forms: Vec<Edn>) -> Result<Vec<Edn>, PeerError> {
+        let db = self.db();
+        if db.schema().protections().next().is_none() {
+            return Ok(forms);
+        }
+        let hydrator = self.hydrator().await?;
+        seal::seal_forms(&db, hydrator.keys(), forms)
+    }
+
     /// Submits already-encoded transaction data, returning the raw wire
     /// response (used by the peer server's transact proxy).
+    ///
+    /// Transaction data arriving here is already encoded, so a value on a
+    /// protected attribute must already be sealed: this is the peer server's
+    /// proxy path, where the thin client — not the server — holds the keys.
     ///
     /// # Errors
     /// Returns [`PeerError`] for rejected transactions or transport failure.
@@ -1034,6 +1126,24 @@ impl Admin {
             .request_index(pb::RequestIndexRequest { db: db.to_owned() })
             .await?;
         Ok(response.into_inner().index_basis_t)
+    }
+
+    /// Applies a reviewed schema plan to `db`.
+    ///
+    /// The *desired schema* is submitted, not the plan: the transactor
+    /// recomputes the plan under its commit queue and refuses unless the
+    /// digest matches `plan_digest`, so a plan that has gone stale is
+    /// rejected rather than silently re-interpreted. See
+    /// `docs/design/schema-migrations.md`.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] when the plan is stale, a precondition or
+    /// acknowledgement is missing, or the transport fails.
+    pub async fn alter_schema(
+        &mut self,
+        request: pb::AlterSchemaRequest,
+    ) -> Result<pb::AlterSchemaResponse, PeerError> {
+        Ok(self.client.alter_schema(request).await?.into_inner())
     }
 
     /// Overrides `db`'s index-publication pacing at runtime; `None` fields

@@ -1,0 +1,830 @@
+//! Attribute-level sealing and hydration.
+//!
+//! A value on a protected attribute is sealed by the writing peer before the
+//! transaction leaves it, and opened only by a reader whose keyring resolves
+//! the class key. Everything in between — the transactor, the log, the
+//! indexes, a peer without the key — handles the ciphertext bytewise and
+//! keeps working (`docs/design/encryption.md`, ADR-0018).
+//!
+//! Key resolution is async and happens once, into a [`ClassKeys`] snapshot,
+//! so the sync transact and query paths never touch a keyring.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use corium_core::{
+    AttrId, EntityId, KeywordInterner, LegacyPlaintextPolicy, MissingKeyPolicy, ProtectionClass,
+    ProtectionScope, Schema, Sealed, Value, ValueType, decode_seal_plaintext,
+    encode_seal_plaintext,
+};
+use corium_crypt::{KeyError, Keyring, SecretKey, open_deterministic, seal_deterministic};
+
+/// Domain separator opening every sealing AAD.
+const SEAL_AAD_PREFIX: &[u8] = b"corium/seal-v1";
+
+/// Sealing or hydration failure.
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum ProtectError {
+    /// The attribute is not protected at this basis.
+    #[error("attribute {0} is not protected")]
+    NotProtected(AttrId),
+    /// The schema names a class the class table does not define.
+    #[error("protection class {0} is not installed")]
+    UnknownClass(EntityId),
+    /// No key for the class and epoch this process needs.
+    #[error("no key for protection class {class} at epoch {epoch}")]
+    MissingKey {
+        /// Class whose key is absent.
+        class: EntityId,
+        /// Epoch that was wanted.
+        epoch: u32,
+    },
+    /// The body did not authenticate under the class key.
+    ///
+    /// Distinct from a decode failure on purpose: a wrong key, a moved
+    /// ciphertext, and a tampered body must all look the same.
+    #[error("sealed value for class {class} epoch {epoch} did not authenticate")]
+    Authentication {
+        /// Class named by the sealed header.
+        class: EntityId,
+        /// Epoch named by the sealed header.
+        epoch: u32,
+    },
+    /// Entity-scoped classes are declared but not yet sealable.
+    #[error("protection class {0} uses :db.protect.scope/entity, which this build cannot seal")]
+    UnsupportedScope(EntityId),
+    /// The plaintext could not be encoded or decoded.
+    #[error("seal plaintext: {0}")]
+    Plaintext(#[from] corium_core::SealPlaintextError),
+    /// The value is not of the attribute's declared type.
+    #[error("attribute {attr} holds {vtype:?} values; this one is not")]
+    TypeMismatch {
+        /// Attribute being sealed for.
+        attr: AttrId,
+        /// Type the schema declares.
+        vtype: ValueType,
+    },
+    /// The sealed header names a class the attribute has never used.
+    #[error("attribute {attr} was never sealed under class {class}")]
+    ForeignClass {
+        /// Attribute the value was found on.
+        attr: AttrId,
+        /// Class the sealed header names.
+        class: EntityId,
+    },
+}
+
+/// Every class key one process can resolve, snapshotted once.
+///
+/// Resolution is async and a class key is stable for the life of a
+/// connection, so the snapshot is taken at connect time and the sync paths
+/// only look keys up. A class whose key this process cannot resolve is simply
+/// absent, which is the ordinary case for a keyless peer rather than an
+/// error.
+#[derive(Clone, Debug, Default)]
+pub struct ClassKeys {
+    keys: BTreeMap<(EntityId, u32), Arc<SecretKey>>,
+}
+
+impl ClassKeys {
+    /// Resolves the current epoch key of every class in `schema`.
+    ///
+    /// A class whose key the keyring cannot produce is skipped: a peer
+    /// holding some keys and not others is the normal deployment, and what a
+    /// reader sees for the rest is the class's own missing-key policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyError`] only for a malformed key identity; a key that is
+    /// merely absent or unresolvable leaves the class out of the snapshot.
+    pub async fn resolve(schema: &Schema, keyring: &dyn Keyring) -> Result<Self, KeyError> {
+        let mut keys = BTreeMap::new();
+        for (id, class) in schema.classes() {
+            let key_id = corium_crypt::KeyId::new(class.key_id.clone())?;
+            if let Ok(key) = keyring.key(&key_id, class.current_epoch).await {
+                keys.insert((*id, class.current_epoch), Arc::new(key));
+            }
+        }
+        Ok(Self { keys })
+    }
+
+    /// Adds one class key, for tests and for epochs resolved on demand.
+    pub fn insert(&mut self, class: EntityId, epoch: u32, key: SecretKey) {
+        self.keys.insert((class, epoch), Arc::new(key));
+    }
+
+    /// Whether this process can open values sealed by `class` at `epoch`.
+    #[must_use]
+    pub fn holds(&self, class: EntityId, epoch: u32) -> bool {
+        self.keys.contains_key(&(class, epoch))
+    }
+
+    /// Whether the snapshot resolves no class at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The subset of this snapshot whose classes name a key id in `allowed`.
+    ///
+    /// This is where a `KeyPolicy` meets the key set a process actually holds
+    /// (`docs/design/encryption.md`, "Peer server, thin clients, SQL"). A
+    /// server resolves its own keyring once, at connect time, and then hands
+    /// each principal the subset that principal is entitled to — so one peer
+    /// server serves readers with different key sets from one immutable
+    /// database value, and holding a key is never the same as disclosing it.
+    ///
+    /// A class the schema does not define cannot be matched to a key id, so
+    /// it is dropped: the policy names key ids, and a key whose class has
+    /// vanished from the schema is not one the policy granted.
+    #[must_use]
+    pub fn restrict_to(&self, schema: &Schema, allowed: &BTreeSet<String>) -> Self {
+        let keys = self
+            .keys
+            .iter()
+            .filter(|((class, _), _)| {
+                schema
+                    .class(*class)
+                    .is_some_and(|class| allowed.contains(&class.key_id))
+            })
+            .map(|(id, key)| (*id, Arc::clone(key)))
+            .collect();
+        Self { keys }
+    }
+
+    fn key(&self, class: EntityId, epoch: u32) -> Result<&SecretKey, ProtectError> {
+        self.keys
+            .get(&(class, epoch))
+            .map(AsRef::as_ref)
+            .ok_or(ProtectError::MissingKey { class, epoch })
+    }
+}
+
+/// Builds the AAD binding a sealed body to its context.
+///
+/// Every field the design lists is present, so a body cannot be moved to
+/// another key, epoch, attribute, subject, or declared type without failing
+/// authentication.
+fn seal_aad(
+    key_id: &str,
+    epoch: u32,
+    attr: AttrId,
+    entity: Option<EntityId>,
+    vtype: ValueType,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(SEAL_AAD_PREFIX.len() + key_id.len() + 21);
+    aad.extend_from_slice(SEAL_AAD_PREFIX);
+    aad.extend_from_slice(key_id.as_bytes());
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad.extend_from_slice(&attr.raw().to_be_bytes());
+    if let Some(entity) = entity {
+        aad.extend_from_slice(&entity.raw().to_be_bytes());
+    }
+    aad.push(value_type_byte(vtype));
+    aad
+}
+
+/// The declared-type byte the AAD carries, in [`ValueType`] declaration
+/// order — the same order the sortable encoding uses.
+const fn value_type_byte(vtype: ValueType) -> u8 {
+    match vtype {
+        ValueType::Bool => 0,
+        ValueType::Long => 1,
+        ValueType::Double => 2,
+        ValueType::Instant => 3,
+        ValueType::Uuid => 4,
+        ValueType::Keyword => 5,
+        ValueType::Str => 6,
+        ValueType::Bytes => 7,
+        ValueType::Ref => 8,
+    }
+}
+
+/// The entity an entity-scoped seal binds, or `None` under attribute scope.
+///
+/// `entity` is `None` where the caller does not know one — the writing peer
+/// sealing a value for a tempid. Attribute scope does not bind the entity, so
+/// that is not a problem for it; entity scope needs the id before tempid
+/// resolution would assign one, which costs an id-reservation round trip the
+/// peer does not make yet, so it is refused either way for now.
+fn scoped_entity(
+    class: &ProtectionClass,
+    _entity: Option<EntityId>,
+) -> Result<Option<EntityId>, ProtectError> {
+    match class.scope {
+        ProtectionScope::Attribute => Ok(None),
+        ProtectionScope::Entity => Err(ProtectError::UnsupportedScope(class.id)),
+    }
+}
+
+/// Rounds plaintext up to the class's padding multiple with zero bytes.
+///
+/// The true length is not recorded: every value encoding is self-delimiting,
+/// so the decoder finds the end of the value and ignores what follows (see
+/// `decode_seal_plaintext`). Padding costs storage and removes the length
+/// side channel for short, guessable values.
+fn pad(plaintext: &mut Vec<u8>, padding: Option<u32>) {
+    let Some(multiple) = padding.map(|multiple| multiple as usize).filter(|m| *m > 0) else {
+        return;
+    };
+    let remainder = plaintext.len() % multiple;
+    if remainder != 0 {
+        plaintext.resize(plaintext.len() + (multiple - remainder), 0);
+    }
+}
+
+/// Seals `value` for `attr` under the attribute's current class.
+///
+/// `e` is the entity the value belongs to, or `None` when the caller does not
+/// know it yet — a writing peer sealing for a tempid. Attribute scope, the
+/// only scope this build seals, does not bind the entity.
+///
+/// # Errors
+///
+/// Returns [`ProtectError`] when the attribute is unprotected, its class is
+/// missing or entity-scoped, the value is not of the attribute's declared
+/// type, the process holds no key for it, or the value cannot be encoded as
+/// seal plaintext.
+pub fn seal_value(
+    schema: &Schema,
+    keys: &ClassKeys,
+    attr: AttrId,
+    e: Option<EntityId>,
+    value: &Value,
+    interner: &KeywordInterner,
+) -> Result<Value, ProtectError> {
+    let class_id = schema
+        .protection(attr)
+        .current()
+        .ok_or(ProtectError::NotProtected(attr))?;
+    let class = schema
+        .class(class_id)
+        .ok_or(ProtectError::UnknownClass(class_id))?;
+    let entity = scoped_entity(class, e)?;
+    let vtype = schema
+        .get(attr)
+        .map_or(ValueType::Str, |attribute| attribute.value_type);
+    // The declared type is cleartext in the sealed header, and the transactor
+    // checks the value against it there. Taking it from the schema rather than
+    // from the value would make that check vacuous: a wrongly typed plaintext
+    // would be sealed under the right label and pass. It is checked here, the
+    // last place that can still see the plaintext.
+    if !value.has_type(vtype) {
+        return Err(ProtectError::TypeMismatch { attr, vtype });
+    }
+    let key = keys.key(class_id, class.current_epoch)?;
+
+    let mut plaintext = encode_seal_plaintext(value, interner)?;
+    pad(&mut plaintext, class.padding);
+    let aad = seal_aad(&class.key_id, class.current_epoch, attr, entity, vtype);
+    let body =
+        seal_deterministic(key, &aad, &plaintext).map_err(|_| ProtectError::Authentication {
+            class: class_id,
+            epoch: class.current_epoch,
+        })?;
+    Ok(Value::Sealed(Sealed {
+        class: class_id,
+        epoch: class.current_epoch,
+        vtype,
+        body: Arc::from(body),
+    }))
+}
+
+/// Opens a sealed value found on `attr` of entity `e`.
+///
+///
+/// The class and epoch come from the value's own cleartext header, so a
+/// mixed attribute — one re-classified or rotated mid-life — decodes without
+/// schema archaeology.
+///
+/// # Errors
+///
+/// Returns [`ProtectError`] when the header names a class the attribute never
+/// used, the process holds no key for it, or the body does not authenticate.
+pub fn open_value(
+    schema: &Schema,
+    keys: &ClassKeys,
+    attr: AttrId,
+    e: Option<EntityId>,
+    sealed: &Sealed,
+    interner: &KeywordInterner,
+) -> Result<Value, ProtectError> {
+    if !schema
+        .protection(attr)
+        .classes()
+        .any(|class| class == sealed.class)
+    {
+        return Err(ProtectError::ForeignClass {
+            attr,
+            class: sealed.class,
+        });
+    }
+    let class = schema
+        .class(sealed.class)
+        .ok_or(ProtectError::UnknownClass(sealed.class))?;
+    let entity = scoped_entity(class, e)?;
+    let key = keys.key(sealed.class, sealed.epoch)?;
+    let aad = seal_aad(&class.key_id, sealed.epoch, attr, entity, sealed.vtype);
+    let plaintext =
+        open_deterministic(key, &aad, &sealed.body).map_err(|_| ProtectError::Authentication {
+            class: sealed.class,
+            epoch: sealed.epoch,
+        })?;
+    Ok(decode_seal_plaintext(&plaintext, sealed.vtype, interner)?)
+}
+
+/// What a reader should do with one datom on a protected attribute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Disposition {
+    /// The reader holds the key: open the value and bind plaintext.
+    Hydrate,
+    /// Bind the value as it stands; it renders redacted.
+    Redact,
+    /// Drop the datom from scan results.
+    Hide,
+    /// Fail the read.
+    Fail,
+}
+
+/// Decides what a reader does with a value on a protected attribute.
+///
+/// `holds_key` is whether this process can open the value in hand — for a
+/// sealed value, its own class and epoch; for legacy plaintext, the
+/// attribute's current class. The two cases share this decision on purpose:
+/// "may this reader have this attribute's values?" is one question, and its
+/// answer must not depend on which side of a protection change a datom fell
+/// on.
+#[must_use]
+pub fn disposition(class: &ProtectionClass, holds_key: bool) -> Disposition {
+    if holds_key {
+        return Disposition::Hydrate;
+    }
+    match class.on_missing_key {
+        MissingKeyPolicy::Redact => Disposition::Redact,
+        MissingKeyPolicy::Hide => Disposition::Hide,
+        MissingKeyPolicy::Error => Disposition::Fail,
+    }
+}
+
+/// What a read should bind for one scanned datom.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Hydration {
+    /// Bind this value: plaintext for a key holder, the sealed value for a
+    /// reader under `redact`.
+    Bind(Value),
+    /// Drop the datom from the results entirely (`hide`).
+    Hide,
+    /// Fail the read (`error`), naming the class.
+    Refuse(EntityId),
+}
+
+/// Largest number of opened plaintexts one hydrator keeps.
+///
+/// The cache exists to keep repeated scans of the same values off the AEAD
+/// path, not to hold a working set; when it fills it is cleared rather than
+/// evicted one entry at a time, which costs one re-open per value and no
+/// bookkeeping.
+const PLAINTEXT_CACHE_CAP: usize = 10_000;
+
+/// Opens sealed values for one reader, against one key set.
+///
+/// Hydration is a property of the read, not of the database value: one peer
+/// server answers principals with different key sets from the same immutable
+/// `Db`, so the key set travels with the query rather than with the data.
+#[derive(Debug, Default)]
+pub struct Hydrator {
+    keys: ClassKeys,
+    cache: std::sync::Mutex<std::collections::HashMap<[u8; 32], Value>>,
+}
+
+impl Hydrator {
+    /// Builds a hydrator over a resolved key snapshot.
+    #[must_use]
+    pub fn new(keys: ClassKeys) -> Self {
+        Self {
+            keys,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The keys this reader holds.
+    #[must_use]
+    pub const fn keys(&self) -> &ClassKeys {
+        &self.keys
+    }
+
+    /// Decides and performs what a read does with one scanned value.
+    ///
+    /// A value on an unprotected attribute passes straight through, which is
+    /// every value in a database that declares no class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtectError`] when a value the reader *can* open turns out
+    /// to be unopenable — a foreign class, a body that does not
+    /// authenticate. A value it simply holds no key for is not an error; it
+    /// follows the class policy.
+    pub fn hydrate(
+        &self,
+        schema: &Schema,
+        interner: &KeywordInterner,
+        attr: AttrId,
+        e: EntityId,
+        value: &Value,
+    ) -> Result<Hydration, ProtectError> {
+        let Some(class_id) = schema.protection(attr).current() else {
+            return Ok(Hydration::Bind(value.clone()));
+        };
+        let class = schema
+            .class(class_id)
+            .ok_or(ProtectError::UnknownClass(class_id))?;
+        let Value::Sealed(sealed) = value else {
+            return Ok(self.hydrate_legacy(schema, class, attr, value));
+        };
+        match disposition(class, self.keys.holds(sealed.class, sealed.epoch)) {
+            Disposition::Hydrate => {
+                let digest = cache_key(attr, sealed);
+                if let Some(hit) = self.cached(&digest) {
+                    return Ok(Hydration::Bind(hit));
+                }
+                let plaintext = open_value(schema, &self.keys, attr, Some(e), sealed, interner)?;
+                self.remember(digest, &plaintext);
+                Ok(Hydration::Bind(plaintext))
+            }
+            Disposition::Redact => Ok(Hydration::Bind(value.clone())),
+            Disposition::Hide => Ok(Hydration::Hide),
+            Disposition::Fail => Ok(Hydration::Refuse(class_id)),
+        }
+    }
+
+    /// Applies the class policy to a plaintext datom asserted before the
+    /// attribute was protected.
+    ///
+    /// The reader that holds the class key sees plaintext for old datoms and
+    /// hydrated values for new ones, uniformly. A reader without it gets the
+    /// class's `legacy-plaintext` policy, which defaults to treating the
+    /// datom exactly like a sealed value it has no key for — policy, not
+    /// cryptography, and documented as such.
+    ///
+    /// Create-time protection cannot produce such a datom; forward-only
+    /// alteration will.
+    fn hydrate_legacy(
+        &self,
+        schema: &Schema,
+        class: &ProtectionClass,
+        attr: AttrId,
+        value: &Value,
+    ) -> Hydration {
+        let holds_key = self.keys.holds(class.id, class.current_epoch);
+        if holds_key || class.legacy_plaintext == LegacyPlaintextPolicy::PassThrough {
+            return Hydration::Bind(value.clone());
+        }
+        match disposition(class, false) {
+            Disposition::Redact => Hydration::Bind(redacted_stand_in(schema, class, attr, value)),
+            Disposition::Hide => Hydration::Hide,
+            // `holds_key` is false here, so `disposition` never says hydrate.
+            Disposition::Hydrate | Disposition::Fail => Hydration::Refuse(class.id),
+        }
+    }
+
+    fn cached(&self, digest: &[u8; 32]) -> Option<Value> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(digest)
+            .cloned()
+    }
+
+    fn remember(&self, digest: [u8; 32], value: &Value) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= PLAINTEXT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(digest, value.clone());
+    }
+}
+
+/// Cache key for one opened body, bound to the attribute it was found on.
+fn cache_key(attr: AttrId, sealed: &Sealed) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&attr.raw().to_be_bytes());
+    hasher.update(&sealed.class.raw().to_be_bytes());
+    hasher.update(&sealed.epoch.to_be_bytes());
+    hasher.update(&sealed.body);
+    *hasher.finalize().as_bytes()
+}
+
+/// The redacted value bound in place of legacy plaintext.
+///
+/// The body is a digest of the plaintext rather than a constant, so two
+/// legacy values that differ stay distinct and two that match stay equal.
+/// That is the same equality the class's own determinism already exposes; a
+/// constant placeholder would instead make every redacted value join with
+/// every other, which is exactly the "matches by accident" this design rules
+/// out.
+fn redacted_stand_in(
+    schema: &Schema,
+    class: &ProtectionClass,
+    attr: AttrId,
+    value: &Value,
+) -> Value {
+    let vtype = schema
+        .get(attr)
+        .map_or(ValueType::Str, |attribute| attribute.value_type);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"corium/redacted-legacy-v1");
+    hasher.update(&attr.raw().to_be_bytes());
+    hasher.update(&corium_core::encode_value(value));
+    Value::Sealed(Sealed {
+        class: class.id,
+        epoch: class.current_epoch,
+        vtype,
+        body: Arc::from(hasher.finalize().as_bytes().as_slice()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corium_core::{
+        Attribute, Cardinality, Keyword, LegacyPlaintextPolicy, Partition, ProtectionTimeline,
+        SealAlgorithm,
+    };
+
+    const CLASS: EntityId = EntityId::new(Partition::Db as u32, 100);
+    const SSN: AttrId = EntityId::new(Partition::Db as u32, 101);
+    const OTHER: AttrId = EntityId::new(Partition::Db as u32, 102);
+    const ALICE: EntityId = EntityId::new(Partition::User as u32, 1);
+
+    fn class(padding: Option<u32>, scope: ProtectionScope) -> ProtectionClass {
+        ProtectionClass {
+            id: CLASS,
+            key_id: "file:/etc/corium/pii.key".into(),
+            algorithm: SealAlgorithm::Aes256GcmSiv,
+            scope,
+            padding,
+            on_missing_key: MissingKeyPolicy::Redact,
+            legacy_plaintext: LegacyPlaintextPolicy::Redact,
+            current_epoch: 1,
+        }
+    }
+
+    fn schema_with(vtype: ValueType, padding: Option<u32>) -> Schema {
+        let mut schema = Schema::default();
+        schema.insert_class(class(padding, ProtectionScope::Attribute));
+        for id in [SSN, OTHER] {
+            schema.insert(Attribute {
+                id,
+                value_type: vtype,
+                cardinality: Cardinality::One,
+                unique: None,
+                is_component: false,
+                indexed: false,
+                no_history: false,
+            });
+            schema.set_protection(id, ProtectionTimeline::protected_from(0, CLASS));
+        }
+        schema
+    }
+
+    fn keys() -> ClassKeys {
+        let mut keys = ClassKeys::default();
+        keys.insert(CLASS, 1, SecretKey::from_slice(&[7_u8; 32]).expect("key"));
+        keys
+    }
+
+    #[test]
+    fn every_value_type_round_trips() {
+        let keys = keys();
+        let mut interner = KeywordInterner::default();
+        let kw = interner.intern(Keyword::new(Some("status"), "active"));
+        for (vtype, value) in [
+            (ValueType::Bool, Value::Bool(true)),
+            (ValueType::Long, Value::Long(-9)),
+            (ValueType::Double, Value::Double(corium_core::TotalF64(1.5))),
+            (ValueType::Instant, Value::Instant(1_700_000_000_000)),
+            (ValueType::Uuid, Value::Uuid(0x1234_5678_9abc_def0)),
+            (ValueType::Keyword, Value::Keyword(kw)),
+            (ValueType::Str, Value::Str("123-45-6789".into())),
+            (ValueType::Bytes, Value::Bytes(Arc::from(vec![0, 1, 0, 0]))),
+        ] {
+            let schema = schema_with(vtype, None);
+            let sealed = seal_value(&schema, &keys, SSN, Some(ALICE), &value, &interner)
+                .unwrap_or_else(|error| panic!("{vtype:?} seals: {error}"));
+            let Value::Sealed(header) = &sealed else {
+                panic!("sealing must produce a sealed value")
+            };
+            assert_eq!(header.vtype, vtype);
+            assert_eq!(header.class, CLASS);
+            assert_eq!(
+                open_value(&schema, &keys, SSN, Some(ALICE), header, &interner).expect("opens"),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn a_reader_that_never_interned_the_keyword_still_gets_it() {
+        let schema = schema_with(ValueType::Keyword, None);
+        let keys = keys();
+        let mut writer = KeywordInterner::default();
+        let kw = writer.intern(Keyword::new(Some("status"), "active"));
+        let sealed = seal_value(
+            &schema,
+            &keys,
+            SSN,
+            Some(ALICE),
+            &Value::Keyword(kw),
+            &writer,
+        )
+        .expect("seals");
+        let Value::Sealed(header) = &sealed else {
+            panic!("sealed expected")
+        };
+
+        let reader = KeywordInterner::default();
+        let opened = open_value(&schema, &keys, SSN, Some(ALICE), header, &reader).expect("opens");
+        let Value::Keyword(id) = opened else {
+            panic!("keyword expected")
+        };
+        assert_eq!(
+            reader.resolve(id),
+            Some(Keyword::new(Some("status"), "active"))
+        );
+        // The protected vocabulary stayed out of the durable naming table.
+        assert_eq!(reader.len(), 0);
+    }
+
+    #[test]
+    fn sealing_is_deterministic_so_the_transactor_can_pair_facts() {
+        let schema = schema_with(ValueType::Str, None);
+        let keys = keys();
+        let interner = KeywordInterner::default();
+        let value = Value::Str("123-45-6789".into());
+        let first = seal_value(&schema, &keys, SSN, Some(ALICE), &value, &interner).expect("seals");
+        let again = seal_value(&schema, &keys, SSN, Some(ALICE), &value, &interner).expect("seals");
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn a_body_cannot_be_moved_to_another_attribute() {
+        let schema = schema_with(ValueType::Str, None);
+        let keys = keys();
+        let interner = KeywordInterner::default();
+        let sealed = seal_value(
+            &schema,
+            &keys,
+            SSN,
+            Some(ALICE),
+            &Value::Str("123-45-6789".into()),
+            &interner,
+        )
+        .expect("seals");
+        let Value::Sealed(header) = &sealed else {
+            panic!("sealed expected")
+        };
+        assert_eq!(
+            open_value(&schema, &keys, OTHER, Some(ALICE), header, &interner),
+            Err(ProtectError::Authentication {
+                class: CLASS,
+                epoch: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn padding_hides_length_without_recording_it() {
+        let schema = schema_with(ValueType::Str, Some(64));
+        let keys = keys();
+        let interner = KeywordInterner::default();
+        let mut lengths = std::collections::BTreeSet::new();
+        for text in ["a", "abcdefghij", "123-45-6789"] {
+            let sealed = seal_value(
+                &schema,
+                &keys,
+                SSN,
+                Some(ALICE),
+                &Value::Str(text.into()),
+                &interner,
+            )
+            .expect("seals");
+            let Value::Sealed(header) = &sealed else {
+                panic!("sealed expected")
+            };
+            lengths.insert(header.body.len());
+            assert_eq!(
+                open_value(&schema, &keys, SSN, Some(ALICE), header, &interner).expect("opens"),
+                Value::Str(text.into())
+            );
+        }
+        assert_eq!(lengths.len(), 1, "padded bodies must share one length");
+        // Plaintext padded to 64 bytes plus the 16-byte AEAD tag.
+        assert_eq!(lengths.into_iter().next(), Some(80));
+    }
+
+    #[test]
+    fn a_wrong_key_reports_authentication_not_a_decode_error() {
+        let schema = schema_with(ValueType::Str, None);
+        let interner = KeywordInterner::default();
+        let sealed = seal_value(
+            &schema,
+            &keys(),
+            SSN,
+            Some(ALICE),
+            &Value::Str("123-45-6789".into()),
+            &interner,
+        )
+        .expect("seals");
+        let Value::Sealed(header) = &sealed else {
+            panic!("sealed expected")
+        };
+        let mut wrong = ClassKeys::default();
+        wrong.insert(CLASS, 1, SecretKey::from_slice(&[9_u8; 32]).expect("key"));
+        assert_eq!(
+            open_value(&schema, &wrong, SSN, Some(ALICE), header, &interner),
+            Err(ProtectError::Authentication {
+                class: CLASS,
+                epoch: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_class_the_attribute_never_used_is_refused_before_any_key_work() {
+        let schema = schema_with(ValueType::Str, None);
+        let foreign = Sealed {
+            class: EntityId::new(Partition::Db as u32, 200),
+            epoch: 1,
+            vtype: ValueType::Str,
+            body: Arc::from(vec![0_u8; 32]),
+        };
+        assert_eq!(
+            open_value(
+                &schema,
+                &keys(),
+                SSN,
+                Some(ALICE),
+                &foreign,
+                &KeywordInterner::default()
+            ),
+            Err(ProtectError::ForeignClass {
+                attr: SSN,
+                class: foreign.class,
+            })
+        );
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_never_sealed() {
+        // The declared type is cleartext in the header and is what the
+        // transactor checks the value against. If sealing took it from the
+        // schema without looking at the value, a wrongly typed plaintext
+        // would be sealed under the right label and sail past that check.
+        let schema = schema_with(ValueType::Long, None);
+        assert_eq!(
+            seal_value(
+                &schema,
+                &keys(),
+                SSN,
+                Some(ALICE),
+                &Value::Str("not a long".into()),
+                &KeywordInterner::default()
+            ),
+            Err(ProtectError::TypeMismatch {
+                attr: SSN,
+                vtype: ValueType::Long,
+            })
+        );
+    }
+
+    #[test]
+    fn entity_scope_is_declarable_but_not_yet_sealable() {
+        let mut schema = schema_with(ValueType::Str, None);
+        schema.insert_class(class(None, ProtectionScope::Entity));
+        assert_eq!(
+            seal_value(
+                &schema,
+                &keys(),
+                SSN,
+                Some(ALICE),
+                &Value::Str("x".into()),
+                &KeywordInterner::default()
+            ),
+            Err(ProtectError::UnsupportedScope(CLASS))
+        );
+    }
+
+    #[test]
+    fn a_missing_key_follows_the_class_policy() {
+        let mut class = class(None, ProtectionScope::Attribute);
+        assert_eq!(disposition(&class, true), Disposition::Hydrate);
+        assert_eq!(disposition(&class, false), Disposition::Redact);
+        class.on_missing_key = MissingKeyPolicy::Hide;
+        assert_eq!(disposition(&class, false), Disposition::Hide);
+        class.on_missing_key = MissingKeyPolicy::Error;
+        assert_eq!(disposition(&class, false), Disposition::Fail);
+    }
+}

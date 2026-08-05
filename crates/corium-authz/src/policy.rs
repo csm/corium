@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use corium_core::{AttrId, Keyword, Value};
 use corium_db::Db;
-use corium_protocol::authz::{Action, ActionClass, ViewFilter};
+use corium_protocol::authz::{Action, ActionClass, KeyGrant, ViewFilter};
 
 use crate::model::{
     Binding, FilterKind, ObjectDef, ObjectRef, Permission, PrincipalDef, Rewrite, SubjectRef,
@@ -71,6 +71,16 @@ pub enum PolicyError {
     },
 }
 
+/// One compiled view: the attribute filter it imposes, and the protection
+/// class keys it permits hydrating. Either half may restrict nothing.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledView {
+    /// Attribute visibility, or `None` when the view names no attributes.
+    pub(crate) filter: Option<Arc<dyn ViewFilter>>,
+    /// Protection classes the view permits hydrating.
+    pub(crate) keys: KeyGrant,
+}
+
 /// Counts describing a compiled policy, for logs and `authz status`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PolicyStats {
@@ -100,8 +110,8 @@ pub struct Policy {
     rewrites: BTreeMap<String, Vec<Rewrite>>,
     /// `(object type, action-or-class-or-*)` → relations satisfying it.
     permissions: BTreeMap<(String, String), BTreeSet<String>>,
-    /// View name → compiled filter.
-    views: BTreeMap<String, Arc<dyn ViewFilter>>,
+    /// View name → compiled restriction.
+    views: BTreeMap<String, CompiledView>,
     /// `(relation, object)` → binding.
     bindings: BTreeMap<(String, ObjectRef), Binding>,
     /// Principal id → registration.
@@ -290,18 +300,30 @@ impl Policy {
     fn read_views(&mut self, reader: &Reader) -> Result<(), PolicyError> {
         for (eid, values) in reader.rows(schema::VIEW_NAME) {
             let name = reader.one_string("view", eid, schema::VIEW_NAME, values)?;
-            let kind_text = reader.required_string("view", eid, schema::VIEW_FILTER_TYPE)?;
-            let kind =
-                FilterKind::parse(&kind_text).ok_or_else(|| PolicyError::UnsupportedFilter {
-                    view: name.clone(),
-                    kind: kind_text,
-                })?;
+            // A view may restrict attributes, keys, or both, so the filter
+            // type is required only when the view names one.
+            let kind = match reader.optional_string("view", eid, schema::VIEW_FILTER_TYPE)? {
+                Some(text) => Some(FilterKind::parse(&text).ok_or_else(|| {
+                    PolicyError::UnsupportedFilter {
+                        view: name.clone(),
+                        kind: text,
+                    }
+                })?),
+                None => None,
+            };
             let definition = ViewDef {
                 name: name.clone(),
                 kind,
                 attributes: reader.strings(eid, schema::VIEW_ATTRIBUTE),
+                keys: reader.strings(eid, schema::VIEW_KEY),
             };
-            self.views.insert(name, view::build(&definition));
+            self.views.insert(
+                name,
+                CompiledView {
+                    filter: view::build(&definition),
+                    keys: view::key_grant(&definition),
+                },
+            );
             self.stats.views += 1;
         }
         Ok(())
@@ -435,8 +457,8 @@ impl Policy {
             })
     }
 
-    /// The compiled filter a binding names.
-    pub(crate) fn view(&self, name: &str) -> Option<&Arc<dyn ViewFilter>> {
+    /// The compiled restriction a binding names.
+    pub(crate) fn view(&self, name: &str) -> Option<&CompiledView> {
         self.views.get(name)
     }
 }
@@ -525,6 +547,19 @@ impl Reader {
         self.one_string(entity, eid, attribute, values)
     }
 
+    /// Reads a string attribute that policy data may legitimately omit.
+    fn optional_string(
+        &self,
+        entity: &'static str,
+        eid: corium_core::EntityId,
+        attribute: &'static str,
+    ) -> Result<Option<String>, PolicyError> {
+        match self.value(eid, attribute) {
+            Some(values) => self.one_string(entity, eid, attribute, values).map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn strings(&self, eid: corium_core::EntityId, attribute: &'static str) -> Vec<String> {
         self.value(eid, attribute).map_or_else(Vec::new, |values| {
             values.iter().filter_map(|value| self.text(value)).collect()
@@ -539,7 +574,7 @@ impl Reader {
             Value::Keyword(id) => self
                 .interner
                 .resolve(*id)
-                .map(std::string::ToString::to_string),
+                .map(|keyword| keyword.to_string()),
             _ => None,
         }
     }

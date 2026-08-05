@@ -15,8 +15,8 @@ pub mod pull;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use corium_core::{Keyword, Value};
-use corium_db::Db;
+use corium_core::{EntityId, Keyword, Value};
+use corium_db::{Db, read::ReadContext};
 use thiserror::Error;
 
 use crate::aggregate::AggOut;
@@ -27,7 +27,7 @@ use crate::exec::{ExecCtx, Frame, to_entity};
 
 pub use crate::cache::QueryCache;
 pub use crate::entity::Entity;
-pub use crate::pull::{pull, pull_many};
+pub use crate::pull::{pull, pull_many, pull_many_with, pull_with};
 
 /// Query failure.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -59,6 +59,13 @@ pub enum QueryError {
     /// The execution fuel budget was exhausted.
     #[error("query fuel exhausted")]
     FuelExhausted,
+    /// The read needed the plaintext of a value it holds no key for.
+    ///
+    /// Raised by value-ordered aggregates over sealed values, and by a scan
+    /// whose class sets `:db.protect/on-missing-key :db.protect.missing/error`
+    /// (`docs/design/encryption.md`).
+    #[error("protection class {0} is not readable without its key")]
+    Protected(EntityId),
 }
 
 /// One query input, positionally matching the query's `:in` specification.
@@ -93,6 +100,12 @@ pub struct ExecOptions {
     pub fuel: Option<u64>,
     /// Optional resolver for non-native call clause names.
     pub extern_call: Option<ExternCall>,
+    /// The view and key set this read is answered under.
+    ///
+    /// Both are properties of the read, not of the `Db`: one peer server
+    /// answers principals with different authority from the same immutable
+    /// value, so they travel with the query rather than with the data.
+    pub read: ReadContext,
 }
 
 impl std::fmt::Debug for ExecOptions {
@@ -100,6 +113,7 @@ impl std::fmt::Debug for ExecOptions {
         f.debug_struct("ExecOptions")
             .field("fuel", &self.fuel)
             .field("extern_call", &self.extern_call.is_some())
+            .field("read", &self.read)
             .finish()
     }
 }
@@ -158,7 +172,7 @@ pub fn run(
             (InSpec::Db(_), QInput::Db(_)) => {}
             (InSpec::Rules, QInput::Edn(form)) => rules = parse_rules(form)?,
             (InSpec::Scalar(var), QInput::Edn(form)) => {
-                let value = input_value(default_db, form)?;
+                let value = input_value(default_db, &options.read, form)?;
                 for frame in &mut frames {
                     frame.insert(var.clone(), value.clone());
                 }
@@ -171,7 +185,7 @@ pub fn run(
                     return Err(QueryError::Arity("tuple input arity mismatch".into()));
                 }
                 for (var, item) in vars.iter().zip(items) {
-                    let value = input_value(default_db, item)?;
+                    let value = input_value(default_db, &options.read, item)?;
                     for frame in &mut frames {
                         frame.insert(var.clone(), value.clone());
                     }
@@ -183,7 +197,7 @@ pub fn run(
                 })?;
                 let values = items
                     .iter()
-                    .map(|item| input_value(default_db, item))
+                    .map(|item| input_value(default_db, &options.read, item))
                     .collect::<Result<Vec<_>, _>>()?;
                 frames = cross_bind(&frames, |frame, out| {
                     for value in &values {
@@ -208,7 +222,7 @@ pub fn run(
                     converted.push(
                         items
                             .iter()
-                            .map(|item| input_value(default_db, item))
+                            .map(|item| input_value(default_db, &options.read, item))
                             .collect::<Result<_, _>>()?,
                     );
                 }
@@ -237,6 +251,7 @@ pub fn run(
     if let Some(extern_call) = options.extern_call.clone() {
         ctx.set_extern_call(extern_call);
     }
+    ctx.set_read(options.read.clone());
     let frames = exec::eval_clauses(&ctx, &query.wheres, frames, &mut Vec::new())?;
 
     // Project to find + with variables with set semantics.
@@ -311,7 +326,7 @@ pub fn run(
     for row in out_rows {
         let mut out = Vec::with_capacity(row.len());
         for cell in row {
-            out.push(cell_to_edn(default_db, cell)?);
+            out.push(cell_to_edn(default_db, &options.read, cell)?);
         }
         edn_rows.push(out);
     }
@@ -345,14 +360,14 @@ enum Cell {
     Agg(AggOut),
 }
 
-fn cell_to_edn(default_db: Option<&Db>, cell: Cell) -> Result<Edn, QueryError> {
+fn cell_to_edn(default_db: Option<&Db>, read: &ReadContext, cell: Cell) -> Result<Edn, QueryError> {
     let db = default_db.ok_or_else(|| QueryError::UnknownSource(ast::DEFAULT_SRC.into()))?;
     match cell {
         Cell::Val(value, FindElem::Pull(_, pattern)) => {
             let eid = to_entity(&value).ok_or_else(|| {
                 QueryError::Type("pull requires an entity-valued variable".into())
             })?;
-            pull::pull(db, &pattern, eid)
+            pull::pull_with(db, &pattern, eid, read)
         }
         Cell::Val(value, _) | Cell::Agg(AggOut::Value(value)) => Ok(value_to_edn(db, &value)),
         Cell::Agg(AggOut::Coll(values)) => Ok(Edn::Vector(
@@ -377,7 +392,7 @@ fn cross_bind(frames: &[Frame], mut expand: impl FnMut(&Frame, &mut Vec<Frame>))
 
 /// Converts an input argument to a value, supporting scalars, tagged
 /// entities/instants/uuids, and lookup refs.
-fn input_value(db: Option<&Db>, form: &Edn) -> Result<Value, QueryError> {
+fn input_value(db: Option<&Db>, read: &ReadContext, form: &Edn) -> Result<Value, QueryError> {
     if let Some(value) = edn_to_value(db, form) {
         return Ok(value);
     }
@@ -395,6 +410,14 @@ fn input_value(db: Option<&Db>, form: &Edn) -> Result<Value, QueryError> {
         let value = db.schema().get(attr).map_or(value.clone(), |meta| {
             exec::coerce_for_type(value, meta.value_type)
         });
+        // A lookup ref over an attribute this reader cannot see would be an
+        // existence oracle: the value never comes back, but whether it
+        // resolves reports whether some entity holds it.
+        if !read.visible(attr) {
+            return Err(QueryError::Type(format!(
+                "lookup ref {form} names an attribute this reader cannot see"
+            )));
+        }
         return db
             .lookup(attr, &value)
             .map(Value::Ref)

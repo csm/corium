@@ -13,8 +13,8 @@
 `corium peer-server` hosts peer-local queries for thin clients. Both accept
 TLS and bearer-token flags documented by `corium <command> --help`.
 
-The transactor's blob, root, and transaction-log storage is selected with
-`--store`: `fs` (the default, under `--data-dir`), `mem` (in-memory and
+The transactor's statically linked blob, root, and transaction-log storage is
+selected with `--store`: `fs` (the default, under `--data-dir`), `mem` (in-memory and
 ephemeral — a single process, everything lost on exit; for demos and tests,
 not production), `postgres` (shared PostgreSQL storage at `--postgres-url`,
 requiring a build with `--features postgres`), `turso` (an
@@ -27,6 +27,34 @@ store versioned logs natively in the same backend as their blobs and roots.
 Online backup reads every durable backend; restore and offline GC write a
 filesystem data directory.
 
+A separately built driver can be selected without rebuilding the transactor:
+
+```sh
+corium transactor \
+  --store-plugin /opt/corium/plugins/libcorium_store_turso.so \
+  --store 'turso:{"path":"/srv/corium/store.db"}' \
+  --data-dir /srv/corium
+```
+
+`--store-plugin` is repeatable. `CORIUM_STORE_PLUGINS` may additionally name a
+path-separator-delimited list of library files or directories. Corium does not
+scan the working directory. Loading a storage plugin executes native
+code inside the transactor and gives that code the backend configuration,
+which may contain credentials. Install libraries and their containing
+directories with the same ownership and write restrictions as the transactor
+binary. Never load a plugin from a user-writable directory.
+
+Before deployment, run the live conformance checks against a disposable
+backend namespace:
+
+```sh
+corium store verify turso '{"path":"/tmp/corium-plugin-check.db"}' \
+  --store-plugin /opt/corium/plugins/libcorium_store_turso.so
+```
+
+The loader rejects an incompatible Corium ABI generation or `abi_stable` type
+layout and keeps accepted libraries loaded for the lifetime of the process.
+
 `GetStorageInfo` never returns a service backend's primary write credential.
 For PostgreSQL, configure a separate database role that has `SELECT` on
 `corium_blobs` and `corium_roots`, then pass its URL with
@@ -34,6 +62,12 @@ For PostgreSQL, configure a separate database role that has `SELECT` on
 missing, storage-aware peer bootstrap and online backup fail explicitly
 instead of falling back to `--postgres-url`. Local filesystem and Turso
 stores need no separate credential configuration.
+
+Plugin stores also require a separate read-only JSON configuration. Supply it
+with `--plugin-read-only-config`, `CORIUM_PLUGIN_READ_ONLY_CONFIG`, or the EDN
+key `:plugin-read-only-config`. Corium never advertises the plugin's primary
+configuration. If the read-only configuration is absent, `GetStorageInfo`
+fails for that plugin store.
 
 The PostgreSQL backend creates `corium_blobs` and `corium_roots` in the
 connection's current schema and stores transaction-log objects as fenced
@@ -126,6 +160,93 @@ this same endpoint; its configuration and exact metric contract are in
 [peer-segment-cache.md](design/peer-segment-cache.md). `corium db stats` and
 the transactor `Status` RPC provide basis, index lag, counts, queue depth, and
 GC counters on demand.
+
+## Schema updates
+
+`corium schema update` compares a schema file with the schema installed in a
+database and prints what would change, what it would cost, and what it would
+mean. It is read-only unless `--apply` is given:
+
+```sh
+corium schema update people --schema schema.toml
+```
+
+The plan is computed against one immutable database value, so every count in
+it is measured at one basis and one schema. Each difference is reported as a
+property-level change with an execution class:
+
+| Class | Meaning |
+|---|---|
+| `additive` | No existing fact is inspected or rewritten (a new attribute, or cardinality one → many). |
+| `validate-reindex` | Existing facts stay valid, but a bounded scan, constraint validation, or covering-index rebuild is needed (adding `index` or `unique`, changing uniqueness mode, toggling `isComponent`, retirement). |
+| `rewrite` | Current facts must change first (collapsing cardinality where entities hold several values). |
+| `destructive` | Information or historical interpretation would be lost (changing an attribute's value type in place). This command can never run one; the plan prints a replacement-attribute recipe instead. |
+
+Risk is reported separately from the class: an AVET backfill is expensive but
+semantically harmless, while a metadata-only `isComponent` flip can change the
+meaning of every live reference. Changes whose *meaning* changes carry a
+stable acknowledgement code — `component-enable`, `component-disable`,
+`unique-mode-change`, `no-history-enable`, `no-history-disable`,
+`retire-live-attribute`, `protection-forward-only` — printed next to the
+change and passed back with `--ack`.
+
+A file manages the declarations it contains. Installed attributes it does not
+mention are reported as `unmanaged` and left alone; `--prune` turns them into
+retirement requests instead. Retirement refuses new assertions while keeping
+the ident, its metadata, and its history readable — it is not deletion, and
+`schema update` has no hard-delete or excision facility. Idents match exactly:
+a removed ident and an added ident are two changes, never an inferred rename.
+Engine attributes such as `:db/txInstant` are never managed by a file.
+
+| Flag | Effect |
+|---|---|
+| `--prune` | Retire installed attributes the file omits. Part of the plan digest. |
+| `--json` | Emit the versioned machine contract instead of the human report. Scripts must read this, not the human rendering. |
+| `--detailed-exit-code` | Exit 0 for no change and 2 for changes planned. Without it a successful plan always exits 0, so `&&` chains keep working. |
+| `--apply --plan <digest>` | Apply exactly the plan whose digest was printed. |
+| `--allow <class>` | Permit an execution class above `additive`. `destructive` has no allowance. |
+| `--ack <change-code>` | Acknowledge a semantic change by its stable code. |
+
+Parse, plan, stale-plan, and blocked-change failures exit 1 and carry stable
+codes (`parse-error`, `plan-error`, `plan-mismatch`, `allow-required`,
+`ack-required`, `blocked-change`, `apply-failed`) when `--json` is set.
+
+### Applying a plan
+
+Re-run the exact invocation the plan printed, adding `--apply --plan <digest>`
+plus any `--allow` and `--ack` flags it asked for:
+
+```sh
+corium schema update people --schema schema.toml \
+  --apply --plan sha256:91… --allow validate-reindex --ack component-enable
+```
+
+Applying needs the `alter-schema` authority, which is separate from `transact`
+so an application writer cannot broaden its own vocabulary. The transactor
+recomputes the plan from the submitted schema under its writer queue and
+refuses unless the digest matches, so a plan that went stale between review and
+apply is rejected rather than reinterpreted. Ordinary writes in between are
+fine: a plan is invalidated by a schema change or a failed precondition, not by
+data drift.
+
+Re-running an apply that has already landed succeeds and reports
+`changed: false`. Installing a change is what invalidates the digest that
+described it, so the command re-plans, finds nothing to do, and writes nothing
+— safe in a pipeline.
+
+Every applied transaction records who requested it, both digests, the observed
+basis, the tool version, the execution classes, and the acknowledgements on its
+transaction entity, under `:db.schemaUpdate/*`. Those are ordinary queryable
+attributes, so the schema history of a database is a Datalog query.
+
+> **Not yet implemented:** `rewrite` and `destructive` changes are still
+> refused — resolving cardinality conflicts, copying values to a replacement
+> typed attribute, and sweeping current facts are jobs that do not exist yet.
+> Index and uniqueness coverage becomes total the moment the change commits,
+> because a peer rebuilds its covering indexes in memory; the two-stage
+> requested/ready state that published segment roots will need is not built.
+> The staged delivery is in
+> [schema-migrations.md](design/schema-migrations.md#delivery-plan).
 
 ## Index publication pacing and bulk loading
 
@@ -524,6 +645,81 @@ Two operational consequences worth planning for:
 - **Backup does not support encrypted databases yet.** `corium backup` refuses
   one, because copying its ciphertext without the key manifest (backup format 2)
   would produce an archive no restore could open.
+
+## Attribute protection
+
+Storage encryption protects the medium. **Attribute protection** protects
+facts from readers: values on an attribute that names a protection class are
+sealed by the writing peer under that class's key, and only a process whose
+keyring resolves that key ever sees them in the clear — not the transactor,
+not a peer without the key, not an operator with storage credentials. Declare
+classes in the create-time schema
+([docs/schema-toml.md](schema-toml.md#protection-classes)); see
+[docs/design/encryption.md](design/encryption.md) and
+[ADR-0018](adr/0018-attribute-protection-classes.md).
+
+Class keys are resolved by identity, exactly like a KEK, and are passed to
+whichever processes should read the class. A process with no class keys is a
+fully working peer: it commits, indexes, syncs, and answers every query that
+does not touch a protected value identically, and protected values come back
+redacted, hidden, or refused according to the class's `on-missing-key` policy.
+
+A **peer server** and a **pgwire server** serve many principals from one
+process, so which of their keys a given request may use is a policy question.
+Name the key ids on a view and bind it to the relation that may read them:
+
+```clojure
+{:authz.view/name "pii-reader" :authz.view/key ["file:/etc/corium/pii.key"]}
+{:authz.binding/relation "hr" :authz.binding/object "database:people"
+ :authz.binding/view "pii-reader"}
+```
+
+A guarded server defaults to **strict** key policy: a principal whose decision
+names no key id hydrates nothing, and its protected values come back redacted,
+hidden, or refused per class policy. A server with authorization disabled keeps
+the old behaviour and hydrates every request with its whole keyring.
+`--key-policy strict|server-wide` overrides the default on both `peer-server`
+and `postgres-server`; an operator upgrading a guarded, key-holding deployment
+that is not ready to write key grants sets `server-wide` deliberately. Two
+things to know:
+
+- `:authz.binding/unfiltered` grants full *attribute* visibility and **no**
+  keys. Keys are named by key id and that binding names none, so a relation
+  that must read protected values names them explicitly.
+- Granting a key id a process does not hold does nothing. Policy narrows the
+  process's keyring; it never extends it.
+
+`postgres-server` additionally does **not** terminate TLS, and an
+authenticated SQL client sends its bearer token in the PostgreSQL password
+field. Front it with a TLS-terminating proxy or bind it to loopback; it rejects
+`--tls-cert`/`--tls-key` rather than accepting flags it cannot honour, and
+warns at startup when authentication is configured.
+
+> **This is authorization, not cryptography.** A key-holding server still has
+> the plaintext and is choosing not to disclose it, so a compromised or
+> misconfigured server defeats it. Seal-through mode — where the server
+> forwards sealed values and the thin client hydrates for itself — is not
+> implemented. For a genuinely less-trusted deployment, run the server with no
+> class keys and let entitled applications use an embedded peer (`LocalPeer`)
+> with their own keyring, where the keys stay in the process that owns them.
+
+Unlike encryption at rest, protection is *not* fixed at database creation:
+`corium schema update` can protect, unprotect, or re-classify an attribute.
+The change is forward-only. Values written from that basis onward take the new
+form; every value already stored keeps the form it had, so protecting an
+attribute does not seal its existing plaintext and unprotecting one does not
+open its existing ciphertext. Sweeping the current values is separate work
+Corium does not do yet.
+
+Two consequences are worth planning for. An attribute that has ever been
+protected can never gain `:db/index` or `:db/unique`, permanently — ciphertext
+order is not value order. And protecting an attribute breaks lookup refs and
+value-ordered reads through it from that basis on. The plan reports both before
+you apply, and requires `--ack protection-forward-only`.
+
+Class *definitions* are still create-time: a schema update can point an
+attribute at an installed class, but not install one, so decide the classes
+themselves before you create the database.
 
 ## Authorization (self-hosted ReBAC)
 

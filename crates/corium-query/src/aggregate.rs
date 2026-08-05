@@ -7,7 +7,7 @@
 use corium_core::{TotalF64, Value};
 
 use crate::QueryError;
-use crate::builtins::compare;
+use crate::builtins::{compare, protected_class};
 
 /// An aggregate outcome, distinguishing scalar, ordered-collection, and
 /// set-valued results for output conversion.
@@ -33,6 +33,14 @@ fn distinct_sorted(values: &[Value]) -> Result<Vec<Value>, QueryError> {
 }
 
 fn sort_values(values: &mut [Value]) -> Result<(), QueryError> {
+    // Sealed values have byte order, not value order. The aggregates that
+    // reach this point — distinct, count-distinct, sample — need a total
+    // order, not a meaningful one, so they take the encoding's. The ones that
+    // would report an order to the caller are refused in `apply`.
+    if protected_class(values).is_some() {
+        values.sort();
+        return Ok(());
+    }
     // Validate comparability first so sort_by can stay total.
     for window in values.windows(2) {
         compare(&window[0], &window[1])?;
@@ -88,6 +96,17 @@ pub fn apply(op: &str, n: Option<i64>, values: &[Value]) -> Result<AggOut, Query
         n.and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| QueryError::Arity(format!("({op} n ?x) requires a positive count")))
     };
+    // count, count-distinct, distinct, sample, and grouping all work over
+    // values the reader cannot hydrate — determinism already tells it which
+    // are the same. Anything that needs value order or arithmetic does not
+    // (`docs/design/encryption.md`).
+    if matches!(
+        op,
+        "min" | "max" | "sum" | "avg" | "median" | "variance" | "stddev"
+    ) && let Some(class) = protected_class(values)
+    {
+        return Err(QueryError::Protected(class));
+    }
     match (op, n) {
         ("count", None) => Ok(AggOut::Value(Value::Long(
             i64::try_from(values.len()).unwrap_or(i64::MAX),

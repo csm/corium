@@ -348,7 +348,9 @@ mod tests {
     use super::*;
 
     fn fixture() -> Db {
-        let attr = EntityId::from_raw(10);
+        // At or above `FIRST_ATTR_ID`: the low db-partition range belongs to
+        // the engine's own attributes.
+        let attr = EntityId::from_raw(100);
         let mut schema = Schema::default();
         schema.insert(Attribute {
             id: attr,

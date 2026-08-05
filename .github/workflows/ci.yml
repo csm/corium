@@ -6,6 +6,19 @@ on:
   pull_request:
 
 jobs:
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: clients/java/pom.xml
+      - run: mvn -f clients/java/pom.xml --batch-mode --activate-profiles release -Dgpg.skip=true verify
+      - run: python3 clients/java/scripts/release.py check
+
   python:
     runs-on: ubuntu-latest
     steps:
@@ -71,8 +84,8 @@ jobs:
       # them in their intended GC mode.
       - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
       - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
-      - name: Lint optional Python storage backends
-        run: cargo clippy -p corium-ffi -p corium-python --features all-storage --all-targets -- -D warnings
+      - name: Lint optional native-client storage backends
+        run: cargo clippy -p corium-ffi -p corium-python -p corium-jni --features all-storage --all-targets -- -D warnings
       - name: Test optional Python storage backends
         run: cargo test -p corium-ffi --features all-storage
       - name: Check Python direct-storage artifact isolation
@@ -82,9 +95,9 @@ jobs:
             echo "base Python artifact unexpectedly includes an optional storage driver"
             exit 1
           fi
-          cargo check -p corium-python --no-default-features --features artifact-turso
-          cargo check -p corium-python --no-default-features --features artifact-postgres
-          cargo check -p corium-python --no-default-features --features artifact-s3
+          cargo check -p corium-python --no-default-features --features turso
+          cargo check -p corium-python --no-default-features --features postgres
+          cargo check -p corium-python --no-default-features --features s3
       - name: Test GC-mode cljrs crates (standalone)
         run: |
           cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
@@ -94,7 +107,7 @@ jobs:
       - name: Test PostgreSQL store
         env:
           CORIUM_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/corium_test?sslmode=disable
-        run: cargo test -p corium-store --features postgres --test postgres
+        run: cargo test -p corium-store-postgres --test store
       - name: Test S3 store
         env:
           CORIUM_TEST_S3_BUCKET: corium-test
@@ -102,4 +115,4 @@ jobs:
           AWS_SECRET_ACCESS_KEY: test
           AWS_REGION: us-east-1
           AWS_ENDPOINT_URL: http://localhost:4566
-        run: cargo test -p corium-store --features s3 --test s3
+        run: cargo test -p corium-store-s3 --test store

@@ -1,11 +1,7 @@
-[build-system]
-requires = ["maturin>=1.9,<2.0"]
-build-backend = "maturin"
-
 [project]
 name = "corium-postgres"
 version = "0.1.0"
-description = "Corium Python client with PostgreSQL direct-storage support"
+description = "PostgreSQL direct-storage plugin for the Corium Python client"
 requires-python = ">=3.10"
 dependencies = ["corium==0.1.0"]
 license = { text = "Apache-2.0 OR MIT" }
@@ -15,11 +11,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Typing :: Typed",
 ]
 
-[tool.maturin]
-manifest-path = "../../../../crates/corium-python/Cargo.toml"
-module-name = "corium._corium_postgres"
-python-source = "python"
-features = ["artifact-postgres"]
+[project.urls]
+Documentation = "https://github.com/csm/corium/tree/main/clients/python"
+Issues = "https://github.com/csm/corium/issues"
+Repository = "https://github.com/csm/corium"
+
+[project.entry-points."corium.store_plugins"]
+postgres = "corium_postgres:plugin_path"

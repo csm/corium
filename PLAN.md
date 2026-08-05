@@ -23,6 +23,7 @@ This document is the entry point to the plan. The design is elaborated in
 | [docs/design/auth.md](docs/design/auth.md) | Request-scoped identity, the authorization seam, and the self-hosted ReBAC policy database |
 | [docs/design/encryption.md](docs/design/encryption.md) | Encryption at rest, attribute protection classes and per-class keys, hydration and redaction |
 | [docs/design/operator-service.md](docs/design/operator-service.md) | Operator peer service: jobs, schedules, approvals, fleet view, JSON gateway, UI |
+| [docs/design/schema-migrations.md](docs/design/schema-migrations.md) | Declarative schema diffing, impact tiers, basis-fenced apply, retirement, and rewrite jobs |
 | [docs/design/clojurust-integration.md](docs/design/clojurust-integration.md) | Boundary conversion, sandboxed database functions, cljrs client API |
 | [docs/design/clients-and-ops.md](docs/design/clients-and-ops.md) | CLI, query console, backup/restore, metrics |
 | [docs/design/backup-format.md](docs/design/backup-format.md) | Versioned binary backup container and checkpoint framing |
@@ -163,10 +164,10 @@ reserved `"datomic.tx"` tempid (or `:db/current-tx`), and `as-of`/`since`
 accept a wall-clock instant as well as a basis `t` — in Rust, cljrs, the wire
 protocol, the console, and the SQL shell.
 
-Confidentiality is specified but not yet built
-([docs/design/encryption.md](docs/design/encryption.md)). Two layers:
-envelope encryption of every durable artifact — index blobs, log records,
-backups, cached segments — under a per-database data key wrapped by a KMS
+Confidentiality is built in two layers
+([docs/design/encryption.md](docs/design/encryption.md)). Envelope encryption
+of every durable artifact — index blobs, log records, cached segments — under
+a per-database data key wrapped by a KMS
 ([ADR-0017](docs/adr/0017-encryption-at-rest.md)); and attribute **protection
 classes**, where values on a protected attribute are sealed with that class's
 key by the writing peer and hydrated only by readers granted it
@@ -174,7 +175,40 @@ key by the writing peer and hydrated only by readers granted it
 is unchanged — a keyless peer still reads storage, holds a `Db`, and queries
 locally, with protected values redacted — and protected datoms are excluded
 from AVET and VAET, which the schema enforces by rejecting `:db/protection`
-alongside `:db/index`, `:db/unique`, and `:db.type/ref`.
+alongside `:db/index`, `:db/unique`, and `:db.type/ref`. Sealing is
+deterministic (AES-256-GCM-SIV with the context in the AAD), which is what
+lets a transactor holding no key keep pairing retractions, superseding
+cardinality-one values, and comparing `:db/cas` bytewise.
+
+An attribute's protection can now be changed after creation, through the
+declarative schema update below: `:db/protection` is part of the desired
+schema model, and applying a change appends to the attribute's forward-only
+`(t, class)` timeline rather than rewriting it, so every value already sealed
+stays sealed and stays retractable by naming the form it was asserted in. An
+attribute that has ever been protected is permanently ineligible for
+`:db/index` and `:db/unique`. Re-sealing or opening the values already stored
+is separate rewrite work that does not exist yet, as are entity scope, the
+per-principal key policy on the peer server, and the class rotation and shred
+commands. Backups of an encrypted database and KMS-backed keyrings remain to
+finish layer 1.
+
+Schema itself is now basis-versioned data
+([docs/design/schema-migrations.md](docs/design/schema-migrations.md),
+[ADR-0020](docs/adr/0020-planned-schema-migrations.md)). Attribute metadata is
+stored under an engine-owned vocabulary (`:db/valueType`, `:db/cardinality`,
+`:db/unique`, `:db/index`, `:db/isComponent`, `:db/noHistory`, `:db/doc`,
+`:db/protection`, `:db/retired`) on the attribute entity, so a schema change is
+an ordinary transaction that the transactor, every peer, and log replay all
+fold back into the same `Schema`. `corium schema update` stays plan-first — it
+prints a digest-bearing plan and writes nothing without `--apply --plan
+<digest>` — and the transactor recomputes that plan under its writer queue
+rather than trusting the digest as a token. Applying is a separate
+`alter-schema` authority from `Transact`, so an application writer cannot
+broaden the vocabulary it writes under. Additive, index, uniqueness,
+component, no-history, documentation, protection, and retirement changes all
+apply; `rewrite` and `destructive` changes remain refused, and index readiness
+is total on commit only because a peer still rebuilds its covering indexes in
+memory.
 
 Operator-level management is specified as its own surface
 ([docs/design/operator-service.md](docs/design/operator-service.md),

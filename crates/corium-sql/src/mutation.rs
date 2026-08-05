@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{Attribute, Cardinality, EntityId, Keyword, TotalF64, Value, ValueType};
+use corium_db::read::ReadContext;
 use corium_db::{Db, DbView};
 use corium_query::edn::Edn;
 use sqlparser::ast::{
@@ -185,12 +186,22 @@ struct Target {
 
 pub(crate) async fn plan(
     db: &Db,
+    read: &ReadContext,
     sql: &str,
     params: &[SqlValue],
 ) -> Result<Option<SqlMutation>, SqlError> {
     if db.view() != DbView::Current {
         return Err(SqlError::Mutation(
             "writes require a current database view".into(),
+        ));
+    }
+    // A session that cannot see every column of a table cannot write it
+    // honestly: DELETE retracts values it was never shown, and a write it
+    // cannot read back is how a view gets probed. This mirrors the peer
+    // server, which refuses `Transact` for a restricted principal.
+    if read.is_restricted() {
+        return Err(SqlError::Mutation(
+            "this principal reads through a restricted view and may not write".into(),
         ));
     }
     let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
@@ -209,6 +220,7 @@ pub(crate) async fn plan(
 
 pub(crate) async fn describe(
     db: &Db,
+    read: &ReadContext,
     sql: &str,
     params: &[SqlValue],
 ) -> Result<Option<Vec<SqlColumn>>, SqlError> {
@@ -252,7 +264,7 @@ pub(crate) async fn describe(
     let Some(returning) = returning_sql(returning) else {
         return Ok(Some(Vec::new()));
     };
-    let query = SqlSession::new(db)?
+    let query = SqlSession::with_read(db, read)?
         .query_params(
             &format!("SELECT {returning} FROM {} WHERE FALSE", target.sql_name),
             params,
@@ -802,6 +814,11 @@ fn value_to_edn(db: &Db, value: &Value) -> Result<Edn, SqlError> {
             Edn::Tagged("bytes".into(), Box::new(Edn::Str(hex)))
         }
         Value::Ref(value) => return eid(*value),
+        Value::Sealed(_) => {
+            return Err(SqlError::Mutation(
+                "sealed values cannot be written through SQL".into(),
+            ));
+        }
     })
 }
 

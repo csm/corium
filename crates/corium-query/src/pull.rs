@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use corium_core::{AttrId, EntityId, IndexOrder, Keyword, Value, ValueType};
-use corium_db::{Db, key_prefix};
+use corium_db::{Db, key_prefix, protect::Hydration, read::ReadContext};
 
 use crate::QueryError;
 use crate::boundary::value_to_edn;
@@ -181,10 +181,28 @@ fn parse_attr_spec(db: &Db, form: &Edn, sub: SubSelect) -> Result<PullSpec, Quer
 /// # Errors
 /// Returns [`QueryError`] for malformed patterns or unknown attribute idents.
 pub fn pull(db: &Db, pattern: &Edn, eid: EntityId) -> Result<Edn, QueryError> {
+    pull_with(db, pattern, eid, &ReadContext::open())
+}
+
+/// Pulls `pattern` for `eid` under one reader's view and key set.
+///
+/// Attributes the view hides are absent from the result, exactly as if the
+/// entity carried no such datom; sealed values are opened when `read` holds
+/// the class key.
+///
+/// # Errors
+/// Returns [`QueryError`] for malformed patterns, unknown attribute idents,
+/// and classes whose policy is to fail the read.
+pub fn pull_with(
+    db: &Db,
+    pattern: &Edn,
+    eid: EntityId,
+    read: &ReadContext,
+) -> Result<Edn, QueryError> {
     let parsed = parse_pattern(db, pattern)?;
     // The root is on the recursion path: a cycle back to it stops.
     let mut path = BTreeSet::from([eid]);
-    pull_entity(db, &parsed, eid, &mut path)
+    pull_entity(db, read, &parsed, eid, &mut path)
 }
 
 /// Pulls `pattern` for each entity, preserving order.
@@ -192,25 +210,73 @@ pub fn pull(db: &Db, pattern: &Edn, eid: EntityId) -> Result<Edn, QueryError> {
 /// # Errors
 /// Returns [`QueryError`] for malformed patterns or unknown attribute idents.
 pub fn pull_many(db: &Db, pattern: &Edn, eids: &[EntityId]) -> Result<Edn, QueryError> {
+    pull_many_with(db, pattern, eids, &ReadContext::open())
+}
+
+/// Pulls `pattern` for each entity under one reader's view and key set.
+///
+/// # Errors
+/// Returns [`QueryError`] for malformed patterns, unknown attribute idents,
+/// and classes whose policy is to fail the read.
+pub fn pull_many_with(
+    db: &Db,
+    pattern: &Edn,
+    eids: &[EntityId],
+    read: &ReadContext,
+) -> Result<Edn, QueryError> {
     let parsed = parse_pattern(db, pattern)?;
     let results = eids
         .iter()
         .map(|eid| {
             let mut path = BTreeSet::from([*eid]);
-            pull_entity(db, &parsed, *eid, &mut path)
+            pull_entity(db, read, &parsed, *eid, &mut path)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Edn::Vector(results))
 }
 
-fn entity_datoms(db: &Db, eid: EntityId) -> Vec<(AttrId, Value)> {
+fn entity_datoms(
+    db: &Db,
+    read: &ReadContext,
+    eid: EntityId,
+) -> Result<Vec<(AttrId, Value)>, QueryError> {
     let prefix = key_prefix(IndexOrder::Eavt, Some(eid), None, None);
-    db.datoms_prefix(IndexOrder::Eavt, &prefix)
-        .map(|datom| (datom.a, datom.v.clone()))
-        .collect()
+    let mut out = Vec::new();
+    for datom in db.datoms_prefix(IndexOrder::Eavt, &prefix) {
+        if let Some(value) = hydrate(db, read, datom.a, datom.e, &datom.v)? {
+            out.push((datom.a, value));
+        }
+    }
+    Ok(out)
 }
 
-fn reverse_refs(db: &Db, attr: AttrId, eid: EntityId) -> Vec<EntityId> {
+/// Resolves one value for this reader; `None` means the read hides it —
+/// either policy hides the attribute or the class hides the value.
+pub(crate) fn hydrate(
+    db: &Db,
+    read: &ReadContext,
+    a: AttrId,
+    e: EntityId,
+    value: &Value,
+) -> Result<Option<Value>, QueryError> {
+    match read.read(db.schema(), db.interner(), a, e, value) {
+        Ok(Hydration::Bind(value)) => Ok(Some(value)),
+        Ok(Hydration::Hide) => Ok(None),
+        Ok(Hydration::Refuse(class)) => Err(QueryError::Protected(class)),
+        Err(error) => Err(QueryError::Type(error.to_string())),
+    }
+}
+
+/// Entities whose `attr` references `eid`.
+///
+/// A reverse-ref pull walks VAET directly rather than through the value
+/// hydration seam, so the view is applied here: an attribute this reader
+/// cannot see does not point back at anything either. Without this, `:person/_manager`
+/// would report the existence of a relationship the forward pull hides.
+fn reverse_refs(db: &Db, read: &ReadContext, attr: AttrId, eid: EntityId) -> Vec<EntityId> {
+    if !read.visible(attr) {
+        return Vec::new();
+    }
     let value = Value::Ref(eid);
     let prefix = key_prefix(IndexOrder::Vaet, None, Some(attr), Some(&value));
     db.datoms_prefix(IndexOrder::Vaet, &prefix)
@@ -220,11 +286,12 @@ fn reverse_refs(db: &Db, attr: AttrId, eid: EntityId) -> Vec<EntityId> {
 
 fn pull_entity(
     db: &Db,
+    read: &ReadContext,
     pattern: &PullPattern,
     eid: EntityId,
     path: &mut BTreeSet<EntityId>,
 ) -> Result<Edn, QueryError> {
-    let own = entity_datoms(db, eid);
+    let own = entity_datoms(db, read, eid)?;
     let mut pairs: Vec<(Edn, Edn)> = Vec::new();
     if pattern.db_id || pattern.wildcard {
         pairs.push((
@@ -258,13 +325,13 @@ fn pull_entity(
                 // Wildcard recursively pulls component entities.
                 sub: SubSelect::None,
             };
-            if let Some((key, value)) = pull_spec(db, &spec, pattern, eid, &own, path)? {
+            if let Some((key, value)) = pull_spec(db, read, &spec, pattern, eid, &own, path)? {
                 pairs.push((key, value));
             }
         }
     }
     for spec in &pattern.specs {
-        if let Some((key, value)) = pull_spec(db, spec, pattern, eid, &own, path)? {
+        if let Some((key, value)) = pull_spec(db, read, spec, pattern, eid, &own, path)? {
             pairs.push((key, value));
         }
     }
@@ -279,6 +346,7 @@ fn pull_entity(
 #[allow(clippy::too_many_lines)]
 fn pull_spec(
     db: &Db,
+    read: &ReadContext,
     spec: &PullSpec,
     enclosing: &PullPattern,
     eid: EntityId,
@@ -314,7 +382,7 @@ fn pull_spec(
             let render =
                 |value: &Value, path: &mut BTreeSet<EntityId>| -> Result<Edn, QueryError> {
                     if is_ref && let Value::Ref(child) = value {
-                        return render_ref(db, spec, enclosing, *child, is_component, path);
+                        return render_ref(db, read, spec, enclosing, *child, is_component, path);
                     }
                     Ok(value_to_edn(db, value))
                 };
@@ -335,7 +403,7 @@ fn pull_spec(
         }
         PullAttr::Reverse(attr, reverse_ident) => {
             let is_component = db.schema().get(*attr).is_some_and(|m| m.is_component);
-            let parents = reverse_refs(db, *attr, eid);
+            let parents = reverse_refs(db, read, *attr, eid);
             if parents.is_empty() {
                 let default = spec.default.clone().map(|form| {
                     (
@@ -357,7 +425,7 @@ fn pull_spec(
                     Edn::keyword("db/id"),
                     Edn::Long(i64::try_from(parent.raw()).unwrap_or(i64::MAX)),
                 )])),
-                SubSelect::Pattern(sub) => pull_entity(db, sub, parent, path),
+                SubSelect::Pattern(sub) => pull_entity(db, read, sub, parent, path),
                 SubSelect::Recur(_) => Err(QueryError::Parse(
                     "recursion is not supported on reverse refs".into(),
                 )),
@@ -384,6 +452,7 @@ fn pull_spec(
 
 fn render_ref(
     db: &Db,
+    read: &ReadContext,
     spec: &PullSpec,
     enclosing: &PullPattern,
     child: EntityId,
@@ -406,7 +475,7 @@ fn render_ref(
             if !path.insert(child) {
                 return Ok(db_id_map(child));
             }
-            let result = pull_entity(db, sub, child, path);
+            let result = pull_entity(db, read, sub, child, path);
             path.remove(&child);
             result
         }
@@ -424,7 +493,7 @@ fn render_ref(
                     candidate.sub = SubSelect::Recur(d.map(|d| d.saturating_sub(1)));
                 }
             }
-            let result = pull_entity(db, &sub, child, path);
+            let result = pull_entity(db, read, &sub, child, path);
             path.remove(&child);
             result
         }
@@ -439,7 +508,7 @@ fn render_ref(
                     db_id: true,
                     specs: Vec::new(),
                 };
-                let result = pull_entity(db, &wildcard, child, path);
+                let result = pull_entity(db, read, &wildcard, child, path);
                 path.remove(&child);
                 result
             } else {

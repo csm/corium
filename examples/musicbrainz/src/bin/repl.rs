@@ -123,7 +123,9 @@ fn open_postgres_storage(
         .as_deref()
         .ok_or_else(|| "--peer-store postgres requires --postgres-url".to_owned())?;
     let store = runtime
-        .block_on(corium_store::PostgresBlobStore::connect_existing(url))
+        .block_on(corium_store_postgres::PostgresBlobStore::connect_existing(
+            url,
+        ))
         .map_err(|error| format!("cannot open PostgreSQL peer storage: {error}"))?;
     Ok(Arc::new(store))
 }
@@ -146,7 +148,7 @@ fn open_turso_storage(
         .clone()
         .unwrap_or_else(|| args.data_dir.join("store.db"));
     let store = runtime
-        .block_on(corium_store::TursoBlobStore::open_existing(path))
+        .block_on(corium_store_turso::TursoBlobStore::open_existing(path))
         .map_err(|error| format!("cannot open Turso peer storage: {error}"))?;
     Ok(Arc::new(store))
 }
