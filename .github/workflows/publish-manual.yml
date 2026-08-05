@@ -1,0 +1,245 @@
+name: Publish manual
+
+# Renders the operator manual under docs/manual with mdbook and uploads the
+# result to a server over SFTP (password auth), mirroring the approach in
+# publish-site.yml.
+#
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+# Every setting resolves in this order, first non-empty wins:
+#
+#   1. a workflow_dispatch input   (one-off override for a manual run)
+#   2. a repository/environment variable  (vars.MANUAL_SFTP_*)
+#   3. a repository secret         (secrets.MANUAL_SFTP_*, then the shared
+#                                   SFTP_* secrets publish-site.yml uses)
+#
+# Host and path are read from variables so they are visible in the Actions log
+# and editable without touching a secret. Put them in secrets instead if the
+# hostname is itself sensitive — both are checked.
+#
+#   MANUAL_SFTP_HOST         hostname of the SFTP server        (required)
+#   MANUAL_SFTP_PORT         port                               (default 22)
+#   MANUAL_SFTP_REMOTE_DIR   absolute target directory          (required)
+#
+# Credentials are secrets only:
+#
+#   MANUAL_SFTP_USERNAME     login user                         (required)
+#   MANUAL_SFTP_PASSWORD     login password                     (required)
+#   MANUAL_SFTP_KNOWN_HOSTS  the server's public host key, in known_hosts
+#                            format, e.g. the output of
+#                            `ssh-keyscan -p 22 manual.example.com`
+#                            (optional but strongly recommended — see below)
+#
+# ---------------------------------------------------------------------------
+# A note on the host key
+# ---------------------------------------------------------------------------
+# With password auth the client proves nothing to itself about the server, so
+# an unverified host key means the password is handed to whoever answers on
+# that address. Set MANUAL_SFTP_KNOWN_HOSTS and this job pins the key. Leave it
+# unset and the job falls back to lftp's `sftp:auto-confirm` — the same
+# behaviour publish-site.yml has today — and prints a warning.
+#
+# ---------------------------------------------------------------------------
+# The remote directory is mirrored with --delete
+# ---------------------------------------------------------------------------
+# Anything in MANUAL_SFTP_REMOTE_DIR that is not in the rendered book is
+# DELETED. Give the manual a dedicated directory. The job refuses to run
+# against `/` or a bare relative path as a guard, but it cannot tell a
+# dedicated directory from a shared one.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/manual/**"
+      - ".github/workflows/publish-manual.yml"
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "SFTP host (overrides MANUAL_SFTP_HOST)"
+        required: false
+        type: string
+      port:
+        description: "SFTP port (overrides MANUAL_SFTP_PORT, default 22)"
+        required: false
+        type: string
+      remote_path:
+        description: "Absolute remote directory (overrides MANUAL_SFTP_REMOTE_DIR)"
+        required: false
+        type: string
+      dry_run:
+        description: "Build and report only. Do not connect or upload."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: publish-manual
+  cancel-in-progress: true
+
+env:
+  # Pinned so a rendering change arrives in a reviewed commit rather than on
+  # whatever mdbook released that morning.
+  MDBOOK_VERSION: "0.5.4"
+  BOOK_DIR: docs/manual
+  BUILD_DIR: docs/manual/book
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdbook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@${{ env.MDBOOK_VERSION }}
+
+      - name: Build the book
+        run: mdbook build "$BOOK_DIR"
+
+      - name: Check the rendered output
+        # book.toml sets create-missing = false, so a broken SUMMARY.md link
+        # already fails the build. This catches the other way a publish goes
+        # wrong: a build that succeeds but produces nothing worth uploading.
+        run: |
+          set -euo pipefail
+          if [ ! -s "$BUILD_DIR/index.html" ]; then
+            echo "::error::$BUILD_DIR/index.html is missing or empty." >&2
+            exit 1
+          fi
+          pages=$(find "$BUILD_DIR" -name '*.html' | wc -l)
+          echo "Rendered $pages HTML pages, $(du -sh "$BUILD_DIR" | cut -f1) total."
+          if [ "$pages" -lt 10 ]; then
+            echo "::error::Only $pages pages rendered; refusing to mirror over the live site." >&2
+            exit 1
+          fi
+
+      - name: Upload the rendered book as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual
+          path: ${{ env.BUILD_DIR }}
+          retention-days: 14
+
+      - name: Resolve the SFTP target
+        id: target
+        env:
+          IN_HOST: ${{ inputs.host }}
+          IN_PORT: ${{ inputs.port }}
+          IN_PATH: ${{ inputs.remote_path }}
+          VAR_HOST: ${{ vars.MANUAL_SFTP_HOST }}
+          VAR_PORT: ${{ vars.MANUAL_SFTP_PORT }}
+          VAR_PATH: ${{ vars.MANUAL_SFTP_REMOTE_DIR }}
+          SEC_HOST: ${{ secrets.MANUAL_SFTP_HOST || secrets.SFTP_HOST }}
+          SEC_PORT: ${{ secrets.MANUAL_SFTP_PORT || secrets.SFTP_PORT }}
+          SEC_PATH: ${{ secrets.MANUAL_SFTP_REMOTE_DIR }}
+        run: |
+          set -euo pipefail
+          # First non-empty of input, variable, secret. Always succeeds, so an
+          # all-empty result is reported below rather than tripping `set -e`.
+          pick() {
+            for v in "$@"; do
+              if [ -n "$v" ]; then
+                printf '%s' "$v"
+                return 0
+              fi
+            done
+            return 0
+          }
+
+          host=$(pick "${IN_HOST:-}" "${VAR_HOST:-}" "${SEC_HOST:-}")
+          port=$(pick "${IN_PORT:-}" "${VAR_PORT:-}" "${SEC_PORT:-}" "22")
+          path=$(pick "${IN_PATH:-}" "${VAR_PATH:-}" "${SEC_PATH:-}")
+
+          missing=""
+          if [ -z "$host" ]; then missing="$missing MANUAL_SFTP_HOST"; fi
+          if [ -z "$path" ]; then missing="$missing MANUAL_SFTP_REMOTE_DIR"; fi
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required configuration:$missing (set a repository variable, a secret, or a workflow_dispatch input)." >&2
+            exit 1
+          fi
+
+          case "$port" in
+            ''|*[!0-9]*) echo "::error::Port '$port' is not a number." >&2; exit 1 ;;
+          esac
+
+          # mirror --delete makes a wrong path destructive. Require an absolute
+          # path, and refuse the ones that would sweep a whole filesystem.
+          case "$path" in
+            /) echo "::error::Refusing to mirror over '/'." >&2; exit 1 ;;
+            /*) ;;
+            *) echo "::error::Remote directory must be absolute, got '$path'." >&2; exit 1 ;;
+          esac
+          if [ "$(printf '%s' "$path" | tr -cd / | wc -c)" -lt 2 ]; then
+            echo "::warning::Remote directory '$path' is a top-level directory and is mirrored with --delete."
+          fi
+
+          # The host may have come from a secret, in which case Actions masks
+          # it in the log anyway; write it to the step output either way.
+          {
+            echo "host=$host"
+            echo "port=$port"
+            echo "path=$path"
+          } >> "$GITHUB_OUTPUT"
+          echo "Target: sftp://$host:$port$path"
+
+      - name: Upload over SFTP
+        if: ${{ !inputs.dry_run }}
+        env:
+          SFTP_HOST: ${{ steps.target.outputs.host }}
+          SFTP_PORT: ${{ steps.target.outputs.port }}
+          SFTP_REMOTE_DIR: ${{ steps.target.outputs.path }}
+          SFTP_USERNAME: ${{ secrets.MANUAL_SFTP_USERNAME || secrets.SFTP_USERNAME }}
+          # lftp reads the password from this variable with --env-password, so
+          # it never appears in a command line or in the process table.
+          LFTP_PASSWORD: ${{ secrets.MANUAL_SFTP_PASSWORD || secrets.SFTP_PASSWORD }}
+          SFTP_KNOWN_HOSTS: ${{ secrets.MANUAL_SFTP_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SFTP_USERNAME:-}" ] || [ -z "${LFTP_PASSWORD:-}" ]; then
+            echo "::error::MANUAL_SFTP_USERNAME and MANUAL_SFTP_PASSWORD must both be set." >&2
+            exit 1
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends lftp
+
+          # Pin the host key when one is configured. Without it lftp accepts
+          # whatever key the server offers, which means sending the password
+          # to an unauthenticated peer.
+          if [ -n "${SFTP_KNOWN_HOSTS:-}" ]; then
+            mkdir -p ~/.ssh && chmod 700 ~/.ssh
+            printf '%s\n' "$SFTP_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+            # auto-confirm no makes lftp decline ssh's "authenticity of host
+            # can't be established" prompt; StrictHostKeyChecking=yes makes ssh
+            # refuse outright rather than depend on the runner's ssh config.
+            HOST_KEY_SETTING="set sftp:auto-confirm no
+          set sftp:connect-program \"ssh -a -x -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts\""
+            echo "Host key pinned from MANUAL_SFTP_KNOWN_HOSTS."
+          else
+            HOST_KEY_SETTING="set sftp:auto-confirm yes"
+            echo "::warning::MANUAL_SFTP_KNOWN_HOSTS is not set, so the server's host key is accepted unverified. With password auth this exposes the password to a man in the middle. Set it to the output of 'ssh-keyscan -p <port> <host>'."
+          fi
+
+          lftp -u "$SFTP_USERNAME" --env-password "sftp://${SFTP_HOST}:${SFTP_PORT}" <<EOF
+          set cmd:fail-exit yes
+          ${HOST_KEY_SETTING}
+          set net:max-retries 3
+          set net:timeout 20
+          mirror --reverse --delete --verbose --no-perms "${BUILD_DIR}/" "${SFTP_REMOTE_DIR}"
+          bye
+          EOF
+
+          echo "Published ${BUILD_DIR}/ to ${SFTP_REMOTE_DIR}."
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "Dry run: built the book and skipped the upload."
+          echo "Would have mirrored ${BUILD_DIR}/ to ${{ steps.target.outputs.path }}"
+          echo "on sftp://${{ steps.target.outputs.host }}:${{ steps.target.outputs.port }}."
+          echo "The rendered book is attached to this run as the 'manual' artifact."

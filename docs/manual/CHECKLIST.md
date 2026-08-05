@@ -245,5 +245,22 @@ The book builds clean as of this writing. `docs/manual/book/` is in
 `book.toml` sets `create-missing = false`, so a broken `SUMMARY.md` link fails
 the build rather than creating an empty page.
 
+### Publishing the book
+
+`.github/workflows/publish-manual.yml` renders the book and mirrors it to a
+web host over SFTP. It runs on a push to `main` that touches `docs/manual/`,
+and on demand through `workflow_dispatch`.
+
+The host, port, and remote directory come from repository variables
+(`MANUAL_SFTP_HOST`, `MANUAL_SFTP_PORT`, `MANUAL_SFTP_REMOTE_DIR`), and a
+manual run can override each one. The credentials are secrets
+(`MANUAL_SFTP_USERNAME`, `MANUAL_SFTP_PASSWORD`), as is the optional
+`MANUAL_SFTP_KNOWN_HOSTS` host key. The workflow header documents the
+resolution order.
+
+The remote directory is mirrored with `--delete`, so give the manual a
+directory of its own. A `workflow_dispatch` run with `dry_run` set builds the
+book, reports the target, and uploads nothing.
+
 Every internal link and anchor resolves, and the style check finds no banned
 modal, contraction, semicolon, or sentence over 25 words.
