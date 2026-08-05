@@ -51,6 +51,9 @@ jobs:
       - name: Build Corium CLI
         run: cargo build -p corium-cli --features postgres,turso,s3,oidc
 
+      - name: Build the Java client engine
+        run: cargo build -p corium-jni
+
       - name: Install Python client
         continue-on-error: true
         run: python -m pip install -e clients/python

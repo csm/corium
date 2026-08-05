@@ -84,8 +84,8 @@ jobs:
       # them in their intended GC mode.
       - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
       - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
-      - name: Lint optional Python storage backends
-        run: cargo clippy -p corium-ffi -p corium-python --features all-storage --all-targets -- -D warnings
+      - name: Lint optional native-client storage backends
+        run: cargo clippy -p corium-ffi -p corium-python -p corium-jni --features all-storage --all-targets -- -D warnings
       - name: Test optional Python storage backends
         run: cargo test -p corium-ffi --features all-storage
       - name: Check Python direct-storage artifact isolation
