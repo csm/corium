@@ -264,9 +264,10 @@ struct Scope {
 
 /// One explicit transaction's pinned basis and provisionally applied writes.
 ///
-/// SQL mutations are accumulated as ordinary Corium forms and repeatedly
-/// prepared against `base`. This makes each statement see earlier writes while
-/// `COMMIT` still submits one atomic, basis-guarded Corium transaction.
+/// Each SQL mutation is prepared incrementally against `current`, so later
+/// statements see earlier writes without re-planning the whole transaction.
+/// `COMMIT` submits the accumulated forms as one atomic, basis-guarded Corium
+/// transaction against `base`.
 struct TransactionState {
     database: String,
     base: Db,
@@ -1286,9 +1287,7 @@ where
             }
             let statement = transaction.next_statement;
             let (forms, renamed) = namespace_tempids(mutation.forms(), statement);
-            let mut combined = transaction.forms.clone();
-            combined.extend(forms);
-            let staged = stage_transaction(&transaction.base, &combined)?;
+            let staged = stage_transaction(&transaction.current, &forms)?;
             let tempids = renamed
                 .into_iter()
                 .filter_map(|(original, namespaced)| {
@@ -1302,7 +1301,7 @@ where
             let db_after = staged.db_after;
             let transaction = self.transaction.as_mut().expect("transaction pinned above");
             transaction.current = db_after.clone();
-            transaction.forms = combined;
+            transaction.forms.extend(forms);
             transaction.next_statement += 1;
             (db_after, tempids)
         } else {
@@ -1432,6 +1431,9 @@ where
 
 /// Gives one statement's generated tempids names that remain distinct when
 /// several SQL mutations are submitted as one Corium transaction.
+///
+/// SQL `INSERT` currently emits tempids only as map-form `:db/id` values;
+/// vector operation forms produced by `UPDATE` and `DELETE` use concrete ids.
 fn namespace_tempids(forms: &[Edn], statement: u64) -> (Vec<Edn>, BTreeMap<String, String>) {
     let db_id = Edn::keyword("db/id");
     let mut renamed = BTreeMap::new();

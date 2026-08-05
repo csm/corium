@@ -401,6 +401,10 @@ impl Db {
     /// transaction it covers — unless it was published before the engine
     /// recorded instants as datoms, in which case instant-named views resolve
     /// only within the replayed tail.
+    ///
+    /// Production snapshot loaders should use
+    /// [`Self::from_current_snapshot_with_next_user`] so allocations belonging
+    /// to fully retracted entities are also preserved.
     #[must_use]
     pub fn from_current_snapshot(
         basis_t: u64,
@@ -409,14 +413,9 @@ impl Db {
         interner: KeywordInterner,
         datoms: Vec<Datom>,
     ) -> Self {
-        let next_user_sequence = datoms
-            .iter()
-            .filter(|datom| datom.e.partition() == Partition::User as u32)
-            .map(|datom| datom.e.sequence() + 1)
-            .fold(FIRST_USER_ID, u64::max);
         Self::from_current_snapshot_with_next_user(
             basis_t,
-            next_user_sequence,
+            FIRST_USER_ID,
             schema,
             idents,
             interner,
@@ -427,8 +426,9 @@ impl Db {
     /// Creates a current value from a published snapshot and its persisted
     /// user-entity allocation high-water mark.
     ///
-    /// `next_user_sequence` is authoritative even when it is higher than all
-    /// live entity ids because deleted entities must never be reallocated.
+    /// `next_user_sequence` preserves allocations for deleted entities when it
+    /// is higher than all live ids. A stale or absent persisted value is
+    /// floored at one past the highest live user entity.
     #[must_use]
     pub fn from_current_snapshot_with_next_user(
         basis_t: u64,
@@ -438,6 +438,11 @@ impl Db {
         interner: KeywordInterner,
         datoms: Vec<Datom>,
     ) -> Self {
+        let next_user_sequence = datoms
+            .iter()
+            .filter(|datom| datom.e.partition() == Partition::User as u32)
+            .map(|datom| datom.e.sequence().saturating_add(1))
+            .fold(next_user_sequence.max(FIRST_USER_ID), u64::max);
         bootstrap::install(&mut schema, &mut idents);
         let mut instants = TxInstants::default();
         for datom in &datoms {
@@ -458,7 +463,7 @@ impl Db {
         }
         Self {
             basis_t,
-            next_user_sequence: next_user_sequence.max(FIRST_USER_ID),
+            next_user_sequence,
             schema,
             recorded: datoms.into_iter().map(Arc::new).collect(),
             idents: Arc::new(idents),
@@ -1457,6 +1462,19 @@ mod tests {
             db.with_transaction(8, &[datom(4_500, 1, Value::Str("later".into()), 8, true)]);
         assert_eq!(advanced.next_user_sequence(), 4_501);
         assert_eq!(db.next_user_sequence(), 4_200);
+    }
+
+    #[test]
+    fn snapshot_allocator_hint_never_undercuts_live_entities() {
+        let db = Db::from_current_snapshot_with_next_user(
+            7,
+            0,
+            schema(),
+            Idents::default(),
+            KeywordInterner::default(),
+            vec![datom(4_500, 1, Value::Str("live".into()), 7, true)],
+        );
+        assert_eq!(db.next_user_sequence(), 4_501);
     }
 
     #[test]

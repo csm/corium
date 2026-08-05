@@ -6,8 +6,6 @@
 //! native objects; all data crossing the boundary converts once through
 //! [`crate::convert`].
 
-#![allow(clippy::large_enum_variant)]
-
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -236,7 +234,7 @@ fn define(globals: &Arc<GlobalEnv>, name: &str, function: NativeFn) {
 
 /// A query input owned across the boundary conversion.
 enum Input {
-    Db(Db),
+    Db(Box<Db>),
     Arg(Edn),
 }
 
@@ -253,7 +251,7 @@ pub fn register_read_api(globals: &Arc<GlobalEnv>) {
             let inputs = args[1..]
                 .iter()
                 .map(|arg| match db_of(arg) {
-                    Ok(db) => Ok(Input::Db(db)),
+                    Ok(db) => Ok(Input::Db(Box::new(db))),
                     Err(_) => to_edn(arg)
                         .map(Input::Arg)
                         .map_err(|error| verr(error.to_string())),
@@ -262,7 +260,7 @@ pub fn register_read_api(globals: &Arc<GlobalEnv>) {
             let qinputs: Vec<QInput<'_>> = inputs
                 .iter()
                 .map(|input| match input {
-                    Input::Db(db) => QInput::Db(db),
+                    Input::Db(db) => QInput::Db(db.as_ref()),
                     Input::Arg(edn) => QInput::Edn(edn.clone()),
                 })
                 .collect();

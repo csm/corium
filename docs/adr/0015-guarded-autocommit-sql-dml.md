@@ -58,6 +58,13 @@ than silently autocommitting them while claiming transaction semantics. The
 basis-fenced commit. DDL, schema changes, joined/multi-table mutation forms,
 upsert/conflict clauses, and new keyword interning remain deferred.
 
+For driver compatibility, pgwire reports `read committed` through PostgreSQL's
+isolation probes. Corium's guarded implementation is intentionally stronger:
+an explicit transaction reads one pinned snapshot and `COMMIT` returns `40001`
+if the database basis changed, including changes to disjoint entities. Client
+frameworks do not necessarily retry that error, so applications must retry the
+whole transaction when appropriate.
+
 PostgreSQL wire authentication remains distinct from Corium authorization.
 The server's configured Corium service principal currently authorizes
 transactions; mapping each PostgreSQL login to a Corium principal is future
