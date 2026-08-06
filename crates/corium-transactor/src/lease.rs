@@ -134,6 +134,7 @@ pub async fn acquire(
             owner_endpoint: endpoint.to_owned(),
             index_basis_t: current.as_ref().map_or(0, |root| root.index_basis_t),
             roots: current.as_ref().and_then(|root| root.roots.clone()),
+            history_roots: current.as_ref().and_then(|root| root.history_roots.clone()),
             // Preserve the published snapshot's recovery hints across the
             // fence bump so a successor can still recover from the index root.
             next_entity_id: current.as_ref().map_or(0, |root| root.next_entity_id),

@@ -713,7 +713,13 @@ pub fn meta_root_name(db: &str) -> String {
 /// key, instead of failing later with a decode error on a blob it cannot
 /// parse. Roots from formats 1-3 decode with version `0` — no manifest, no
 /// encryption.
-pub const FORMAT_VERSION: u32 = 4;
+///
+/// Format 5 adds four history covering-index roots. They retain assertions,
+/// retractions, and superseded values (except `:db/noHistory` attributes), so
+/// a snapshot-bootstrapped reader can answer retained-history views before
+/// `index_basis_t` without replaying the log prefix. Older roots decode with
+/// no history roots.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Published durable index-root metadata carrying the write lease
 /// (see `docs/design/log-and-transactor.md`).
@@ -742,6 +748,13 @@ pub struct DbRoot {
     /// EAVT, AEVT, AVET, and VAET blob ids; `None` before the first index
     /// publication (a bare fence bump).
     pub roots: Option<[BlobId; 4]>,
+    /// Historical EAVT, AEVT, AVET, and VAET blob ids.
+    ///
+    /// These contain every retained assertion and retraction through
+    /// `index_basis_t`. `None` identifies roots published before format 5 (or
+    /// a bare fence bump), for which exact pre-snapshot views require log
+    /// replay.
+    pub history_roots: Option<[BlobId; 4]>,
     /// Next unallocated user-partition entity id as of `index_basis_t`.
     ///
     /// A transactor recovering from the index root replays only the log
@@ -818,6 +831,16 @@ impl DbRoot {
         out.push_str(&self.last_tx_instant.to_string());
         out.push('\n');
         out.push_str(&self.key_manifest_version.to_string());
+        out.push('\n');
+        match &self.history_roots {
+            Some(roots) => {
+                for root in roots {
+                    out.push_str(root.as_str());
+                    out.push('\n');
+                }
+            }
+            None => out.push_str("-\n-\n-\n-\n"),
+        }
         out.into_bytes()
     }
 
@@ -869,6 +892,23 @@ impl DbRoot {
         // Absent in formats 1-3, which had no key manifest and so no
         // encryption: `0` is exactly what those roots mean.
         let key_manifest_version = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
+        // Added in format 5. Absence is deliberately distinct from an empty
+        // history index, which is represented by four manifest blob ids.
+        let history_ids: Vec<&str> = lines.by_ref().take(4).collect();
+        let history_roots = if history_ids.is_empty() && format_version < 5 {
+            None
+        } else if history_ids.len() != 4 {
+            return None;
+        } else if history_ids.iter().all(|id| *id == "-") {
+            None
+        } else {
+            Some([
+                BlobId::from_hex(history_ids[0])?,
+                BlobId::from_hex(history_ids[1])?,
+                BlobId::from_hex(history_ids[2])?,
+                BlobId::from_hex(history_ids[3])?,
+            ])
+        };
         Some(Self {
             format_version,
             lease_version,
@@ -877,6 +917,7 @@ impl DbRoot {
             owner_endpoint,
             index_basis_t,
             roots,
+            history_roots,
             next_entity_id,
             last_tx_instant,
             key_manifest_version,

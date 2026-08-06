@@ -299,9 +299,9 @@ impl BatchCursor {
     }
 }
 
-/// The snapshot this transactor last installed at the published root, kept so
-/// the next indexing pass folds the log tail into it instead of rebuilding
-/// every covering index from scratch.
+/// The current and history snapshots this transactor last installed at the
+/// published root, kept so the next indexing pass folds the log tail into
+/// them instead of rebuilding every covering index from scratch.
 struct PublishedIndexes {
     /// Lease version and index basis the published root carries; both are
     /// checked against that root before the pass trusts anything below.
@@ -309,15 +309,18 @@ struct PublishedIndexes {
     basis_t: u64,
     /// Segments in [`ORDERS`] slot order, whose leaves are the chunks named
     /// by `manifests`.
-    segments: [Segment; 4],
+    current_segments: [Segment; 4],
+    history_segments: Option<[Segment; 4]>,
     /// Manifest blob id per index, matched against the stored root to prove
     /// a live root still references the chunks this pass carries over — so
     /// garbage collection cannot have swept one out from under it.
-    manifests: [BlobId; 4],
+    current_manifests: [BlobId; 4],
+    history_manifests: Option<[BlobId; 4]>,
     /// The chunk each leaf was published as. A leaf carried over from this
     /// snapshot is already in the store under this id, so the next pass
     /// neither re-encodes nor re-uploads it.
-    chunks: [HashMap<LeafId, BlobId>; 4],
+    current_chunks: [HashMap<LeafId, BlobId>; 4],
+    history_chunks: Option<[HashMap<LeafId, BlobId>; 4]>,
 }
 
 impl PublishedIndexes {
@@ -327,7 +330,8 @@ impl PublishedIndexes {
             self.lease_version == lease_version
                 && root.lease_version == lease_version
                 && root.index_basis_t == self.basis_t
-                && root.roots.as_ref() == Some(&self.manifests)
+                && root.roots.as_ref() == Some(&self.current_manifests)
+                && root.history_roots.as_ref() == self.history_manifests.as_ref()
         })
     }
 }
@@ -740,7 +744,8 @@ impl EmbeddedTransactor {
         state.db = state.db.clone().with_naming(idents, interner);
     }
 
-    /// Publishes a consistent snapshot of all four covering indexes.
+    /// Publishes consistent snapshots of all four current and four history
+    /// covering indexes.
     ///
     /// The pass folds the log tail since the last publication into the
     /// segments that publication produced ([`corium_index::Segment::apply`]),
@@ -793,7 +798,7 @@ impl EmbeddedTransactor {
             .publish_pass(store, root_name, lease_version, previous)
             .await?
         {
-            return Ok(root);
+            return Ok(*root);
         }
         // The root's index state moved under a pass that was carrying chunks
         // over from the last publication, so nothing was installed. Rebuilding
@@ -802,7 +807,7 @@ impl EmbeddedTransactor {
             .publish_pass(store, root_name, lease_version, None)
             .await?
         {
-            PassOutcome::Published(root) => Ok(root),
+            PassOutcome::Published(root) => Ok(*root),
             PassOutcome::Raced => {
                 unreachable!("a pass that carries nothing over publishes unconditionally")
             }
@@ -843,28 +848,31 @@ impl EmbeddedTransactor {
             .as_ref()
             .map(|_| RootIndexState::of(stored.as_ref()));
 
-        let (segments, planned) =
-            tokio::task::spawn_blocking(move || plan_indexes(&snapshot, previous.as_ref()))
-                .await
-                .map_err(|error| TransactError::IndexTask(error.to_string()))?;
+        let (current_segments, current_planned, history) = tokio::task::spawn_blocking(move || {
+            let current = plan_indexes(&snapshot, previous.as_ref());
+            let history = snapshot.has_complete_history().then(|| {
+                plan_history_indexes(
+                    &snapshot,
+                    previous
+                        .as_ref()
+                        .filter(|previous| previous.history_segments.is_some()),
+                )
+            });
+            (current.0, current.1, history)
+        })
+        .await
+        .map_err(|error| TransactError::IndexTask(error.to_string()))?;
 
-        let mut manifests = Vec::with_capacity(ORDERS.len());
-        let mut chunk_ids = Vec::with_capacity(ORDERS.len());
-        for chunks in &planned {
-            let mut children = Vec::with_capacity(chunks.len());
-            for chunk in chunks {
-                children.push(match chunk {
-                    ChunkPlan::Published(id) => id.clone(),
-                    ChunkPlan::Rebuilt(bytes) => store.put_if_absent(bytes).await?,
-                });
-            }
-            let manifest = corium_store::encode_index_manifest(&children);
-            manifests.push(store.put_if_absent(&manifest).await?);
-            chunk_ids.push(children);
-        }
-        let manifests: [BlobId; 4] = manifests
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("one manifest per covering index"));
+        let (current_manifests, current_chunk_ids) =
+            upload_planned_indexes(store, &current_planned).await?;
+        let history_uploaded = match &history {
+            Some((_, planned)) => Some(upload_planned_indexes(store, planned).await?),
+            None => None,
+        };
+        let (history_manifests, history_chunk_ids) = match history_uploaded {
+            Some((manifests, chunk_ids)) => (Some(manifests), Some(chunk_ids)),
+            None => (None, None),
+        };
         let root = DbRoot {
             format_version: corium_store::FORMAT_VERSION,
             lease_version,
@@ -872,7 +880,8 @@ impl EmbeddedTransactor {
             lease_expires_unix_ms: 0,
             owner_endpoint: String::new(),
             index_basis_t: basis_t,
-            roots: Some(manifests.clone()),
+            roots: Some(current_manifests.clone()),
+            history_roots: history_manifests.clone(),
             // Recovery hints for opening from this root without full replay.
             next_entity_id,
             last_tx_instant,
@@ -884,12 +893,20 @@ impl EmbeddedTransactor {
         if outcome == RootPublication::Raced {
             return Ok(PassOutcome::Raced);
         }
+        let history_segments = history.map(|(segments, _)| segments);
+        let history_chunks = history_segments
+            .as_ref()
+            .zip(history_chunk_ids)
+            .map(|(segments, chunk_ids)| chunk_ids_by_leaf(segments, chunk_ids));
         let next = PublishedIndexes {
             lease_version,
             basis_t,
-            chunks: chunk_ids_by_leaf(&segments, chunk_ids),
-            segments,
-            manifests,
+            current_chunks: chunk_ids_by_leaf(&current_segments, current_chunk_ids),
+            history_chunks,
+            current_segments,
+            history_segments,
+            current_manifests,
+            history_manifests,
         };
         // Keep the pass's segments only when the published root is the one
         // that describes them — either because this CAS installed it, or
@@ -904,7 +921,7 @@ impl EmbeddedTransactor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
         }
-        Ok(PassOutcome::Published(root))
+        Ok(PassOutcome::Published(Box::new(root)))
     }
 }
 
@@ -912,7 +929,7 @@ impl EmbeddedTransactor {
 enum PassOutcome {
     /// The attempt published this root (installed, or superseded by an equal
     /// or newer basis).
-    Published(DbRoot),
+    Published(Box<DbRoot>),
     /// The attempt carried chunks over from an earlier publication and the
     /// root stopped vouching for them before the CAS, so nothing was
     /// installed and the caller must retry from a rebuild.
@@ -928,6 +945,7 @@ enum PassOutcome {
 struct RootIndexState {
     index_basis_t: u64,
     roots: Option<[BlobId; 4]>,
+    history_roots: Option<[BlobId; 4]>,
 }
 
 impl RootIndexState {
@@ -935,6 +953,7 @@ impl RootIndexState {
         Self {
             index_basis_t: root.map_or(0, |root| root.index_basis_t),
             roots: root.and_then(|root| root.roots.clone()),
+            history_roots: root.and_then(|root| root.history_roots.clone()),
         }
     }
 }
@@ -955,7 +974,7 @@ fn plan_indexes(
     let mut planned: Vec<Vec<ChunkPlan>> = Vec::with_capacity(ORDERS.len());
     for (slot, order) in ORDERS.into_iter().enumerate() {
         let segment = match previous {
-            Some(previous) => previous.segments[slot].apply_ref(
+            Some(previous) => previous.current_segments[slot].apply_ref(
                 order,
                 snapshot
                     .recorded_since(previous.basis_t)
@@ -963,7 +982,7 @@ fn plan_indexes(
             ),
             None => Segment::from_sorted_ref(order, snapshot.datoms_at(order)),
         };
-        let stored = previous.map(|previous| &previous.chunks[slot]);
+        let stored = previous.map(|previous| &previous.current_chunks[slot]);
         planned.push(
             segment
                 .leaves()
@@ -982,6 +1001,60 @@ fn plan_indexes(
     )
 }
 
+/// Builds the four retained-history segments.
+///
+/// History keys include the transaction suffix, so a tail inserts new keys
+/// rather than replacing the prior statement of a fact. `:db/noHistory`
+/// attributes are omitted at publication, matching [`Db::history`].
+fn plan_history_indexes(
+    snapshot: &Db,
+    previous: Option<&PublishedIndexes>,
+) -> ([Segment; 4], [Vec<ChunkPlan>; 4]) {
+    let history = snapshot.history();
+    let mut segments: Vec<Segment> = Vec::with_capacity(ORDERS.len());
+    let mut planned: Vec<Vec<ChunkPlan>> = Vec::with_capacity(ORDERS.len());
+    for (slot, order) in ORDERS.into_iter().enumerate() {
+        let segment = match previous {
+            Some(previous) => previous
+                .history_segments
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("history publication has history segments"))[slot]
+                .insert_history_ref(
+                    order,
+                    snapshot.recorded_since(previous.basis_t).filter(|datom| {
+                        !snapshot
+                            .schema()
+                            .get(datom.a)
+                            .is_some_and(|attribute| attribute.no_history)
+                            && corium_db::covered(snapshot.schema(), order, datom)
+                    }),
+                ),
+            None => Segment::from_sorted_ref(order, history.datoms_at(order)),
+        };
+        let stored = previous.map(|previous| {
+            &previous
+                .history_chunks
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("history publication has history chunks"))[slot]
+        });
+        planned.push(
+            segment
+                .leaves()
+                .map(|leaf| plan_chunk(leaf, stored))
+                .collect(),
+        );
+        segments.push(segment);
+    }
+    (
+        segments
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one history segment per covering index")),
+        planned
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one history chunk plan per covering index")),
+    )
+}
+
 /// Reuses the blob id a leaf was last published under, or encodes the leaf
 /// when the pass rebuilt it.
 fn plan_chunk(leaf: &Leaf, stored: Option<&HashMap<LeafId, BlobId>>) -> ChunkPlan {
@@ -993,11 +1066,42 @@ fn plan_chunk(leaf: &Leaf, stored: Option<&HashMap<LeafId, BlobId>>) -> ChunkPla
     }
 }
 
+/// Uploads every rebuilt leaf in four planned indexes and publishes one
+/// manifest per order. Carried leaves contribute their existing blob ids
+/// without another write.
+async fn upload_planned_indexes(
+    store: &impl BlobStore,
+    planned: &[Vec<ChunkPlan>; 4],
+) -> Result<([BlobId; 4], [Vec<BlobId>; 4]), TransactError> {
+    let mut manifests = Vec::with_capacity(ORDERS.len());
+    let mut chunk_ids = Vec::with_capacity(ORDERS.len());
+    for chunks in planned {
+        let mut children = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            children.push(match chunk {
+                ChunkPlan::Published(id) => id.clone(),
+                ChunkPlan::Rebuilt(bytes) => store.put_if_absent(bytes).await?,
+            });
+        }
+        let manifest = corium_store::encode_index_manifest(&children);
+        manifests.push(store.put_if_absent(&manifest).await?);
+        chunk_ids.push(children);
+    }
+    Ok((
+        manifests
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one manifest per covering index")),
+        chunk_ids
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("one chunk-id run per covering index")),
+    ))
+}
+
 /// Indexes each segment's published chunk ids by leaf, so the next pass can
 /// recognize a carried-over leaf as a chunk it has already stored.
 fn chunk_ids_by_leaf(
     segments: &[Segment; 4],
-    chunk_ids: Vec<Vec<BlobId>>,
+    chunk_ids: [Vec<BlobId>; 4],
 ) -> [HashMap<LeafId, BlobId>; 4] {
     let mut per_index = chunk_ids.into_iter();
     std::array::from_fn(|slot| {
@@ -1078,7 +1182,10 @@ async fn publish_root_pinned(
                 });
             }
             if stored.lease_version == root.lease_version
-                && stored.index_basis_t >= root.index_basis_t
+                && (stored.index_basis_t > root.index_basis_t
+                    || (stored.index_basis_t == root.index_basis_t
+                        && stored.roots == root.roots
+                        && stored.history_roots == root.history_roots))
             {
                 return Ok(RootPublication::Superseded);
             }

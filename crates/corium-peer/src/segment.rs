@@ -254,19 +254,36 @@ pub async fn load_current_snapshot(
         return Err(SnapshotError::MissingMetadata(db.into()));
     };
     let (schema, idents, interner) = codec::decode_metadata(&metadata)?;
-    let datoms = load_index_keys(store, &roots[0])
+    let current = load_index_keys(store, &roots[0])
         .await?
         .into_iter()
         .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(Db::from_current_snapshot_with_next_user(
-        root.index_basis_t,
-        root.next_entity_id,
-        schema,
-        idents,
-        interner,
-        datoms,
-    )))
+    if let Some([history_eavt, ..]) = root.history_roots {
+        let history = load_index_keys(store, &history_eavt)
+            .await?
+            .into_iter()
+            .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Db::from_history_snapshot_with_next_user(
+            root.index_basis_t,
+            root.next_entity_id,
+            schema,
+            idents,
+            interner,
+            history,
+            current,
+        )))
+    } else {
+        Ok(Some(Db::from_current_snapshot_with_next_user(
+            root.index_basis_t,
+            root.next_entity_id,
+            schema,
+            idents,
+            interner,
+            current,
+        )))
+    }
 }
 
 /// Loads one covering index's sorted keys: a format-3 manifest's chunks in
@@ -416,6 +433,7 @@ mod tests {
             owner_endpoint: String::new(),
             index_basis_t: 37,
             roots: Some([id.clone(), id.clone(), id.clone(), id]),
+            history_roots: None,
             // Legacy roots did not persist an allocator hint.
             next_entity_id: 0,
             last_tx_instant: 0,
@@ -475,6 +493,7 @@ mod tests {
             owner_endpoint: String::new(),
             index_basis_t: 37,
             roots: Some([id.clone(), id.clone(), id.clone(), id]),
+            history_roots: None,
             next_entity_id: 1_005,
             last_tx_instant: 0,
             key_manifest_version: 0,
@@ -498,6 +517,75 @@ mod tests {
         assert_eq!(db.basis_t(), 37);
         assert_eq!(db.next_user_sequence(), 1_005);
         assert_eq!(db.datoms(), datoms);
+    }
+
+    #[tokio::test]
+    async fn loads_published_history_for_pre_snapshot_views() {
+        let store = MemoryStore::default();
+        let asserted = Datom {
+            e: EntityId::from_raw(1_001),
+            a: EntityId::from_raw(101),
+            v: Value::Str("past".into()),
+            tx: EntityId::from_raw(1),
+            added: true,
+        };
+        let retracted = Datom {
+            tx: EntityId::from_raw(2),
+            added: false,
+            ..asserted.clone()
+        };
+        let current_manifest = corium_store::encode_index_manifest(&[]);
+        let current_id = store
+            .put(&current_manifest)
+            .await
+            .expect("current manifest");
+        let history_chunk = corium_store::encode_segment_chunk(
+            [&asserted, &retracted]
+                .into_iter()
+                .map(|datom| datom.key(IndexOrder::Eavt))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(Vec::as_slice),
+        );
+        let history_chunk_id = store.put(&history_chunk).await.expect("history chunk");
+        let history_manifest = corium_store::encode_index_manifest(&[history_chunk_id]);
+        let history_id = store
+            .put(&history_manifest)
+            .await
+            .expect("history manifest");
+        let root = DbRoot {
+            format_version: FORMAT_VERSION,
+            lease_version: 1,
+            owner: "test".into(),
+            lease_expires_unix_ms: 0,
+            owner_endpoint: String::new(),
+            index_basis_t: 2,
+            roots: Some(std::array::from_fn(|_| current_id.clone())),
+            history_roots: Some(std::array::from_fn(|_| history_id.clone())),
+            next_entity_id: 1_002,
+            last_tx_instant: 0,
+            key_manifest_version: 0,
+        };
+        RootStore::cas_root(&store, &db_root_name("history"), None, &root.encode())
+            .await
+            .expect("put root");
+        let metadata = codec::encode_metadata(
+            &corium_core::Schema::default(),
+            &Idents::default(),
+            &KeywordInterner::default(),
+        );
+        RootStore::cas_root(&store, &meta_root_name("history"), None, &metadata)
+            .await
+            .expect("put metadata");
+
+        let db = load_current_snapshot(&store, "history")
+            .await
+            .expect("load snapshot")
+            .expect("published snapshot");
+        assert!(db.has_complete_history());
+        assert!(db.datoms().is_empty());
+        assert_eq!(db.as_of(1).datoms(), vec![asserted.clone()]);
+        assert_eq!(db.history().datoms(), vec![asserted, retracted]);
     }
 
     #[tokio::test]

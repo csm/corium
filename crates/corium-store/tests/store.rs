@@ -281,6 +281,7 @@ async fn retention_keeps_blobs_when_backend_has_no_timestamps() {
 #[test]
 fn db_root_round_trips_lease_fields() {
     use corium_store::{DbRoot, FORMAT_VERSION};
+    let history = corium_store::digest(b"history");
     let root = DbRoot {
         format_version: FORMAT_VERSION,
         lease_version: 7,
@@ -289,6 +290,7 @@ fn db_root_round_trips_lease_fields() {
         owner_endpoint: "http://transactor-a:4334".into(),
         index_basis_t: 42,
         roots: None,
+        history_roots: Some(std::array::from_fn(|_| history.clone())),
         next_entity_id: 1_042,
         last_tx_instant: 123_400,
         key_manifest_version: 4,
@@ -320,6 +322,15 @@ fn format_one_roots_decode_with_an_unowned_lease() {
     assert_eq!(decoded.last_tx_instant, i64::MIN);
     // No key manifest, so the database is unencrypted.
     assert_eq!(decoded.key_manifest_version, 0);
+    assert!(decoded.history_roots.is_none());
+}
+
+#[test]
+fn format_five_roots_require_all_history_slots() {
+    use corium_store::DbRoot;
+    let truncated =
+        b"corium-root-v5\n1\n0\n-\n-\n-\n-\n-\n0\n-\n0\n-9223372036854775808\n0\n-\n-\n";
+    assert!(DbRoot::decode(truncated).is_none());
 }
 
 #[test]

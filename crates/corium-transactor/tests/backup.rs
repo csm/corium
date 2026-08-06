@@ -3,6 +3,7 @@
 use std::io::{Seek, Write};
 use std::time::Duration;
 
+use corium_db::Db;
 use corium_protocol::codec;
 use corium_query::edn::read_one;
 use corium_store::{BlobStore, DbRoot, RootStore, db_root_name};
@@ -14,6 +15,18 @@ use corium_transactor::node::{NodeConfig, TransactorNode};
 
 fn encoded(text: &str) -> Vec<u8> {
     codec::encode_edn(&read_one(text).expect("test EDN"))
+}
+
+fn assert_history_matches(restored: &Db, original: &Db) {
+    assert!(restored.has_complete_history());
+    assert_eq!(restored.history().datoms(), original.history().datoms());
+    for t in 0..=restored.basis_t() {
+        assert_eq!(
+            restored.as_of(t).datoms(),
+            original.as_of(t).datoms(),
+            "restore lost the as-of view at transaction {t}"
+        );
+    }
 }
 
 async fn wait_index(node: &TransactorNode, db: &str, basis: u64) {
@@ -165,6 +178,7 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
     let original_db = node.db_state("main").await.expect("main state").db();
     assert_eq!(restored_db.basis_t(), original_db.basis_t());
     assert_eq!(restored_db.datoms(), original_db.datoms());
+    assert_history_matches(&restored_db, &original_db);
 
     let error = restore(&backup_file, restored.path(), "clone")
         .await

@@ -346,9 +346,9 @@ pub struct Db {
     instants: TxInstants,
     indexes: Arc<OnceLock<[Index; 4]>>,
     stats: Arc<OnceLock<PlannerStats>>,
-    /// Whether `recorded` is the whole log rather than a snapshot's live
-    /// prefix. A value opened from a published current-state snapshot has
-    /// already lost the retractions before that snapshot's basis, so
+    /// Whether `recorded` contains the complete retained history rather than
+    /// a current snapshot's live prefix. A value opened from a published
+    /// current-state snapshot has already lost pre-basis retractions, so
     /// historical questions about it can be answered only as a floor.
     complete_history: bool,
 }
@@ -477,6 +477,92 @@ impl Db {
         }
     }
 
+    /// Creates a database value from published current and history EAVT
+    /// snapshots at the same basis.
+    ///
+    /// `history` contains every retained assertion and retraction through
+    /// `basis_t`; `current` supplies the live values of `:db/noHistory`
+    /// attributes, which are deliberately absent from history indexes. The
+    /// resulting value has complete retained history, so pre-snapshot
+    /// `as-of` and `history` views are exact for retained attributes without
+    /// replaying the log prefix. Values already discarded under
+    /// `:db/noHistory` cannot be reconstructed.
+    #[must_use]
+    pub fn from_history_snapshot(
+        basis_t: u64,
+        schema: Schema,
+        idents: Idents,
+        interner: KeywordInterner,
+        history: Vec<Datom>,
+        current: Vec<Datom>,
+    ) -> Self {
+        Self::from_history_snapshot_with_next_user(
+            basis_t,
+            FIRST_USER_ID,
+            schema,
+            idents,
+            interner,
+            history,
+            current,
+        )
+    }
+
+    /// Creates a complete retained-history value while preserving the
+    /// persisted user-entity allocation high-water mark.
+    #[must_use]
+    pub fn from_history_snapshot_with_next_user(
+        basis_t: u64,
+        next_user_sequence: u64,
+        mut schema: Schema,
+        mut idents: Idents,
+        interner: KeywordInterner,
+        mut history: Vec<Datom>,
+        current: Vec<Datom>,
+    ) -> Self {
+        bootstrap::install(&mut schema, &mut idents);
+        history.extend(current.into_iter().filter(|datom| {
+            schema
+                .get(datom.a)
+                .is_some_and(|attribute| attribute.no_history)
+        }));
+        let next_user_sequence = history
+            .iter()
+            .filter(|datom| datom.e.partition() == Partition::User as u32)
+            .map(|datom| datom.e.sequence().saturating_add(1))
+            .fold(next_user_sequence.max(FIRST_USER_ID), u64::max);
+        let mut instants = TxInstants::default();
+        for datom in &history {
+            if let Datom {
+                e,
+                a,
+                v: Value::Instant(instant),
+                tx,
+                added: true,
+                ..
+            } = datom
+                && *a == bootstrap::TX_INSTANT
+                && *e == *tx
+                && tx.partition() == Partition::Tx as u32
+            {
+                instants.record(tx.sequence(), *instant);
+            }
+        }
+        Self {
+            basis_t,
+            next_user_sequence,
+            schema,
+            recorded: history.into_iter().map(Arc::new).collect(),
+            idents: Arc::new(idents),
+            interner: Arc::new(interner),
+            schema_generation: 0,
+            view: DbView::Current,
+            instants,
+            indexes: Arc::new(OnceLock::new()),
+            stats: Arc::new(OnceLock::new()),
+            complete_history: true,
+        }
+    }
+
     /// Attaches ident and keyword naming registries, returning the named value.
     #[must_use]
     pub fn with_naming(mut self, mut idents: Idents, interner: KeywordInterner) -> Self {
@@ -532,8 +618,10 @@ impl Db {
         self.view
     }
 
-    /// Whether this value carries every fact ever recorded, rather than a
-    /// published snapshot's live prefix plus the log tail replayed onto it.
+    /// Whether this value carries the complete history retained by its
+    /// schema, rather than a published current snapshot's live prefix plus
+    /// the log tail replayed onto it. `:db/noHistory` facts deliberately do
+    /// not count toward completeness.
     ///
     /// History views and historical counts are exact only when this holds.
     /// It is a property of how the value was opened, so replaying more

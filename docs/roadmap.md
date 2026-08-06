@@ -121,22 +121,25 @@ Scaling and durability (see
   filesystem layout. Object-store *chunk sealing* (compacting the tail into
   content-addressed `log-root` chunks) remains future work; until then the
   native backends keep one record per transaction.
-- **Recovery from the index root.** *(Done for the current value.)* A
-  transactor now opens a database from its published EAVT snapshot plus the
-  log tail since `index-basis-t` (`TransactorNode::recover_transactor` →
-  `EmbeddedTransactor::recover_from_snapshot`), so open and restart time are
-  proportional to the tail, not the whole history. The `DbRoot` carries two
+- **Recovery from the index root.** *(Done, including historical views.)* A
+  transactor now opens a database from its published current and history EAVT
+  snapshots plus the log tail since `index-basis-t`
+  (`TransactorNode::recover_transactor` →
+  `EmbeddedTransactor::recover_from_snapshot`). This avoids replaying the log
+  prefix; until lazy segment descent lands, opening still materializes the
+  retained-history EAVT root. The `DbRoot` carries two
   recovery hints a current-facts snapshot cannot reconstruct — the entity
   allocator high-water (`next_entity_id`, so ids of entities retracted
   before the snapshot are never reused) and the last `:db/txInstant`
   (`last_tx_instant`, preserving transaction-time monotonicity across an
   empty tail); a root missing them (or a snapshot that fails to load) falls
-  back to full-log replay, which is always correct. Still open: **complete
-  pre-snapshot `history`/`as-of` views**, which need the history trees
-  ("future history roots" in
-  [indexes-and-storage.md](design/indexes-and-storage.md)) — published v1
-  segments carry current facts only, so those views still require full-log
-  replay.
+  back to full-log replay, which is always correct. Storage format 5 publishes
+  four retained-history covering roots alongside the four current roots.
+  Snapshot-bootstrapped peers and recovered transactors use the history EAVT
+  root for exact pre-snapshot `history`/`as-of` views of retained attributes;
+  roots from older formats fall back to full-log replay and upgrade on
+  publication. Values discarded under `:db/noHistory` remain the explicit
+  copy-free-fork semantics question below.
 - **Lazy segment descent on the read side (peer resident set).** Today a
   peer is an in-memory database that storage reconstructs rather than
   bounds. Its `Db` value keeps every datom it has seen — the full history,
@@ -153,8 +156,8 @@ Scaling and durability (see
   path — inner tree levels in the published format so a reader can seek
   without materializing an index, then descent through `corium-store`'s
   bounded segment cache, so a peer's memory tracks its working set and view
-  latency tracks the answer. Depends on published history roots for the
-  historical views, exactly as the item above. See
+  latency tracks the answer. The published history-root prerequisite is now
+  present. See
   [indexes-and-storage.md](design/indexes-and-storage.md) and
   [time-model.md](design/time-model.md).
 - **Transactor fleet placement and routing.** Pursue the
@@ -171,8 +174,9 @@ Scaling and durability (see
 - **Copy-free fork.** `db fork` currently copies the log prefix and
   rebuilds indexes; share the parent's index roots behind an as-of ceiling
   in the DbRoot (format bump) to make fork cost independent of database
-  size. Depends on published history roots (rewinding below the parent's
-  index basis needs retracted facts), and needs explicit semantics for
+  size. The published history-root prerequisite is now present (rewinding
+  below the parent's index basis needs retracted facts); this still needs
+  explicit semantics for
   `:db/noHistory` attributes, whose pre-retraction values cannot be
   faithfully rewound.
 - **S3-compatible storage backend.** *(Done.)* `S3BlobStore` implements both
