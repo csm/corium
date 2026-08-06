@@ -8,6 +8,7 @@ use corium_log::{
 };
 use std::io::Write;
 use std::sync::Arc;
+use tokio::runtime::Runtime;
 
 // Frame header (8) + transaction number (8) + final byte of tx_instant (7).
 const TX_INSTANT_LOW_BYTE_OFFSET: usize = 8 + 8 + 7;
@@ -976,5 +977,84 @@ async fn sealed_native_log_round_trips_across_versions() {
     assert_eq!(
         v2.replay_async().await.expect("replay"),
         (1..=3).map(sentinel_record).collect::<Vec<_>>()
+    );
+}
+
+/// Backup copies a sealed log without holding a key, so a keyless handle must
+/// be able to index and hand back frames — and must refuse to pretend it can
+/// read them.
+#[test]
+fn a_sealed_log_hands_back_its_frames_without_a_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let v1 = VersionedLog::open_sealed(dir.path(), "db", 1, cipher("db")).expect("open v1");
+    v1.append(&record(1)).expect("append 1");
+    v1.append(&record(2)).expect("append 2");
+    let v2 = VersionedLog::open_sealed(dir.path(), "db", 2, cipher("db")).expect("open v2");
+    v2.append(&record(3)).expect("append 3");
+
+    let runtime = Runtime::new().expect("runtime");
+    let opaque = VersionedLog::open_read_only_opaque(dir.path(), "db").expect("keyless reader");
+    let frames = runtime
+        .block_on(opaque.tx_range_framed_async(1, None))
+        .expect("frames");
+    assert_eq!(
+        frames
+            .iter()
+            .map(|f| (f.t, f.log_version))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 1), (3, 2)],
+        "each frame must carry the lease version authenticated into it"
+    );
+    // Nothing was opened: a keyless handle reports that rather than guessing.
+    assert!(matches!(opaque.replay(), Err(LogError::FramesOnly)));
+
+    // The copied bytes are the log's own, so a key holder opens them exactly
+    // where they came from — and only there.
+    for (frame, expected) in frames.iter().zip([record(1), record(2), record(3)]) {
+        assert_eq!(
+            corium_log::decode_framed_records_sealed(
+                &frame.frame,
+                Some(&cipher("db")),
+                frame.log_version,
+            )
+            .expect("decode"),
+            vec![expected]
+        );
+        assert!(
+            corium_log::decode_framed_records_sealed(
+                &frame.frame,
+                Some(&cipher("db")),
+                frame.log_version + 1,
+            )
+            .is_err(),
+            "a frame must not open against another lease version"
+        );
+    }
+}
+
+/// The same handle over a cleartext log is a plain byte copy, which is what
+/// lets backup use one path for encrypted and unencrypted databases alike.
+#[test]
+fn an_unencrypted_log_hands_back_the_same_frames_it_would_re_encode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = VersionedLog::open(dir.path(), "db", 1).expect("open");
+    log.append(&record(1)).expect("append 1");
+    log.append(&record(2)).expect("append 2");
+
+    let runtime = Runtime::new().expect("runtime");
+    let frames = runtime
+        .block_on(
+            VersionedLog::open_read_only_opaque(dir.path(), "db")
+                .expect("keyless reader")
+                .tx_range_framed_async(2, None),
+        )
+        .expect("frames");
+    let mut expected = Vec::new();
+    append_framed_record(&mut expected, &record(2)).expect("frame");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].frame, expected);
+    assert_eq!(
+        decode_framed_records(&frames[0].frame).expect("decode"),
+        vec![record(2)]
     );
 }

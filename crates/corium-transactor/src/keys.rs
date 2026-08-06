@@ -161,9 +161,10 @@ pub enum KeyWiringError {
 /// The lineage bytes authenticated into every log record of `db`.
 ///
 /// A record's AAD binds this, so a record cannot be opened as if it belonged
-/// to another database. The database name is that identity today; a restore
-/// under a different name therefore mints its own keys and re-seals, which is
-/// what backup format 2 will have to arrange.
+/// to another database. The database name is that identity today, so a copy of
+/// a database under another name re-seals its records rather than moving them:
+/// [`crate::backup::restore`] rewrites them onto the target's lineage under the
+/// archive's own data keys, and a fork mints a fresh manifest first.
 #[must_use]
 pub fn log_lineage(db: &str) -> Vec<u8> {
     db.as_bytes().to_vec()

@@ -188,12 +188,13 @@ conflict), `--token`, `--ca`, `--tls-domain`, `--window`, `--storage-key`. See
 ### `corium backup <db> <destination>`
 
 Creates or refreshes a backup from a live transactor. Flags: `--transactor`,
-`--token`, `--ca`, `--tls-domain`. See
-[backup and restore](../availability/backup.md).
+`--token`, `--ca`, `--tls-domain`, `--storage-key` (required for an encrypted
+database). See [backup and restore](../availability/backup.md).
 
 ### `corium restore <source>`
 
-Restores a backup offline. Flags: `--data-dir`, `--as-db`. Both are required.
+Restores a backup offline. Flags: `--data-dir`, `--as-db` — both required — and
+`--storage-key`, required for an encrypted archive.
 
 ## Interactive surfaces
 

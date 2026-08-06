@@ -174,8 +174,9 @@ rewritten, not patched.
   inspection are planned.
 - **A schema update cannot install a protection class**, only point an
   attribute at one. Class definitions stay create-time.
-- **`corium backup` refuses an encrypted database.** Backup format 2 is not
-  built.
+- **Backup and restore never change a database's encryption state.** An
+  archive restores as it was taken; there is no re-keying restore, so no
+  migration path onto (or off) storage encryption.
 - **KMS key identities do not resolve.** Only `file:` and `env:` work.
 - **`SIGTERM` is not handled.** Only `SIGINT` triggers graceful shutdown and
   lease release.

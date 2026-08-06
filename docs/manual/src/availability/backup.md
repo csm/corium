@@ -21,6 +21,7 @@ corium backup --transactor http://127.0.0.1:4334 people /backups/people.corium
 | `--transactor <url>` | `http://127.0.0.1:4334` | Transactor used for storage discovery. |
 | `--token <secret>` | Development token | Bearer token. `--token ""` connects anonymously. |
 | `--ca <pem>`, `--tls-domain <name>` | None | TLS for the transactor connection. |
+| `--storage-key <uri>` | None | Key-encryption key, for an encrypted database. Repeatable; `CORIUM_STORAGE_KEY` also sets it. |
 
 The positional arguments are the database name and the destination file.
 
@@ -38,8 +39,9 @@ snapshot as a replay base. Later runs do not repeat that work.
 The report is one EDN map:
 
 ```clojure
-{:db "people" :backup-format 1 :writer-version "…" :basis-t 1240
- :index-basis-t 1200 :replayed-transactions 40 :copied-blobs 12 :reused-blobs 480}
+{:db "people" :backup-format 2 :writer-version "…" :content-encryption :none
+ :basis-t 1240 :index-basis-t 1200 :replayed-transactions 40 :copied-blobs 12
+ :reused-blobs 480}
 ```
 
 ## The archive
@@ -52,6 +54,10 @@ appended it.
 
 An unsupported future format fails before restore, and the error names its
 writer.
+
+This release writes format 2 and reads formats 1 and 2. An archive keeps the
+format it was created with, so an incremental run against an existing format 1
+file appends a format 1 checkpoint rather than rewriting its header.
 
 `--log-format human|json` controls diagnostic logging only. It never changes
 the artifact.
@@ -70,9 +76,44 @@ the artifact.
 The advertised PostgreSQL connection is read and write in this version. A
 future release can substitute read-only credentials without a protocol change.
 
-> **Partly implemented.** `corium backup` refuses an encrypted database.
-> Backup format 1 cannot carry the key manifest. See
-> [encryption at rest](../security/encryption.md).
+## Encrypted databases
+
+A database created with `--storage-key` backs up and restores through the same
+two commands, with the key named on both ends.
+
+```sh
+corium backup  --transactor http://127.0.0.1:4334 \
+               --storage-key file:/etc/corium/storage.key \
+               people /backups/people.corium
+
+corium restore /backups/people.corium --data-dir /srv/corium-restored \
+               --as-db people --storage-key file:/etc/corium/storage.key
+```
+
+The archive is backup format 2 and holds ciphertext throughout: index segments
+are copied byte for byte and transaction records stay sealed, so nothing is
+decrypted on the way in. The header and each checkpoint also carry the
+database's key manifest — a KEK identity and data keys already *wrapped* under
+it, never key material — which is what lets a restore bootstrap itself from the
+archive plus access to the KEK.
+
+Each side needs the key for a different reason, and the reports say which:
+`:content-encryption` is `:storage` rather than `:none`.
+
+- **Backup** needs it only to follow index references, which live inside a
+  blob's ciphertext. Without it the command refuses and names the key rather
+  than writing an archive missing its segments.
+- **Restore** needs it to rewrite the records. A sealed record authenticates
+  the database it belongs to, so restoring — under the source's own name or a
+  new one — opens the copied records and writes them again onto the restored
+  database's lineage.
+
+The restored database keeps the archive's data keys, so a clone shares key
+material with its source. Run `corium keys rotate` or `corium keys rewrap` on
+the clone when it must be independently revocable; `corium db fork` mints a
+fresh manifest instead of copying one.
+
+See [encryption at rest](../security/encryption.md).
 
 ## Restore
 
@@ -93,6 +134,7 @@ corium restore /backups/people.corium --data-dir /srv/corium --as-db people-stag
 |---|---|
 | `--data-dir <path>` | Target transactor data directory. Required. |
 | `--as-db <name>` | Target database name. It can differ from the source name. Required. |
+| `--storage-key <uri>` | Key-encryption key, required for an encrypted archive. |
 
 Restore writes a filesystem data directory. It does not write to a `postgres`,
 `turso`, or `s3` store directly.
@@ -111,13 +153,13 @@ publication.
 
 ## Backup policy
 
-Three rules make a backup useful.
+Four rules make a backup useful.
 
 - Run `corium db request-index <db>` before a backup when the snapshot must be
   current. A backup reads through the published basis.
 - Keep the first full archive and its incremental chain together. An
   incremental run needs the checkpoint in the same file.
 - Test a restore on a schedule. An untested backup is not a backup.
-
-For a database that `corium backup` refuses, back up the underlying storage
-instead. See the [runbooks](../operations/runbooks.md).
+- Store an encrypted database's KEK apart from its archives. The archive holds
+  the data keys wrapped, so the two together are a database and either alone is
+  not.

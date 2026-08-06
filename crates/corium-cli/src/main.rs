@@ -738,6 +738,8 @@ enum Command {
         db: String,
         /// Binary backup file; reusing it appends an incremental checkpoint.
         destination: PathBuf,
+        #[command(flatten)]
+        keys: KeyFlags,
     },
     /// Restore a backup, optionally under a new database name (clone).
     Restore {
@@ -749,6 +751,8 @@ enum Command {
         /// Target database name; may differ from the backed-up source name.
         #[arg(long)]
         as_db: String,
+        #[command(flatten)]
+        keys: KeyFlags,
     },
     /// Open an interactive peer-local Datalog console.
     Console {
@@ -1445,7 +1449,9 @@ async fn run_command(command: Command) -> Result<(), String> {
             tls_domain,
             db,
             destination,
+            keys,
         } => {
+            let keyring = keys.keyring()?;
             let tls = if ca.is_none() && tls_domain.is_none() {
                 None
             } else {
@@ -1464,13 +1470,15 @@ async fn run_command(command: Command) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             let source = corium_transactor::backup::BackupSource::from_info(info)
                 .map_err(|error| error.to_string())?;
-            let report = corium_transactor::backup::backup(&source, &db, destination)
-                .await
-                .map_err(|error| error.to_string())?;
+            let report =
+                corium_transactor::backup::backup(&source, &db, destination, keyring.as_ref())
+                    .await
+                    .map_err(|error| error.to_string())?;
             println!(
-                "{{:db {db:?} :backup-format {} :writer-version {:?} :basis-t {} :index-basis-t {} :replayed-transactions {} :copied-blobs {} :reused-blobs {}}}",
+                "{{:db {db:?} :backup-format {} :writer-version {:?} :content-encryption :{} :basis-t {} :index-basis-t {} :replayed-transactions {} :copied-blobs {} :reused-blobs {}}}",
                 report.backup_format_version,
                 report.writer_version,
+                report.content_encryption,
                 report.basis_t,
                 report.index_basis_t,
                 report.replayed_transactions,
@@ -1483,16 +1491,20 @@ async fn run_command(command: Command) -> Result<(), String> {
             source,
             data_dir,
             as_db,
+            keys,
         } => {
-            let report = corium_transactor::backup::restore(source, data_dir, &as_db)
-                .await
-                .map_err(|error| error.to_string())?;
+            let keyring = keys.keyring()?;
+            let report =
+                corium_transactor::backup::restore(source, data_dir, &as_db, keyring.as_ref())
+                    .await
+                    .map_err(|error| error.to_string())?;
             println!(
-                "{{:source-db {:?} :db {:?} :backup-format {} :writer-version {:?} :basis-t {} :copied-blobs {} :reused-blobs {}}}",
+                "{{:source-db {:?} :db {:?} :backup-format {} :writer-version {:?} :content-encryption :{} :basis-t {} :copied-blobs {} :reused-blobs {}}}",
                 report.source_db,
                 report.target_db,
                 report.backup_format_version,
                 report.writer_version,
+                report.content_encryption,
                 report.basis_t,
                 report.copied_blobs,
                 report.reused_blobs
