@@ -134,7 +134,7 @@ A section `[protect.<name>]` declares the class `:protect/<name>`. Its options:
 
 | Option | Values | Default |
 |---|---|---|
-| `key` | Key identity, e.g. `"file:/etc/corium/pii.key"` | required |
+| `key` | Key identity, e.g. `"file:/etc/corium/pii.key"` or `"awskms:alias/corium-pii"` (an HMAC key; see [operations](operations.md#keys-in-a-kms)) | required |
 | `algorithm` | `"aes-256-gcm-siv"` | `"aes-256-gcm-siv"` |
 | `scope` | `"attribute"` or `"entity"` | `"attribute"` |
 | `padding` | Bytes to round plaintext up to, at least 16 | unset |

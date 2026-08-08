@@ -10,7 +10,8 @@ use std::time::Duration;
 use corium_client::query::{Query, attr, data, var};
 use corium_client::tx::{EntityMap, TxBuilder, tempid};
 use corium_client::{Args, LocalPeer, Peer};
-use corium_crypt::{KeyId, StaticKeyring};
+use corium_crypt::testing::InMemoryKms;
+use corium_crypt::{KeyId, KmsKeyring, StaticKeyring};
 use corium_peer::{Admin, ConnectConfig};
 use corium_query::edn::read_all;
 use corium_transactor::node::{NodeConfig, TransactorNode};
@@ -488,5 +489,119 @@ async fn a_key_holder_reads_exactly_what_an_unprotected_database_returns() {
     assert!(
         observed[4].contains(SENTINEL),
         "pull must return the hydrated value: {observed:?}"
+    );
+}
+
+/// A keyring whose class key is derived inside a key service.
+fn kms_keyring(service: &Arc<InMemoryKms>, key: &KeyId) -> Arc<KmsKeyring> {
+    Arc::new(KmsKeyring::new(
+        Arc::clone(service) as Arc<dyn corium_crypt::KmsClient>,
+        [key.clone()],
+    ))
+}
+
+#[tokio::test]
+async fn a_class_key_from_a_key_service_seals_on_one_peer_and_opens_on_another() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The class names a KMS identity, so no process ever reads the material:
+    // each derives it by asking the service to MAC the class context.
+    let key = KeyId::new("awskms:alias/corium-pii").expect("key id");
+    let (endpoint, _stop) = start_transactor(dir.path()).await;
+    Admin::connect(&endpoint, None, None)
+        .await
+        .expect("admin")
+        .create_database("people", &read_all(&schema(&key)).expect("schema parses"))
+        .await
+        .expect("create db");
+
+    let writing_service = Arc::new(InMemoryKms::new(41));
+    let writer = LocalPeer::connect(
+        ConnectConfig::new(&endpoint, "people").with_keyring(kms_keyring(&writing_service, &key)),
+    )
+    .await
+    .expect("key-holding peer connects");
+    writer
+        .transact(
+            TxBuilder::new()
+                .entity(
+                    EntityMap::with_id(tempid("alice"))
+                        .set("person/name", "Alice")
+                        .set("person/ssn", SENTINEL),
+                )
+                .build(),
+        )
+        .await
+        .expect("write through the key holder");
+    assert!(
+        writing_service.calls() > 0,
+        "the class key was never derived remotely"
+    );
+
+    // Neither the sealed value nor the service's key reached storage.
+    let durable = durable_bytes(&dir.path().join("data"));
+    assert!(
+        !durable
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes()),
+        "the protected value reached storage in the clear"
+    );
+    assert!(
+        !durable
+            .windows(32)
+            .any(|window| window == [41_u8; 32].as_slice()),
+        "the key service's key reached storage"
+    );
+
+    let ssn = Query::find_coll(var("ssn"))
+        .in_scalar(var("name"))
+        .where_(data(var("e"), attr("person/name"), var("name")))
+        .and(data(var("e"), attr("person/ssn"), var("ssn")));
+
+    // A second peer, a separate client over the same service key — the
+    // deployment where two processes hold one grant — opens what the first
+    // sealed. That only works because derivation is deterministic.
+    let granted = LocalPeer::connect(
+        ConnectConfig::new(&endpoint, "people")
+            .with_keyring(kms_keyring(&Arc::new(InMemoryKms::new(41)), &key)),
+    )
+    .await
+    .expect("second grant holder connects");
+    assert_eq!(
+        granted
+            .sync()
+            .await
+            .expect("sync")
+            .query(&ssn, Args::new().scalar("Alice"))
+            .await
+            .expect("granted query")
+            .values_as::<String>()
+            .expect("strings"),
+        vec![SENTINEL.to_string()]
+    );
+
+    // A peer whose keyring resolves other identities but not this class is
+    // simply not granted it: an ordinary keyless reader for this attribute,
+    // and the class policy redacts.
+    let ungranted = LocalPeer::connect(ConnectConfig::new(&endpoint, "people").with_keyring(
+        kms_keyring(
+            &Arc::new(InMemoryKms::new(41)),
+            &KeyId::new("awskms:alias/corium-payroll").expect("key id"),
+        ),
+    ))
+    .await
+    .expect("other peer connects");
+    let results = ungranted
+        .sync()
+        .await
+        .expect("sync")
+        .query(&ssn, Args::new().scalar("Alice"))
+        .await
+        .expect("query still runs");
+    let values = results.values();
+    assert_eq!(values.len(), 1);
+    assert!(
+        values[0].to_string().starts_with("#corium/redacted"),
+        "expected a redacted rendering, got {}",
+        values[0]
     );
 }

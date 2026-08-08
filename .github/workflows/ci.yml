@@ -105,6 +105,13 @@ jobs:
       - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
       - name: Lint optional native-client storage backends
         run: cargo clippy -p corium-ffi -p corium-python -p corium-jni --features all-storage --all-targets -- -D warnings
+      # The AWS KMS keyring is off by default, so the workspace build above
+      # never compiles it.
+      - name: Lint and test the KMS keyring backends
+        run: |
+          cargo clippy -p corium-crypt --features aws-kms,testing --all-targets -- -D warnings
+          cargo test -p corium-crypt --features aws-kms,testing
+          cargo clippy -p corium-cli --features aws-kms --all-targets -- -D warnings
       - name: Test optional Python storage backends
         run: cargo test -p corium-ffi --features all-storage
       - name: Check Python direct-storage artifact isolation

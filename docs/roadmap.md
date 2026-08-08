@@ -219,9 +219,13 @@ Security and multi-tenancy:
   storage format 4, backup format 2 (`corium backup` and `corium restore` take
   `--storage-key`, and the archive holds ciphertext end to end), `--storage-key`
   on the transactor, peer server, `corium log`, and offline `corium gc`,
-  `corium db create --storage-key`, and `corium keys status|rotate|rewrap`.
-  Remaining: KMS-backed keyrings; today a key identity resolves through `file:`
-  or `env:`. See
+  `corium db create --storage-key`, `corium keys status|rotate|rewrap`, and
+  KMS-backed keyrings: `KmsKeyring` over a `KmsClient` seam, with AWS KMS behind
+  the `aws-kms` feature (`Encrypt`/`Decrypt` for storage data keys,
+  `GenerateMac` for the local material a protection class needs), and
+  `CompositeKeyring` so one process takes its storage key from a file and its
+  class keys from KMS. Remaining: `gcpkms:` and `vault:` clients against that
+  same seam. See
   [encryption.md](design/encryption.md) and
   [ADR-0017](adr/0017-encryption-at-rest.md).
 - **Attribute protection classes.** *(Specified.)* Per-attribute confidentiality
