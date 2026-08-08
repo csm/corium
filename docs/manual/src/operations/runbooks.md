@@ -183,13 +183,28 @@ See [indexes and storage](../theory/indexes.md).
 
 ## Backing up an encrypted database
 
-`corium backup` refuses an encrypted database.
+`corium backup` and `corium restore` both take `--storage-key`. The archive is
+backup format 2 and holds ciphertext throughout: segments are copied verbatim
+and transaction records stay sealed, so a stolen archive is as opaque as the
+storage it came from.
 
-1. Stop the transactor, or accept a crash-consistent copy.
-2. Copy the underlying storage with its own tool. Use a filesystem snapshot,
-   a PostgreSQL dump, or S3 replication.
-3. Copy the KEK separately, and keep it in a different system.
+1. Give the backup the KEK the database names: `corium backup --storage-key
+   file:/etc/corium/storage.key people /backups/people.corium`. Backup needs it
+   only to follow index references, and it never writes anything in the clear.
+2. Restore with the same key: `corium restore /backups/people.corium --data-dir
+   … --as-db people --storage-key file:/etc/corium/storage.key`. Restore needs
+   it to move the records onto the restored database's lineage.
+3. Store the KEK separately from the archive, in a different system. The
+   archive carries the *wrapped* data keys and nothing usable without the KEK,
+   which is the property that makes storing them together pointless and storing
+   them apart safe.
 4. Test the restore path on a separate host before you rely on it.
+
+The restored database keeps the archive's data keys, so a clone shares key
+material with its source. Run `corium keys rotate <db>` (new epoch for
+new writes) or `corium keys rewrap <db> --kek <uri>` (new KEK) on the clone when
+it must be independently revocable, or use `corium db fork`, which mints a fresh
+manifest as it copies.
 
 ## Storage is full
 

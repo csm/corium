@@ -1,17 +1,82 @@
-//! M6 backup/restore acceptance coverage.
+//! M6 backup/restore acceptance coverage, including backup format 2 — the
+//! container that carries an encrypted database.
 
 use std::io::{Seek, Write};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use corium_db::Db;
+use corium_crypt::{KeyId, Keyring, StaticKeyring};
 use corium_protocol::codec;
 use corium_query::edn::read_one;
-use corium_store::{BlobStore, DbRoot, RootStore, db_root_name};
+use corium_store::{BlobStore, DbRoot, RootStore, db_root_name, keys_root_name};
 use corium_transactor::StoreSpec;
 use corium_transactor::backup::{
-    BACKUP_FORMAT_VERSION, BackupError, BackupSource, backup, restore,
+    BACKUP_FORMAT_VERSION, BackupError, BackupSource, ContentEncryption, backup, restore,
 };
 use corium_transactor::node::{NodeConfig, TransactorNode};
+
+/// A value distinctive enough that finding it in an archive means the backup
+/// wrote it in the clear.
+const SENTINEL: &str = "kaleidoscope-pangolin";
+
+/// Writes a key file and returns the identity naming it.
+fn key_file(dir: &Path, name: &str, byte: u8) -> KeyId {
+    let path = dir.join(name);
+    std::fs::write(&path, [byte; 32]).expect("write key");
+    KeyId::new(format!("file:{}", path.display())).expect("key id")
+}
+
+fn keyring(keys: &[KeyId]) -> Arc<dyn Keyring> {
+    Arc::new(StaticKeyring::resolve(keys.to_vec()).expect("resolve keys"))
+}
+
+fn contains_sentinel(bytes: &[u8]) -> bool {
+    bytes
+        .windows(SENTINEL.len())
+        .any(|window| window == SENTINEL.as_bytes())
+}
+
+/// Every byte under `dir`, so a plaintext search covers blobs, roots, and log
+/// files alike.
+fn durable_bytes(dir: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).expect("read dir") {
+            let entry = entry.expect("dir entry");
+            if entry.file_type().expect("file type").is_dir() {
+                pending.push(entry.path());
+            } else {
+                bytes.extend(std::fs::read(entry.path()).expect("read file"));
+            }
+        }
+    }
+    bytes
+}
+
+/// Asserts that `bytes` carries the database's content and none of it in the
+/// clear. The magic checks matter as much as the sentinel: absence of plaintext
+/// proves nothing if nothing was written.
+fn assert_ciphertext_only(bytes: &[u8], what: &str) {
+    assert!(
+        !contains_sentinel(bytes),
+        "{what} holds plaintext user data"
+    );
+    assert!(
+        bytes
+            .windows(corium_crypt::BLOB_MAGIC.len())
+            .any(|window| window == corium_crypt::BLOB_MAGIC),
+        "no encrypted blob reached {what}"
+    );
+    assert!(
+        bytes
+            .windows(corium_crypt::LOG_MAGIC.len())
+            .any(|window| window == corium_crypt::LOG_MAGIC),
+        "no encrypted log record reached {what}"
+    );
+}
 
 fn encoded(text: &str) -> Vec<u8> {
     codec::encode_edn(&read_one(text).expect("test EDN"))
@@ -57,7 +122,7 @@ async fn assert_future_format_rejected(backup_file: &std::path::Path, target: &s
         .expect("seek version");
     file.write_all(&(BACKUP_FORMAT_VERSION + 1).to_be_bytes())
         .expect("write future version");
-    let error = restore(&future, target, "future")
+    let error = restore(&future, target, "future", None)
         .await
         .expect_err("future format must be rejected");
     assert!(matches!(
@@ -100,7 +165,7 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
     let first_source =
         BackupSource::from_info(node.backup_info("main").await.expect("backup info"))
             .expect("filesystem source");
-    let first = backup(&first_source, "main", &backup_file)
+    let first = backup(&first_source, "main", &backup_file, None)
         .await
         .expect("full backup");
     assert!(backup_file.is_file());
@@ -114,7 +179,7 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
     let incremental_source =
         BackupSource::from_info(node.backup_info("main").await.expect("backup info"))
             .expect("filesystem source");
-    let incremental = backup(&incremental_source, "main", &backup_file)
+    let incremental = backup(&incremental_source, "main", &backup_file, None)
         .await
         .expect("incremental");
     assert_eq!(incremental.copied_blobs, 0);
@@ -140,7 +205,7 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
         .expect("open archive for partial append")
         .write_all(b"CKPT\0\0")
         .expect("write partial checkpoint");
-    let delta = backup(&fixed, "main", &backup_file)
+    let delta = backup(&fixed, "main", &backup_file, None)
         .await
         .expect("incremental delta");
     assert_eq!(delta.basis_t, 3);
@@ -150,13 +215,13 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
 
     let latest = BackupSource::from_info(node.backup_info("main").await.expect("backup info"))
         .expect("filesystem source");
-    let catch_up = backup(&latest, "main", &backup_file)
+    let catch_up = backup(&latest, "main", &backup_file, None)
         .await
         .expect("catch-up backup");
     assert_eq!(catch_up.basis_t, 4);
     assert_eq!(catch_up.replayed_transactions, 1);
 
-    let report = restore(&backup_file, restored.path(), "clone")
+    let report = restore(&backup_file, restored.path(), "clone", None)
         .await
         .expect("restore clone");
     assert_eq!(report.backup_format_version, BACKUP_FORMAT_VERSION);
@@ -180,7 +245,7 @@ async fn full_incremental_and_clone_restore_preserve_basis_and_data() {
     assert_eq!(restored_db.datoms(), original_db.datoms());
     assert_history_matches(&restored_db, &original_db);
 
-    let error = restore(&backup_file, restored.path(), "clone")
+    let error = restore(&backup_file, restored.path(), "clone", None)
         .await
         .expect_err("existing target");
     assert!(matches!(error, BackupError::TargetExists(name) if name == "clone"));
@@ -205,13 +270,13 @@ async fn empty_database_round_trips_through_a_binary_checkpoint() {
 
     let source = BackupSource::from_info(node.backup_info("empty").await.expect("backup info"))
         .expect("filesystem source");
-    let report = backup(&source, "empty", &backup_file)
+    let report = backup(&source, "empty", &backup_file, None)
         .await
         .expect("empty backup");
     assert_eq!(report.basis_t, 0);
     assert_eq!(report.replayed_transactions, 0);
 
-    let report = restore(&backup_file, restored.path(), "clone")
+    let report = restore(&backup_file, restored.path(), "clone", None)
         .await
         .expect("restore empty database");
     assert_eq!(report.basis_t, 0);
@@ -297,13 +362,13 @@ async fn native_turso_log_is_backed_up_through_the_same_replay_path() {
 
     let source = BackupSource::from_info(node.backup_info("native").await.expect("backup info"))
         .expect("turso source");
-    let report = backup(&source, "native", &backup_file)
+    let report = backup(&source, "native", &backup_file, None)
         .await
         .expect("native backup");
     assert_eq!(report.basis_t, 1);
     assert_eq!(report.replayed_transactions, 1);
 
-    restore(&backup_file, restored.path(), "clone")
+    restore(&backup_file, restored.path(), "clone", None)
         .await
         .expect("restore");
     let mut restored_config = NodeConfig::new(restored.path().to_path_buf());
@@ -319,5 +384,179 @@ async fn native_turso_log_is_backed_up_through_the_same_replay_path() {
             .db()
             .basis_t(),
         1
+    );
+}
+
+/// Backup format 2 end to end: an encrypted database is archived without ever
+/// being decrypted, and restores — under a new name — into a working database.
+#[tokio::test]
+async fn an_encrypted_database_round_trips_through_an_encrypted_archive() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let source_dir = dir.path().join("source");
+    let restored_dir = dir.path().join("restored");
+    let backup_file = dir.path().join("vault.corium");
+    let kek = key_file(dir.path(), "storage.key", 11);
+    let keys = keyring(std::slice::from_ref(&kek));
+
+    let mut config = NodeConfig::new(source_dir.clone());
+    config.index_interval = Duration::from_millis(10);
+    config.gc_interval = None;
+    config.keyring = Some(Arc::clone(&keys));
+    let node = TransactorNode::open(config).await.expect("node");
+    let schema = encoded(
+        "[{:db/ident :note/text
+           :db/valueType :db.type/string
+           :db/cardinality :db.cardinality/one}]",
+    );
+    assert!(
+        node.create_db("vault", &schema, Some(kek.clone()))
+            .await
+            .expect("create")
+    );
+    node.transact(
+        "vault",
+        &encoded(&format!("[{{:db/id \"n\" :note/text \"{SENTINEL}\"}}]")),
+    )
+    .await
+    .expect("transact");
+    wait_index(&node, "vault", 1).await;
+
+    // Copying needs the key only to follow index blobs' child references, but
+    // it does need one: without it the archive would be missing segments.
+    let source = BackupSource::from_info(node.backup_info("vault").await.expect("backup info"))
+        .expect("filesystem source");
+    let error = backup(&source, "vault", &backup_file, None)
+        .await
+        .expect_err("a keyless backup must refuse");
+    assert!(
+        matches!(&error, BackupError::MissingKeyring { db, kek: named }
+            if db == "vault" && named == &kek),
+        "{error}"
+    );
+    assert!(!backup_file.exists(), "a refused backup left an archive");
+
+    let report = backup(&source, "vault", &backup_file, Some(&keys))
+        .await
+        .expect("encrypted backup");
+    assert_eq!(report.backup_format_version, BACKUP_FORMAT_VERSION);
+    assert_eq!(report.content_encryption, ContentEncryption::Storage);
+    assert_eq!(report.basis_t, 1);
+    assert_eq!(report.replayed_transactions, 1);
+    assert!(report.copied_blobs > 0);
+
+    // The archive is the artifact the threat model cares about: a copied
+    // backup file must be as opaque as the storage it came from.
+    assert_ciphertext_only(
+        &std::fs::read(&backup_file).expect("read archive"),
+        "the archive",
+    );
+
+    // Reopening takes a new lease, so the next record lands in a new log
+    // version file — and a sealed record authenticates the version it was
+    // written under, so the archive has to carry that with the bytes.
+    drop(node);
+    let mut reopened = NodeConfig::new(source_dir.clone());
+    reopened.index_interval = Duration::from_millis(10);
+    reopened.gc_interval = None;
+    reopened.keyring = Some(Arc::clone(&keys));
+    let node = TransactorNode::open(reopened).await.expect("reopen node");
+
+    // A rotation between incremental runs moves the manifest forward, so the
+    // archive's newest checkpoint carries both epochs and its records span
+    // them.
+    assert_eq!(
+        node.rotate_storage_key("vault").await.expect("rotate"),
+        2,
+        "rotation opens the next epoch"
+    );
+    node.transact(
+        "vault",
+        &encoded("[{:db/id \"second\" :note/text \"after rotation\"}]"),
+    )
+    .await
+    .expect("post-rotation transact");
+    let source = BackupSource::from_info(node.backup_info("vault").await.expect("backup info"))
+        .expect("filesystem source");
+    let incremental = backup(&source, "vault", &backup_file, Some(&keys))
+        .await
+        .expect("incremental backup");
+    assert_eq!(incremental.basis_t, 2);
+    assert_eq!(incremental.replayed_transactions, 1);
+
+    // Restoring is where the key is genuinely required: the copied records
+    // move onto the restored database's own lineage.
+    let error = restore(&backup_file, &restored_dir, "clone", None)
+        .await
+        .expect_err("a keyless restore must refuse");
+    assert!(
+        matches!(&error, BackupError::MissingKeyring { kek: named, .. } if named == &kek),
+        "{error}"
+    );
+
+    let report = restore(&backup_file, &restored_dir, "clone", Some(&keys))
+        .await
+        .expect("restore clone");
+    assert_eq!(report.content_encryption, ContentEncryption::Storage);
+    assert_eq!(report.source_db, "vault");
+    assert_eq!(report.target_db, "clone");
+    assert_eq!(report.basis_t, 2);
+
+    let original = node.db_state("vault").await.expect("vault state").db();
+    assert_restored_clone(&restored_dir, &keys, &kek, &original).await;
+
+    // ...and the restored data directory is as opaque as the source's.
+    assert_ciphertext_only(&durable_bytes(&restored_dir), "the restored database");
+}
+
+/// Opens the restored clone and checks it is the source database, still
+/// encrypted, and metered honestly.
+async fn assert_restored_clone(
+    restored_dir: &Path,
+    keys: &Arc<dyn Keyring>,
+    kek: &KeyId,
+    original: &corium_db::Db,
+) {
+    let mut config = NodeConfig::new(restored_dir.to_path_buf());
+    config.gc_interval = None;
+    config.keyring = Some(Arc::clone(keys));
+    let node = TransactorNode::open(config)
+        .await
+        .expect("open restored node");
+    let state = node.db_state("clone").await.expect("clone state");
+    assert!(
+        state.is_encrypted(),
+        "the restored clone lost its encryption"
+    );
+    assert_eq!(state.db().basis_t(), original.basis_t());
+    assert_eq!(state.db().datoms(), original.datoms());
+    assert!(
+        format!("{:?}", state.db().datoms()).contains(SENTINEL),
+        "the restored clone lost its data"
+    );
+
+    // The clone carries the archive's manifest, so its own `keys:` root is
+    // what a later rotation or re-wrap acts on.
+    let manifest = corium_store::KeyManifest::decode(
+        &node
+            .store()
+            .get_root(&keys_root_name("clone"))
+            .await
+            .expect("keys root")
+            .expect("the clone has no key manifest"),
+    )
+    .expect("decode manifest");
+    assert_eq!(&manifest.kek, kek);
+    assert_eq!(manifest.active_storage_epoch(), Some(2));
+    // Every record was re-sealed under the active epoch, so the nonce budget
+    // must credit that epoch with the whole log rather than with the tail the
+    // source happened to write under it.
+    assert_eq!(manifest.log_records_sealed(2, 2), Some(2));
+    assert_eq!(manifest.log_records_sealed(1, 2), Some(0));
+    // A later rotation on the clone still works from any basis.
+    assert_eq!(
+        node.rotate_storage_key("clone")
+            .await
+            .expect("rotate the clone"),
+        3
     );
 }

@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use corium_log::{
-    LogCipher, LogError, MemLogRegistry, NativeLogStorage, NativeVersionedLog, TransactionLog,
-    TxRecord, VersionedLog,
+    FramedRecord, LogCipher, LogError, MemLogRegistry, NativeLogStorage, NativeVersionedLog,
+    TransactionLog, TxRecord, VersionedLog,
 };
 pub use corium_store::StorageConnectionError;
 use corium_store::{
@@ -646,6 +646,21 @@ impl TransactionLog for BlockingTransactionLog {
             .await
             .map_err(|error| LogError::Native(format!("log task failed: {error}")))?
     }
+
+    fn tx_range_framed(&self, start: u64, end: Option<u64>) -> Result<Vec<FramedRecord>, LogError> {
+        self.0.tx_range_framed(start, end)
+    }
+
+    async fn tx_range_framed_async(
+        &self,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<FramedRecord>, LogError> {
+        let log = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || log.tx_range_framed(start, end))
+            .await
+            .map_err(|error| LogError::Native(format!("log task failed: {error}")))?
+    }
 }
 
 /// Prevents a storage handle opened for replay from being used to append even
@@ -668,6 +683,18 @@ impl TransactionLog for ReadOnlyTransactionLog {
         end: Option<u64>,
     ) -> Result<Vec<TxRecord>, LogError> {
         self.0.tx_range_async(start, end).await
+    }
+
+    fn tx_range_framed(&self, start: u64, end: Option<u64>) -> Result<Vec<FramedRecord>, LogError> {
+        self.0.tx_range_framed(start, end)
+    }
+
+    async fn tx_range_framed_async(
+        &self,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<FramedRecord>, LogError> {
+        self.0.tx_range_framed_async(start, end).await
     }
 }
 
@@ -805,6 +832,43 @@ impl LogBackend {
                 }
                 None => NativeVersionedLog::open_read_only(Arc::clone(storage), name),
             })))),
+        }
+    }
+
+    /// Opens the named log for keyless frame copying.
+    ///
+    /// Backup reads through this handle: an encrypted database's records are
+    /// copied into the archive as the bytes the log holds, so the copy needs no
+    /// storage key and the archive stays encrypted. Only
+    /// [`TransactionLog::tx_range_framed_async`] works on the result.
+    ///
+    /// # Errors
+    /// Returns an error when a transaction log cannot be opened.
+    pub async fn open_read_only_opaque(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn TransactionLog>, LogError> {
+        match self {
+            Self::Fs(dir) => {
+                let dir = dir.clone();
+                let name = name.to_owned();
+                let log = tokio::task::spawn_blocking(move || {
+                    VersionedLog::open_read_only_opaque(dir, &name)
+                })
+                .await
+                .map_err(|error| LogError::Native(format!("log task failed: {error}")))??;
+                Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
+                    BlockingTransactionLog(Arc::new(log)),
+                ))))
+            }
+            // In-memory logs are never sealed, so the default framed read —
+            // re-framing decoded records as cleartext — is exact for them.
+            Self::Mem(registry) => Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
+                registry.open(name, 0),
+            )))),
+            Self::Native(storage) => Ok(Arc::new(ReadOnlyTransactionLog(Arc::new(
+                NativeVersionedLog::open_read_only_opaque(Arc::clone(storage), name),
+            )))),
         }
     }
 
