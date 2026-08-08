@@ -15,14 +15,17 @@ corium db create people --schema schema.toml --storage-key file:/etc/corium/stor
 A database created without a storage key stays unencrypted forever. A database
 created with one stays encrypted forever.
 
-There is no in-place migration. Migrating an unencrypted database means a
-backup and a restore into a new database.
+There is no in-place migration.
 
-> **Partly implemented.** `corium backup` refuses an encrypted database.
-> Backup format 1 cannot carry the key manifest, so no restore can open the
-> resulting archive. An encrypted database therefore has no supported backup
-> path today. Protect it with storage-level replication and
-> snapshots until backup format 2 lands.
+An encrypted database backs up and restores like any other, with the KEK named
+on both ends. See [backup and
+restore](../availability/backup.md#encrypted-databases).
+
+> **Not implemented.** An archive restores with the encryption state it was
+> taken with, so backup and restore do not convert a database in either
+> direction. Turning encryption on for existing data means loading it into a
+> database created with `--storage-key`; a re-keying restore, which would have
+> to re-encrypt every segment and so rewrite every blob id, does not exist.
 
 ## Key identities
 

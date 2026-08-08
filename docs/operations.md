@@ -642,9 +642,11 @@ Two operational consequences worth planning for:
   `corium gc --data-dir` read blob and log content, so pass `--storage-key`.
   Offline GC refuses to run without it rather than sweep every index chunk it
   cannot follow.
-- **Backup does not support encrypted databases yet.** `corium backup` refuses
-  one, because copying its ciphertext without the key manifest (backup format 2)
-  would produce an archive no restore could open.
+- **Backup and restore need the key too.** `corium backup` takes
+  `--storage-key` to follow index references, and `corium restore` takes it to
+  move the archive's records onto the restored database's lineage. The archive
+  itself (backup format 2) holds ciphertext and the wrapped data keys, never key
+  material.
 
 ## Attribute protection
 

@@ -3,14 +3,12 @@
 Status: **layer 1 implemented; layer 2 implemented for protection declared at
 database creation.** The storage-encryption primitives, the blob-store
 decorator, log-record payload encryption, the `keys:<db>` key manifest (with
-storage format 4), and the process wiring — `--storage-key` on the transactor,
-peer server, and offline commands; `corium db create --storage-key`;
-`corium keys status|rotate|rewrap` — are implemented. Remaining in layer 1:
-backup format 2 (until then `corium backup` refuses an encrypted database
-rather than writing an archive no restore could open) and KMS-backed keyrings
-(a key identity resolves through `file:` or `env:` today; `awskms:`,
-`gcpkms:`, and `vault:` are recognized as key sources and rejected as
-unresolvable).
+storage format 4), backup format 2, and the process wiring — `--storage-key` on
+the transactor, peer server, offline commands, and `corium backup|restore`;
+`corium db create --storage-key`; `corium keys status|rotate|rewrap` — are
+implemented. Remaining in layer 1: KMS-backed keyrings (a key identity resolves
+through `file:` or `env:` today; `awskms:`, `gcpkms:`, and `vault:` are
+recognized as key sources and rejected as unresolvable).
 
 Layer 2 is implemented end to end for the shape of protection Corium's schema
 can express today. A class declared in the create-time schema
@@ -205,7 +203,8 @@ Primitives:
 
 One DEK per database per epoch, wrapped under the deployment KEK. Enabled by
 `--storage-key <key-uri>` at database creation; a database created without it
-stays unencrypted forever unless migrated by backup/restore.
+stays unencrypted forever; backup and restore preserve that state rather than
+converting it (see [Compatibility and migration](#compatibility-and-migration)).
 
 ### Index blobs
 
@@ -384,16 +383,28 @@ is authoritative.
 
 ### Backups
 
-Backup format version 2:
+Backup format version 2 ([backup-format.md](backup-format.md)):
 
-- Header gains `Content encryption: u32` and `Key manifest: bytes`.
+- Header gains `Content encryption: u32` and `Key manifest: bytes`; each
+  checkpoint carries the manifest current as of that checkpoint, so a rotation
+  between incremental runs travels with the records sealed under the new epoch.
 - `BLOB` frames carry stored objects **verbatim** — no decrypt/re-encrypt — so
   backup remains a byte copy and needs no storage key to *copy*, only to walk
   manifests.
-- `CKPT` transaction records stay log-framed, hence still encrypted.
+- `CKPT` transaction records stay log-framed, hence still encrypted, and the
+  checkpoint records the log version each frame was sealed under.
 
 Restoring into a deployment that can unwrap the archive's KEK yields a working
-database. Restoring where the KEK is unavailable fails cleanly at open.
+database. Restoring where the KEK is unavailable fails cleanly, naming the key:
+a log record's AAD binds the database lineage and log version it was written
+under, so restore opens the copied records and writes them again onto the
+restored database's own lineage. The blobs beside them are replaced verbatim —
+blob encryption binds no database identity — so the restored database keeps the
+archive's data keys and shares key material with its source until `corium keys
+rotate` or `corium keys rewrap` says otherwise. A `db fork`, which re-seals
+under a freshly minted manifest, is the operation that yields an independently
+revocable copy.
+
 Restoring *without the class keys* yields a fully functional database whose
 protected attributes are permanently redacted — which is exactly what you want
 when shipping production data to a staging environment.
@@ -1025,8 +1036,12 @@ records key grants, rotations, and shreds.
   version-checked the way the existing formats are; an older reader meeting a
   newer artifact gets the existing upgrade error, not a parse failure.
 - An existing unencrypted database keeps working untouched, forever. Turning on
-  storage encryption for one is a backup/restore into a new database created
-  with `--storage-key`.
+  storage encryption for one is *not* yet a backup/restore: an archive carries
+  its source's encryption state and restores with it, so converting a database
+  means loading its data into one created with `--storage-key`. A re-keying
+  restore would have to re-encrypt every segment, and a blob id is the digest
+  of the stored object, so it would rewrite every id and republish the whole
+  index — a distinct piece of work from backup format 2, not a flag on it.
 - Adding a protection class to an existing schema is additive, and so is
   protecting a populated attribute — forward only, per
   [Changing protection](#changing-protection). The alteration that is *not*
@@ -1052,8 +1067,8 @@ altered.
 2. **Layer 1.** `EncryptedBlobStore` decorator and the id change; log record
    payload encryption; `keys:<db>` manifest and storage format 4; cache
    placement; backup format 2; `--storage-key` on every process; `corium keys
-   init|status|rotate|rewrap`. Deliverable acceptance: a byte scan of a
-   populated data directory and blob store finds no sentinel plaintext, and a
+   init|status|rotate|rewrap`. Deliverable acceptance, both met: a byte scan of
+   a populated data directory and blob store finds no sentinel plaintext, and a
    full backup/restore round-trips across a DEK rotation.
 3. **Layer 2 core.** `Value::Sealed`, the `0xA0` encoding, class entities, the
    per-attribute protection timeline in the schema cache, schema validation

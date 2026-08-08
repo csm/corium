@@ -93,11 +93,19 @@ Corium version. Immutable snapshot blobs follow as framed binary sections;
 each full or incremental run ends with a committed checkpoint frame carrying
 its writer version, metadata, basis, and framed transaction range. A partial
 trailing frame is ignored and replaced by the next incremental run. The exact
-version 1 layout is specified in [backup-format.md](backup-format.md).
+layout of versions 1 and 2 is specified in
+[backup-format.md](backup-format.md).
+
+An encrypted database's blobs and records are copied without being decrypted,
+and the archive carries the database's key manifest — wrapped data keys, never
+material — so a version 2 archive is as opaque as the storage it came from and
+still restorable given the KEK.
 
 Restore installs the archive's root under a (possibly new) database name. The
 log is authoritative, so a snapshot behind the latest checkpoint basis is
-completed by replay during recovery.
+completed by replay during recovery. A sealed record authenticates the database
+it belongs to, so restoring an encrypted archive rewrites its records onto the
+restored database's lineage rather than copying them.
 
 ## Observability
 
