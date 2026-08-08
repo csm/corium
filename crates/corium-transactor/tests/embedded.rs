@@ -36,14 +36,10 @@ impl TransactionLog for DelayedAsyncLog {
     }
 }
 
-/// Materializes the current value at a published index root the way a
-/// transactor recovering from the index root does: read the EAVT snapshot,
-/// decode its keys back to datoms.
-async fn load_index_root_snapshot(store: &FsStore, root: &DbRoot, schema: Schema) -> Db {
+async fn load_root_datoms(store: &FsStore, id: &BlobId) -> Vec<Datom> {
     use corium_store::{decode_index_manifest, decode_segment_keys, is_index_manifest};
-    let eavt = &root.roots.as_ref().expect("published roots")[IndexOrder::Eavt as usize];
     let blob = store
-        .get(eavt)
+        .get(id)
         .await
         .expect("get eavt")
         .expect("eavt present");
@@ -57,16 +53,35 @@ async fn load_index_root_snapshot(store: &FsStore, root: &DbRoot, schema: Schema
     } else {
         decode_segment_keys(&blob).expect("flat keys")
     };
-    let datoms = keys
-        .iter()
+    keys.iter()
         .map(|key| Datom::from_key(IndexOrder::Eavt, key).expect("decode datom"))
-        .collect();
-    Db::from_current_snapshot(
+        .collect()
+}
+
+/// Materializes the complete value at a published index root the way a
+/// transactor recovering from format 5 does: read current and history EAVT
+/// snapshots and decode their keys back to datoms.
+async fn load_index_root_snapshot(store: &FsStore, root: &DbRoot, schema: Schema) -> Db {
+    let current = load_root_datoms(
+        store,
+        &root.roots.as_ref().expect("published roots")[IndexOrder::Eavt as usize],
+    )
+    .await;
+    let history = load_root_datoms(
+        store,
+        &root
+            .history_roots
+            .as_ref()
+            .expect("published history roots")[IndexOrder::Eavt as usize],
+    )
+    .await;
+    Db::from_history_snapshot(
         root.index_basis_t,
         schema,
         Idents::default(),
         KeywordInterner::default(),
-        datoms,
+        history,
+        current,
     )
 }
 fn schema() -> (Schema, EntityId) {
@@ -694,6 +709,10 @@ async fn incremental_publication_matches_a_rebuild_from_scratch() {
         rebuilt.roots, incremental.roots,
         "folding the tail in published different indexes than a full rebuild"
     );
+    assert_eq!(
+        rebuilt.history_roots, incremental.history_roots,
+        "inserting the history tail published different indexes than a full rebuild"
+    );
 }
 
 #[tokio::test]
@@ -791,20 +810,31 @@ async fn index_root_recovery_matches_full_log_replay() {
     let log: Arc<dyn TransactionLog> =
         Arc::new(FileLog::open(dir.path().join("tx.log")).expect("log"));
     let tx = EmbeddedTransactor::recover(schema.clone(), Arc::clone(&log)).expect("recover");
+    let mut first = None;
     for value in 1..=3 {
-        tx.transact([TxItem::Op(TxOp::Add(
-            EntityRef::Temp(format!("e{value}")),
-            a,
-            Value::Long(value),
-        ))])
-        .expect("transact head");
+        let report = tx
+            .transact([TxItem::Op(TxOp::Add(
+                EntityRef::Temp(format!("e{value}")),
+                a,
+                Value::Long(value),
+            ))])
+            .expect("transact head");
+        first.get_or_insert(report.tx.tempids[&format!("e{value}")]);
     }
+    // Supersede a value before publication. The old assertion and its
+    // retraction exist only in the history roots, never in the current root.
+    tx.transact([TxItem::Op(TxOp::Add(
+        EntityRef::Id(first.expect("first entity")),
+        a,
+        Value::Long(10),
+    ))])
+    .expect("replace before snapshot");
     // Publish a snapshot mid-history, then commit a tail past it.
     let root = tx
         .publish_indexes(&store, "db:main", 1)
         .await
         .expect("publish");
-    assert_eq!(root.index_basis_t, 3);
+    assert_eq!(root.index_basis_t, 4);
     for value in 4..=6 {
         tx.transact([TxItem::Op(TxOp::Add(
             EntityRef::Temp(format!("e{value}")),
@@ -815,7 +845,7 @@ async fn index_root_recovery_matches_full_log_replay() {
     }
     drop(tx);
 
-    // Recovering from the index root replays only the (3, 6] tail.
+    // Recovering from the index root replays only the (4, 7] tail.
     let snapshot = load_index_root_snapshot(&store, &root, schema.clone()).await;
     let from_index = EmbeddedTransactor::recover_from_snapshot(
         snapshot,
@@ -831,21 +861,69 @@ async fn index_root_recovery_matches_full_log_replay() {
     )
     .expect("full replay");
     assert_eq!(from_index.db().basis_t(), from_log.db().basis_t());
-    assert_eq!(from_index.db().basis_t(), 6);
+    assert_eq!(from_index.db().basis_t(), 7);
     assert_eq!(
         from_index.db().datoms(),
         from_log.db().datoms(),
         "index-root recovery must reconstruct the same current value as full replay"
     );
+    assert!(from_index.db().has_complete_history());
+    for t in 0..=7 {
+        assert_eq!(
+            from_index.db().as_of(t).datoms(),
+            from_log.db().as_of(t).datoms(),
+            "index-root recovery lost the as-of view at transaction {t}"
+        );
+    }
+    assert_eq!(
+        from_index.db().history().datoms(),
+        from_log.db().history().datoms(),
+        "index-root recovery lost retained history"
+    );
     // `:db/txInstant` datoms are live facts, so the published snapshot carries
     // transaction time for the history it covers, not just for the tail.
-    for t in 1..=6 {
+    for t in 1..=7 {
         assert_eq!(
             from_index.db().tx_instant(t),
             from_log.db().tx_instant(t),
             "snapshot recovery lost the instant of transaction {t}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_legacy_current_snapshot_never_publishes_partial_history_roots() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (schema, a) = schema();
+    let datom = Datom {
+        e: EntityId::new(Partition::User as u32, corium_db::FIRST_USER_ID),
+        a,
+        v: Value::Long(1),
+        tx: EntityId::new(Partition::Tx as u32, 1),
+        added: true,
+    };
+    let snapshot = Db::from_current_snapshot(
+        1,
+        schema,
+        Idents::default(),
+        KeywordInterner::default(),
+        vec![datom],
+    );
+    assert!(!snapshot.has_complete_history());
+    let tx = EmbeddedTransactor::recover_from_snapshot(
+        snapshot,
+        corium_db::FIRST_USER_ID + 1,
+        1,
+        Arc::new(MemoryLog::default()),
+    )
+    .expect("recover legacy snapshot");
+    let store = FsStore::open(dir.path().join("store")).expect("store");
+    let root = tx
+        .publish_indexes(&store, "db:legacy", 1)
+        .await
+        .expect("publish current roots");
+    assert!(root.roots.is_some());
+    assert!(root.history_roots.is_none());
 }
 
 #[tokio::test]

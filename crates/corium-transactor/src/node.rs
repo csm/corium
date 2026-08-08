@@ -898,12 +898,12 @@ impl TransactorNode {
 
     /// Builds the recovered transactor for `open_db`.
     ///
-    /// When the post-fence root publishes a current snapshot with recovery
-    /// hints, recovers from the index root plus the log tail — open time
-    /// proportional to the tail, not the whole history. Any missing hint
-    /// (a pre-recovery root, or a bare fence bump with no snapshot) or a
-    /// failure materializing the snapshot falls back to full-log replay,
-    /// which is always correct because the log is the source of truth.
+    /// When the post-fence root publishes current and history snapshots with
+    /// recovery hints, recovers from those roots plus the log tail without
+    /// replaying the log prefix. Any missing history root or hint (an older
+    /// root, or a bare fence bump with no snapshot), or a failure
+    /// materializing the snapshot, falls back to full-log replay, which is
+    /// always correct because the log is the source of truth.
     #[allow(clippy::too_many_arguments)]
     async fn recover_transactor(
         &self,
@@ -919,12 +919,14 @@ impl TransactorNode {
         // an absent snapshot both rule out the tail-only path.
         if let Some(root) = root
             && let Some(roots) = &root.roots
+            && let Some(history_roots) = &root.history_roots
             && root.next_entity_id != 0
         {
-            match Self::load_current_snapshot(
+            match Self::load_history_snapshot(
                 store,
                 root,
                 &roots[IndexOrder::Eavt as usize],
+                &history_roots[IndexOrder::Eavt as usize],
                 schema,
                 idents,
                 interner,
@@ -953,31 +955,39 @@ impl TransactorNode {
         Ok(EmbeddedTransactor::recover_from_async(base, Arc::clone(log)).await?)
     }
 
-    /// Materializes the current database value at a published index root from
-    /// its EAVT snapshot — the transactor-side counterpart of the peer's
-    /// bootstrap (`corium-peer`'s `load_current_snapshot`). Only current
-    /// facts are reconstructed; the log tail carries everything since.
-    async fn load_current_snapshot(
+    /// Materializes a complete database value at a published index root from
+    /// its current and history EAVT snapshots — the transactor-side
+    /// counterpart of the peer bootstrap. The log tail carries everything
+    /// since this shared basis.
+    async fn load_history_snapshot(
         store: &DbStore,
         root: &DbRoot,
-        eavt: &BlobId,
+        current_eavt: &BlobId,
+        history_eavt: &BlobId,
         schema: &Schema,
         idents: &Idents,
         interner: &KeywordInterner,
     ) -> Result<Db, StoreError> {
-        let datoms = Self::load_index_keys(store, eavt)
+        let current = Self::load_index_keys(store, current_eavt)
             .await?
             .into_iter()
             .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))?;
-        Ok(Db::from_current_snapshot_with_next_user(
+        let history = Self::load_index_keys(store, history_eavt)
+            .await?
+            .into_iter()
+            .map(|key| Datom::from_key(IndexOrder::Eavt, &key))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Io(std::io::Error::other(error.to_string())))?;
+        Ok(Db::from_history_snapshot_with_next_user(
             root.index_basis_t,
             root.next_entity_id,
             schema.clone(),
             idents.clone(),
             interner.clone(),
-            datoms,
+            history,
+            current,
         ))
     }
 
@@ -2147,6 +2157,15 @@ impl TransactorNode {
                 &mut marked,
             )
             .await?;
+            if let Some(history_roots) = root.history_roots {
+                mark_reachable(
+                    store.as_ref(),
+                    history_roots,
+                    |_, bytes| corium_store::index_blob_children(bytes),
+                    &mut marked,
+                )
+                .await?;
+            }
         }
         let report =
             sweep_unmarked(self.store.as_ref(), &marked, retention, SystemTime::now()).await?;

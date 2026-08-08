@@ -310,6 +310,77 @@ impl Segment {
         }
     }
 
+    /// Inserts retained history datoms into this segment.
+    ///
+    /// Unlike [`Self::apply`], this indexes the complete covering key,
+    /// including transaction and assertion/retraction bit: a later statement
+    /// of the same fact is another history entry rather than a replacement.
+    /// Untouched leaves remain shared, so publishing a history tail rewrites
+    /// only the chunks its new keys land in.
+    #[must_use]
+    pub fn insert_history_ref<'a>(
+        &self,
+        order: IndexOrder,
+        datoms: impl IntoIterator<Item = &'a Datom>,
+    ) -> Self {
+        let pending: Vec<Vec<u8>> = datoms
+            .into_iter()
+            .map(|datom| datom.key(order))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if pending.is_empty() {
+            return self.clone();
+        }
+
+        let mut builder = LeafBuilder::with_capacity(self.leaves.len() + 1);
+        let mut cursor = 0;
+        for (index, leaf) in self.leaves.iter().enumerate() {
+            let keys = leaf.keys();
+            let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
+                continue;
+            };
+            while pending
+                .get(cursor)
+                .is_some_and(|key| key.as_slice() < first.as_slice())
+            {
+                builder.push(pending[cursor].clone());
+                cursor += 1;
+            }
+            let touched = pending
+                .get(cursor)
+                .is_some_and(|key| key.as_slice() <= last.as_slice());
+            let followed = index + 1 < self.leaves.len() || cursor < pending.len();
+            if !touched && (leaf.is_closed() || !followed) {
+                builder.carry(leaf);
+                continue;
+            }
+            if touched {
+                builder.begin_dirty();
+            }
+            for key in keys {
+                while pending
+                    .get(cursor)
+                    .is_some_and(|inserted| inserted.as_slice() < key.as_slice())
+                {
+                    builder.push(pending[cursor].clone());
+                    cursor += 1;
+                }
+                if pending.get(cursor).is_some_and(|inserted| inserted == key) {
+                    // Re-indexing the same transaction is idempotent.
+                    cursor += 1;
+                }
+                builder.push(key.clone());
+            }
+        }
+        for key in &pending[cursor..] {
+            builder.push(key.clone());
+        }
+        Self {
+            leaves: builder.finish().into(),
+        }
+    }
+
     /// Counts keys shared exactly with `older`.
     ///
     /// Both segments are sorted, so this is one linear pass over the two key
@@ -551,6 +622,32 @@ mod tests {
         assert!(
             rebuilt <= 1 + RESYNC_LEAF_LIMIT,
             "one insertion rebuilt {rebuilt} of {leaves} leaves"
+        );
+    }
+
+    #[test]
+    fn history_insertion_keeps_prior_statements_and_reuses_untouched_leaves() {
+        let original = Segment::from_sorted(IndexOrder::Eavt, many(20_000));
+        let retained = [retraction(1_000, 1, 1_000), retraction(15_000, 1, 15_000)];
+        let inserted = original.insert_history_ref(IndexOrder::Eavt, retained.iter());
+
+        let expected: std::collections::BTreeSet<Vec<u8>> = original
+            .keys()
+            .cloned()
+            .chain(retained.iter().map(|datom| datom.key(IndexOrder::Eavt)))
+            .collect();
+        assert_eq!(
+            inserted.keys().cloned().collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(inserted.len(), original.len() + retained.len());
+        assert!(inserted.shared_leaf_count(&original) > 0);
+
+        let repeated = inserted.insert_history_ref(IndexOrder::Eavt, retained.iter());
+        assert_eq!(
+            repeated.len(),
+            inserted.len(),
+            "history insertion is idempotent"
         );
     }
 

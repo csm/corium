@@ -69,8 +69,9 @@ merged with `log tail (index-basis-t, basis-t]` replayed into an in-memory
 live index. Peers hold the live index incrementally via tx-reports; a cold
 reader replays the tail from storage.
 
-The implemented publication (storage format 3) is a first cut of the
-segment-tree design: each covering index is stored as a manifest blob
+The implemented publication (current storage format 5) is a first cut of the
+segment-tree design: each current and history covering index is stored as a
+manifest blob
 naming content-defined leaf chunks (`corium-store`'s `snapshot` module),
 so consecutive roots share every untouched chunk. Inner tree levels (and
 with them seek-without-full-download) are still future work; readers
@@ -132,26 +133,25 @@ through A → install C naming those chunks* leaves the live root pointing at
 deleted blobs, and the basis-monotonicity check alone does not prevent it,
 because C's basis can legitimately exceed B's.
 
-The implemented peer bootstrap follows that rule for the current value: a
+The implemented peer bootstrap follows that rule for the current and retained
+history values: a
 peer initialized with a blob/root storage connection reads `meta:<db>` and
-`db:<db>`, materializes the published EAVT snapshot at `index-basis-t`, and
+`db:<db>`, materializes the published current and history EAVT snapshots at
+`index-basis-t`, and
 subscribes to the transactor from that basis. A peer without storage
 credentials uses the compatibility path and subscribes from basis zero.
-Published v1 segments contain current facts only, so a snapshot-bootstrapped
-peer does not reconstruct transactions that ceased contributing live facts
-before the snapshot; complete pre-snapshot historical views still require
-full-log replay (or the future history roots described above).
+Roots published before storage format 5 contain current facts only; opening
+one does not claim complete history, and transactor recovery falls back to
+full-log replay before publishing format-5 history roots.
 
 A recovering **transactor** uses the same published snapshot: it opens a
-database from the EAVT root plus the log tail since `index-basis-t` instead
-of replaying the whole log (see the recovery item in
-[roadmap.md](../roadmap.md)). Because the snapshot drops entities retracted
-before it, the DbRoot also carries two recovery hints the current-facts
-segments cannot supply — `next_entity_id` (the entity-allocator high-water,
-so a retracted id is never reused) and `last_tx_instant` (for
-`:db/txInstant` monotonicity when the tail is empty). A root written before
-these hints existed leaves them at their sentinels, which forces the exact
-full-log replay used previously.
+database from the current and history EAVT roots plus the log tail since
+`index-basis-t` instead of replaying the whole log (see the recovery item in
+[roadmap.md](../roadmap.md)). The DbRoot continues to carry two recovery
+high-water marks directly — `next_entity_id` (so a retracted id is never
+reused) and `last_tx_instant` (for `:db/txInstant` monotonicity when the tail
+is empty). A root written before these hints or history roots existed leaves
+them absent, which forces exact full-log replay before it is upgraded.
 
 Filesystem, PostgreSQL, Turso, and S3 implement the same peer read interface.
 PostgreSQL readers use ordinary MVCC and do not contend with the root CAS
