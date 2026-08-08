@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use corium_db::Db;
 use corium_crypt::{KeyId, Keyring, StaticKeyring};
+use corium_db::Db;
 use corium_protocol::codec;
 use corium_query::edn::read_one;
 use corium_store::{BlobStore, DbRoot, RootStore, db_root_name, keys_root_name};
