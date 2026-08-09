@@ -25,12 +25,16 @@ Design documents, the roadmap, and architecture decision records live in
 
 ## Getting started
 
-Corium builds with a recent stable Rust toolchain. From the repository root:
+Corium builds with Rust 1.88 or newer. From the repository root:
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+cargo build
+./scripts/test-rust.sh
 ```
+
+The test script runs the GC-mode Clojure crates separately from the
+`no-gc` transaction-function runtime. A single `cargo test --workspace`
+feature-unifies those incompatible allocator modes.
 
 Start a local transactor (here fully in-memory, so there is nothing to clean
 up afterwards):

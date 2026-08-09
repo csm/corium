@@ -99,10 +99,10 @@ jobs:
       - run: cargo fmt --all -- --check
       # corium-cljrs and the musicbrainz example are excluded from
       # workspace-wide builds: unified with the cljrs-featured transactor
-      # they would compile in no-gc mode. The standalone step below builds
-      # them in their intended GC mode.
+      # they would compile in no-gc mode. The test script builds them in
+      # their intended GC mode with a separate Cargo invocation.
       - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
-      - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
+      - run: ./scripts/test-rust.sh
       - name: Lint optional native-client storage backends
         run: cargo clippy -p corium-ffi -p corium-python -p corium-jni --features all-storage --all-targets -- -D warnings
       - name: Test optional Python storage backends
@@ -117,10 +117,8 @@ jobs:
           cargo check -p corium-python --no-default-features --features turso
           cargo check -p corium-python --no-default-features --features postgres
           cargo check -p corium-python --no-default-features --features s3
-      - name: Test GC-mode cljrs crates (standalone)
-        run: |
-          cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
-          cargo test -p corium-cljrs -p corium-mbrainz
+      - name: Lint GC-mode cljrs crates (standalone)
+        run: cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
       - name: Test PostgreSQL wire protocol with JDBC
         run: examples/postgres-jdbc/run.sh
       - name: Test PostgreSQL store

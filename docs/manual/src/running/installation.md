@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-Corium builds with a stable Rust toolchain, version 1.85 or newer. It uses
+Corium builds with a stable Rust toolchain, version 1.88 or newer. It uses
 edition 2024.
 
 Build the CLI:
@@ -17,7 +17,7 @@ the operator, for example `/usr/local/bin/corium`.
 Run the test suite before you promote a build:
 
 ```sh
-cargo test --workspace
+./scripts/test-rust.sh
 ```
 
 ## Cargo features
@@ -58,11 +58,11 @@ That feature is for a host that links the driver in. See
 workspace members. A `--workspace` build unifies the Clojure runtime into
 `no-gc` mode and degrades their garbage-collection semantics.
 
-Build and test those two crates on their own:
+The repository test script runs the workspace and those two crates in
+separate Cargo invocations:
 
 ```sh
-cargo test -p corium-cljrs
-cargo test -p corium-mbrainz
+./scripts/test-rust.sh
 ```
 
 ## What a deployment needs

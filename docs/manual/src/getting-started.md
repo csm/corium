@@ -8,7 +8,7 @@ The steps take about ten minutes. Use four terminals.
 
 ## Step 1 — Build the binary
 
-Corium needs Rust 1.85 or newer. From the repository root, run:
+Corium needs Rust 1.88 or newer. From the repository root, run:
 
 ```sh
 cargo build -p corium-cli --release
