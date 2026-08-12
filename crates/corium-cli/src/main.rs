@@ -2117,6 +2117,16 @@ async fn offline_gc(
         )
         .await
         .map_err(|error| error.to_string())?;
+        if let Some(history_roots) = root.history_roots {
+            corium_store::mark_reachable(
+                reader.as_ref(),
+                history_roots,
+                |_, bytes| corium_store::index_blob_children(bytes),
+                &mut marked,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
     }
     corium_store::sweep_unmarked(
         store.as_ref(),

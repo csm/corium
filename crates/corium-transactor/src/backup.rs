@@ -906,6 +906,7 @@ fn bare_root() -> DbRoot {
         owner_endpoint: String::new(),
         index_basis_t: 0,
         roots: None,
+        history_roots: None,
         next_entity_id: 0,
         last_tx_instant: i64::MIN,
         key_manifest_version: 0,
@@ -995,7 +996,12 @@ async fn create_archive(
     )?;
     let mut seen = std::collections::HashSet::new();
     let mut copied = 0;
-    for id in root.roots.iter().flatten() {
+    for id in root
+        .roots
+        .iter()
+        .flatten()
+        .chain(root.history_roots.iter().flatten())
+    {
         write_blob_tree(source_store, crypto, id, &mut seen, &mut file, &mut copied).await?;
     }
     write_frame(&mut file, CHECKPOINT_TAG, checkpoint)?;
@@ -1347,7 +1353,12 @@ pub async fn restore(
     }
     let (copied_blobs, reused_blobs) = copy_blobs(source, &archive, &target_store).await?;
     let mut seen = std::collections::HashSet::new();
-    for id in root.roots.iter().flatten() {
+    for id in root
+        .roots
+        .iter()
+        .flatten()
+        .chain(root.history_roots.iter().flatten())
+    {
         validate_blob_tree(&target_store, crypto.as_ref(), id, &mut seen).await?;
     }
     let records = restored_records(&archive, crypto.as_ref())?;
