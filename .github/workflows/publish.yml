@@ -22,10 +22,8 @@ jobs:
       - run: cargo fmt --all -- --check
       # GC-mode cljrs crates build standalone so they keep GC mode (see ci.yml).
       - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
-      - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
-      - run: |
-          cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
-          cargo test -p corium-cljrs -p corium-mbrainz
+      - run: ./scripts/test-rust.sh
+      - run: cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
 
   clojure-ci:
     name: "Build & Test Clojure client"

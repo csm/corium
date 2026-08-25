@@ -1,11 +1,15 @@
 # Getting started
 
-Corium currently builds with Rust 1.85 or newer. From the repository root:
+Corium currently builds with Rust 1.88 or newer. From the repository root:
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+cargo build
+./scripts/test-rust.sh
 ```
+
+The test script keeps the GC-mode Clojure crates separate from the `no-gc`
+transaction-function runtime. Cargo feature unification makes a single
+`cargo test --workspace` invalid for this repository.
 
 Start a local transactor in one terminal:
 
