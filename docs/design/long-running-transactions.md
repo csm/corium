@@ -182,6 +182,8 @@ with it is the branch; see the liveness invariant under
 | `:db.saga/expires-at` | instant | one | deadline; extendable by the owner while `:open` |
 | `:db.saga/id-grants` | ref (component) | many | entity-id blocks leased to the branch; grant entities carry `:db.saga.grant/partition`, `/start`, `/length` |
 | `:db.saga/footprint` | ref | many | *advisory* declared touch-set — entities, or attribute entities to name whole attributes |
+| `:db.saga/reserves` | ref | many | *checked* reservation set — entities, or attribute entities; binds the saga's own writes, never other writers (see [Footprints and reservations](#footprints-and-reservations)) |
+| `:db.saga/sealed` | boolean | one | when true, the reservation set is fixed at open and cannot grow |
 | `:db.saga/merged-tx` | ref | one | on commit: the merge transaction |
 | `:db.saga/steps` | long | one | on commit: number of branch transactions squashed |
 | `:db.saga/conflict-report` | string (EDN) | one | on a failed merge attempt: what collided (latest attempt) |
@@ -213,11 +215,72 @@ know precisely which facts those were. The adaptation contract for a tier-2
 reader is one sentence: *treat everything read from a branch as provisional
 under that saga id until the registry says `:committed`.*
 
+### Footprints and reservations
+
 The **footprint** is deliberately advisory. A binding footprint would be
 Option B's locks through the back door. As a declaration it lets tier-1
 readers and tooling warn about overlapping in-flight sagas at open time,
 without ever being load-bearing for correctness — correctness lives in
 merge validation.
+
+An advisory declaration has a corresponding weakness: readers cannot
+*rely* on it. A saga may touch entities it never declared, so "X is not
+in any footprint" answers nothing. For sagas that know their shape up
+front, the registry therefore offers a second, **checked** mode:
+`:db.saga/reserves` names the exact pre-existing entities (and/or whole
+attributes) the saga will operate on, and the engine enforces the
+declaration — *against the saga itself*. The direction of the binding is
+the whole trick: a reservation constrains the saga's own branch writes
+and never touches any other writer, so it is a contract, not a lock.
+Option B stays rejected.
+
+Enforcement is a step-time check in the branch pipeline, after expansion
+and tempid resolution, refusing the step (like any validation error) on
+violation:
+
+- an assertion or retraction whose `e` is a pre-`t₀` entity must have
+  `e` in the reserved entities or `a` in the reserved attributes;
+- a **ref value** targeting a pre-`t₀` entity must target a reserved
+  entity (or be asserted under a reserved attribute). This closure rule
+  is not pedantry: corium indexes refs in reverse (VAET), so a new
+  entity merely *pointing at* X changes what reverse-ref navigation from
+  X returns after merge. Without the rule, "X is outside the reserved
+  set" would be false in exactly the way a reader can't see coming;
+- branch-created entities (ids in granted blocks) are unrestricted among
+  themselves — new structure grows at will, attached to the parent graph
+  only through reserved entities, which is what makes the reserved set a
+  complete boundary of the saga's effect.
+
+What a reserved saga buys each party:
+
+- **Tier-1 readers** get a *reliable* answer: an entity outside the
+  reserved set (of an entity-reserved saga) is untouched by that saga —
+  writes and reverse-refs included — as of the registry basis they read.
+  They can also see conflict *brewing*: a parent tx-report touching a
+  reserved entity while the saga is open is an early warning the merge
+  scan will later confirm, available to tooling before anyone commits.
+- **The merge** narrows: write–write, dangling-ref, and retraction-miss
+  scanning confine to the reserved set (plus granted blocks), since the
+  step checks guarantee novelty touches nothing else pre-existing.
+  Uniqueness stays global — a unique value can collide with any entity.
+- **The saga owner** trades flexibility for the above: an unreserved
+  entity discovered mid-flight needs a registry extension first — an
+  ordinary parent transaction adding to `:db.saga/reserves`, visible to
+  readers with a basis, exactly like any other registry change. A saga
+  opened `:db.saga/sealed` forgoes even that: its set is fixed at open,
+  which is the strongest statement a reader can lean on. (The basis-
+  relative contract is the honest one either way: "complete as of the
+  registry I read," with extensions arriving as observable tx-reports.)
+
+Reservation granularity matters at scale. Reserved entities are registry
+datoms in the parent — reserving a million entities is a million datoms,
+which is the wrong shape. Bulk work reserves **attributes** instead
+("this saga writes only `:order/status`"), trading per-entity precision
+for a set that stays small; entity-level reservation is for the
+workflow-shaped sagas that motivated this design, whose write sets are
+tens of entities known by name. The two combine, and both remain
+optional: a saga with no reservations behaves as before, advisory
+footprint and all.
 
 ## Branches
 
@@ -286,6 +349,38 @@ seeded from the parent's clock at `t₀`, so instant-named views on the
 branch resolve sensibly even though branch instants and parent instants
 after `t₀` are unrelated sequences.
 
+### Read-path cost
+
+What does reading in-flight sagas cost, layer by layer? Never `N + 1`
+log merges, and nothing at all for those who don't ask:
+
+- **Tier 0/1: zero change.** A parent `Db` remains exactly today's
+  two-layer construction — published index trees plus the parent's log
+  tail `(index-basis, basis-t]` — with registry datoms as ordinary data
+  inside it, however many sagas are open.
+- **Tier 2, one branch: at most three layers, and the third is frozen.**
+  A branch `Db` is the latest published parent root with index-basis
+  `≤ t₀`, plus the parent's log records `(index-basis, t₀]` closing the
+  gap, plus the branch's own tail. The gap slice is fixed at open — the
+  branch's base never moves — and retained history roots keep it small
+  when a publication sits near `t₀`. So a branch read is the ordinary
+  peer construction with one bounded, immutable slice inserted.
+- **And three collapses back to two.** A branch is a database; the
+  existing indexing job pointed at it folds the frozen gap and the
+  branch tail into published branch trees (structurally shared with the
+  parent's segments by content address), after which branch reads are
+  ordinary two-layer reads. Publication triggers on the same tail-size
+  heuristics as anywhere — precisely the long, chatty, actually-watched
+  sagas earn it; a short saga's tail is a handful of records nobody
+  needs trees for.
+- **`N` sagas cost per-branch, on consultation only.** No view unions
+  branches. A reader consulting three sagas holds three `Db` values; a
+  multi-database Datalog query over them takes them as separate inputs,
+  not as one `N`-way merged log. The per-open-saga cost that accrues to
+  the *system* rather than to opting-in readers is the transactor
+  hosting `N` branch pipelines and pinning `N` sets of `t₀`-era
+  segments — named in the consequences, bounded by mandatory expiry.
+
 ### Entity-id grants
 
 Fork's id story does not survive a merge: branch and parent both continue
@@ -308,7 +403,12 @@ entities, and merged datoms would collide. Two fixes were considered:
 
 Grants are durable (registry datoms) and fenced by the same single writer
 that allocates parent ids, so a transactor crash between granting and
-branching cannot double-issue a block.
+branching cannot double-issue a block. One guard closes the explicit-id
+loophole: a transaction may name an arbitrary entity id directly, so
+while a grant is live the parent's writer refuses assertions naming ids
+inside granted blocks. This is allocator integrity, not a lock — leased
+id space names no user-visible entity, and no legitimate parent
+transaction has business writing there.
 
 ## Merge
 
@@ -347,6 +447,12 @@ future work; it is a different promise and must be asked for by name.)
      retracted (`:db/retractEntity`);
    - *retraction misses*: the branch retracts `(e, a, v)` whose `v` is no
      longer the parent's value (the CAS-shaped conflict).
+
+   For a saga with reservations, the write–write, dangling-ref, and
+   retraction-miss scans confine to the reserved set plus granted blocks
+   — the step-time checks guaranteed novelty touches nothing else
+   pre-existing (see [Footprints and
+   reservations](#footprints-and-reservations)); uniqueness stays global.
 
    One non-conflict is a deliberate choice, not an omission:
    **cardinality-many assertions union.** Parent and branch each asserting
@@ -517,7 +623,8 @@ else's).
 ## Surfaces
 
 - **Peer API.** `Connection::saga_open(db, opts) → Saga` (opts:
-  description, footprint, expiry, id-grant sizing);
+  description, footprint, reservations and `sealed`, expiry, id-grant
+  sizing); `Saga::reserve(...)` to extend an unsealed reservation set;
   `Saga::transact(...)` / `Saga::db()` (ordinary `Db` value of the
   branch); `Saga::commit(guards, resolutions) → Result<MergeReport,
   ConflictReport>`; `Saga::abort()`; `Saga::extend(expiry)`;

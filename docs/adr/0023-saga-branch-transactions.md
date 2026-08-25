@@ -55,9 +55,23 @@ A saga is a database branch plus a registry entry in the parent database.
   branch transaction entities never merge, so the tx partition needs no
   grants. Schema changes on a branch are refused.
 - **Registry.** Engine-installed vocabulary (`:db.saga/*`: id, status,
-  basis, owner, expiry, id grants, advisory footprint, outcome refs) in
-  every database. Open, extend, commit, abort, and expire are ordinary
-  parent transactions on the saga entity.
+  basis, owner, expiry, id grants, advisory footprint, checked
+  reservations, outcome refs) in every database. Open, extend, commit,
+  abort, and expire are ordinary parent transactions on the saga entity.
+- **Reservations bind the saga, never other writers.** Beyond the
+  advisory footprint, a saga may *reserve* the exact pre-existing
+  entities (and/or whole attributes) it operates on. The branch pipeline
+  enforces the declaration at step time: writes to unreserved
+  pre-existing entities are refused, and refs from novelty to
+  pre-existing entities must target reserved ones (reverse-ref/VAET
+  visibility is why), so branch-created entities attach to the parent
+  graph only through the reserved set. Readers get a reliable effect
+  boundary ("X is outside the set" means untouched, as of the registry
+  basis read; `:db.saga/sealed` fixes the set at open), and the merge's
+  write–write, dangling-ref, and retraction-miss scans confine to the
+  reserved set. Parent writers are never constrained — races on reserved
+  entities are still arbitrated by the merge scan, now with an early
+  warning tier-1 tooling can watch for.
 - **Entity-id grants.** The parent's writer leases the branch disjoint
   per-partition sequence blocks, recorded in the registry; branch
   allocations survive the merge verbatim, so ids resolved by the saga's
@@ -140,6 +154,17 @@ rebase-commit modes, and any pgwire `BEGIN` mapping.
 - An open branch pins parent segments at `t₀` and holds id grants; GC
   pressure and grant consumption are bounded by mandatory expiry rather
   than by trusting owners.
+- Tier-2 reads cost at most three merge layers — published parent root
+  `≤ t₀`, the frozen parent gap `(index-basis, t₀]`, the branch tail —
+  never `N + 1`: no view unions branches, and branch index publication
+  (the existing indexing job) collapses long-lived branches back to
+  ordinary two-layer reads. Tier-0/1 reads are unchanged at any `N`.
+- Entity-level reservations are registry datoms in the parent, so they
+  price themselves: fine for the tens-of-entities workflow sagas they
+  serve, wrong for bulk work, which reserves attributes instead. The
+  explicit-id loophole also closes: while grants are live, the parent's
+  writer refuses transactions naming ids inside granted blocks —
+  allocator integrity, not a lock.
 - Squashing trades parent-log granularity for timeline honesty: parent
   history shows one labeled commit; auditors needing step grain must
   consult the retained branch, and retention policy becomes an
