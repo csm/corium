@@ -433,8 +433,10 @@ fn decode_binary_numeric(bytes: &[u8]) -> Result<SqlValue, String> {
     let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
     let dscale = u16::from_be_bytes([bytes[6], bytes[7]]);
     let digits = bytes[8..]
-        .chunks_exact(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
         .collect::<Vec<_>>();
     if digits.iter().any(|digit| *digit >= 10_000) {
         return Err("binary numeric contains an invalid base-10000 digit".into());
@@ -501,7 +503,9 @@ fn decode_bytea(text: &str) -> Result<Vec<u8>, String> {
     if !hex.len().is_multiple_of(2) {
         return Err("bytea hex input has odd length".into());
     }
-    hex.chunks_exact(2)
+    hex.as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             std::str::from_utf8(pair)
                 .ok()

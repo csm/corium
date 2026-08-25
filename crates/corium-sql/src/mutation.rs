@@ -752,7 +752,9 @@ fn sql_unspecified(db: &Db, projected: &Projected, value: &str) -> Result<Value,
             }
             let bytes = hex
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex checked"), 16)
                         .expect("hex digits checked")
