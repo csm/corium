@@ -175,7 +175,7 @@ with it is the branch; see the liveness invariant under
 | Attribute | Type | Card | Notes |
 |---|---|---|---|
 | `:db.saga/id` | uuid | one | unique identity; the saga's name everywhere |
-| `:db.saga/status` | keyword | one | `:open` → `:committed` \| `:aborted` \| `:expired` |
+| `:db.saga/status` | keyword | one | `:db.saga.status/open` → `…/committed` \| `…/aborted` \| `…/expired` — namespaced like every enum in the `:db` vocabulary (`:db.cardinality/one`); prose below abbreviates to `:open` etc. |
 | `:db.saga/basis-t` | long | one | parent basis `t₀` the branch was rooted at |
 | `:db.saga/description` | string | one | human-readable purpose |
 | `:db.saga/owner` | string | one | authenticated principal that opened it |
@@ -544,9 +544,12 @@ the opposite direction and earns its own design pass.
 
 ## Lifecycle, failure, and expiry
 
-States: `:open → :committed | :aborted | :expired`. All transitions are
-single parent transactions; there is no `:committing` limbo because the
-flip rides inside the merge transaction itself.
+States: `:db.saga.status/open → :db.saga.status/committed |
+:db.saga.status/aborted | :db.saga.status/expired` (abbreviated `:open`
+etc. throughout, per the registry table). All transitions are single
+parent transactions;
+there is no committing limbo because the flip rides inside the merge
+transaction itself.
 
 | Failure | Outcome |
 |---|---|

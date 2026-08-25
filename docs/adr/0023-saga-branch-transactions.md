@@ -56,8 +56,10 @@ A saga is a database branch plus a registry entry in the parent database.
   grants. Schema changes on a branch are refused.
 - **Registry.** Engine-installed vocabulary (`:db.saga/*`: id, status,
   basis, owner, expiry, id grants, advisory footprint, checked
-  reservations, outcome refs) in every database. Open, extend, commit,
-  abort, and expire are ordinary parent transactions on the saga entity.
+  reservations, outcome refs) in every database; enum values are
+  namespaced idents in the `:db` convention (`:db.saga.status/open`,
+  abbreviated `:open` etc. in prose). Open, extend, commit, abort, and
+  expire are ordinary parent transactions on the saga entity.
 - **Reservations bind the saga, never other writers.** Beyond the
   advisory footprint, a saga may *reserve* the exact pre-existing
   entities (and/or whole attributes) it operates on. The branch pipeline
