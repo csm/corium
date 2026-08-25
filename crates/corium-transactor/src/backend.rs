@@ -559,8 +559,12 @@ fn ambient_s3_endpoint() -> Option<String> {
 }
 
 impl StorageInfoConfig {
-    #[cfg_attr(not(feature = "s3"), allow(clippy::unused_async))]
     pub(crate) async fn initialize(&self) {
+        // Keep initialization async across feature sets. S3 performs async
+        // client setup below; other storage configurations have no setup.
+        #[cfg(not(feature = "s3"))]
+        std::future::ready(()).await;
+
         #[cfg(feature = "s3")]
         if let Some(s3) = &self.s3 {
             s3.initialize().await;
