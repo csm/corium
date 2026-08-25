@@ -27,3 +27,4 @@ reference the old. Format: Context / Decision / Consequences.
 | [0020](0020-planned-schema-migrations.md) | Plan and apply schema migrations as basis-versioned data | Accepted |
 | [0021](0021-contextual-read-authorization.md) | Contextual read authorization on the peer server and pgwire | Accepted |
 | [0022](0022-pluggable-storage.md) | Runtime-pluggable storage backends | Accepted |
+| [0023](0023-saga-branch-transactions.md) | Long-running transactions as branch-and-merge sagas | Proposed |
