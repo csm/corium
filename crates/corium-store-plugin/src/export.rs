@@ -215,7 +215,6 @@ mod tests {
 
     use async_trait::async_trait;
     use corium_store::{BlobIdStream, BlobStore, RootStore, digest};
-    use tokio_stream::StreamExt as _;
 
     use super::*;
 
