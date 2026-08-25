@@ -121,21 +121,45 @@ A saga is a database branch plus a registry entry in the parent database.
   backups exclude them, forks never copy them). Any database that finds
   `:open` registry entries with no branch — a restored parent, a fork
   taken mid-saga — expires them on first open.
-- **External effects stay a layer above.** The branch makes the
-  *database* side atomic; workflows with outside side effects use the
-  registry as durable orchestrator state and the retained branch as the
-  record of what needs compensating — classic saga orchestration over an
-  atomic core, not instead of one.
+- **Compensation is explicit, and split by boundary.** Abort's default
+  stays total — one status transaction, branch discarded. A saga may
+  register a **compensating transaction** (static EDN tx data, or a
+  `:db/fn` invoked with the parent's current value plus the branch value):
+  fresh tx data validated like any transaction and applied **atomically
+  with the abort/expiry flip**, saga id on the transaction entity — a
+  deliberately authored, user-facing failure record, never a partial
+  landing of branch novelty. Branch facts are inputs to it; its granted
+  ids are refused as outputs; a filtered (subset) merge was considered
+  and rejected. Registration is durable registry data, so expiry applies
+  it for a crashed owner; liveness outranks — a compensation failing at
+  expiry is recorded (`:db.saga/on-abort-error`) and the saga expires
+  without it, and a branchless expiry (restore, fork) skips it so
+  diverged timelines never double-apply a failure record.
+- **External effects stay a layer above, with a durable ledger.** The
+  branch makes the *database* side atomic; workflows with outside side
+  effects use the registry as durable orchestrator state and the retained
+  branch as the record of what needs compensating — classic saga
+  orchestration over an atomic core, not instead of one. Reverse progress
+  gets the forward treatment: an **external-compensation ledger**
+  (`:db.saga/compensations` component entities — key, status, detail,
+  completed-at, error) written by the orchestrator as ordinary parent
+  transactions and never executed by the engine, surviving branch
+  deletion, seedable atomically at abort by the compensating transaction.
+  No new saga status: `:aborted`/`:expired` stay terminal, and "fully
+  compensated" is derived from the ledger.
 
 V1 excludes: read-set tracking (serializability beyond write-write is
 opt-in via guards), nested and cross-database sagas, base refresh and
-rebase-commit modes, and any pgwire `BEGIN` mapping.
+rebase-commit modes, abort-time subset merges and any engine execution of
+external compensations, and any pgwire `BEGIN` mapping.
 
 ## Consequences
 
 - Parent readers can never observe state that later rolls back — abort
-  needs no compensation in the database and no reader ever adapts to a
-  retraction it didn't opt into. The cost is that partial progress is
+  needs no compensating retractions in the database (a registered
+  compensation *records*; it never undoes, because nothing landed) and no
+  reader ever adapts to a retraction it didn't opt into. The cost is
+  that partial progress is
   only visible to those who ask, which is the requirement, but means
   tier-0 writers can race an in-flight saga; the conflict scan at merge,
   not any reservation, is what protects the saga, so long sagas over hot
@@ -175,6 +199,21 @@ rebase-commit modes, and any pgwire `BEGIN` mapping.
   stale reads if the owner declared no guard — the same explicit-optimism
   trade ADR-0015 and ADR-0020 already chose; the remedy is guards, and
   the failure mode is a loud conflict report, never a quiet recompute.
+- An aborted saga is no longer necessarily markless: a registered
+  compensation writes deliberate, saga-labeled facts into canonical state
+  in the abort transaction itself. The atomicity promise is unchanged —
+  saga novelty never half-lands — but auditors should know an abort or
+  expiry transaction can carry user-facing data, and that expiry runs
+  compensations with no owner present, authorized as the recorded owner
+  against then-current policy (drift fails it into
+  `:db.saga/on-abort-error` rather than blocking expiry).
+- The compensation ledger gives orchestrators standard reverse-progress
+  bookkeeping in the parent — resumable from data, surviving branch
+  deletion, seedable atomically at abort — at the price of more reserved
+  vocabulary and one more SQL surface (`corium_saga_compensations`); the
+  engine still never executes an external compensation, and retention may
+  end early for a fully-resolved ledger but is never extended by a
+  pending one.
 - Every surface grows a saga face: bootstrap vocabulary, peer API,
   protocol, CLI, console, a `corium_sagas` SQL relation, authz applied
   to branch views (ADR-0021 unchanged), operator-service sweep job.

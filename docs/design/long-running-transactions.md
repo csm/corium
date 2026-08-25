@@ -37,7 +37,10 @@ What such work needs, stated as requirements:
    staying alive for days.
 2. **Atomic outcome.** Commit makes every step's effect canonical at one
    basis `t`; abort leaves canonical state exactly as if the saga had never
-   run. No third outcome.
+   run. No third outcome. (A saga may register a *compensation* — a
+   deliberately authored failure record applied atomically with the abort
+   — see [Compensation](#compensation); what never happens is a partial
+   landing of the saga's own writes.)
 3. **Isolated by default, observable on demand.** Readers who have never
    heard of sagas must see only canonical facts and pay nothing. But the
    saga must not be invisible to the wider system: a reader who wants to
@@ -91,8 +94,8 @@ database the aborted saga also stays in every history view and `since`
 window as ordinary user data, indistinguishable from work that was meant
 to last. Classic sagas *do* solve the external-effects problem, though, and
 the design keeps them — as an orchestration layer above the database
-mechanism (see [External effects](#external-effects-and-the-classic-saga-layer)),
-not as the database mechanism.
+mechanism (see [Compensation](#compensation)), not as the database
+mechanism.
 
 ### Option B — long-lived write intents (pessimistic)
 
@@ -187,6 +190,10 @@ with it is the branch; see the liveness invariant under
 | `:db.saga/merged-tx` | ref | one | on commit: the merge transaction |
 | `:db.saga/steps` | long | one | on commit: number of branch transactions squashed |
 | `:db.saga/conflict-report` | string (EDN) | one | on a failed merge attempt: what collided (latest attempt) |
+| `:db.saga/on-abort-tx` | string (EDN) | one | compensation: static tx data applied atomically with the abort/expiry flip (see [Compensation](#the-compensating-transaction)) |
+| `:db.saga/on-abort-fn` | ref | one | compensation: a `:db/fn` entity invoked at abort/expiry with the parent and branch values; at most one of `/on-abort-tx`, `/on-abort-fn` |
+| `:db.saga/on-abort-error` | string (EDN) | one | why a system-time compensation did not land: validation failure at expiry, or the branchless-expiry skip |
+| `:db.saga/compensations` | ref (component) | many | external-compensation ledger entries (`:db.saga.compensation/key`, `/status`, `/detail`, `/completed-at`, `/error`) — written by the orchestrator, never executed by the engine |
 | `:db.saga/guard` | string (EDN) | many | *step tx metadata, used in the branch*: a guard declared by the step that established the read dependency (see [Merge](#merge)) |
 
 Opening, expiry extension, commit, and abort are ordinary parent
@@ -549,7 +556,10 @@ States: `:db.saga.status/open → :db.saga.status/committed |
 etc. throughout, per the registry table). All transitions are single
 parent transactions;
 there is no committing limbo because the flip rides inside the merge
-transaction itself.
+transaction itself. Abort and expiry likewise carry any registered
+compensating transaction inside the same flip (see
+[Compensation](#the-compensating-transaction)); the failure table below
+includes its edges.
 
 | Failure | Outcome |
 |---|---|
@@ -558,7 +568,9 @@ transaction itself.
 | Crash during merge, before append | No parent effect; saga `:open`; retry re-runs the scan against then-current state |
 | Crash during merge, after append | Saga is `:committed` (same record); retry observes the status and reports success |
 | Abort races an in-flight merge | The parent's writer serializes them; whichever lands first wins, and the loser gets a status error — an abort arriving after the merge committed fails with "already `:committed`", it does **not** report success |
-| Owner disappears | `:db.saga/expires-at` passes; the expiry sweep expires the saga |
+| Owner disappears | `:db.saga/expires-at` passes; the expiry sweep expires the saga, applying any registered compensation |
+| Compensation fails at explicit abort | The abort fails like any invalid transaction; the saga stays `:open` — fix the tx data or abort without it |
+| Compensation fails at expiry | Liveness outranks: the sweep expires the saga *without* the compensation datoms and records `:db.saga/on-abort-error`; branch retention is the grace period to record by hand |
 | Transactor failover | Registry, branch log, and grants are durable storage state; the new lease holder sees all of it — nothing lived only in memory |
 | Restore, fork, or replica finds `:open` registry entries with no branch | The saga is expired on first open — see the liveness invariant below |
 
@@ -572,6 +584,11 @@ were in flight. One rule covers every such case: on first open, the
 transactor expires any `:open` saga whose branch does not exist. `:expired`
 already means "the system, not a decision, ended this," which is exactly
 what happened; the entries remain as honest history, and nothing dangles.
+A branchless expiry also never applies a registered compensation: a
+restored or forked database shares its timeline's past with the original
+but not its future, and applying the same failure record on both sides of
+the divergence would double every externally visible consequence — the
+skip is recorded in `:db.saga/on-abort-error`.
 
 **Expiry is mandatory.** An open saga pins parent segments from `t₀` and
 holds id grants; an abandoned one must not do so forever. Every saga
@@ -600,16 +617,104 @@ the first to merge wins, and later merges see its effects in their
 conflict scan. Footprint overlap between open sagas can be *warned about*
 at open time; it is never an error, because footprints are advisory.
 
-## External effects and the classic-saga layer
+## Compensation
+
+Abort's default is total: one status transaction, the branch discarded,
+canonical state untouched. That default is correct and it stays the
+default — but it leaves two real needs unserved, one on each side of the
+database boundary:
+
+- a failed saga often should leave a **user-facing record** — an order
+  marked failed with a reason, a repair flagged rejected-after-review — in
+  ordinary application attributes that tier-0 readers see, not buried in
+  registry state only saga-aware readers consult;
+- a saga whose steps took external actions needs its outward unwinding
+  tracked somewhere durable that outlives the branch.
+
+The design serves each with an explicit mechanism, and keeps them
+distinct, because they are distinct: one is a transaction the database can
+apply atomically, the other is bookkeeping about work only the application
+can perform.
+
+### The compensating transaction
+
+A saga may register a **compensation**: tx data applied to the parent
+atomically with the abort — one parent transaction carrying the flip to
+`:aborted` (or `:expired`), the compensation's datoms, and the saga id on
+the transaction entity. Observers get both in one tx-report: no window
+exists in which the registry says the saga failed but the failure record
+is missing, and `[?tx :db.saga/id ?saga]` finds the record forever.
+
+Two registration forms, at most one per saga, both durable registry data
+settable at open or while `:open`:
+
+- `:db.saga/on-abort-tx` — static EDN tx data, for the common case of
+  asserting a few known failure facts;
+- `:db.saga/on-abort-fn` — a ref to an ordinary `:db/fn` entity, invoked
+  at abort as `(parent-db, branch-db, saga-id) → tx-data` in the same
+  sandboxed runtime, fuel budgets, and determinism contract as any
+  transaction function (ADR-0008), with one extension: it receives the
+  branch's `Db` value alongside the parent's, so it can summarize what
+  the saga was doing — steps completed, entities touched, external-action
+  metadata — into the record it writes.
+
+Registration is durable for the same reason step-declared guards are: the
+contract must not live only in one process's memory. A crashed owner's
+saga reaches its deadline and the expiry sweep applies the registered
+compensation with no owner present. An explicit abort may also supply
+compensation tx data at call time — the aborter has observed current
+state and decides — and call-time data replaces the registered form for
+that abort.
+
+The semantics are the merge's principles pointed at failure:
+
+- **A fresh transaction, not a replay and not a leak.** The compensation
+  is evaluated against the parent's *current* state and validated exactly
+  like any transaction — expansion, uniqueness, schema, the lot. Branch
+  facts are *inputs* to it (readable via `branch-db`), never outputs:
+  branch novelty is not filtered into it, and ids from the saga's granted
+  blocks are refused in its tx data — the explicit-id guard still holds
+  at the moment of abort, and the abandoned block stays what abandoned
+  blocks always are, a hole. New entities the compensation creates take
+  ordinary parent ids.
+- **Fail loudly where an owner can hear; never block liveness where none
+  can.** A compensation that fails validation at explicit abort fails the
+  abort — the saga stays `:open`, and the owner fixes the tx data or
+  aborts without it. At expiry the sweep must not be held hostage by a
+  buggy compensation: it expires the saga *without* the compensation
+  datoms and records the failure as `:db.saga/on-abort-error`; the branch
+  retention window is the owner's grace period to write the record by
+  hand.
+- **Requirement 2 bends but does not break.** "As if the saga had never
+  run" holds for the saga's novelty — nothing half-lands, ever. The
+  compensation is not surviving novelty: it is a new, deliberately
+  authored transaction that is part of the abort decision, and labeled as
+  such. An aborted saga with a compensation leaves exactly what its owner
+  chose to record about the failure, and nothing else.
+
+One shape was considered and rejected: a compensation that *selects which
+branch facts to keep* — a filtered merge. It drags the entire merge
+apparatus (conflict scan, guards, grant retention, resolution semantics)
+into the abort path, for a novelty subset chosen under weaker observation
+guarantees than commit demands, and the motivating need does not require
+it: a failure record is a handful of fresh facts, and re-asserting a
+salvageable value into the compensation covers small keeps (with parent
+ids — identity does not survive, which is honest, because the entity's
+branch history does not merge either). Genuine salvage of large partial
+work already has its path — query the retained branch, re-assert under a
+fresh saga — and a subset-merge, if it ever earns its keep, is future
+work beside base refresh.
+
+### The external-compensation ledger
 
 The branch commits or aborts database effects atomically. It cannot
 un-send an email. Workflows whose steps have external side effects still
 need compensation logic — the classic saga — and the design gives that
 layer a durable home rather than a competing mechanism:
 
-- The registry entry is the orchestrator's durable state: status,
-  progress, deadline — crash-safe and queryable, so a restarted
-  orchestrator resumes from data.
+- The registry entry is the orchestrator's durable state for *forward*
+  progress: status, progress, deadline — crash-safe and queryable, so a
+  restarted orchestrator resumes from data.
 - Step transactions on the branch carry ordinary tx metadata; a workflow
   records each external action and its compensation handle
   (application-defined attributes) alongside the data it justified.
@@ -619,6 +724,49 @@ layer a durable home rather than a competing mechanism:
   compensations *outward*; the database side needs none, because the
   database side never happened.
 
+*Reverse* progress gets the same treatment as forward progress. Driving
+compensations outward is itself long-running, crash-prone work, and
+without a home for its state every orchestrator invents the same
+bookkeeping schema. The registry therefore carries an
+**external-compensation ledger** — `:db.saga/compensations`, component
+entities with:
+
+| Attribute | Type | Card | Notes |
+|---|---|---|---|
+| `:db.saga.compensation/key` | string | one | application-chosen identifier; opaque to the engine |
+| `:db.saga.compensation/status` | keyword | one | `:db.saga.compensation.status/pending` → `…/done` \| `…/failed` \| `…/skipped` |
+| `:db.saga.compensation/detail` | string (EDN) | one | the handle/payload the compensating task needs — what to undo, and how |
+| `:db.saga.compensation/completed-at` | instant | one | when it resolved |
+| `:db.saga.compensation/error` | string (EDN) | one | why it failed, if it did |
+
+The engine never executes these — the honest split stands. They are a
+standard ledger the orchestrator writes with ordinary parent transactions
+as it works. What the vocabulary buys:
+
+- **Resumability from data, again.** A compensating task that crashes
+  resumes from the ledger, not from its own files, and a different
+  process can take over by reading the parent.
+- **It outlives the branch.** The branch is the record of what was
+  *done*, and it has a retention window; the ledger of what must be
+  *undone* lives in the parent and does not die with it.
+- **Atomic seeding.** The compensating transaction above is the natural
+  writer of the initial ledger: an `on-abort-fn` reads the branch's
+  external-action metadata and asserts the pending entries — atomically
+  with the `:aborted` flip. From the first instant any reader sees the
+  saga failed, the complete undo list is durably in the parent, whether
+  or not the orchestrator ever wakes again.
+- **Observability.** `corium saga status` (and the SQL relation) can show
+  "aborted, two of five compensations pending"; tier-1 readers can
+  distinguish an aborted-and-unwound saga from an aborted one whose
+  external effects still stand — a real difference to downstream systems.
+
+No new saga status arises. `:aborted` and `:expired` stay terminal for
+the database side; unwinding progress belongs to the ledger, and "fully
+compensated" is a derived fact tooling computes. Retention may consult
+it — a branch whose saga's ledger is fully resolved can be reclaimed
+early — but a pending ledger never extends retention past its window
+(liveness again), because the ledger, unlike the branch, persists.
+
 This split is the honest division: atomicity where the system can actually
 promise it (its own state), durable bookkeeping where it cannot (everyone
 else's).
@@ -627,20 +775,27 @@ else's).
 
 - **Peer API.** `Connection::saga_open(db, opts) → Saga` (opts:
   description, footprint, reservations and `sealed`, expiry, id-grant
-  sizing); `Saga::reserve(...)` to extend an unsealed reservation set;
-  `Saga::transact(...)` / `Saga::db()` (ordinary `Db` value of the
-  branch); `Saga::commit(guards, resolutions) → Result<MergeReport,
-  ConflictReport>`; `Saga::abort()`; `Saga::extend(expiry)`;
+  sizing, on-abort compensation); `Saga::reserve(...)` to extend an
+  unsealed reservation set; `Saga::transact(...)` / `Saga::db()`
+  (ordinary `Db` value of the branch); `Saga::commit(guards, resolutions)
+  → Result<MergeReport, ConflictReport>`; `Saga::abort()` /
+  `Saga::abort_with(tx_data)` (call-time compensation replacing the
+  registered form); `Saga::extend(expiry)`;
   `Connection::saga_resume(db, id)`; `Connection::saga_view(db, id) → Db`
-  for tier-2 readers. Registry queries are just queries.
+  for tier-2 readers. Registry queries are just queries, and the
+  external-compensation ledger is written with ordinary transactions —
+  no dedicated API.
 - **Protocol.** gRPC additions mirroring the peer API; the branch is
   served over the existing database-view machinery (a `DbViewSpec`-shaped
   reference naming the saga), so thin clients get tier-2 reads for free.
-- **CLI.** `corium saga open|list|status|extend|commit|abort <db> ...`;
-  `corium console <db> --saga <id>` to point a console at a branch;
-  `corium saga log <id>` for step history.
+- **CLI.** `corium saga open|list|status|extend|commit|abort <db> ...`
+  (`open --on-abort <fn-ident|edn>`, `abort --compensate <edn>`;
+  `status` includes the compensation ledger); `corium console <db>
+  --saga <id>` to point a console at a branch; `corium saga log <id>`
+  for step history.
 - **SQL.** A `corium_sagas` system relation over the registry (id, status,
-  basis, owner, expiry, description) beside the existing system
+  basis, owner, expiry, description) and a `corium_saga_compensations`
+  relation over the ledger, beside the existing system
   relations; branch reads via the console/session db-view selection.
   Mapping pgwire interactive `BEGIN`/`COMMIT` onto sagas is explicitly out
   of scope for v1 (ADR-0015's guarded autocommit stands); it is an
@@ -649,8 +804,11 @@ else's).
   branch reads are authorized like parent reads (same policy database,
   same contextual authorization — ADR-0021 applies to branch views
   unchanged); the merge is authorized as a transact by the saga owner at
-  commit time against then-current policy. The registry's own attributes
-  are ordinary data under the same model.
+  commit time against then-current policy. An expiry-time compensation is
+  authorized as a transact by the recorded saga owner against then-current
+  policy — policy drift fails it like any validation failure (recorded in
+  `:db.saga/on-abort-error`, never blocking expiry). The registry's own
+  attributes are ordinary data under the same model.
 
 ## Limits and non-goals (v1)
 
@@ -658,6 +816,10 @@ else's).
   conflicts are detected; read-write anomalies are the saga's to declare
   via guards. This is the same honesty ADR-0015 chose for guarded DML —
   optimistic, explicit, validated at the writer.
+- **No engine-driven external compensation.** The ledger is data; the
+  orchestrator is the actor. Likewise no filtered merge on abort — a
+  compensation is a fresh transaction, never a novelty subset (see
+  [Compensation](#the-compensating-transaction)).
 - **No nested sagas.** A branch of a branch has no parent-merge story yet.
 - **No cross-database sagas.** One saga, one database; multi-database
   atomicity is a different (two-phase) problem.
@@ -681,9 +843,12 @@ else's).
 
 1. **Registry + vocabulary** — bootstrap attributes, open/abort/expiry as
    transactions, `corium_sagas` relation, no branches yet (a saga with no
-   steps is already useful as a durable workflow record).
+   steps is already useful as a durable workflow record). Compensation
+   vocabulary included: static `:db.saga/on-abort-tx` and the
+   external-compensation ledger need no branch at all.
 2. **Branches** — overlay construction, id grants, step transacting, peer
-   and CLI read surfaces (tier 2).
+   and CLI read surfaces (tier 2); `:db.saga/on-abort-fn` invocation,
+   which needs the branch value.
 3. **Merge** — squash, conflict scan, guards, resolutions, the atomic
    commit-and-flip; conflict reports.
 4. **Expiry sweep + retention** — operator-service job with in-transactor
