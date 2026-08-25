@@ -281,7 +281,6 @@ impl StoreSpec {
     ///
     /// # Errors
     /// Returns an error when a local path cannot be represented on the wire.
-    #[cfg_attr(not(feature = "s3"), allow(clippy::unused_async))]
     pub async fn connection_info(
         &self,
         data_dir: &std::path::Path,
@@ -306,6 +305,11 @@ impl StoreSpec {
                 .into_string()
                 .map_err(|_| "storage path is not valid UTF-8".to_owned())
         }
+
+        // Keep one async API across feature sets. S3 awaits temporary
+        // credentials below; other backends resolve immediately.
+        #[cfg(not(feature = "s3"))]
+        std::future::ready(()).await;
 
         let text = |name: &str| self.config.get(name).and_then(serde_json::Value::as_str);
         let backend = match self.kind.as_str() {
