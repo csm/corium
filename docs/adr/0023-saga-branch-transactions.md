@@ -45,10 +45,15 @@ A saga is a database branch plus a registry entry in the parent database.
 
 - **Branch.** Opening a saga creates a lightweight overlay branch — the
   parent's published state as of opening basis `t₀` plus the branch's own
-  log — on the parent's transactor. O(1) creation, segments shared by
-  content address, parent's encryption keys, not in the user catalog.
-  Steps are ordinary fully-validated durable transactions against the
-  branch; schema changes on a branch are refused.
+  log — hosted in the parent's transactor process. O(1) creation,
+  segments shared by content address, parent's encryption keys, not in
+  the user catalog. Steps are ordinary fully-validated durable
+  transactions against the branch, serialized in a **per-branch
+  pipeline**: pre-leased id blocks mean a step never enters the parent's
+  writer queue — only open, extend, abort, and merge do. The branch keeps
+  its own timeline (`t` from `t₀`, its own `:db/txInstant` monotonicity);
+  branch transaction entities never merge, so the tx partition needs no
+  grants. Schema changes on a branch are refused.
 - **Registry.** Engine-installed vocabulary (`:db.saga/*`: id, status,
   basis, owner, expiry, id grants, advisory footprint, outcome refs) in
   every database. Open, extend, commit, abort, and expire are ordinary
@@ -62,17 +67,25 @@ A saga is a database branch plus a registry entry in the parent database.
 - **Merge.** Commit squashes the branch's net novelty into **one** parent
   transaction, validated inside the single-writer path against the
   parent's *current* state and schema: write–write conflict scan over
-  `(t₀, now]`, uniqueness, dangling refs, retraction misses, plus
-  explicit caller-supplied guards (CAS-shaped preconditions, guard
-  queries) for read dependencies. The registry flip to `:committed` rides
-  in the same transaction — atomicity is structural, retries are
-  idempotent. Effects are replayed, not inputs: tx functions are never
-  silently re-evaluated against state the owner didn't observe; drift
-  fails loudly with an EDN conflict report, and a retry may carry
-  per-conflict resolutions (accept-parent or override). No splicing of
-  branch transactions into parent history — the parent log records what
-  happened on the parent's timeline; step-level history stays queryable
-  in the branch, retained post-commit under a retention policy.
+  `(t₀, now]`, uniqueness, dangling refs, retraction misses
+  (cardinality-many assertions deliberately union), plus explicit guards
+  (CAS-shaped preconditions, guard queries) for read dependencies —
+  supplied with the commit request or declared durably as `:db.saga/guard`
+  step metadata along the way, with commit evaluating the union. The
+  registry flip to `:committed` rides in the same transaction — atomicity
+  is structural, retries are idempotent. Effects are replayed, not
+  inputs: tx functions are never silently re-evaluated against state the
+  owner didn't observe; drift fails loudly with an EDN conflict report,
+  and a retry may carry per-conflict resolutions fenced to that report —
+  *accept-parent* for any conflict class, *override* only for
+  cardinality-one write–write, where it has an exact observed expansion;
+  uniqueness, dangling-ref, and retraction-miss conflicts are never
+  override-able, because each override would write outside what the owner
+  observed or the saga touched. No splicing of branch transactions into
+  parent history — the parent log records what happened on the parent's
+  timeline; step-level history stays queryable in the branch, retained
+  post-commit under a per-database retention policy (per-saga override at
+  open).
 - **Visibility by tiers.** Unaware readers see canonical facts only and
   pay nothing. Registry-aware readers discover in-flight sagas — and
   advisory footprints — with plain Datalog and watch status transitions
@@ -87,6 +100,11 @@ A saga is a database branch plus a registry entry in the parent database.
   overdue sagas and reclaims branches after a grace window, so abandoned
   sagas cannot pin `t₀`-era segments forever. `:expired` is distinct from
   `:aborted`.
+- **A saga is live only where its branch lives.** Registry datoms travel
+  with backup, restore, fork, and replication; branches do not (v1
+  backups exclude them, forks never copy them). Any database that finds
+  `:open` registry entries with no branch — a restored parent, a fork
+  taken mid-saga — expires them on first open.
 - **External effects stay a layer above.** The branch makes the
   *database* side atomic; workflows with outside side effects use the
   registry as durable orchestrator state and the retained branch as the
@@ -106,12 +124,19 @@ rebase-commit modes, and any pgwire `BEGIN` mapping.
   tier-0 writers can race an in-flight saga; the conflict scan at merge,
   not any reservation, is what protects the saga, so long sagas over hot
   entities will see conflict reports and must resolve or re-do work.
-- The transactor grows real machinery: branch bookkeeping, id-block
-  leasing in the allocator, and the merge scan — O(branch novelty +
-  parent novelty since `t₀`) inside the writer path. Merge of a large
-  saga is an observable pause for that database, like index activation
-  in ADR-0020; the conflict scan bounds it, splicing was rejected partly
-  to keep it one append.
+- The transactor grows real machinery: branch bookkeeping, per-branch
+  pipelines, id-block leasing in the allocator, and the merge scan —
+  O(branch novelty + parent novelty since `t₀`) inside the writer path.
+  Merge of a large saga is an observable pause for that database, like
+  index activation in ADR-0020; the conflict scan bounds it, splicing
+  was rejected partly to keep it one append. Steps never queue in the
+  parent's writer, but a chatty saga still shares the transactor
+  process's CPU, I/O, and cache for its whole lifetime.
+- A parent schema migration that invalidates branch novelty strands an
+  open saga through no fault of its own: merge validates against current
+  schema and fails loudly, and with no base refresh in v1 the recourse
+  is salvage-and-redo. This is the sharpest edge among the v1 limits;
+  migration planning should report open sagas as advisory impact.
 - An open branch pins parent segments at `t₀` and holds id grants; GC
   pressure and grant consumption are bounded by mandatory expiry rather
   than by trusting owners.

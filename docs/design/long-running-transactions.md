@@ -164,10 +164,13 @@ nobody blocks. The rest of this document specifies the pieces.
 
 ## The saga registry
 
-The engine installs a small reserved vocabulary in every database
-(`:db.part/db` sequence range, alongside `:db/txInstant`), so the registry
-needs no application schema and travels with backup, restore, and
-replication like any data:
+The engine installs a small reserved vocabulary in every database —
+attributes in `:db.part/db`, allocated from the reserved sequence range
+below the first user-installable id, the same register `:db/txInstant`
+lives in — so the registry needs no application schema and travels with
+backup, restore, and replication like any data (what does *not* travel
+with it is the branch; see the liveness invariant under
+[Lifecycle](#lifecycle-failure-and-expiry)):
 
 | Attribute | Type | Card | Notes |
 |---|---|---|---|
@@ -182,6 +185,7 @@ replication like any data:
 | `:db.saga/merged-tx` | ref | one | on commit: the merge transaction |
 | `:db.saga/steps` | long | one | on commit: number of branch transactions squashed |
 | `:db.saga/conflict-report` | string (EDN) | one | on a failed merge attempt: what collided (latest attempt) |
+| `:db.saga/guard` | string (EDN) | many | *step tx metadata, used in the branch*: a guard declared by the step that established the read dependency (see [Merge](#merge)) |
 
 Opening, expiry extension, commit, and abort are ordinary parent
 transactions touching this entity — which is the whole visibility story:
@@ -226,8 +230,9 @@ can:
 | Catalog | a full user database | internal (`<db>` sub-namespaced by saga id); listed via saga surfaces, not `db list` |
 | Lifecycle | independent forever | tied to the saga: merged then retained-or-deleted, or discarded on abort/expiry |
 | Entity ids | replays parent counters; diverges freely | allocates from leased blocks so ids survive merge verbatim |
-| Transactor | any | the parent's transactor (id grants and merge live in its writer) |
-| Encryption | fresh data key, no shared ciphertext | shares the parent's data key — same trust domain, shares segments by construction |
+| Transactor | any | the parent's transactor *process*, but its own writer pipeline — see below |
+| Timeline | continues the source's `t` counters, diverging freely | its own `t` counters from `t₀` — see [Branch time](#branch-time) |
+| Encryption | fresh data key, no shared ciphertext | shares the parent's data key — same trust domain, shares segments by construction; if protection classes land (ADR-0017/0018), class keys gate protected attributes on a branch exactly as on the parent |
 | Schema | full database, may evolve | data transactions only; schema changes refused on a branch |
 
 The overlay construction is the same shape a peer already uses for its own
@@ -246,6 +251,40 @@ is a hundred real transactions whose interleaved reads and writes the
 owner performed and observed; that observation is what merge preserves
 (and what distinguishes the chosen merge semantics from a rebase — see
 below).
+
+Steps do **not** pass through the parent's writer queue. The branch is
+hosted in the parent's transactor process, but it is its own little
+database with its own serialized pipeline (and its own group-commit
+batching): because id blocks are leased up front, a step needs no
+per-step coordination with the parent at all. The parent's writer is
+entered only where the parent's state actually changes — open (grant
+allocation plus the registry transaction), extend, abort, and merge. A
+chatty saga therefore costs the parent shared process resources (CPU,
+storage I/O, cache), never queueing latency in its commit path; the
+one parent-writer pause a saga causes is the merge scan at commit.
+
+### Branch time
+
+A branch keeps its own timeline. Its log numbers transactions from
+`t₀ + 1` upward, independently of the parent — exactly as a fork does —
+and branch transaction entities take ids in `:db.part/tx` from those `t`
+values. No id grants cover the tx partition, because **branch transaction
+entities never merge**: the squash rewrites every novelty datom's `tx` to
+the single merge transaction, and step tx-entity datoms (`:db/txInstant`,
+step metadata, `:db.saga/guard` declarations) stay behind in the branch,
+which is precisely where the step-grain story reads them (see *Squash,
+not splice* below). Branch tx ids may therefore numerically coincide with
+parent tx ids issued after `t₀`; the two never meet in one database, so
+no ambiguity arises — but surfaces that display both (a console pointed
+at a branch, `corium saga log`) should label ids with their timeline.
+
+Time views on a branch `Db` are the branch's own: `as-of t` for `t ≤ t₀`
+answers identically to the parent's `as-of t` (shared prefix, shared
+segments); above `t₀` it walks branch history. `:db/txInstant` follows
+the ordinary monotonic rule (`max(now, last + 1)`) *within the branch*,
+seeded from the parent's clock at `t₀`, so instant-named views on the
+branch resolve sensibly even though branch instants and parent instants
+after `t₀` are unrelated sequences.
 
 ### Entity-id grants
 
@@ -296,6 +335,8 @@ future work; it is a different promise and must be asked for by name.)
 1. Load the branch novelty: fold branch transactions into net assertions
    and retractions (an intra-branch assert-then-retract cancels; the last
    write per `(e, a)` on cardinality-one wins — this is the squash).
+   Branch tx-entity datoms are excluded: step transaction entities never
+   merge (see [Branch time](#branch-time)).
 2. **Conflict scan** against parent changes in `(t₀, now]`:
    - *write–write*: the parent asserted or retracted any datom on an
      `(e, a)` the branch also wrote (cardinality-one), or the exact
@@ -306,12 +347,28 @@ future work; it is a different promise and must be asked for by name.)
      retracted (`:db/retractEntity`);
    - *retraction misses*: the branch retracts `(e, a, v)` whose `v` is no
      longer the parent's value (the CAS-shaped conflict).
-3. **Guard evaluation**: the commit request may carry explicit guards —
-   `:db/cas`-shaped preconditions and boolean guard queries — evaluated
-   against the parent's current value. Guards are how a saga makes its
-   *read* dependencies explicit; the engine does not track read sets (see
-   Limits), so serializability beyond write-write is opt-in and visible in
-   the request.
+
+   One non-conflict is a deliberate choice, not an omission:
+   **cardinality-many assertions union.** Parent and branch each asserting
+   different values on the same many-cardinality `(e, a)` merge to the
+   union — that is what a set-valued attribute means — and both asserting
+   the *same* `(e, a, v)` is idempotent. Only the exact-triple races above
+   (parent retracted a triple the branch asserts, or the reverse) conflict.
+   A saga that needs "nobody else added to this set" is asserting a read
+   dependency, and declares it as a guard.
+3. **Guard evaluation**: guards are `:db/cas`-shaped preconditions and
+   boolean guard queries evaluated against the parent's current value —
+   how a saga makes its *read* dependencies explicit. The engine does not
+   track read sets (see Limits), so serializability beyond write-write is
+   opt-in and visible. Guards come from two places: the commit request,
+   and — so the contract is durable rather than living only in one
+   process's memory — `:db.saga/guard` metadata asserted on the branch
+   step that established the dependency, at the owner's option. Commit
+   evaluates the union of both by default; a step-declared guard that
+   fails is reported with the step that declared it, which makes the
+   conflict traceable to the read that mattered. A crashed owner, or a
+   different process resuming the saga, inherits the declared guards for
+   free.
 4. **Full transaction validation** of the novelty against the parent's
    current schema (which may have migrated since `t₀` — ADR-0020 makes
    schema basis-versioned, and merge validates against *now*, exactly as a
@@ -341,15 +398,43 @@ deleted once nobody needs it. History-minded readers get:
 `as-of`/`history` views for the fine grain.
 
 **Conflict resolution and retry.** A failed merge is information, not a
-dead end. The commit request accepts per-conflict resolutions: for a named
-`(e, a)`, either *accept-parent* (drop the branch's write) or *override*
-(the branch's value wins even though the parent moved). A retry validates
-that no conflicts appeared beyond the resolved set, then proceeds. The saga
-owner can also simply keep working — resolve the divergence with further
-branch transactions informed by the report, and commit again. A general
-*base refresh* (folding parent novelty into the branch to re-root it at a
-newer `t₀`) is future work; it is a merge in the opposite direction and
-earns its own design pass.
+dead end. The commit request accepts per-conflict resolutions, each fenced
+to the conflict report it answers: a resolution names the parent-side
+value the report showed, and holds only while that value still stands —
+further parent drift on a resolved `(e, a)` is a fresh conflict, never
+silently absorbed. Reading the report *is* the observation that makes
+resolving consistent with effects-replay: the owner is no longer deciding
+against unobserved state.
+
+Which resolutions exist depends on the conflict class, and the asymmetry
+is principled:
+
+- *accept-parent* — drop the branch's conflicting write from the novelty —
+  is available for **every** class. It only ever removes something from
+  the merge.
+- *override* — the branch's value wins — is available **only for
+  write–write conflicts on cardinality-one `(e, a)`**, where it has an
+  exact expansion: retract the parent's reported current value, assert the
+  branch's. Both datoms name state the owner has seen (one in the branch,
+  one in the report), and the write stays within the saga's own footprint.
+- *uniqueness*, *dangling-ref*, and *retraction-miss* conflicts are **not
+  override-able.** Each override would fabricate a write outside what the
+  owner observed or outside what the saga touched: evicting the parent's
+  claimant of a unique value edits an entity the saga never wrote,
+  overriding a dangling ref resurrects a retracted entity, and overriding
+  a retraction miss retracts a value the branch never held. The design's
+  first merge principle — replay what was observed, fail loudly on the
+  rest — outranks resolution convenience here. The recourse is
+  accept-parent, or a decision made where decisions belong: an ordinary
+  follow-up transaction (or fresh saga) that does the disputed write in
+  the open, after this merge lands.
+
+A retry validates that no conflicts appeared beyond the resolved set, then
+proceeds. The saga owner can also simply keep working — resolve the
+divergence with further branch transactions informed by the report, and
+commit again. A general *base refresh* (folding parent novelty into the
+branch to re-root it at a newer `t₀`) is future work; it is a merge in
+the opposite direction and earns its own design pass.
 
 ## Lifecycle, failure, and expiry
 
@@ -363,8 +448,21 @@ flip rides inside the merge transaction itself.
 | Crash mid-step | Step either fully in the branch log or absent — ordinary transaction durability, per step |
 | Crash during merge, before append | No parent effect; saga `:open`; retry re-runs the scan against then-current state |
 | Crash during merge, after append | Saga is `:committed` (same record); retry observes the status and reports success |
-| Owner disappears | `:db.saga/expires-at` passes; the expiry sweep aborts the saga |
+| Abort races an in-flight merge | The parent's writer serializes them; whichever lands first wins, and the loser gets a status error — an abort arriving after the merge committed fails with "already `:committed`", it does **not** report success |
+| Owner disappears | `:db.saga/expires-at` passes; the expiry sweep expires the saga |
 | Transactor failover | Registry, branch log, and grants are durable storage state; the new lease holder sees all of it — nothing lived only in memory |
+| Restore, fork, or replica finds `:open` registry entries with no branch | The saga is expired on first open — see the liveness invariant below |
+
+**A saga is live only where its branch lives.** The registry travels with
+the parent's data — backup, restore, `db fork`, replication — but the
+branch does not: backups do not capture saga branches (v1), and a fork
+copies the parent's log prefix, registry datoms included, never the
+branches. So a database can find itself holding `:open` registry entries
+whose branches are absent — a restored parent, a fork taken while sagas
+were in flight. One rule covers every such case: on first open, the
+transactor expires any `:open` saga whose branch does not exist. `:expired`
+already means "the system, not a decision, ended this," which is exactly
+what happened; the entries remain as honest history, and nothing dangles.
 
 **Expiry is mandatory.** An open saga pins parent segments from `t₀` and
 holds id grants; an abandoned one must not do so forever. Every saga
@@ -375,8 +473,17 @@ so the data plane does not depend on the service — transitions overdue
 sagas to `:expired` and queues their branches for deletion. `:expired` is
 distinguished from `:aborted` so a returning owner knows the system, not a
 decision, ended the work; the branch retention window gives them a grace
-period to salvage (re-open as a fresh saga from the old branch's contents)
-before deletion.
+period to salvage before deletion. (Salvage means application-driven
+replay: open a fresh saga at a new `t₀`, query the old branch, and
+re-assert what is still wanted. It is not an engine operation, and it does
+not depend on the future base-refresh work — the application decides what
+survives, with both `Db` values in hand.)
+
+**Retention is a per-database policy knob** — how long committed and
+expired branches are kept before deletion — with a per-saga override at
+open for workloads whose audit or salvage needs differ. The operator
+service administers it like any schedule; the in-transactor fallback
+applies the per-database default.
 
 **Concurrent sagas** compose without new rules: each has its own branch
 and disjoint id grants; merges serialize through the parent's writer;
@@ -450,6 +557,12 @@ else's).
 - **No base refresh / rebase modes.** Future work, each with its own
   semantics to specify: base refresh re-roots the branch on a newer
   parent basis; rebase-commit re-runs original tx *inputs* at merge.
+  The sharpest consequence of this gap: a parent schema migration that
+  invalidates branch novelty (merge validates against *current* schema)
+  strands the saga through no fault of its own — the merge fails loudly,
+  and with no base refresh the recourse is salvage-and-redo. Migration
+  planning (ADR-0020) should treat open sagas as an advisory input, the
+  way it already reports affected data.
 - **Branch writes go through the parent's transactor.** A saga is not a
   write-throughput feature; see
   [write-path-scaling.md](write-path-scaling.md) for that problem.
