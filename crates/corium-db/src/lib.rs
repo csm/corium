@@ -40,10 +40,10 @@ use rpds::{RedBlackTreeMapSync, VectorSync};
 /// Sequence of the first installable attribute entity in the db partition.
 ///
 /// Everything below this in `:db.part/db` belongs to the engine: the schema
-/// vocabulary, `:db/txInstant`, and the schema-update audit trail
-/// ([`bootstrap`]). A schema that claims one of those ids is silently replaced
-/// when the engine installs its own, so the reservation is asserted in debug
-/// builds rather than left as a rule to remember.
+/// vocabulary, `:db/txInstant`, the saga registry, and the schema-update audit
+/// trail ([`bootstrap`]). A schema that claims one of those ids is silently
+/// replaced when the engine installs its own, so the reservation is asserted
+/// in debug builds rather than left as a rule to remember.
 pub const FIRST_ATTR_ID: u64 = 100;
 
 /// The first user-assignable sequence number. Lower ids are reserved for bootstrap data.

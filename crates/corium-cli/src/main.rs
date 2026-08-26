@@ -438,6 +438,11 @@ impl ServeFlags {
         use corium_protocol::authz::ExternalTokens;
         use corium_protocol::oidc::{OidcConfig, OidcVerifier};
 
+        // Keep one async API when discovery is disabled; discovery awaits the
+        // provider metadata request below.
+        #[cfg(not(feature = "oidc-discovery"))]
+        std::future::ready(()).await;
+
         let Some(issuer) = &self.oidc_issuer else {
             return Ok(None);
         };
@@ -464,8 +469,10 @@ impl ServeFlags {
     }
 
     #[cfg(not(feature = "oidc"))]
-    #[allow(clippy::unused_async)]
     async fn oidc_provider(&self) -> Result<Option<Arc<dyn IdentityProvider>>, String> {
+        // Keep the call site independent of the selected OIDC feature set.
+        std::future::ready(()).await;
+
         if self.oidc_issuer.is_some() || self.oidc_jwks_file.is_some() {
             return Err(
                 "OIDC support is not built in; rebuild corium-cli with --features oidc-discovery"

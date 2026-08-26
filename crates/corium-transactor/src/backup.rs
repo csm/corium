@@ -473,12 +473,13 @@ fn encode_log_versions(frames: &[FramedRecord]) -> Result<Vec<u8>, BackupError> 
 
 /// Pairs an encoded run table with the frames it covers.
 fn decode_log_versions(bytes: &[u8], record_count: u64) -> Result<Vec<(u64, u64)>, BackupError> {
-    if !bytes.len().is_multiple_of(16) {
+    let (entries, remainder) = bytes.as_chunks::<16>();
+    if !remainder.is_empty() {
         return Err(invalid("checkpoint log-version table is malformed"));
     }
     let mut runs = Vec::with_capacity(bytes.len() / 16);
     let mut total = 0_u64;
-    for entry in bytes.chunks_exact(16) {
+    for entry in entries {
         let version = u64::from_be_bytes(entry[..8].try_into().expect("eight bytes"));
         let count = u64::from_be_bytes(entry[8..].try_into().expect("eight bytes"));
         if count == 0 {
