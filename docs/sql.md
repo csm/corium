@@ -109,6 +109,10 @@ All views expose normalized metadata and fact relations:
   executes an entry — it is the orchestrator's own record of reverse progress
   outside the database, and it outlives the saga that prompted it.
 
+The two saga relations fold current values, so they are absent from a history
+session, where a saga's assertions and retractions sit side by side and "the
+status" is not a question with one answer; read `corium_sys.datoms` there.
+
 A history session initially exposes only `corium_sys` relations, so additions
 and retractions remain unambiguous events. Wide history tables are reserved for
 a later validity-interval design.

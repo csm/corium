@@ -623,8 +623,15 @@ fn register_system_tables(
     schema.register_table("datoms".into(), datoms_table(db, read))?;
     schema.register_table("attributes".into(), attributes_table(db)?)?;
     schema.register_table("idents".into(), idents_table(db)?)?;
-    schema.register_table("sagas".into(), sagas_table(db)?)?;
-    schema.register_table("saga_compensations".into(), saga_compensations_table(db)?)?;
+    // The registry relations fold current values, so they mean what they say
+    // only in a view that has current values. A history view holds a saga's
+    // assertions and retractions side by side, where "the status" is not a
+    // question with one answer; `corium_sys.datoms` is where that view's saga
+    // facts are read, transition by transition.
+    if db.view() != DbView::History {
+        schema.register_table("sagas".into(), sagas_table(db)?)?;
+        schema.register_table("saga_compensations".into(), saga_compensations_table(db)?)?;
+    }
     Ok(())
 }
 

@@ -15,6 +15,12 @@
 //! deriving it from raw datoms would be three chances to disagree about, say,
 //! whether a saga with no `:db.saga/status` datom is open.
 //!
+//! Every read here folds *current* values, so it means what it says in a
+//! current or `as-of` view — a `since` view answers "what changed", and a
+//! history view holds a saga's assertions and its retractions side by side,
+//! where "the status" is not a question with one answer. Callers that want the
+//! transitions themselves read the datoms.
+//!
 //! It is deliberately total about absence. A registry entry is data written by
 //! a transaction, and a transaction can be interrupted, restored from a backup
 //! taken mid-flight, or (in a database whose writer predates this vocabulary)

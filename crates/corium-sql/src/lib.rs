@@ -957,6 +957,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_history_session_reads_saga_transitions_as_datoms() {
+        let session = SqlSession::new(&saga_fixture().history()).expect("session");
+        assert!(
+            session
+                .query("SELECT id FROM corium_sys.sagas")
+                .await
+                .is_err(),
+            "a history view has no current status to fold"
+        );
+        let rows = session
+            .query(
+                "SELECT count(*) FROM corium_sys.datoms \
+                 WHERE attr = ':db.saga/status' AND added",
+            )
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("rows");
+        assert_eq!(rows, vec![vec![SqlValue::Integer(1)]]);
+    }
+
+    #[tokio::test]
     async fn the_compensation_ledger_joins_to_its_saga() {
         let session = SqlSession::new(&saga_fixture()).expect("session");
         let rows = session
