@@ -135,9 +135,13 @@ impl FfiError {
             }
             // Sealing failures happen while the transaction is still being
             // built, so they are transaction failures, not connection ones.
+            // A refused saga transition is the same kind of thing: the
+            // registry's state does not allow the transaction being built.
             ClientError::Peer(
-                error
-                @ (PeerError::TxForm(_) | PeerError::MissingKey(_) | PeerError::Protection(_)),
+                error @ (PeerError::TxForm(_)
+                | PeerError::MissingKey(_)
+                | PeerError::Protection(_)
+                | PeerError::Saga(_)),
             ) => Self::new(ErrorKind::Transaction, error.to_string()),
             ClientError::Query(QueryError::FuelExhausted) => {
                 Self::new(ErrorKind::FuelExhausted, "query fuel exhausted")
