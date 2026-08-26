@@ -1,0 +1,459 @@
+name: Nightly Release
+
+# Publishes corium once a night rather than on every merge to main, and only
+# when the day's merges actually changed something that ships: a day of pure
+# documentation or website edits produces no release.
+#
+# Each release pushes a `v0.1.N` tag, publishes the Rust crates to crates.io,
+# the Java client to Maven Central, the Clojure client to Clojars, and the
+# Python distributions to PyPI, then creates a GitHub release whose notes are
+# generated from the merged pull requests — optionally with a Claude-written
+# highlights section (see .github/scripts/summarize-changelog.sh).
+#
+# The GitHub release is deliberately the last step: it is the marker that a
+# version finished shipping everywhere. If a run dies partway through, the next
+# night sees a tag at HEAD with no release and resumes that version instead of
+# allocating a new one, so a version can never exist with some artifacts
+# published and the rest missing. Every publish step is idempotent for that
+# reason.
+on:
+  schedule:
+    # 07:00 UTC daily — after the US working day, before the European one.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Release even if only docs/web changed'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Build and generate notes, but do not tag, publish, or release'
+        type: boolean
+        default: false
+
+# One release at a time; never cancel a run that may be halfway through
+# pushing artifacts to a registry.
+concurrency:
+  group: nightly-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BASE_VERSION: "0.1"
+
+jobs:
+  check:
+    name: Check for releasable changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      prev_tag: ${{ steps.decide.outputs.prev_tag }}
+      prev_base: ${{ steps.decide.outputs.prev_base }}
+      head_sha: ${{ steps.decide.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Tags carry the version series, so they must come along.
+          fetch-tags: true
+
+      - name: Decide
+        id: decide
+        env:
+          FORCE: ${{ inputs.force }}
+          # Lets the script spot a tag whose release never finished shipping.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/should-release.sh
+
+      - name: Summary
+        env:
+          SHOULD_RELEASE: ${{ steps.decide.outputs.should_release }}
+          TAG: ${{ steps.decide.outputs.tag }}
+          PREV_TAG: ${{ steps.decide.outputs.prev_tag }}
+        run: |
+          {
+            if [ "$SHOULD_RELEASE" = "true" ]; then
+              echo "Releasing **$TAG** (previous: ${PREV_TAG:-none})."
+            else
+              echo "No release: nothing but documentation or website changes since ${PREV_TAG}."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    name: Build & test
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Pin every job to the commit the gate judged, so a merge landing
+      # mid-run cannot publish a tree that was never tested.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.head_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Restore only. Caches written from a default-branch context are
+          # readable by every branch and pull request, so a job that checks
+          # out a ref chosen at runtime must not be able to write one. The
+          # entries this restores are saved by ci.yml on pushes to main.
+          save-if: "false"
+      - run: cargo fmt --all -- --check
+      # GC-mode cljrs crates build standalone so they keep GC mode (see ci.yml).
+      - run: cargo clippy --workspace --exclude corium-cljrs --exclude corium-mbrainz --all-targets -- -D warnings
+      - run: cargo test --workspace --exclude corium-cljrs --exclude corium-mbrainz
+      - run: |
+          cargo clippy -p corium-cljrs -p corium-mbrainz --all-targets -- -D warnings
+          cargo test -p corium-cljrs -p corium-mbrainz
+
+  clojure-ci:
+    name: Build & test Clojure client
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.head_sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: clients/clojure/deps.edn
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+      - working-directory: clients/clojure
+        run: clojure -M:test
+      - working-directory: clients/clojure
+        run: clojure -T:build jar
+      - run: python3 clients/clojure/scripts/release.py check
+
+  notes:
+    name: Generate release notes
+    # Gated on the build so a failing night does not spend an LLM call. Still
+    # runs alongside `publish`, not before it.
+    needs: [check, ci, clojure-ci]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+      PREV_TAG: ${{ needs.check.outputs.prev_tag }}
+      PREV_BASE: ${{ needs.check.outputs.prev_base }}
+      TARGET_COMMITISH: ${{ needs.check.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Runs in parallel with the build so an LLM call never sits on the
+      # critical path between a green build and a published crate. The summary
+      # is best-effort: a missing ANTHROPIC_API_KEY or a failed call leaves the
+      # mechanically generated notes in place and the release goes out anyway.
+      - name: Generate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CHANGELOG_MODEL: ${{ vars.CHANGELOG_MODEL }}
+        run: .github/scripts/generate-changelog.sh release-notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release notes for $TAG"
+            echo
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish to crates.io
+    needs: [check, ci, clojure-ci]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # No build cache here on purpose. This job compiles nothing — it edits
+      # manifests, reads `cargo metadata`, and publishes with --no-verify — so
+      # a cache would buy nothing while giving the one job that holds the
+      # registry token a way to both read and write shared cache entries.
+      - name: Install cargo-release
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release
+
+      - name: Set crate and client versions
+        run: |
+          echo "Publishing version: $VERSION"
+          cargo release version "$VERSION" --execute --no-confirm
+          python3 clients/python/scripts/release.py set "$VERSION"
+          python3 clients/java/scripts/release.py set "$VERSION"
+          python3 clients/clojure/scripts/release.py set "$VERSION"
+          echo "--- Workspace Cargo.toml ---"
+          cat Cargo.toml
+          echo ""
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          # Commit the bump so `cargo publish` sees a clean tree. The commit is
+          # never pushed to main: only the tag references it, which keeps
+          # main's manifests at their development version.
+          git diff --cached --quiet || git commit -m "chore: release $VERSION"
+
+      - name: Push tag
+        if: env.DRY_RUN != 'true'
+        run: |
+          # Only create the tag if it isn't already on the remote, so a retry
+          # after a partially failed publish is safe.
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists on remote — skipping tag push"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Publish crates
+        if: env.DRY_RUN != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Build --exclude list for packages already live at this version.
+          # Makes the step idempotent so a retry after a partial failure is safe.
+          EXCLUDE=()
+          while IFS= read -r pkg; do
+            name="${pkg%%@*}"
+            ver="${pkg##*@}"
+            if curl -sf "https://crates.io/api/v1/crates/${name}/${ver}" \
+                 -H "User-Agent: corium-publish/1.0" | grep -q '"num"'; then
+              echo "Already published: ${name}@${ver} — skipping"
+              EXCLUDE+=(--exclude "${name}")
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 \
+                     | jq -r '.packages[] | "\(.name)@\(.version)"')
+
+          cargo publish --workspace \
+            --no-verify \
+            "${EXCLUDE[@]}"
+
+  java-native:
+    name: Build Java native jars
+    needs: [check, publish]
+    if: needs.check.outputs.should_release == 'true' && !inputs.dry_run
+    permissions:
+      contents: read
+    uses: ./.github/workflows/java-native.yml
+    with:
+      release_ref: ${{ needs.check.outputs.tag }}
+
+  java-publish:
+    name: Publish Java client to Maven Central
+    needs: [check, publish, java-native]
+    if: needs.check.outputs.should_release == 'true' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    environment:
+      name: maven-central
+      url: https://central.sonatype.com/artifact/dev.corium/corium-client/${{ needs.check.outputs.version }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+
+      - name: Check for an existing release
+        id: central
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # Makes a resumed release safe: Maven Central rejects a redeploy of a
+          # version it already holds, which would otherwise fail every retry
+          # after the Java client shipped but a later registry did not. A resume
+          # is at least a day later, so the Portal has long since synced to
+          # repo1 by the time this runs.
+          POM_URL="https://repo1.maven.org/maven2/dev/corium/corium-client/${VERSION}/corium-client-${VERSION}.pom"
+          if curl --fail --silent --show-error --output /dev/null "$POM_URL"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "dev.corium:corium-client $VERSION is already on Maven Central."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.central.outputs.exists != 'true'
+        with:
+          pattern: java-native-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/setup-java@v4
+        if: steps.central.outputs.exists != 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: clients/java/pom.xml
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_TOKEN
+          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Publish to Maven Central
+        if: steps.central.outputs.exists != 'true'
+        run: >-
+          mvn -f clients/java/pom.xml --batch-mode
+          --activate-profiles release,native
+          -Dcorium.native.jars=${{ github.workspace }}/dist
+          deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_CENTRAL_TOKEN }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+
+  clojure-publish:
+    name: Publish Clojure client to Clojars
+    needs: [check, publish, java-publish]
+    if: needs.check.outputs.should_release == 'true' && !inputs.dry_run
+    uses: ./.github/workflows/publish-clojure.yml
+    with:
+      release_ref: ${{ needs.check.outputs.tag }}
+      version: ${{ needs.check.outputs.version }}
+    secrets: inherit
+
+  python-wheels:
+    name: Build Python wheels
+    needs: [check, publish]
+    if: needs.check.outputs.should_release == 'true' && !inputs.dry_run
+    permissions:
+      contents: read
+    uses: ./.github/workflows/python-wheels.yml
+    with:
+      release_ref: ${{ needs.check.outputs.tag }}
+
+  python-publish:
+    name: Publish ${{ matrix.distribution.name }} to PyPI
+    needs: python-wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution:
+          - name: corium
+            environment: pypi
+          - name: corium-postgres
+            environment: pypi-postgres
+          - name: corium-s3
+            environment: pypi-s3
+          - name: corium-turso
+            environment: pypi-turso
+    runs-on: ubuntu-24.04
+    environment:
+      name: ${{ matrix.distribution.environment }}
+      url: https://pypi.org/project/${{ matrix.distribution.name }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*-${{ matrix.distribution.name }}
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  release:
+    name: Tag release on GitHub
+    # Every registry, so that the release's existence means "this version
+    # shipped everywhere" — which is what the gate reads to decide whether a
+    # tag needs resuming.
+    needs: [check, notes, publish, java-publish, clojure-publish, python-publish]
+    if: needs.check.outputs.should_release == 'true' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — updating its notes."
+            gh release edit "$TAG" --repo "$REPO" \
+              --title "$TAG" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" --repo "$REPO" \
+              --title "$TAG" \
+              --notes-file release-notes.md \
+              --latest
+          fi
+
+      - name: Summary
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "### Released [$TAG](https://github.com/$REPO/releases/tag/$TAG)"
+            echo
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dry-run-summary:
+    name: Dry run summary
+    needs: [check, ci, clojure-ci, notes, publish]
+    if: needs.check.outputs.should_release == 'true' && inputs.dry_run
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          {
+            echo "### Dry run — $TAG was not tagged, published, or released"
+            echo
+            echo "The generated notes are attached to this run as the \`release-notes\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
