@@ -1,7 +1,15 @@
 # Long-Running Transactions (Sagas)
 
-Status: **specified, not implemented.**
-[ADR-0023](../adr/0023-saga-branch-transactions.md) records the decision.
+Status: **registry implemented; branches, merge, and the expiry sweep are
+still specification.** Phase 1 of the [delivery sketch](#delivery-sketch) is in
+the tree: the `:db.saga/*` vocabulary, the lifecycle transitions and the rules
+the transactor holds them to ([`corium_tx::saga`](../../crates/corium-tx/src/saga.rs)),
+the read model ([`corium_db::saga`](../../crates/corium-db/src/saga.rs)), the
+peer API ([`corium_peer::saga`](../../crates/corium-peer/src/saga.rs)),
+`corium_sys.sagas`, and `corium saga`. A saga is therefore a durable, expiring
+workflow record with a compensation ledger, and nothing in this document that
+needs a branch — steps, tier-2 reads, merge, guards, conflict reports — exists
+yet. [ADR-0023](../adr/0023-saga-branch-transactions.md) records the decision.
 
 A saga is a durable unit of work that spans many transactions and an
 arbitrary amount of wall-clock time, and that either lands in the database
@@ -841,11 +849,15 @@ else's).
 
 ## Delivery sketch
 
-1. **Registry + vocabulary** — bootstrap attributes, open/abort/expiry as
-   transactions, `corium_sys.sagas` relation, no branches yet (a saga with no
+1. **Registry + vocabulary** *(done)* — bootstrap attributes, open/abort/expiry
+   as transactions, `corium_sys.sagas` relation, no branches yet (a saga with no
    steps is already useful as a durable workflow record). Compensation
    vocabulary included: static `:db.saga/on-abort-tx` and the
-   external-compensation ledger need no branch at all.
+   external-compensation ledger need no branch at all. Two details the
+   implementation settled: the entity-id grants of phase 2 are refused as
+   ordinary transaction data, since minting them is the allocator's job, and
+   `:db.saga/owner` is still declared by the client — the transactor stamps
+   the authenticated principal when saga authorization lands.
 2. **Branches** — overlay construction, id grants, step transacting, peer
    and CLI read surfaces (tier 2); `:db.saga/on-abort-fn` invocation,
    which needs the branch value.

@@ -6,6 +6,7 @@ mod console;
 mod instant;
 mod metrics_http;
 mod pg_catalog;
+mod saga;
 mod schema;
 mod sql;
 mod tui;
@@ -694,6 +695,10 @@ enum Command {
     /// a database, and apply the exact plan you reviewed.
     #[command(subcommand)]
     Schema(schema::SchemaCommand),
+    /// Long-running transactions: open, list, inspect, extend, and abort the
+    /// sagas a database's registry holds.
+    #[command(subcommand)]
+    Saga(saga::SagaCommand),
     /// Self-hosted authorization database: create it, grant and revoke
     /// relationships, and ask what the policy decides.
     #[command(subcommand)]
@@ -977,6 +982,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Command::Schema(command) => schema::run(command).await,
+        Command::Saga(command) => saga::run(command).await,
         command => run_command(command).await.map(|()| ExitCode::SUCCESS),
     }
 }
@@ -985,7 +991,9 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
 async fn run_command(command: Command) -> Result<(), String> {
     match command {
         // Dispatched by `run`, which needs its exit code.
-        Command::Schema(_) => unreachable!("schema commands are dispatched before this point"),
+        Command::Schema(_) | Command::Saga(_) => {
+            unreachable!("schema and saga commands are dispatched before this point")
+        }
         Command::Store {
             command:
                 StoreCommand::Verify {
@@ -1936,7 +1944,7 @@ fn s3_spec(
     Err("this build lacks the S3 backend; rebuild corium-cli with --features s3".into())
 }
 
-fn parse_duration(text: &str) -> Result<Duration, String> {
+pub(crate) fn parse_duration(text: &str) -> Result<Duration, String> {
     let split = text
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(text.len());
