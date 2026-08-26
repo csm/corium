@@ -2369,21 +2369,32 @@ impl TransactorNode {
             };
             // Convert forms, interning new keyword values into the shared
             // naming, against the staging value.
-            let (items, this_changed) = {
+            let (converted, minted) = {
                 let mut naming = state
                     .naming
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let before = naming.interner.len();
-                match tx_items_from_edn(cursor.db(), &mut naming.interner, &forms) {
-                    Ok(items) => (items, naming.interner.len() > before),
-                    Err(error) => {
-                        drop(naming);
-                        let _ = request.resp.send(Err(error.into()));
-                        continue;
-                    }
+                let converted = tx_items_from_edn(cursor.db(), &mut naming.interner, &forms);
+                let minted = (naming.interner.len() > before).then(|| naming.interner.clone());
+                (converted, minted)
+            };
+            let items = match converted {
+                Ok(items) => items,
+                Err(error) => {
+                    let _ = request.resp.send(Err(error.into()));
+                    continue;
                 }
             };
+            // Validation reads keyword *values* — a saga's status, say —
+            // through the interner of the value being prepared against, so a
+            // transaction that mints a keyword has to be prepared against a
+            // value that already knows it. This is the same reason the
+            // schema-update path interns before `prepare_datoms`.
+            let this_changed = minted.is_some();
+            if let Some(interner) = minted {
+                cursor.intern_naming(interner);
+            }
             match cursor.prepare(items, now_ms) {
                 Ok(prep) => {
                     measure.clear();

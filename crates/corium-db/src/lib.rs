@@ -26,6 +26,7 @@ pub mod bootstrap;
 pub mod impact;
 pub mod protect;
 pub mod read;
+pub mod saga;
 pub mod schemadatoms;
 
 use std::collections::{BTreeMap, BTreeSet};

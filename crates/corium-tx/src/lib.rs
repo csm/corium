@@ -1,5 +1,7 @@
 //! Pure transaction expansion, entity resolution, and validation.
 
+pub mod saga;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{Cardinality, Datom, EntityId, Partition, Unique, Value};
@@ -154,6 +156,10 @@ pub enum TxError {
     /// immutable database cannot make an attribute disappear from history.
     #[error("attribute {0} is retired and refuses new assertions")]
     RetiredAttribute(EntityId),
+    /// A write would leave the saga registry in a state no reader could
+    /// rely on (see [`saga`]).
+    #[error("{0}")]
+    Saga(#[from] saga::SagaViolation),
     /// A retraction or `:db/cas` old value named a class the attribute has
     /// never been sealed under — a form it never had.
     #[error("attribute {attr} was never sealed under class {class}")]
@@ -431,6 +437,10 @@ pub fn prepare(
         }
         working = working.with_transaction(working.basis_t() + 1, &datoms[start..]);
     }
+    // The registry's invariants are properties of the whole transaction — a
+    // transition is a retraction and an assertion together — so they are
+    // checked against what the transaction leaves behind, not op by op.
+    saga::validate(db, &datoms)?;
     Ok(PreparedTx { datoms, tempids })
 }
 
