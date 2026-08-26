@@ -617,7 +617,7 @@ mod tests {
                 datom(saga, bootstrap::SAGA_STATUS, Value::Keyword(open)),
             ],
         );
-        assert!(overdue_entries(&db, 0) == entries(&db));
+        assert_eq!(overdue_entries(&db, 0), entries(&db));
     }
 
     #[test]
