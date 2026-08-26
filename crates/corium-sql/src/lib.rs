@@ -898,4 +898,86 @@ mod tests {
             .expect("rows");
         assert!(rows.is_empty());
     }
+
+    /// A database holding one open saga with a compensation-ledger entry,
+    /// built through the ordinary transaction path the registry uses.
+    fn saga_fixture() -> Db {
+        let mut schema = Schema::default();
+        let mut idents = Idents::default();
+        corium_db::bootstrap::install(&mut schema, &mut idents);
+        let db = Db::new(schema).with_naming(idents, KeywordInterner::default());
+        let forms = corium_query::edn::read_all(
+            r#"
+            [:db/add "s" :db.saga/id #uuid "0000000000000000000000000000002a"]
+            [:db/add "s" :db.saga/status :db.saga.status/open]
+            [:db/add "s" :db.saga/basis-t 7]
+            [:db/add "s" :db.saga/owner "alice"]
+            [:db/add "s" :db.saga/expires-at #inst 1700000000000]
+            [:db/add "s" :db.saga/description "quarterly reconciliation"]
+            [:db/add "s" :db.saga/compensations "c"]
+            [:db/add "c" :db.saga.compensation/key "refund:1234"]
+            [:db/add "c" :db.saga.compensation/status :db.saga.compensation.status/pending]
+            "#,
+        )
+        .expect("registry forms parse");
+        let mut interner = db.interner().clone();
+        let items = tx_items_from_edn(&db, &mut interner, &forms).expect("forms convert");
+        let idents = db.idents().clone();
+        let db = db.with_naming(idents, interner);
+        let tx = EntityId::new(Partition::Tx as u32, 1);
+        let prepared = prepare(&db, items, tx, 1_000).expect("the open prepares");
+        db.with_transaction(1, &prepared.datoms)
+    }
+
+    #[tokio::test]
+    async fn the_saga_registry_is_a_system_relation() {
+        let session = SqlSession::new(&saga_fixture()).expect("session");
+        let rows = session
+            .query(
+                "SELECT id, status, basis_t, owner, description, sealed, compensations \
+                 FROM corium_sys.sagas",
+            )
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqlValue::Text("0000000000000000000000000000002a".into()),
+                SqlValue::Text("open".into()),
+                SqlValue::Integer(7),
+                SqlValue::Text("alice".into()),
+                SqlValue::Text("quarterly reconciliation".into()),
+                SqlValue::Boolean(false),
+                SqlValue::Unsigned(1),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_compensation_ledger_joins_to_its_saga() {
+        let session = SqlSession::new(&saga_fixture()).expect("session");
+        let rows = session
+            .query(
+                "SELECT c.key, c.status, c.completed_at, s.status \
+                 FROM corium_sys.saga_compensations c \
+                 JOIN corium_sys.sagas s ON s.id = c.saga_id",
+            )
+            .await
+            .expect("query")
+            .collect()
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqlValue::Text("refund:1234".into()),
+                SqlValue::Text(":db.saga.compensation.status/pending".into()),
+                SqlValue::Null,
+                SqlValue::Text("open".into()),
+            ]]
+        );
+    }
 }

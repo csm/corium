@@ -11,6 +11,7 @@ use corium_core::{
 };
 use corium_db::protect::Hydration;
 use corium_db::read::ReadContext;
+use corium_db::saga;
 use corium_db::{Db, DbView};
 use datafusion::catalog::{MemTable, MemorySchemaProvider, SchemaProvider, Session};
 use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
@@ -622,7 +623,117 @@ fn register_system_tables(
     schema.register_table("datoms".into(), datoms_table(db, read))?;
     schema.register_table("attributes".into(), attributes_table(db)?)?;
     schema.register_table("idents".into(), idents_table(db)?)?;
+    schema.register_table("sagas".into(), sagas_table(db)?)?;
+    schema.register_table("saga_compensations".into(), saga_compensations_table(db)?)?;
     Ok(())
+}
+
+/// `corium_sys.sagas`: the saga registry, one row per saga (ADR-0023).
+///
+/// The registry is ordinary data, so this relation exists for the same reason
+/// `corium_sys.attributes` does — it spells a fold every operator would
+/// otherwise write by hand, and it spells it the same way on every surface.
+/// Statuses render as the bare name (`open`, `committed`, …) that prose and
+/// the CLI use; a status the engine does not define renders as its whole
+/// keyword, so a row can never quietly pass for one of the four.
+fn sagas_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {
+    let fields = vec![
+        Field::new("e", DataType::UInt64, false),
+        Field::new("id", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("basis_t", DataType::Int64, true),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("owner", DataType::Utf8, true),
+        Field::new(
+            "expires_at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+            true,
+        ),
+        Field::new("sealed", DataType::Boolean, false),
+        Field::new("reserves", DataType::UInt64, false),
+        Field::new("footprint", DataType::UInt64, false),
+        Field::new("merged_tx", DataType::UInt64, true),
+        Field::new("steps", DataType::Int64, true),
+        Field::new("conflict_report", DataType::Utf8, true),
+        Field::new("on_abort_error", DataType::Utf8, true),
+        Field::new("compensations", DataType::UInt64, false),
+    ];
+    let rows: Vec<Vec<ScalarValue>> = saga::entries(db)
+        .into_iter()
+        .map(|entry| {
+            vec![
+                ScalarValue::UInt64(Some(entry.entity.raw())),
+                ScalarValue::Utf8(Some(format!("{:032x}", entry.id))),
+                ScalarValue::Utf8(entry.status.as_ref().map(saga_status_name)),
+                ScalarValue::Int64(entry.basis_t),
+                ScalarValue::Utf8(entry.description.clone()),
+                ScalarValue::Utf8(entry.owner.clone()),
+                ScalarValue::TimestampMillisecond(entry.expires_at, Some("UTC".into())),
+                ScalarValue::Boolean(Some(entry.sealed)),
+                ScalarValue::UInt64(Some(entry.reserves.len() as u64)),
+                ScalarValue::UInt64(Some(entry.footprint.len() as u64)),
+                ScalarValue::UInt64(entry.merged_tx.map(EntityId::raw)),
+                ScalarValue::Int64(entry.steps),
+                ScalarValue::Utf8(entry.conflict_report.clone()),
+                ScalarValue::Utf8(entry.on_abort_error.clone()),
+                ScalarValue::UInt64(Some(entry.compensations.len() as u64)),
+            ]
+        })
+        .collect();
+    make_table(fields, &rows)
+}
+
+/// `corium_sys.saga_compensations`: the external-compensation ledgers, one row
+/// per entry, joined to their saga by `saga_id`.
+///
+/// The ledger is the orchestrator's own bookkeeping about reverse progress it
+/// performed outside the database — the engine never executes an entry — and
+/// it outlives the saga, which is why it is worth a relation of its own rather
+/// than a count on the saga row.
+fn saga_compensations_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {
+    let fields = vec![
+        Field::new("e", DataType::UInt64, false),
+        Field::new("saga_id", DataType::Utf8, false),
+        Field::new("key", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("detail", DataType::Utf8, true),
+        Field::new(
+            "completed_at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+            true,
+        ),
+        Field::new("error", DataType::Utf8, true),
+    ];
+    let rows: Vec<Vec<ScalarValue>> = saga::entries(db)
+        .into_iter()
+        .flat_map(|entry| {
+            let saga_id = format!("{:032x}", entry.id);
+            entry.compensations.into_iter().map(move |compensation| {
+                vec![
+                    ScalarValue::UInt64(Some(compensation.entity.raw())),
+                    ScalarValue::Utf8(Some(saga_id.clone())),
+                    ScalarValue::Utf8(compensation.key),
+                    ScalarValue::Utf8(compensation.status.map(|status| status.to_string())),
+                    ScalarValue::Utf8(compensation.detail),
+                    ScalarValue::TimestampMillisecond(
+                        compensation.completed_at,
+                        Some("UTC".into()),
+                    ),
+                    ScalarValue::Utf8(compensation.error),
+                ]
+            })
+        })
+        .collect();
+    make_table(fields, &rows)
+}
+
+/// How a status renders in SQL: the bare name for the four the engine
+/// defines, the whole keyword for anything else.
+fn saga_status_name(status: &saga::SagaStatus) -> String {
+    match status {
+        saga::SagaStatus::Unknown(_) => status.to_string(),
+        known => known.name().to_owned(),
+    }
 }
 
 /// `corium_sys.datoms`: the raw fact table, materialized when it is scanned.

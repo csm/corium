@@ -210,12 +210,12 @@ external compensations, and any pgwire `BEGIN` mapping.
 - The compensation ledger gives orchestrators standard reverse-progress
   bookkeeping in the parent — resumable from data, surviving branch
   deletion, seedable atomically at abort — at the price of more reserved
-  vocabulary and one more SQL surface (`corium_saga_compensations`); the
+  vocabulary and one more SQL surface (`corium_sys.saga_compensations`); the
   engine still never executes an external compensation, and retention may
   end early for a fully-resolved ledger but is never extended by a
   pending one.
 - Every surface grows a saga face: bootstrap vocabulary, peer API,
-  protocol, CLI, console, a `corium_sagas` SQL relation, authz applied
+  protocol, CLI, console, a `corium_sys.sagas` SQL relation, authz applied
   to branch views (ADR-0021 unchanged), operator-service sweep job.
   The registry-first delivery order keeps each phase shippable and the
   data plane free of operator-service dependence.

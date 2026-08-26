@@ -793,8 +793,8 @@ else's).
   `status` includes the compensation ledger); `corium console <db>
   --saga <id>` to point a console at a branch; `corium saga log <id>`
   for step history.
-- **SQL.** A `corium_sagas` system relation over the registry (id, status,
-  basis, owner, expiry, description) and a `corium_saga_compensations`
+- **SQL.** A `corium_sys.sagas` system relation over the registry (id, status,
+  basis, owner, expiry, description) and a `corium_sys.saga_compensations`
   relation over the ledger, beside the existing system
   relations; branch reads via the console/session db-view selection.
   Mapping pgwire interactive `BEGIN`/`COMMIT` onto sagas is explicitly out
@@ -842,7 +842,7 @@ else's).
 ## Delivery sketch
 
 1. **Registry + vocabulary** — bootstrap attributes, open/abort/expiry as
-   transactions, `corium_sagas` relation, no branches yet (a saga with no
+   transactions, `corium_sys.sagas` relation, no branches yet (a saga with no
    steps is already useful as a durable workflow record). Compensation
    vocabulary included: static `:db.saga/on-abort-tx` and the
    external-compensation ledger need no branch at all.
