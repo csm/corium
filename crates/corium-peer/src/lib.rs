@@ -182,6 +182,21 @@ impl ConnectConfig {
         }
     }
 
+    /// The same connection settings, pointed at the branch of saga `saga`
+    /// in this configuration's database (ADR-0023).
+    ///
+    /// A branch is served over the ordinary database machinery under a name
+    /// derived from the saga id, so a tier-2 reader is an ordinary connection
+    /// — same endpoints, same credentials, same keys — and everything a
+    /// `Connection` does works on it.
+    #[must_use]
+    pub fn for_saga(&self, saga: u128) -> Self {
+        Self {
+            db: corium_db::saga::branch_name(&self.db, saga),
+            ..self.clone()
+        }
+    }
+
     /// Gives this peer direct read access to the transactor's blob/root
     /// storage service.
     ///
@@ -424,6 +439,13 @@ impl Connection {
     #[must_use]
     pub fn db_name(&self) -> &str {
         &self.inner.config.db
+    }
+
+    /// The settings this connection was opened with, so a caller can open a
+    /// second connection — to a saga's branch, say — the same way.
+    #[must_use]
+    pub fn config(&self) -> &ConnectConfig {
+        &self.inner.config
     }
 
     /// Returns the current local database value without blocking on the

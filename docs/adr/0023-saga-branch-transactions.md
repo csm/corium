@@ -1,9 +1,11 @@
 # ADR-0023: Long-running transactions as branch-and-merge sagas
 
-**Status:** Accepted (2026-08-25); the registry phase is implemented — the
-`:db.saga/*` vocabulary, its lifecycle transitions and the rules the writer
-holds them to, the peer API, `corium_sys.sagas`, and `corium saga` — while
-branches, merge, and the expiry sweep remain specification. Design:
+**Status:** Accepted (2026-08-25); the registry and branch phases are
+implemented — the `:db.saga/*` vocabulary, its lifecycle transitions and the
+rules the writer holds them to, the peer API, `corium_sys.sagas`, and
+`corium saga`; then id-block leasing in the allocator, the branch overlay and
+its step pipeline, and the tier-2 read surfaces — while merge and the expiry
+sweep remain specification. Design:
 [`docs/design/long-running-transactions.md`](../design/long-running-transactions.md).
 Builds on [ADR-0016](0016-transaction-time-as-data.md) (transaction
 metadata), follows the plan/apply pattern of

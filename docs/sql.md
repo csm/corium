@@ -109,6 +109,12 @@ All views expose normalized metadata and fact relations:
   executes an entry — it is the orchestrator's own record of reverse progress
   outside the database, and it outlives the saga that prompted it.
 
+A saga's *branch* is a database in its own right, so SQL over partial
+progress needs no new relation: `corium sql <db> --saga <id>` runs the same
+projection against the branch's value, with the standing caveat that
+everything read from a branch is provisional under that saga id until the
+registry says it committed.
+
 The two saga relations fold current values, so they are absent from a history
 session, where a saga's assertions and retractions sit side by side and "the
 status" is not a question with one answer; read `corium_sys.datoms` there.

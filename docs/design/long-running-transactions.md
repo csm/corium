@@ -1,15 +1,21 @@
 # Long-Running Transactions (Sagas)
 
-Status: **registry implemented; branches, merge, and the expiry sweep are
-still specification.** Phase 1 of the [delivery sketch](#delivery-sketch) is in
-the tree: the `:db.saga/*` vocabulary, the lifecycle transitions and the rules
-the transactor holds them to ([`corium_tx::saga`](../../crates/corium-tx/src/saga.rs)),
-the read model ([`corium_db::saga`](../../crates/corium-db/src/saga.rs)), the
-peer API ([`corium_peer::saga`](../../crates/corium-peer/src/saga.rs)),
-`corium_sys.sagas`, and `corium saga`. A saga is therefore a durable, expiring
-workflow record with a compensation ledger, and nothing in this document that
-needs a branch — steps, tier-2 reads, merge, guards, conflict reports — exists
-yet. [ADR-0023](../adr/0023-saga-branch-transactions.md) records the decision.
+Status: **registry and branches implemented; merge and the expiry sweep are
+still specification.** Phases 1 and 2 of the [delivery
+sketch](#delivery-sketch) are in the tree: the `:db.saga/*` vocabulary, the
+lifecycle transitions and the rules the transactor holds them to
+([`corium_tx::saga`](../../crates/corium-tx/src/saga.rs)), the read model
+([`corium_db::saga`](../../crates/corium-db/src/saga.rs)), the peer API
+([`corium_peer::saga`](../../crates/corium-peer/src/saga.rs)),
+`corium_sys.sagas`, and `corium saga`; then id-block leasing in the allocator,
+the branch overlay and its pipeline
+([`corium_transactor::branch`](../../crates/corium-transactor/src/branch.rs),
+[`corium_tx::branch`](../../crates/corium-tx/src/branch.rs)), step transacting,
+and tier-2 reads. So a saga today is a durable, expiring workflow record whose
+partial progress is real, queryable, and isolated — what is missing is the way
+back: merge, guards, and conflict reports, plus the expiry sweep that reclaims
+branches. [ADR-0023](../adr/0023-saga-branch-transactions.md) records the
+decision.
 
 A saga is a durable unit of work that spans many transactions and an
 arbitrary amount of wall-clock time, and that either lands in the database
@@ -249,7 +255,8 @@ the whole trick: a reservation constrains the saga's own branch writes
 and never touches any other writer, so it is a contract, not a lock.
 Option B stays rejected.
 
-Enforcement is a step-time check in the branch pipeline, after expansion
+Enforcement is a step-time check in the branch pipeline
+([`corium_tx::branch`](../../crates/corium-tx/src/branch.rs)), after expansion
 and tempid resolution, refusing the step (like any validation error) on
 violation:
 
@@ -321,6 +328,25 @@ shares, and the sweep already collects only what no live root reaches. A
 branch does pin the parent's `t₀`-era segments for as long as it lives,
 which is one reason sagas carry deadlines (below).
 
+*As implemented:* a branch is hosted as an ordinary `DbState` beside its
+parent, under the name `<parent>.saga.<id>` — a name no database can be
+created under, since database names are alphanumeric, so a branch is never
+listed, never stood by for, and never mistaken for one. Making it a database
+is what buys the read surface: a step is an ordinary `Transact`, a tier-2
+reader an ordinary `Subscribe`, and Datalog, Pull, SQL, and the time views
+follow without a line of new read-path code. What it does *not* have of its
+own is a lease or a data key: branch commits are fenced by the parent's write
+lease, because a node that has lost the parent has no business acking a step,
+and branch records are sealed under the parent's key, because a branch shares
+the parent's segments by construction. Its base is built exactly as described
+above — the newest published parent root with index basis `≤ t₀` plus the
+parent log records closing the gap — falling back to replaying the parent's
+prefix when no such root is available or a `t₀`-era segment has already been
+swept, which is always correct because the log is the source of truth. And it
+is opened on demand rather than when the saga opens: creation is a
+deterministic function of the registry entry, so "open the branch if it is not
+hosted" is both the ordinary path and the crash-recovery path.
+
 Branch steps are ordinary transactions with ordinary guarantees: tempids,
 lookup refs, upsert, uniqueness, `:db/cas`, database functions, tx
 metadata — each step validated against the branch's current state and
@@ -355,6 +381,16 @@ not splice* below). Branch tx ids may therefore numerically coincide with
 parent tx ids issued after `t₀`; the two never meet in one database, so
 no ambiguity arises — but surfaces that display both (a console pointed
 at a branch, `corium saga log`) should label ids with their timeline.
+
+*As implemented:* the branch's durable log is an ordinary log numbered from
+one, wrapped in a `RootedLog` that presents it at `t₀ + 1` upward. Every log
+backend, recovery path, and torn-tail truncation therefore works on it
+unchanged, and nothing about the branch's numbering reaches storage. Reads
+splice: a range below `t₀` is answered from the parent's log and a range above
+it from the branch's, so the concatenation is contiguous in `t` and a peer
+subscribing to a branch folds the parent's prefix and the branch's novelty
+into one value — which is how `as-of t ≤ t₀` on a branch answers exactly what
+the parent answers, without copying a byte of history.
 
 Time views on a branch `Db` are the branch's own: `as-of t` for `t ≤ t₀`
 answers identically to the parent's `as-of t` (shared prefix, shared
@@ -424,6 +460,21 @@ while a grant is live the parent's writer refuses assertions naming ids
 inside granted blocks. This is allocator integrity, not a lock — leased
 id space names no user-visible entity, and no legitimate parent
 transaction has business writing there.
+
+*As implemented:* opening stays ordinary transaction data any client can
+compose, and the block is minted inside the writer as part of preparing that
+very transaction — `:db.saga/id-grants` is refused as submitted data, because
+carving a block out of the allocator's counter is the allocator's job. The
+grant datoms therefore ride in the transaction that opens the saga: leased
+but unrecorded is not a state that exists. Two consequences follow in the
+allocator. Recovery floors the parent's next id past every block the registry
+records, open or finished, because a leased block is spent whether or not a
+datom uses it yet and an allocator trusting only the ids it can see would
+reissue the range it promised. And the refusal above covers both positions of
+a datom: a ref *value* naming a granted id would attach parent data to an
+entity the branch has not created yet. Both end when the saga does — a
+committed saga's ids are ordinary entities in the parent, and writing them is
+ordinary work.
 
 ## Merge
 
@@ -781,6 +832,15 @@ else's).
 
 ## Surfaces
 
+*As implemented:* the rules are read from the parent's registry per commit
+batch rather than cached when the branch opens, which is what lets an unsealed
+saga widen its reservation set with an ordinary parent transaction while its
+branch is running. Two further step-time refusals fall out of the same place:
+a step may not write the `:db.saga/*` registry (it lives in the parent, and
+smuggling an entry through the merge would be a nested saga by accident) and
+may not mint an entity in `:db.part/db` (schema belongs to the parent's own
+plan/apply lifecycle; `alter-schema` against a branch is refused outright).
+
 - **Peer API.** `Connection::saga_open(db, opts) → Saga` (opts:
   description, footprint, reservations and `sealed`, expiry, id-grant
   sizing, on-abort compensation); `Saga::reserve(...)` to extend an
@@ -792,7 +852,12 @@ else's).
   `Connection::saga_resume(db, id)`; `Connection::saga_view(db, id) → Db`
   for tier-2 readers. Registry queries are just queries, and the
   external-compensation ledger is written with ordinary transactions —
-  no dedicated API.
+  no dedicated API. *As implemented:* `Connection::saga_branch(id) →
+  SagaBranch` is both of the last two — it opens a second connection, with
+  this one's endpoints, credentials, and keys, to the branch database. Steps
+  go through `SagaBranch::step`, the branch value through `SagaBranch::db`
+  (or `sync`), the step grain through `SagaBranch::steps`, and everything
+  else through the `Connection` underneath, because a branch is a database.
 - **Protocol.** gRPC additions mirroring the peer API; the branch is
   served over the existing database-view machinery (a `DbViewSpec`-shaped
   reference naming the saga), so thin clients get tier-2 reads for free.
@@ -800,7 +865,8 @@ else's).
   (`open --on-abort <fn-ident|edn>`, `abort --compensate <edn>`;
   `status` includes the compensation ledger); `corium console <db>
   --saga <id>` to point a console at a branch; `corium saga log <id>`
-  for step history.
+  for step history. *As implemented:* all of these except `commit`, plus
+  `corium saga step <db> <id> <edn|->`, which transacts one step.
 - **SQL.** A `corium_sys.sagas` system relation over the registry (id, status,
   basis, owner, expiry, description) and a `corium_sys.saga_compensations`
   relation over the ledger, beside the existing system
@@ -858,9 +924,15 @@ else's).
    ordinary transaction data, since minting them is the allocator's job, and
    `:db.saga/owner` is still declared by the client — the transactor stamps
    the authenticated principal when saga authorization lands.
-2. **Branches** — overlay construction, id grants, step transacting, peer
-   and CLI read surfaces (tier 2); `:db.saga/on-abort-fn` invocation,
-   which needs the branch value.
+2. **Branches** *(done, less one piece)* — overlay construction, id grants,
+   step transacting, peer and CLI read surfaces (tier 2). One detail the
+   implementation settled: a branch's naming is the parent's, copied when the
+   branch is first opened and durable from then on, because a step may mint
+   keyword names the parent has never seen and the branch's own log records
+   cannot be decoded without them. `:db.saga/on-abort-fn` invocation, which
+   needs the branch value, is deferred to the phase that owns abort and
+   expiry: applying a compensation atomically with the flip means the
+   transactor, not the client, composing that transaction.
 3. **Merge** — squash, conflict scan, guards, resolutions, the atomic
    commit-and-flip; conflict reports.
 4. **Expiry sweep + retention** — operator-service job with in-transactor
