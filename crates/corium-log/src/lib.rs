@@ -490,7 +490,10 @@ impl RootedLog {
 
     fn outward(&self, mut records: Vec<TxRecord>) -> Vec<TxRecord> {
         for record in &mut records {
-            record.t += self.basis;
+            // Saturating, like `inward`'s subtraction: neither direction has
+            // an error channel, and a `t` that could overflow here has long
+            // since stopped being a transaction number.
+            record.t = record.t.saturating_add(self.basis);
         }
         records
     }

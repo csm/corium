@@ -55,7 +55,9 @@ pub const DEFAULT_ID_BLOCK: i64 = 1 << 20;
 /// A dot is not legal in a database name, which is the point: the branch
 /// namespace cannot collide with a database somebody creates, so a branch is
 /// never listed, never stood by for, and never created by name.
-const BRANCH_INFIX: &str = ".saga.";
+/// What separates a parent database's name from the saga id in a branch
+/// name. Public so a store scan can build the prefix branches share.
+pub const BRANCH_INFIX: &str = ".saga.";
 
 /// The name a saga's branch is hosted under.
 ///

@@ -27,7 +27,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tracing::Instrument;
 
 use crate::backend::{LogBackend, NodeStore, StorageInfoConfig, StoreSpec, open_node_store};
-use crate::branch::{Branch, branch_name, is_branch_name, parse_branch_name};
+use crate::branch::{BRANCH_INFIX, Branch, branch_name, is_branch_name, parse_branch_name};
 use crate::keys::{DbCrypto, DbStore, KeyWiringError, reload_db_crypto, resolve_db_crypto};
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
@@ -1747,8 +1747,12 @@ impl TransactorNode {
                     .map_or_else(|| "statusless".to_owned(), ToString::to_string)
             )));
         }
-        let basis_t = u64::try_from(entry.basis_t.unwrap_or_default())
-            .map_err(|_| NodeError::BadRequest(format!("saga {saga:032x} has no opening basis")))?;
+        let basis_t = entry
+            .basis_t
+            .and_then(|basis| u64::try_from(basis).ok())
+            .ok_or_else(|| {
+                NodeError::BadRequest(format!("saga {saga:032x} has no opening basis"))
+            })?;
         // Without a block the branch could not allocate a single entity, and
         // steps would fail one by one instead of the branch failing to open.
         let floor = entry
@@ -1924,6 +1928,42 @@ impl TransactorNode {
         self.log_backend.delete_all(&name).await?;
         self.store.delete_root(&meta_root_name(&name)).await?;
         Ok(hosted.is_some() || had_log)
+    }
+
+    /// Every branch of `parent` with durable state, hosted or not.
+    ///
+    /// Read from the store rather than the hosted map, and from the store
+    /// rather than the parent's registry: a branch outlives the saga entry's
+    /// open status (a committed branch is retained for its step history), and
+    /// a metadata root is written the first time a branch is opened, so the
+    /// roots are exactly the branches that ever existed.
+    async fn branch_names(&self, parent: &str) -> Result<Vec<String>, NodeError> {
+        let prefix = meta_root_name(&format!("{parent}{BRANCH_INFIX}"));
+        let mut names: Vec<String> = self
+            .store
+            .list_roots(&prefix)
+            .await?
+            .into_iter()
+            .filter_map(|root| root.strip_prefix("meta:").map(ToOwned::to_owned))
+            // `a.saga.<id>` is a prefix of `a.saga.<id>.saga.<id>`, which is
+            // not a branch of `a`.
+            .filter(|name| parse_branch_name(name).is_some_and(|(found, _)| found == parent))
+            .collect();
+        // A branch hosted before it wrote its metadata root would be missed by
+        // the scan alone.
+        names.extend(
+            self.branches
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .filter(|hosted| {
+                    parse_branch_name(hosted).is_some_and(|(found, _)| found == parent)
+                })
+                .cloned(),
+        );
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     /// The branches this node currently hosts, by name.
@@ -2164,16 +2204,13 @@ impl TransactorNode {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(name);
         // A branch has no life apart from its parent: deleting the database
-        // deletes the overlays hosted on it, log and metadata alike.
-        let branches: Vec<String> = self
-            .branches
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .filter(|hosted| parse_branch_name(hosted).is_some_and(|(parent, _)| parent == name))
-            .cloned()
-            .collect();
-        for branch in branches {
+        // deletes the overlays hosted on it, log and metadata alike. The
+        // hosted map is not the list — a branch nobody has touched since this
+        // node started is durable but unhosted, and deleting only what is in
+        // memory would strand its log and metadata behind a name no scan
+        // opens. Every branch writes a metadata root when it is first opened,
+        // so that is the list.
+        for branch in self.branch_names(name).await? {
             if let Some((parent, saga)) = parse_branch_name(&branch) {
                 self.discard_branch(parent, saga).await?;
             }
@@ -2732,6 +2769,14 @@ impl TransactorNode {
             }
             None => None,
         };
+        // The one place branch rules are attached. Everything a branch commits
+        // goes through this loop, so tying the two to the same source is what
+        // keeps a branch from being written as an ordinary database.
+        debug_assert_eq!(
+            rules.is_some(),
+            state.branch.is_some(),
+            "a branch's writes must carry its step rules"
+        );
         let now_ms = now_unix_ms();
         let mut cursor = state.transactor.batch_cursor();
         let mut resps: Vec<oneshot::Sender<Result<pb::TransactResponse, NodeError>>> = Vec::new();

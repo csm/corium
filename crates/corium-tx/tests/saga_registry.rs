@@ -523,6 +523,32 @@ fn the_transaction_that_commits_a_saga_may_write_its_block() {
 }
 
 #[test]
+fn aborting_a_saga_does_not_open_its_block() {
+    let db = fixture();
+    let (db, saga) = opened(&db, 1);
+    let (db, leased) = with_grant(&db, saga, 8_000, 1_000);
+    // An abort ends the saga without merging anything, and the branch stays
+    // readable afterwards — so a write into the block in the same append
+    // would alias an entity the branch still shows under that id, with no
+    // merge to reconcile the two.
+    let error = prepare(
+        &db,
+        vec![
+            add_to(
+                saga,
+                bootstrap::SAGA_STATUS,
+                status(&db, &SagaStatus::Aborted),
+            ),
+            add_to(leased, NOTE, Value::Str(Arc::from("aliased"))),
+        ],
+        tx(3),
+        1_000,
+    )
+    .expect_err("only the merge writes a leased block");
+    assert!(matches!(violation(error), SagaViolation::GrantedId(e) if e == leased));
+}
+
+#[test]
 fn the_compensation_ledger_outlives_the_saga() {
     let db = fixture();
     let (db, entity) = opened(&db, 1);

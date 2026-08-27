@@ -421,3 +421,62 @@ async fn a_branch_survives_a_restart_with_its_allocations_intact() {
     entities.dedup();
     assert_eq!(entities.len(), 2, "the restart reused an id: {entities:?}");
 }
+
+#[tokio::test]
+async fn deleting_a_database_takes_its_branches_with_it() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let node = TransactorNode::open(config(dir.path()))
+        .await
+        .expect("node");
+    assert!(
+        node.create_db("main", &schema(), None)
+            .await
+            .expect("create")
+    );
+    open_saga(&node, "").await;
+    let name = branch_name("main", SAGA);
+    node.transact(&name, &encoded("[{:db/id \"new\" :item/value 1}]"))
+        .await
+        .expect("a step, so the branch has durable state");
+
+    // Restart, so the branch has a log and a metadata root but is hosted by
+    // nobody: this is the state the hosted map cannot see, and the one a
+    // deletion would stranded storage behind if it only swept memory.
+    drop(node);
+    let node = TransactorNode::open(config(dir.path()))
+        .await
+        .expect("reopen");
+    assert!(
+        node.hosted_branches().is_empty(),
+        "a branch is opened on demand, not by the startup scan"
+    );
+
+    assert!(node.delete_db("main").await.expect("delete"));
+
+    // Nothing of the branch is left: recreating the parent must not find a
+    // saga's half-written overlay waiting under the same name.
+    assert!(
+        node.create_db("main", &schema(), None)
+            .await
+            .expect("recreate")
+    );
+    open_saga(&node, "").await;
+    let parent = node.db_state("main").await.expect("main");
+    let attribute = item_value(&parent.db());
+    let branch = node.db_state(&name).await.expect("a fresh branch");
+    let db = branch.db();
+    // The recreated database opens the saga at basis 0, so its branch starts
+    // there. The deleted branch had taken a step, so a log that survived the
+    // deletion would put this one at 1 instead.
+    assert_eq!(
+        db.basis_t(),
+        0,
+        "a fresh branch starts at its own t₀, not on the deleted log's tail"
+    );
+    assert!(
+        !db.datoms()
+            .iter()
+            .any(|datom| datom.a == attribute && datom.v == corium_core::Value::Long(1)),
+        "the deleted branch's step must not come back"
+    );
+}

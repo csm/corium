@@ -41,7 +41,7 @@ use corium_tx::branch::BranchRules;
 
 use crate::node::{DbState, NodeError};
 
-pub use corium_db::saga::{branch_name, is_branch_name, parse_branch_name};
+pub use corium_db::saga::{BRANCH_INFIX, branch_name, is_branch_name, parse_branch_name};
 
 /// What a hosted [`DbState`] needs to know to be a branch.
 pub struct Branch {

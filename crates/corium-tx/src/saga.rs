@@ -141,19 +141,24 @@ pub fn validate(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
 /// and a saga may perfectly well name ids it was itself leased. Refusing
 /// those would refuse a saga its own bookkeeping.
 ///
-/// The one transaction that may write inside a block is the one that finishes
-/// the saga holding it, which is what the merge is.
+/// The one transaction that may write inside a block is the one that commits
+/// the saga holding it, which is the merge.
 fn validate_granted_ids(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
     let grants: Vec<_> = saga::open_entries(db)
         .into_iter()
-        // A saga this transaction is finishing is not an open saga to the
-        // datoms beside the flip. This is the merge: the transaction that
-        // commits a saga carries its branch novelty, ids and all, and lands
-        // both as one append. The refusal protects unspent leases, and by the
-        // end of this transaction the lease is spent or abandoned either way.
+        // A saga this transaction *commits* is not an open saga to the datoms
+        // beside the flip. This is the merge: the transaction that commits a
+        // saga carries its branch novelty, ids and all, and lands both as one
+        // append, after which those ids are ordinary parent entities.
+        //
+        // Only `:committed`. An abort or an expiry ends the saga without
+        // merging anything, and the branch is retained and readable
+        // afterwards — so ids written into the block by the aborting
+        // transaction would alias entities the branch still shows under the
+        // same ids, with no merge to reconcile the two.
         .filter(|entry| {
             saga::asserted_status(db, entry.entity, datoms)
-                .is_none_or(|status| !status.is_terminal())
+                .is_none_or(|status| status != SagaStatus::Committed)
         })
         .flat_map(|entry| entry.grants)
         .collect();

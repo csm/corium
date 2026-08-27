@@ -328,6 +328,16 @@ shares, and the sweep already collects only what no live root reaches. A
 branch does pin the parent's `t₀`-era segments for as long as it lives,
 which is one reason sagas carry deadlines (below).
 
+*As implemented:* a branch never publishes an index and never writes a
+segment — it is excluded from the startup, standby, and indexer scans by
+name — so it holds the parent's storage keys as a snapshot taken when it
+opened and does nothing with them afterwards. A parent key rotation replaces
+the segment key store, not the record cipher, so a branch's log keeps sealing
+under the cipher it opened with and a rotation mid-saga changes nothing about
+it; the branch picks the parent's current keys up the next time it is opened.
+Key *fencing* is not a snapshot: a branch asks its parent, so a fenced parent
+stops its branches too.
+
 *As implemented:* a branch is hosted as an ordinary `DbState` beside its
 parent, under the name `<parent>.saga.<id>` — a name no database can be
 created under, since database names are alphanumeric, so a branch is never
@@ -929,10 +939,30 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
    implementation settled: a branch's naming is the parent's, copied when the
    branch is first opened and durable from then on, because a step may mint
    keyword names the parent has never seen and the branch's own log records
-   cannot be decoded without them. `:db.saga/on-abort-fn` invocation, which
-   needs the branch value, is deferred to the phase that owns abort and
-   expiry: applying a compensation atomically with the flip means the
-   transactor, not the client, composing that transaction.
+   cannot be decoded without them. Two consequences are known and left for
+   the merge phase to close, because merge is where schema reconciliation is
+   actually decided:
+
+   * *The snapshot is taken at first open, not at `t₀`.* Naming is not
+     versioned by `t`, so the parent's naming as of `t₀` is not
+     reconstructible without replaying its log from zero. A branch first
+     opened long after `t₀` therefore sees attributes installed since — which
+     is harmless for reading (its base has no datoms under them) but means
+     the same saga can get different schemas depending on when someone first
+     touched its branch. It is deterministic per branch, not per saga.
+   * *A parent migration does not reach an open branch.* Steps naming
+     post-snapshot attributes fail to resolve, and steps already taken were
+     validated against the older schema. The merge is the checkpoint that
+     matters — it validates the branch's novelty against the parent's
+     *current* schema — so migrations are not refused while sagas are open:
+     a schema change that takes days to roll out should not be blocked by a
+     saga that takes days to finish. What a long-lived saga owes is a
+     re-validation at merge, which is exactly what it gets.
+
+   `:db.saga/on-abort-fn` invocation, which needs the branch value, is
+   deferred to the phase that owns abort and expiry: applying a compensation
+   atomically with the flip means the transactor, not the client, composing
+   that transaction.
 3. **Merge** — squash, conflict scan, guards, resolutions, the atomic
    commit-and-flip; conflict reports.
 4. **Expiry sweep + retention** — operator-service job with in-transactor

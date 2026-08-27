@@ -217,7 +217,13 @@ fn lease_saga_grants(
         datoms.push(fact(
             grant,
             corium_db::bootstrap::SAGA_GRANT_START,
-            corium_core::Value::Long(i64::try_from(start).unwrap_or(i64::MAX)),
+            // Entity sequences are 42-bit, so this cannot fail. Saturating
+            // instead would record a block whose end does not fit, leaving a
+            // grant that contains nothing and silently refuses the branch
+            // every id it was promised.
+            corium_core::Value::Long(
+                i64::try_from(start).expect("an entity sequence fits in an i64"),
+            ),
         ));
         datoms.push(fact(
             grant,
@@ -291,6 +297,15 @@ impl BatchCursor {
     /// `:db/txInstant` stays monotone via `max(now, last + 1)`. On error the
     /// cursor is unchanged, so a rejected transaction leaves the rest of the
     /// batch unaffected.
+    ///
+    /// This applies no saga-branch rules, and neither do
+    /// [`EmbeddedTransactor::transact`] and
+    /// [`EmbeddedTransactor::transact_async`] beneath it: an embedded
+    /// transactor has no branches. A branch is written through
+    /// [`BatchCursor::prepare_step`] instead, which is the node's only write
+    /// path for one — writing a branch through this method would silently
+    /// skip the reservation, registry, and schema refusals that make its
+    /// novelty mergeable.
     ///
     /// # Errors
     /// Returns [`TxError`] when the transaction fails resolution or validation.
