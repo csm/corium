@@ -1727,6 +1727,13 @@ impl TransactorNode {
         saga: u128,
         name: &str,
     ) -> Result<Arc<DbState>, NodeError> {
+        // A branch of a branch has no merge story in v1, and resolving one
+        // would recurse through `db_state` besides.
+        if is_branch_name(parent) {
+            return Err(NodeError::BadRequest(format!(
+                "{parent} is itself a saga branch; sagas do not nest"
+            )));
+        }
         let parent_state = self.db_state(parent).await?;
         let entry = corium_db::saga::entry(&parent_state.db(), saga).ok_or_else(|| {
             NodeError::BadRequest(format!("no saga {saga:032x} in {parent}'s registry"))

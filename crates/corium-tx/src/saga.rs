@@ -134,8 +134,23 @@ pub fn validate(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
 /// Both positions are checked. A ref *value* naming a granted id would attach
 /// parent data to an entity the branch has not created yet — and, at merge,
 /// to whichever entity the branch happened to give that id.
+///
+/// The one transaction that may write inside a block is the one that finishes
+/// the saga holding it, which is what the merge is.
 fn validate_granted_ids(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
-    let grants = saga::live_grants(db);
+    let grants: Vec<_> = saga::open_entries(db)
+        .into_iter()
+        // A saga this transaction is finishing is not an open saga to the
+        // datoms beside the flip. This is the merge: the transaction that
+        // commits a saga carries its branch novelty, ids and all, and lands
+        // both as one append. The refusal protects unspent leases, and by the
+        // end of this transaction the lease is spent or abandoned either way.
+        .filter(|entry| {
+            saga::asserted_status(db, entry.entity, datoms)
+                .is_none_or(|status| !status.is_terminal())
+        })
+        .flat_map(|entry| entry.grants)
+        .collect();
     if grants.is_empty() {
         return Ok(());
     }
