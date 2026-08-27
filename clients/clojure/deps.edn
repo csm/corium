@@ -1,7 +1,7 @@
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/core.async {:mvn/version "1.8.741"}
-        dev.corium/corium-client {:mvn/version "0.1.81"}}
+        dev.corium/corium-client {:mvn/version "0.1.86"}}
  :aliases
  {:test {:extra-paths ["test"]
          :main-opts ["-m" "corium.test-runner"]}
@@ -17,16 +17,16 @@
   ;; of these aliases in an application; RemotePeer needs none of them.
   :native-linux-x86-64
   {:extra-deps
-   {dev.corium/corium-client$linux-x86_64 {:mvn/version "0.1.81"}}}
+   {dev.corium/corium-client$linux-x86_64 {:mvn/version "0.1.86"}}}
   :native-linux-aarch64
   {:extra-deps
-   {dev.corium/corium-client$linux-aarch64 {:mvn/version "0.1.81"}}}
+   {dev.corium/corium-client$linux-aarch64 {:mvn/version "0.1.86"}}}
   :native-macos-x86-64
   {:extra-deps
-   {dev.corium/corium-client$macos-x86_64 {:mvn/version "0.1.81"}}}
+   {dev.corium/corium-client$macos-x86_64 {:mvn/version "0.1.86"}}}
   :native-macos-aarch64
   {:extra-deps
-   {dev.corium/corium-client$macos-aarch64 {:mvn/version "0.1.81"}}}
+   {dev.corium/corium-client$macos-aarch64 {:mvn/version "0.1.86"}}}
   :native-windows-x86-64
   {:extra-deps
-   {dev.corium/corium-client$windows-x86_64 {:mvn/version "0.1.81"}}}}}
+   {dev.corium/corium-client$windows-x86_64 {:mvn/version "0.1.86"}}}}}
