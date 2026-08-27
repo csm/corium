@@ -1,5 +1,6 @@
 //! Pure transaction expansion, entity resolution, and validation.
 
+pub mod branch;
 pub mod saga;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -170,6 +171,10 @@ pub enum TxError {
     /// rely on (see [`saga`]).
     #[error("{0}")]
     Saga(#[from] saga::SagaViolation),
+    /// A saga branch's step said something about the parent's graph the saga
+    /// never declared, or claimed ids it was not leased (see [`branch`]).
+    #[error("{0}")]
+    Step(#[from] branch::StepViolation),
     /// A retraction or `:db/cas` old value named a class the attribute has
     /// never been sealed under — a form it never had.
     #[error("attribute {attr} was never sealed under class {class}")]

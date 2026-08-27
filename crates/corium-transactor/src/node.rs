@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use corium_core::{Datom, IndexOrder, KeywordInterner, Schema};
+use corium_core::{Datom, IndexOrder, KeywordInterner, Partition, Schema};
 use corium_crypt::{KeyId, Keyring};
 use corium_db::{Db, Idents};
-use corium_log::{LogError, TransactionLog, TxRecord};
+use corium_log::{LogError, RootedLog, TransactionLog, TxRecord};
 use corium_protocol::codec::{self, CodecError};
 use corium_protocol::pb;
 use corium_protocol::schemaform::{SchemaFormError, schema_from_edn};
@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tracing::Instrument;
 
 use crate::backend::{LogBackend, NodeStore, StorageInfoConfig, StoreSpec, open_node_store};
+use crate::branch::{Branch, branch_name, is_branch_name, parse_branch_name};
 use crate::keys::{DbCrypto, DbStore, KeyWiringError, reload_db_crypto, resolve_db_crypto};
 use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
@@ -436,6 +437,10 @@ pub struct DbState {
     index_policy: Mutex<IndexPolicy>,
     held_lease: Mutex<Lease>,
     deposed: AtomicBool,
+    /// Present when this state is a saga's branch rather than a database
+    /// (ADR-0023): its steps obey the saga's declaration, and its commits are
+    /// fenced by the parent's lease.
+    branch: Option<Branch>,
 }
 
 impl DbState {
@@ -472,7 +477,13 @@ impl DbState {
     }
 
     /// The error writes refuse with while the keys are fenced, if they are.
+    ///
+    /// A branch seals its records under the parent's keys, so it is the
+    /// parent's alarm that must stop it writing.
     fn keys_fenced_error(&self) -> Option<NodeError> {
+        if let Some(branch) = &self.branch {
+            return branch.parent.keys_fenced_error();
+        }
         if !self.keys_fenced.load(Ordering::Acquire) {
             return None;
         }
@@ -519,6 +530,12 @@ impl DbState {
         self.transactor.db()
     }
 
+    /// The saga this state is a branch of, when it is one.
+    #[must_use]
+    pub const fn branch(&self) -> Option<&Branch> {
+        self.branch.as_ref()
+    }
+
     /// Watch channel following the commit basis.
     #[must_use]
     pub fn basis_watch(&self) -> watch::Receiver<u64> {
@@ -556,6 +573,21 @@ impl DbState {
             .clone()
     }
 
+    /// The schema, ident registry, and interner this database currently
+    /// names its data by.
+    #[must_use]
+    pub fn naming_snapshot(&self) -> (Schema, Idents, KeywordInterner) {
+        let naming = self
+            .naming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            naming.schema.clone(),
+            naming.idents.clone(),
+            naming.interner.clone(),
+        )
+    }
+
     /// Encoded schema/ident handshake payload plus a consistent basis and
     /// interner snapshot for backfill encoding.
     #[must_use]
@@ -572,15 +604,55 @@ impl DbState {
 
     /// Reads committed records in `[start, end)` from the durable log.
     ///
+    /// A branch answers from two logs (ADR-0023). Its own log holds the
+    /// steps, numbered from `t₀ + 1`; everything at or below `t₀` is the
+    /// parent's history, which the branch shares rather than copies. Splicing
+    /// them here is what makes a branch a whole database to every reader that
+    /// reads a log: the concatenation is contiguous and in `t` order, so a
+    /// peer subscribing to a branch folds the parent's prefix and the
+    /// branch's novelty into one value, and `as-of t` for `t ≤ t₀` answers
+    /// exactly what the parent answers.
+    ///
     /// # Errors
     /// Returns an error when the log cannot be read.
     pub async fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, NodeError> {
-        Ok(self.log.tx_range_async(start, end).await?)
+        let Some(branch) = &self.branch else {
+            return Ok(self.log.tx_range_async(start, end).await?);
+        };
+        let split = branch.basis_t() + 1;
+        let mut records = Vec::new();
+        if start < split {
+            let prefix_end = end.map_or(split, |end| end.min(split));
+            records.extend(
+                branch
+                    .parent
+                    .log
+                    .tx_range_async(start, Some(prefix_end))
+                    .await?,
+            );
+        }
+        let tail_start = start.max(split);
+        if end.is_none_or(|end| end > tail_start) {
+            records.extend(self.log.tx_range_async(tail_start, end).await?);
+        }
+        Ok(records)
     }
 
     /// Verifies this node still owns the write lease (identity check on
     /// the root record; expiry changes from renewals do not matter).
+    ///
+    /// A branch is fenced by its parent's lease. A branch has no lease of its
+    /// own because it has no independent existence: the node that owns the
+    /// parent hosts its branches, and one that has lost the parent must not
+    /// acknowledge a step against them either.
     async fn check_lease(&self, store: &dyn RootStore) -> Result<Lease, NodeError> {
+        match &self.branch {
+            Some(branch) => Box::pin(branch.parent.check_lease(store)).await,
+            None => self.check_own_lease(store).await,
+        }
+    }
+
+    async fn check_own_lease(&self, store: &dyn RootStore) -> Result<Lease, NodeError> {
         if self.deposed.load(Ordering::Acquire) {
             return Err(NodeError::Deposed(self.name.clone()));
         }
@@ -609,6 +681,13 @@ pub struct TransactorNode {
     /// Serializes forks: two forks to the same target must not interleave
     /// appends into one target log.
     fork_lock: tokio::sync::Mutex<()>,
+    /// Saga branches hosted beside their parents (ADR-0023). They are kept
+    /// apart from `dbs` because they are not databases: nothing lists them,
+    /// nothing stands by for them, and nothing may create one by name.
+    branches: std::sync::RwLock<HashMap<String, Arc<DbState>>>,
+    /// Serializes branch opening, so two callers racing the first step of a
+    /// saga do not build two overlays over one branch log.
+    branch_lock: tokio::sync::Mutex<()>,
     metrics: Metrics,
     shutdown: watch::Sender<Option<String>>,
 }
@@ -621,6 +700,31 @@ fn now_unix_ms() -> i64 {
             .as_millis(),
     )
     .unwrap_or(i64::MAX)
+}
+
+/// Beats the subscription stream of `state` every `interval`.
+///
+/// A subscriber treats silence as a dead transactor and fails over, so every
+/// hosted state needs this — a saga branch as much as a database, even though
+/// a branch has no lease to renew and no indexes to publish, which is the
+/// rest of what maintenance does.
+fn spawn_heartbeat(state: &Arc<DbState>, interval: Duration) {
+    let db = Arc::clone(state);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if db.deposed.load(Ordering::Acquire) {
+                return;
+            }
+            let _ = db
+                .broadcast
+                .send(pb::subscribe_item::Item::Heartbeat(pb::Heartbeat {
+                    basis_t: db.db().basis_t(),
+                }));
+        }
+    });
 }
 
 /// The error a group-commit batch hands every one of its callers when it
@@ -670,6 +774,8 @@ impl TransactorNode {
             standby: std::sync::RwLock::new(BTreeSet::new()),
             gc_lock: tokio::sync::Mutex::new(()),
             fork_lock: tokio::sync::Mutex::new(()),
+            branches: std::sync::RwLock::new(HashMap::new()),
+            branch_lock: tokio::sync::Mutex::new(()),
             metrics: Metrics::default(),
             shutdown: watch::channel(None).0,
         });
@@ -679,6 +785,9 @@ impl TransactorNode {
             .await?
             .into_iter()
             .filter_map(|root| root.strip_prefix("meta:").map(str::to_owned))
+            // Saga branches carry metadata roots of their own, and are not
+            // databases: they are opened beside the parent that owns them.
+            .filter(|name| !is_branch_name(name))
             .collect();
         for name in names {
             match node.open_db(&name).await {
@@ -891,6 +1000,7 @@ impl TransactorNode {
             index_policy: Mutex::new(IndexPolicy::from_config(&self.config)),
             held_lease: Mutex::new(held),
             deposed: AtomicBool::new(false),
+            branch: None,
         });
         self.spawn_maintenance(&state);
         Ok(state)
@@ -1048,6 +1158,7 @@ impl TransactorNode {
             .await?
             .into_iter()
             .filter_map(|root| root.strip_prefix("meta:").map(str::to_owned))
+            .filter(|name| !is_branch_name(name))
             .collect();
         {
             let mut standby = self
@@ -1133,24 +1244,7 @@ impl TransactorNode {
             }
         });
         self.spawn_indexing(state);
-        // Heartbeats.
-        let node = Arc::clone(self);
-        let db = Arc::clone(state);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(node.config.heartbeat_interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                if db.deposed.load(Ordering::Acquire) {
-                    return;
-                }
-                let _ = db
-                    .broadcast
-                    .send(pb::subscribe_item::Item::Heartbeat(pb::Heartbeat {
-                        basis_t: db.db().basis_t(),
-                    }));
-            }
-        });
+        spawn_heartbeat(state, self.config.heartbeat_interval);
     }
 
     /// Spawns the background indexing job, paced by the database's
@@ -1283,6 +1377,16 @@ impl TransactorNode {
         use corium_forms::planner::{PlanOptions, installed_schema, plan_against};
 
         let state = self.db_state(&request.db).await?;
+        // Schema migration has its own plan/apply lifecycle against the
+        // parent, and a branch's novelty is validated against the parent's
+        // schema at merge; a branch that could migrate would be planning
+        // against a database nobody else can see (ADR-0023).
+        if state.branch().is_some() {
+            return Err(NodeError::BadRequest(format!(
+                "{} is a saga branch; schema changes belong to the parent database",
+                request.db
+            )));
+        }
         let forms = match codec::decode_edn(&request.desired_schema)? {
             Edn::Vector(forms) | Edn::List(forms) => forms,
             other => {
@@ -1544,6 +1648,12 @@ impl TransactorNode {
         {
             return Ok(state);
         }
+        // A saga branch is named for the saga it hosts, and is opened on
+        // demand: whoever asks for it first — a step, a tier-2 reader — is
+        // what builds the overlay (ADR-0023).
+        if let Some((parent, saga)) = parse_branch_name(name) {
+            return Box::pin(self.saga_branch(parent, saga)).await;
+        }
         if self.config.ha
             && self
                 .standby
@@ -1564,6 +1674,263 @@ impl TransactorNode {
             });
         }
         Err(NodeError::UnknownDb(name.to_owned()))
+    }
+
+    /// Opens (creating on first use) the branch hosting saga `saga` of
+    /// database `parent` — ADR-0023's overlay construction.
+    ///
+    /// The branch is the parent's value as of the saga's opening basis `t₀`
+    /// with the branch's own log replayed on top, and its allocator points at
+    /// the entity-id blocks the parent leased the saga. Everything it needs
+    /// is durable registry data plus two logs, so this is equally the ordinary
+    /// path (a saga's first step) and the recovery path (a step after the
+    /// node restarted): opening is a deterministic function of the registry
+    /// entry, and doing it twice yields the same branch.
+    ///
+    /// # Errors
+    /// Returns [`NodeError::BadRequest`] when the saga is unknown, is not
+    /// open, or its registry entry is missing the basis or the id blocks a
+    /// branch cannot be built without; otherwise store or log failures.
+    pub async fn saga_branch(&self, parent: &str, saga: u128) -> Result<Arc<DbState>, NodeError> {
+        let name = branch_name(parent, saga);
+        if let Some(state) = self
+            .branches
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&name)
+            .cloned()
+        {
+            return Ok(state);
+        }
+        let _guard = self.branch_lock.lock().await;
+        if let Some(state) = self
+            .branches
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&name)
+            .cloned()
+        {
+            return Ok(state);
+        }
+        let state = self.open_branch(parent, saga, &name).await?;
+        spawn_heartbeat(&state, self.config.heartbeat_interval);
+        self.branches
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name, Arc::clone(&state));
+        Ok(state)
+    }
+
+    async fn open_branch(
+        &self,
+        parent: &str,
+        saga: u128,
+        name: &str,
+    ) -> Result<Arc<DbState>, NodeError> {
+        let parent_state = self.db_state(parent).await?;
+        let entry = corium_db::saga::entry(&parent_state.db(), saga).ok_or_else(|| {
+            NodeError::BadRequest(format!("no saga {saga:032x} in {parent}'s registry"))
+        })?;
+        if !entry.is_open() {
+            return Err(NodeError::BadRequest(format!(
+                "saga {saga:032x} is {}; it has no live branch",
+                entry
+                    .status
+                    .as_ref()
+                    .map_or_else(|| "statusless".to_owned(), ToString::to_string)
+            )));
+        }
+        let basis_t = u64::try_from(entry.basis_t.unwrap_or_default())
+            .map_err(|_| NodeError::BadRequest(format!("saga {saga:032x} has no opening basis")))?;
+        // Without a block the branch could not allocate a single entity, and
+        // steps would fail one by one instead of the branch failing to open.
+        let floor = entry
+            .grants
+            .iter()
+            .filter(|grant| grant.partition == Some(i64::from(Partition::User as u32)))
+            .filter_map(|grant| grant.start)
+            .filter_map(|start| u64::try_from(start).ok())
+            .min()
+            .ok_or_else(|| {
+                NodeError::BadRequest(format!(
+                    "saga {saga:032x} holds no entity-id grants; its branch cannot allocate"
+                ))
+            })?;
+        // A branch's naming is the parent's, copied when the branch is first
+        // opened and durable from then on: a step may mint keyword names the
+        // parent has never seen, and the branch's own log records cannot be
+        // decoded without them.
+        let stored_meta = self.store.get_root(&meta_root_name(name)).await?;
+        let (schema, idents, interner) = if let Some(meta) = stored_meta {
+            codec::decode_metadata(&meta)?
+        } else {
+            let (schema, idents, interner) = parent_state.naming_snapshot();
+            let meta = codec::encode_metadata(&schema, &idents, &interner);
+            self.store
+                .cas_root(&meta_root_name(name), None, &meta)
+                .await?;
+            (schema, idents, interner)
+        };
+        let base = self
+            .branch_base(&parent_state, basis_t, &schema, &idents, &interner)
+            .await?;
+        // The branch shares the parent's data key: same trust domain, and it
+        // shares the parent's segments by construction.
+        let crypto = parent_state.crypto();
+        let held = parent_state.lease();
+        // The branch's own log is an ordinary log numbered from one; rooting
+        // it at `t₀` is what makes its first step `t₀ + 1` without copying a
+        // byte of the parent's prefix.
+        let log: Arc<dyn TransactionLog> = Arc::new(RootedLog::new(
+            self.log_backend
+                .open(name, held.version, crypto.cipher.clone())
+                .await?,
+            basis_t,
+        ));
+        let transactor = EmbeddedTransactor::recover_from_async(base, Arc::clone(&log)).await?;
+        transactor.raise_allocation_floor(floor);
+        let basis = transactor.db().basis_t();
+        Ok(Arc::new(DbState {
+            name: name.to_owned(),
+            transactor,
+            log,
+            crypto: std::sync::RwLock::new(crypto),
+            key_manifest_version: AtomicU64::new(
+                parent_state.key_manifest_version.load(Ordering::Acquire),
+            ),
+            keys_unavailable: AtomicBool::new(false),
+            keys_fenced: AtomicBool::new(false),
+            fenced_active_epoch: AtomicU32::new(0),
+            naming: Mutex::new(Naming {
+                schema,
+                idents,
+                interner,
+            }),
+            commit: tokio::sync::Mutex::new(()),
+            pending: Mutex::new(VecDeque::new()),
+            broadcast: broadcast::channel(1024).0,
+            basis: watch::channel(basis).0,
+            index_basis: AtomicU64::new(0),
+            index_policy: Mutex::new(IndexPolicy::from_config(&self.config)),
+            held_lease: Mutex::new(held),
+            deposed: AtomicBool::new(false),
+            branch: Some(Branch {
+                parent: parent_state,
+                saga,
+                basis_t,
+            }),
+        }))
+    }
+
+    /// Materializes the parent's value as of `basis_t`: the branch's base.
+    ///
+    /// This is the three-layer read of the design, and never more: the newest
+    /// published parent root whose index basis is at or below `t₀`, plus the
+    /// parent log records closing the gap to `t₀`. Both layers are frozen —
+    /// the branch's base never moves — so what the branch adds on top is only
+    /// ever its own log.
+    ///
+    /// Any missing or unreadable snapshot falls back to replaying the
+    /// parent's log prefix, which is always correct because the log is the
+    /// source of truth; it is also the honest answer once garbage collection
+    /// has swept a `t₀`-era segment the published root no longer names.
+    async fn branch_base(
+        &self,
+        parent: &Arc<DbState>,
+        basis_t: u64,
+        schema: &Schema,
+        idents: &Idents,
+        interner: &KeywordInterner,
+    ) -> Result<Db, NodeError> {
+        let root = self
+            .store
+            .get_root(&db_root_name(parent.name()))
+            .await?
+            .as_deref()
+            .and_then(DbRoot::decode);
+        let snapshot = match &root {
+            Some(root)
+                if root.index_basis_t <= basis_t
+                    && root.next_entity_id != 0
+                    && root.roots.is_some()
+                    && root.history_roots.is_some() =>
+            {
+                let roots = root.roots.as_ref().expect("checked above");
+                let history_roots = root.history_roots.as_ref().expect("checked above");
+                match Self::load_history_snapshot(
+                    parent.store().as_ref(),
+                    root,
+                    &roots[IndexOrder::Eavt as usize],
+                    &history_roots[IndexOrder::Eavt as usize],
+                    schema,
+                    idents,
+                    interner,
+                )
+                .await
+                {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        tracing::warn!(
+                            db = %parent.name(),
+                            %error,
+                            "branch base could not use the published root; replaying the log prefix"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let mut db = snapshot.unwrap_or_else(|| {
+            Db::new(schema.clone()).with_naming(idents.clone(), interner.clone())
+        });
+        let records = parent
+            .log
+            .tx_range_async(db.basis_t() + 1, Some(basis_t + 1))
+            .await?;
+        for record in records {
+            db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
+        }
+        Ok(db)
+    }
+
+    /// Stops hosting a saga's branch and removes its durable state.
+    ///
+    /// Discarding is what abort, expiry, and the end of a retention window
+    /// each come to; it is idempotent, and reports whether the branch was
+    /// there to discard.
+    ///
+    /// # Errors
+    /// Returns an error when the branch's log or metadata cannot be removed.
+    pub async fn discard_branch(&self, parent: &str, saga: u128) -> Result<bool, NodeError> {
+        let name = branch_name(parent, saga);
+        let _guard = self.branch_lock.lock().await;
+        let hosted = self
+            .branches
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&name);
+        if let Some(state) = &hosted {
+            state.deposed.store(true, Ordering::Release);
+        }
+        let had_log = self.log_backend.exists(&name).await;
+        self.log_backend.delete_all(&name).await?;
+        self.store.delete_root(&meta_root_name(&name)).await?;
+        Ok(hosted.is_some() || had_log)
+    }
+
+    /// The branches this node currently hosts, by name.
+    #[must_use]
+    pub fn hosted_branches(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .branches
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
     }
 
     /// Databases this node currently stands by for (HA mode).
@@ -1789,6 +2156,21 @@ impl TransactorNode {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(name);
+        // A branch has no life apart from its parent: deleting the database
+        // deletes the overlays hosted on it, log and metadata alike.
+        let branches: Vec<String> = self
+            .branches
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|hosted| parse_branch_name(hosted).is_some_and(|(parent, _)| parent == name))
+            .cloned()
+            .collect();
+        for branch in branches {
+            if let Some((parent, saga)) = parse_branch_name(&branch) {
+                self.discard_branch(parent, saga).await?;
+            }
+        }
         self.store.delete_root(&db_root_name(name)).await?;
         self.store.delete_root(&meta_root_name(name)).await?;
         // The manifest goes with the database: leaving it would block
@@ -2327,6 +2709,22 @@ impl TransactorNode {
         // The one exception is a batch that interns new keywords, which
         // publishes the unfenced metadata root — that path re-checks ownership
         // before writing it, below.
+        // A branch's steps are bound by what its saga declared, read from
+        // the parent's registry now rather than cached when the branch
+        // opened: an unsealed saga may widen its reservation set with an
+        // ordinary parent transaction while the branch runs (ADR-0023).
+        let rules = match state.branch.as_ref().map(Branch::step_rules) {
+            Some(Ok(rules)) => Some(rules),
+            Some(Err(error)) => {
+                for request in batch {
+                    let _ = request
+                        .resp
+                        .send(Err(NodeError::BadRequest(error.to_string())));
+                }
+                return;
+            }
+            None => None,
+        };
         let now_ms = now_unix_ms();
         let mut cursor = state.transactor.batch_cursor();
         let mut resps: Vec<oneshot::Sender<Result<pb::TransactResponse, NodeError>>> = Vec::new();
@@ -2395,7 +2793,11 @@ impl TransactorNode {
             if let Some(interner) = minted {
                 cursor.intern_naming(interner);
             }
-            match cursor.prepare(items, now_ms) {
+            let prepare = match &rules {
+                Some(rules) => cursor.prepare_step(items, now_ms, rules),
+                None => cursor.prepare(items, now_ms),
+            };
+            match prepare {
                 Ok(prep) => {
                     measure.clear();
                     let _ = corium_log::append_framed_record(&mut measure, &prep.record);

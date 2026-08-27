@@ -4,6 +4,7 @@
 pub mod authz;
 pub mod backend;
 pub mod backup;
+pub mod branch;
 pub mod keys;
 pub mod lease;
 pub mod metrics;
@@ -24,7 +25,7 @@ use corium_db::{Db, FIRST_USER_ID, Idents};
 use corium_index::{Leaf, LeafId, Segment};
 use corium_log::{LogError, TransactionLog, TxRecord};
 use corium_store::{BlobId, BlobStore, RootStore, StoreError};
-use corium_tx::{PreparedTx, TxError, TxItem, prepare};
+use corium_tx::{PreparedTx, TxError, TxItem, branch::BranchRules, prepare};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, mpsc},
@@ -152,6 +153,93 @@ fn next_user_id<'a>(datoms: impl Iterator<Item = &'a corium_core::Datom>, floor:
         .fold(floor, u64::max)
 }
 
+/// Raises an allocation floor past every entity-id block the saga registry
+/// records (ADR-0023).
+///
+/// A leased block is spent even though no datom in the parent uses it yet:
+/// the branch is allocating from it right now, or the saga it belonged to
+/// abandoned it and left a hole. Either way the ids it covers are gone, and
+/// an allocator recovering from the log alone would see nothing to stop it
+/// handing them out a second time.
+fn floor_past_grants(db: &Db, next_user: u64) -> u64 {
+    next_user.max(corium_db::saga::grant_ceiling(db, Partition::User as u32))
+}
+
+/// Mints the entity-id blocks for sagas this transaction opens, appending the
+/// grant datoms to it and advancing `next` past the blocks (ADR-0023).
+///
+/// Leasing happens here, inside the single writer that allocates parent ids,
+/// because that serialization is the whole guarantee: the block is carved out
+/// of the same counter every other transaction allocates from, and the grant
+/// datoms recording it ride in the very transaction that opens the saga. A
+/// crash between the two is therefore not a state that exists.
+///
+/// `corium-tx` refuses grant datoms in submitted transaction data, so this
+/// runs after preparation and adds to what preparation produced: opening
+/// stays an ordinary transaction any client can compose, and only the block
+/// inside it is the transactor's to write.
+fn lease_saga_grants(
+    before: &Db,
+    datoms: &mut Vec<corium_core::Datom>,
+    tx: EntityId,
+    next: &mut u64,
+) {
+    let opened: Vec<EntityId> = datoms
+        .iter()
+        .filter(|datom| datom.a == corium_db::bootstrap::SAGA_ID && datom.added)
+        .map(|datom| datom.e)
+        .filter(|entity| corium_db::saga::entry_at(before, *entity).is_none())
+        .collect();
+    for saga in opened {
+        let grant = EntityId::new(Partition::User as u32, *next);
+        *next += 1;
+        let start = *next;
+        let length = corium_db::saga::DEFAULT_ID_BLOCK;
+        *next = next.saturating_add(length.unsigned_abs());
+        let fact =
+            |e: EntityId, a: corium_core::AttrId, v: corium_core::Value| corium_core::Datom {
+                e,
+                a,
+                v,
+                tx,
+                added: true,
+            };
+        datoms.push(fact(
+            saga,
+            corium_db::bootstrap::SAGA_ID_GRANTS,
+            corium_core::Value::Ref(grant),
+        ));
+        datoms.push(fact(
+            grant,
+            corium_db::bootstrap::SAGA_GRANT_PARTITION,
+            corium_core::Value::Long(i64::from(Partition::User as u32)),
+        ));
+        datoms.push(fact(
+            grant,
+            corium_db::bootstrap::SAGA_GRANT_START,
+            corium_core::Value::Long(i64::try_from(start).unwrap_or(i64::MAX)),
+        ));
+        datoms.push(fact(
+            grant,
+            corium_db::bootstrap::SAGA_GRANT_LENGTH,
+            corium_core::Value::Long(length),
+        ));
+    }
+}
+
+/// The allocation high-water after preparing a transaction: past every id it
+/// allocated for a tempid, and past any entity-id block it leased.
+fn advance_allocation(before: &Db, prepared: &mut PreparedTx, tx: EntityId, next_user: u64) -> u64 {
+    let mut next = prepared
+        .tempids
+        .values()
+        .filter(|e| e.partition() == Partition::User as u32)
+        .map(|e| e.sequence() + 1)
+        .fold(next_user, u64::max);
+    lease_saga_grants(before, &mut prepared.datoms, tx, &mut next);
+    next
+}
+
 /// A transaction prepared against a [`BatchCursor`] but not yet durable,
 /// carrying its log record and the pieces needed to build a [`TxReport`] once
 /// the batch is durable.
@@ -211,22 +299,48 @@ impl BatchCursor {
         items: impl IntoIterator<Item = TxItem>,
         now_ms: i64,
     ) -> Result<Prepared, TxError> {
+        self.prepare_transaction(items, now_ms, None)
+    }
+
+    /// Prepares one saga-branch step against the cursor (ADR-0023).
+    ///
+    /// A step is an ordinary transaction with the branch's additional
+    /// refusals applied to what it expands to — allocations from the leased
+    /// blocks, writes and refs inside the reservation set, no registry and no
+    /// schema. The checks run before the cursor advances, so a refused step
+    /// leaves the branch exactly as it was, like any other validation error.
+    ///
+    /// # Errors
+    /// Returns [`TxError`] when the transaction fails ordinary resolution or
+    /// validation, or when it breaks one of the branch's rules
+    /// ([`corium_tx::branch::StepViolation`]).
+    pub fn prepare_step(
+        &mut self,
+        items: impl IntoIterator<Item = TxItem>,
+        now_ms: i64,
+        rules: &BranchRules,
+    ) -> Result<Prepared, TxError> {
+        self.prepare_transaction(items, now_ms, Some(rules))
+    }
+
+    fn prepare_transaction(
+        &mut self,
+        items: impl IntoIterator<Item = TxItem>,
+        now_ms: i64,
+        rules: Option<&BranchRules>,
+    ) -> Result<Prepared, TxError> {
         let before = self.db.clone();
         let t = before.basis_t() + 1;
         let tx_id = EntityId::new(Partition::Tx as u32, t);
         let mut prepared = prepare(&before, items, tx_id, self.next_user)?;
+        if let Some(rules) = rules {
+            corium_tx::branch::validate_step(&prepared.datoms, rules)?;
+        }
+        self.next_user = advance_allocation(&before, &mut prepared, tx_id, self.next_user);
         let tx_instant = seal_tx_instant(&mut prepared.datoms, t, now_ms, self.last_instant)?;
         let after = before
             .clone()
             .with_transaction_at(t, tx_instant, &prepared.datoms);
-        self.next_user = prepared
-            .tempids
-            .values()
-            .filter(|e| e.partition() == Partition::User as u32)
-            .map(|e| e.sequence() + 1)
-            .max()
-            .unwrap_or(self.next_user)
-            .max(self.next_user);
         self.last_instant = tx_instant;
         self.db = after.clone();
         Ok(Prepared {
@@ -377,7 +491,7 @@ impl EmbeddedTransactor {
         // Allocation must resume past every id that ever appeared in the log,
         // not just ids with current datoms; otherwise a fully retracted
         // entity's id would be reused after a restart.
-        let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
+        let next_user = floor_past_grants(&db, next_user_id(db.recorded_datoms(), FIRST_USER_ID));
         Ok(Self {
             log,
             state: Mutex::new(State {
@@ -415,7 +529,7 @@ impl EmbeddedTransactor {
             db = db.with_transaction_at(record.t, record.tx_instant, &record.datoms);
             last_instant = last_instant.max(tx_instant);
         }
-        let next_user = next_user_id(db.recorded_datoms(), FIRST_USER_ID);
+        let next_user = floor_past_grants(&db, next_user_id(db.recorded_datoms(), FIRST_USER_ID));
         Self {
             log,
             state: Mutex::new(State {
@@ -472,6 +586,7 @@ impl EmbeddedTransactor {
             last_instant = last_instant.max(tx_instant);
             next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
         }
+        let next_user = floor_past_grants(&db, next_user);
         Ok(Self {
             log,
             state: Mutex::new(State {
@@ -508,6 +623,7 @@ impl EmbeddedTransactor {
             last_instant = last_instant.max(tx_instant);
             next_user = next_user.max(next_user_id(record.datoms.iter(), next_user));
         }
+        let next_user = floor_past_grants(&db, next_user);
         Ok(Self {
             log,
             state: Mutex::new(State {
@@ -541,6 +657,32 @@ impl EmbeddedTransactor {
             .db
             .clone()
     }
+    /// Raises the entity-id allocation floor to `floor`.
+    ///
+    /// A saga branch allocates out of the blocks its parent leased it, not
+    /// out of the counter its base value implies: the base is the parent as
+    /// of `t₀`, whose next free id belongs to the parent. Raising the floor
+    /// once at branch open is what points the branch's allocator at its own
+    /// block, and it is idempotent, so re-opening a branch after a restart
+    /// (whose log tail may already have consumed part of the block) keeps
+    /// whichever floor is higher.
+    pub fn raise_allocation_floor(&self, floor: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.next_user = state.next_user.max(floor);
+    }
+
+    /// The next entity id this transactor would allocate.
+    #[must_use]
+    pub fn next_entity_id(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_user
+    }
+
     /// Subscribes to reports for transactions committed after this call.
     pub fn subscribe(&self) -> mpsc::Receiver<TxReport> {
         let (tx, rx) = mpsc::channel();
@@ -571,6 +713,7 @@ impl EmbeddedTransactor {
         let t = before.basis_t() + 1;
         let tx_id = EntityId::new(Partition::Tx as u32, t);
         let mut prepared = prepare(&before, items, tx_id, state.next_user)?;
+        let next_user = advance_allocation(&before, &mut prepared, tx_id, state.next_user);
         let millis = i64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -586,14 +729,7 @@ impl EmbeddedTransactor {
         })?;
         state.db = before.with_transaction_at(t, tx_instant, &prepared.datoms);
         state.last_instant = tx_instant;
-        state.next_user = prepared
-            .tempids
-            .values()
-            .filter(|e| e.partition() == Partition::User as u32)
-            .map(|e| e.sequence() + 1)
-            .max()
-            .unwrap_or(state.next_user)
-            .max(state.next_user);
+        state.next_user = next_user;
         let report = TxReport {
             db_before: before,
             db_after: state.db.clone(),
@@ -619,7 +755,7 @@ impl EmbeddedTransactor {
         items: impl IntoIterator<Item = TxItem>,
     ) -> Result<TxReport, TransactError> {
         let _commit = self.async_commit.lock().await;
-        let (before, prepared, t, tx_instant) = {
+        let (before, prepared, t, tx_instant, next_user) = {
             let mut state = self
                 .state
                 .lock()
@@ -631,6 +767,7 @@ impl EmbeddedTransactor {
             let t = before.basis_t() + 1;
             let tx_id = EntityId::new(Partition::Tx as u32, t);
             let mut prepared = prepare(&before, items, tx_id, state.next_user)?;
+            let next_user = advance_allocation(&before, &mut prepared, tx_id, state.next_user);
             let millis = i64::try_from(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -640,7 +777,7 @@ impl EmbeddedTransactor {
             .unwrap_or(i64::MAX);
             let tx_instant = seal_tx_instant(&mut prepared.datoms, t, millis, state.last_instant)?;
             state.async_pending = true;
-            (before, prepared, t, tx_instant)
+            (before, prepared, t, tx_instant, next_user)
         };
         let record = TxRecord {
             t,
@@ -665,14 +802,7 @@ impl EmbeddedTransactor {
             .clone()
             .with_transaction_at(t, tx_instant, &prepared.datoms);
         state.last_instant = tx_instant;
-        state.next_user = prepared
-            .tempids
-            .values()
-            .filter(|e| e.partition() == Partition::User as u32)
-            .map(|e| e.sequence() + 1)
-            .max()
-            .unwrap_or(state.next_user)
-            .max(state.next_user);
+        state.next_user = state.next_user.max(next_user);
         state.async_pending = false;
         pending.active = false;
         let report = TxReport {
