@@ -9,6 +9,7 @@
 
 pub mod authz;
 pub mod metrics;
+pub mod saga;
 pub mod seal;
 pub mod segment;
 pub mod server;
@@ -63,6 +64,10 @@ pub enum PeerError {
     /// The connection background task has stopped.
     #[error("connection closed")]
     Closed,
+    /// A saga operation the registry's state does not allow, refused before
+    /// it reached the transactor (see [`saga`]).
+    #[error("{0}")]
+    Saga(String),
     /// A transaction form could not be expanded far enough to seal it.
     #[error(transparent)]
     TxForm(#[from] corium_forms::txforms::TxFormError),

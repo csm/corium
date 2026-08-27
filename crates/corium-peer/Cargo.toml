@@ -18,11 +18,16 @@ corium-log = { workspace = true }
 corium-protocol = { workspace = true }
 corium-query = { workspace = true }
 corium-store = { workspace = true }
+getrandom = "0.3"
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-stream = "0.1.18"
 tonic = { version = "0.14.5", features = ["tls-ring"] }
+
+[dev-dependencies]
+corium-transactor = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

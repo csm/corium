@@ -1,5 +1,7 @@
 //! Pure transaction expansion, entity resolution, and validation.
 
+pub mod saga;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use corium_core::{Cardinality, Datom, EntityId, Partition, Unique, Value};
@@ -33,6 +35,16 @@ pub enum EntityRef {
 pub enum TxOp {
     /// Assert a fact.
     Add(EntityRef, EntityId, Value),
+    /// Assert a reference whose *value* is an entity position, so a
+    /// transaction can point at an entity it is creating in the same breath.
+    ///
+    /// Without this, a client could only attach a new entity to an existing
+    /// one it could already name — which makes a component child impossible
+    /// to create and link atomically, since the child's id is allocated here.
+    /// Only assertion takes this form: retracting or compare-and-swapping a
+    /// fact about an entity that does not exist yet is not a thing a
+    /// transaction can mean.
+    AddRef(EntityRef, EntityId, EntityRef),
     /// Retract a fact.
     Retract(EntityRef, EntityId, Value),
     /// Compare and swap a cardinality-one value.
@@ -154,6 +166,10 @@ pub enum TxError {
     /// immutable database cannot make an attribute disappear from history.
     #[error("attribute {0} is retired and refuses new assertions")]
     RetiredAttribute(EntityId),
+    /// A write would leave the saga registry in a state no reader could
+    /// rely on (see [`saga`]).
+    #[error("{0}")]
+    Saga(#[from] saga::SagaViolation),
     /// A retraction or `:db/cas` old value named a class the attribute has
     /// never been sealed under — a form it never had.
     #[error("attribute {attr} was never sealed under class {class}")]
@@ -263,23 +279,28 @@ pub fn prepare(
     }
     let mut next = next_user_sequence.max(FIRST_USER_ID);
     for op in &ops {
-        let entity = match op {
+        // Both positions of a reference are entity positions, and either may
+        // be the transaction-local one.
+        let entities: [Option<&EntityRef>; 2] = match op {
             TxOp::Add(e, ..) | TxOp::Retract(e, ..) | TxOp::Cas(e, ..) | TxOp::RetractEntity(e) => {
-                e
+                [Some(e), None]
             }
+            TxOp::AddRef(e, _, target) => [Some(e), Some(target)],
         };
-        if let EntityRef::Temp(temp) = entity {
-            // The transaction's own entity is already allocated; metadata
-            // assertions resolve to it rather than to a fresh id.
-            if temp == TX_TEMPID {
-                tempids.insert(temp.clone(), tx);
-                continue;
+        for entity in entities.into_iter().flatten() {
+            if let EntityRef::Temp(temp) = entity {
+                // The transaction's own entity is already allocated; metadata
+                // assertions resolve to it rather than to a fresh id.
+                if temp == TX_TEMPID {
+                    tempids.insert(temp.clone(), tx);
+                    continue;
+                }
+                tempids.entry(temp.clone()).or_insert_with(|| {
+                    let e = EntityId::new(Partition::User as u32, next);
+                    next += 1;
+                    e
+                });
             }
-            tempids.entry(temp.clone()).or_insert_with(|| {
-                let e = EntityId::new(Partition::User as u32, next);
-                next += 1;
-                e
-            });
         }
     }
     let resolve = |entity: &EntityRef| -> Result<EntityId, TxError> {
@@ -300,7 +321,15 @@ pub fn prepare(
     let mut tx_instant_asserted = false;
     for op in ops {
         let start = datoms.len();
+        // A reference to a transaction-local entity becomes an ordinary
+        // assertion the moment both positions are resolved; everything after
+        // this point sees one kind of assertion.
+        let op = match op {
+            TxOp::AddRef(entity, a, target) => TxOp::Add(entity, a, Value::Ref(resolve(&target)?)),
+            other => other,
+        };
         match op {
+            TxOp::AddRef(..) => unreachable!("references are resolved before this match"),
             TxOp::Add(entity, a, v) => {
                 let e = resolve(&entity)?;
                 if a == bootstrap::TX_INSTANT {
@@ -431,6 +460,10 @@ pub fn prepare(
         }
         working = working.with_transaction(working.basis_t() + 1, &datoms[start..]);
     }
+    // The registry's invariants are properties of the whole transaction — a
+    // transition is a retraction and an assertion together — so they are
+    // checked against what the transaction leaves behind, not op by op.
+    saga::validate(db, &datoms)?;
     Ok(PreparedTx { datoms, tempids })
 }
 

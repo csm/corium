@@ -99,6 +99,19 @@ All views expose normalized metadata and fact relations:
   `t`, and `added`.
 - `corium_sys.attributes` describes the Corium schema.
 - `corium_sys.idents` maps entity ids to keyword idents.
+- `corium_sys.sagas` is the saga registry (ADR-0023): one row per saga, with
+  its id, status, opening basis, owner, deadline, whether its reservation set
+  is sealed, and counts of what it declares. Statuses render as the bare name
+  (`open`, `committed`, `aborted`, `expired`); a status the engine does not
+  define renders as its whole keyword, so it can never pass for one of them.
+- `corium_sys.saga_compensations` is the external-compensation ledger, one row
+  per entry, joined to `corium_sys.sagas` on `saga_id`. The engine never
+  executes an entry — it is the orchestrator's own record of reverse progress
+  outside the database, and it outlives the saga that prompted it.
+
+The two saga relations fold current values, so they are absent from a history
+session, where a saga's assertions and retractions sit side by side and "the
+status" is not a question with one answer; read `corium_sys.datoms` there.
 
 A history session initially exposes only `corium_sys` relations, so additions
 and retractions remain unambiguous events. Wide history tables are reserved for

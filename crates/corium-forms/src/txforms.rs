@@ -258,7 +258,8 @@ pub fn tx_value(
         return match entity_ref(db, form)? {
             EntityRef::Id(e) => Ok(Value::Ref(e)),
             EntityRef::Temp(name) => Err(TxFormError::BadValue(format!(
-                "value-position tempid \"{name}\" must be resolved by the client"
+                "tempid \"{name}\" names an entity this transaction is creating, \
+                 which only an assertion may reference"
             ))),
             EntityRef::Lookup(a, v) => db
                 .lookup(a, &v)
@@ -284,14 +285,15 @@ pub fn tx_items_from_edn(
     interner: &mut KeywordInterner,
     forms: &[Edn],
 ) -> Result<Vec<TxItem>, TxFormError> {
-    forms
-        .iter()
-        .map(|form| match form {
-            Edn::Vector(items) => list_form(db, interner, items, form),
-            Edn::Map(pairs) => map_form(db, interner, pairs),
-            other => Err(TxFormError::BadForm(other.to_string())),
-        })
-        .collect()
+    let mut items = Vec::with_capacity(forms.len());
+    for form in forms {
+        match form {
+            Edn::Vector(list) => items.push(list_form(db, interner, list, form)?),
+            Edn::Map(pairs) => items.extend(map_form(db, interner, pairs)?),
+            other => return Err(TxFormError::BadForm(other.to_string())),
+        }
+    }
+    Ok(items)
 }
 
 fn list_form(
@@ -317,11 +319,13 @@ fn list_form(
     Ok(TxItem::Op(match name.as_str() {
         "db/add" => {
             let attr = attr_of(db, arg(2)?)?;
-            TxOp::Add(
-                entity_ref(db, arg(1)?)?,
-                attr,
-                tx_value(db, interner, attr, arg(3)?)?,
-            )
+            let entity = entity_ref(db, arg(1)?)?;
+            // A ref whose value is a tempid points at an entity this
+            // transaction is creating, and only the transactor can resolve it.
+            match value_tempid(db, attr, arg(3)?) {
+                Some(target) => TxOp::AddRef(entity, attr, EntityRef::Temp(target)),
+                None => TxOp::Add(entity, attr, tx_value(db, interner, attr, arg(3)?)?),
+            }
         }
         "db/retract" => {
             let attr = attr_of(db, arg(2)?)?;
@@ -349,11 +353,36 @@ fn list_form(
     }))
 }
 
+/// The tempid a value-position form names, when the attribute is a reference.
+///
+/// A bare string in value position is only ever a tempid: every other value a
+/// ref attribute can hold has a form of its own (`#eid`, a lookup ref, an
+/// ident keyword), and a ref cannot hold a string.
+fn value_tempid(db: &Db, attr: EntityId, form: &Edn) -> Option<String> {
+    match form {
+        Edn::Str(name)
+            if db
+                .schema()
+                .get(attr)
+                .is_some_and(|meta| meta.value_type == ValueType::Ref) =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Expands a map form into the assertions it stands for.
+///
+/// Literal values become one [`TxItem::Map`] — the shape the engine expands
+/// attribute by attribute — while values naming a transaction-local entity
+/// become reference assertions beside it, since a map's values are resolved
+/// values and a tempid is not one yet.
 fn map_form(
     db: &Db,
     interner: &mut KeywordInterner,
     pairs: &[(Edn, Edn)],
-) -> Result<TxItem, TxFormError> {
+) -> Result<Vec<TxItem>, TxFormError> {
     let id_key = kw("db/id");
     let entity = pairs
         .iter()
@@ -361,32 +390,118 @@ fn map_form(
         .map(|(_, value)| entity_ref(db, value))
         .ok_or_else(|| TxFormError::BadForm("map form requires :db/id".into()))??;
     let mut attributes = Vec::new();
+    let mut references = Vec::new();
     for (key, value) in pairs.iter().filter(|(key, _)| *key != id_key) {
         let attr = attr_of(db, key)?;
         // A vector value is a cardinality-many set of values unless it reads
         // as a lookup ref (`[:attr value]`), matching the corpus convention.
         let many = matches!(value, Edn::Vector(items)
             if !(items.len() == 2 && items[0].as_keyword().is_some()));
-        let values = if many {
-            value
-                .as_seq()
-                .unwrap_or_default()
-                .iter()
-                .map(|item| tx_value(db, interner, attr, item))
-                .collect::<Result<Vec<_>, _>>()?
+        let forms = if many {
+            value.as_seq().unwrap_or_default().to_vec()
         } else {
-            vec![tx_value(db, interner, attr, value)?]
+            vec![value.clone()]
         };
-        attributes.push((attr, values));
+        let mut values = Vec::new();
+        for form in &forms {
+            match value_tempid(db, attr, form) {
+                Some(target) => references.push(TxItem::Op(TxOp::AddRef(
+                    entity.clone(),
+                    attr,
+                    EntityRef::Temp(target),
+                ))),
+                None => values.push(tx_value(db, interner, attr, form)?),
+            }
+        }
+        if !values.is_empty() {
+            attributes.push((attr, values));
+        }
     }
-    Ok(TxItem::Map(EntityMap { entity, attributes }))
+    let mut items = vec![TxItem::Map(EntityMap { entity, attributes })];
+    items.extend(references);
+    Ok(items)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corium_core::{Sealed, ValueType};
-    use corium_query::edn::read_one;
+    use corium_core::{Attribute, Cardinality, Sealed, ValueType};
+    use corium_query::edn::{read_all, read_one};
+
+    /// A database with one ref attribute, `:parent/child`.
+    fn db_with_ref_attribute() -> (Db, EntityId) {
+        let attr = EntityId::new(corium_core::Partition::Db as u32, 100);
+        let mut schema = corium_core::Schema::default();
+        schema.insert(Attribute {
+            id: attr,
+            value_type: ValueType::Ref,
+            cardinality: Cardinality::One,
+            unique: None,
+            is_component: true,
+            indexed: false,
+            no_history: false,
+        });
+        let mut idents = corium_db::Idents::default();
+        idents.insert(corium_core::Keyword::new(Some("parent"), "child"), attr);
+        (
+            Db::new(schema).with_naming(idents, KeywordInterner::default()),
+            attr,
+        )
+    }
+
+    /// A component child has to be created and attached in one transaction:
+    /// its id is allocated by the transactor, so the parent can only name it
+    /// by the tempid the same transaction gives it.
+    #[test]
+    fn a_reference_may_name_an_entity_this_transaction_creates() {
+        let (db, attr) = db_with_ref_attribute();
+        let mut interner = KeywordInterner::default();
+        let forms = read_all(r#"[:db/add "parent" :parent/child "child"]"#).expect("parses");
+        let items = tx_items_from_edn(&db, &mut interner, &forms).expect("converts");
+        assert_eq!(
+            items,
+            vec![TxItem::Op(TxOp::AddRef(
+                EntityRef::Temp("parent".into()),
+                attr,
+                EntityRef::Temp("child".into()),
+            ))]
+        );
+    }
+
+    /// The map form is sugar for assertions, so it expands the same way — the
+    /// literal attributes as a map, the tempid reference beside it.
+    #[test]
+    fn a_map_form_expands_a_tempid_reference_beside_its_literals() {
+        let (db, attr) = db_with_ref_attribute();
+        let mut interner = KeywordInterner::default();
+        let forms = read_all(r#"{:db/id "parent" :parent/child "child"}"#).expect("parses");
+        let items = tx_items_from_edn(&db, &mut interner, &forms).expect("converts");
+        assert_eq!(
+            items,
+            vec![
+                TxItem::Map(EntityMap {
+                    entity: EntityRef::Temp("parent".into()),
+                    attributes: Vec::new(),
+                }),
+                TxItem::Op(TxOp::AddRef(
+                    EntityRef::Temp("parent".into()),
+                    attr,
+                    EntityRef::Temp("child".into()),
+                )),
+            ]
+        );
+    }
+
+    /// Retraction and compare-and-swap have no such form: there is nothing to
+    /// retract about an entity that does not exist yet.
+    #[test]
+    fn only_an_assertion_may_name_an_entity_being_created() {
+        let (db, _) = db_with_ref_attribute();
+        let mut interner = KeywordInterner::default();
+        let forms = read_all(r#"[:db/retract "parent" :parent/child "child"]"#).expect("parses");
+        let error = tx_items_from_edn(&db, &mut interner, &forms).expect_err("is refused");
+        assert!(matches!(error, TxFormError::BadValue(_)), "{error:?}");
+    }
 
     #[test]
     fn a_sealed_value_round_trips_through_its_edn_form() {

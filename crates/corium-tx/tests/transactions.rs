@@ -665,3 +665,53 @@ fn a_retired_attribute_refuses_assertions_and_keeps_retractions() {
     .expect("retracting an existing fact stays legal");
     assert_eq!(retraction.datoms.len(), 1);
 }
+
+#[test]
+fn a_reference_to_a_transaction_local_entity_resolves_to_its_allocated_id() {
+    let child = EntityId::new(Partition::Db as u32, 102);
+    let mut schema = Schema::default();
+    schema.insert(attribute(100, ValueType::Str, Cardinality::One, None));
+    schema.insert(corium_core::Attribute {
+        id: child,
+        value_type: ValueType::Ref,
+        cardinality: Cardinality::One,
+        unique: None,
+        is_component: true,
+        indexed: false,
+        no_history: false,
+    });
+    let db = Db::new(schema);
+    let name = EntityId::new(Partition::Db as u32, 100);
+
+    // A component child is created and attached in one transaction: the
+    // parent names it by the tempid, and the transactor resolves both.
+    let prepared = prepare(
+        &db,
+        [
+            TxItem::Op(TxOp::Add(
+                EntityRef::Temp("child".into()),
+                name,
+                Value::Str(Arc::from("leaf")),
+            )),
+            TxItem::Op(TxOp::AddRef(
+                EntityRef::Temp("parent".into()),
+                child,
+                EntityRef::Temp("child".into()),
+            )),
+        ],
+        EntityId::new(Partition::Tx as u32, 1),
+        1_000,
+    )
+    .expect("prepare");
+    let parent = prepared.tempids["parent"];
+    let leaf = prepared.tempids["child"];
+    assert_ne!(parent, leaf);
+    assert!(
+        prepared.datoms.iter().any(|datom| datom.e == parent
+            && datom.a == child
+            && datom.v == Value::Ref(leaf)
+            && datom.added),
+        "the reference resolves to the child's allocated id: {:?}",
+        prepared.datoms
+    );
+}

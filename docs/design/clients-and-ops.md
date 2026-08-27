@@ -11,6 +11,7 @@ corium db create|delete|list <uri>
 corium db fork <src> <dst> [--as-of t]     # point-in-time fork (writable sandbox)
 corium db stats <uri>                      # datom counts, index sizes, basis
 corium schema update <uri> --schema <file> # plan; --apply requires its digest
+corium saga open|list|status|extend|abort <uri> ...  # long-running transactions
 corium gc <uri> [--window 72h]             # segment garbage collection
 corium backup <uri> <dest>                 # see below
 corium restore <src> <uri>
@@ -22,6 +23,14 @@ corium tui <uri>                           # full-screen dashboard (queries + me
 
 Config files are EDN (read via cljrs-reader): storage backend + credentials,
 listen addresses, TLS, memory/fuel budgets, index thresholds.
+
+Sagas are the registry surface of [long-running
+transactions](long-running-transactions.md): `saga open` records durable,
+expiring work in flight (with its owner, advisory footprint, and checked
+reservations), `list`/`status` read the registry — which is ordinary data, also
+projected as `corium_sys.sagas` — and `extend`/`abort` are the transitions an
+owner makes. `commit` and `log` arrive with branches; until then a saga is a
+workflow record with a compensation ledger, not a place to put steps.
 
 Schema updates are plan-first and basis-fenced. The command compares a
 normalized desired file with the installed schema, measures affected data, and

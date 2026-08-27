@@ -1,6 +1,9 @@
 # ADR-0023: Long-running transactions as branch-and-merge sagas
 
-**Status:** Proposed (2026-08-25). Design:
+**Status:** Accepted (2026-08-25); the registry phase is implemented — the
+`:db.saga/*` vocabulary, its lifecycle transitions and the rules the writer
+holds them to, the peer API, `corium_sys.sagas`, and `corium saga` — while
+branches, merge, and the expiry sweep remain specification. Design:
 [`docs/design/long-running-transactions.md`](../design/long-running-transactions.md).
 Builds on [ADR-0016](0016-transaction-time-as-data.md) (transaction
 metadata), follows the plan/apply pattern of
@@ -210,12 +213,12 @@ external compensations, and any pgwire `BEGIN` mapping.
 - The compensation ledger gives orchestrators standard reverse-progress
   bookkeeping in the parent — resumable from data, surviving branch
   deletion, seedable atomically at abort — at the price of more reserved
-  vocabulary and one more SQL surface (`corium_saga_compensations`); the
+  vocabulary and one more SQL surface (`corium_sys.saga_compensations`); the
   engine still never executes an external compensation, and retention may
   end early for a fully-resolved ledger but is never extended by a
   pending one.
 - Every surface grows a saga face: bootstrap vocabulary, peer API,
-  protocol, CLI, console, a `corium_sagas` SQL relation, authz applied
+  protocol, CLI, console, a `corium_sys.sagas` SQL relation, authz applied
   to branch views (ADR-0021 unchanged), operator-service sweep job.
   The registry-first delivery order keeps each phase shippable and the
   data plane free of operator-service dependence.
