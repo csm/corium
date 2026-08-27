@@ -24,8 +24,9 @@
 //!   `:committed` — the flip and the record are one append or neither;
 //! * entity-id grants are the parent allocator's leases. A transaction that
 //!   could mint them could hand itself ids the allocator still believes are
-//!   free — and, for the same reason, no transaction may name an id inside a
-//!   block already leased to an open saga.
+//!   free — and, for the same reason, no transaction may write an entity
+//!   inside a block already leased to an open saga, nor point ordinary data
+//!   at one.
 //!
 //! Everything else about a registry entry — description, footprint,
 //! reservations on an unsealed saga, conflict reports, compensation
@@ -131,9 +132,14 @@ pub fn validate(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
 /// a lock: leased id space names no user-visible entity, and the refusal ends
 /// with the saga, because a committed saga's ids are then ordinary entities.
 ///
-/// Both positions are checked. A ref *value* naming a granted id would attach
-/// parent data to an entity the branch has not created yet — and, at merge,
-/// to whichever entity the branch happened to give that id.
+/// Both positions are checked, but the ref position only for ordinary data.
+/// A user ref naming a granted id would attach parent data to an entity the
+/// branch has not created yet — and, at merge, to whichever entity the branch
+/// happened to give that id. A registry ref is the opposite kind of thing:
+/// the reservation set and the footprint are declarations *about* entities,
+/// naming what a saga will operate on, so they graft nothing onto anything
+/// and a saga may perfectly well name ids it was itself leased. Refusing
+/// those would refuse a saga its own bookkeeping.
 ///
 /// The one transaction that may write inside a block is the one that finishes
 /// the saga holding it, which is what the merge is.
@@ -156,7 +162,7 @@ fn validate_granted_ids(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> 
     }
     for datom in datoms {
         let referenced = match &datom.v {
-            Value::Ref(entity) => Some(*entity),
+            Value::Ref(entity) if !saga::is_registry_attribute(datom.a) => Some(*entity),
             _ => None,
         };
         for entity in [Some(datom.e), referenced].into_iter().flatten() {

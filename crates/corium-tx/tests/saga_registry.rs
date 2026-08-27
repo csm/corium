@@ -16,6 +16,10 @@ use corium_tx::{EntityRef, TxError, TxItem, TxOp, prepare};
 /// vocabulary and not registry vocabulary.
 const NOTE: EntityId = EntityId::new(Partition::Db as u32, 5_000);
 
+/// An ordinary user ref attribute, for the difference between pointing at an
+/// entity as data and naming it in a declaration.
+const NOTE_REF: EntityId = EntityId::new(Partition::Db as u32, 5_001);
+
 fn fixture() -> Db {
     let mut schema = Schema::default();
     let mut idents = Idents::default();
@@ -23,6 +27,15 @@ fn fixture() -> Db {
     schema.insert(corium_core::Attribute {
         id: NOTE,
         value_type: corium_core::ValueType::Str,
+        cardinality: corium_core::Cardinality::One,
+        unique: None,
+        is_component: false,
+        indexed: false,
+        no_history: false,
+    });
+    schema.insert(corium_core::Attribute {
+        id: NOTE_REF,
+        value_type: corium_core::ValueType::Ref,
         cardinality: corium_core::Cardinality::One,
         unique: None,
         is_component: false,
@@ -436,13 +449,13 @@ fn an_open_sagas_leased_ids_are_refused_to_everyone_else() {
     .expect_err("leased ids are the allocator's promise");
     assert!(matches!(violation(error), SagaViolation::GrantedId(e) if e == leased));
 
-    // So is referencing one: a ref value would attach parent data to an
-    // entity the branch has not created yet.
+    // So is referencing one from ordinary data: a ref value would attach
+    // parent data to an entity the branch has not created yet.
     let error = prepare(
         &db,
         vec![add_to(
             EntityId::new(Partition::User as u32, 1_100),
-            bootstrap::SAGA_ON_ABORT_FN,
+            NOTE_REF,
             Value::Ref(leased),
         )],
         tx(3),
@@ -460,6 +473,28 @@ fn an_open_sagas_leased_ids_are_refused_to_everyone_else() {
         1_000,
     )
     .expect("ids outside every block are ordinary");
+}
+
+#[test]
+fn a_saga_may_declare_ids_it_was_leased() {
+    let db = fixture();
+    let (db, saga) = opened(&db, 1);
+    let (db, leased) = with_grant(&db, saga, 8_000, 1_000);
+    // The reservation set and the footprint name entities, they do not write
+    // them — and a block is carved off the allocator's counter, so the ids
+    // just above it are exactly the ones a caller declares when it means "the
+    // entities this saga will deal with". Refusing these would refuse a saga
+    // its own bookkeeping.
+    prepare(
+        &db,
+        vec![
+            add_to(saga, bootstrap::SAGA_RESERVES, Value::Ref(leased)),
+            add_to(saga, bootstrap::SAGA_FOOTPRINT, Value::Ref(leased)),
+        ],
+        tx(3),
+        1_000,
+    )
+    .expect("a declaration is not a write");
 }
 
 #[test]
