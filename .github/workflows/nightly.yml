@@ -15,7 +15,13 @@ name: Nightly Release
 # night sees a tag at HEAD with no release and resumes that version instead of
 # allocating a new one, so a version can never exist with some artifacts
 # published and the rest missing. Every publish step is idempotent for that
-# reason.
+# reason: each one asks its registry what is already live at this version,
+# skips that, and retries only the failures a retry can actually fix — see
+# .github/scripts/publish-crates.sh, publish-java.sh, and publish-clojars.sh.
+# Idempotent also means re-runnable *now*, not just tomorrow: Maven Central in
+# particular keeps publishing for a long time after it accepts a bundle, and
+# uploading a second one on top of the first is rejected until the first
+# finishes.
 on:
   schedule:
     # 07:00 UTC daily — after the US working day, before the European one.
@@ -249,28 +255,14 @@ jobs:
             git push origin "$TAG"
           fi
 
+      # Excludes crates already live at this version so a resumed release does
+      # not trip over its own partial upload, and retries the transport
+      # failures that leave one behind in the first place.
       - name: Publish crates
         if: env.DRY_RUN != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          # Build --exclude list for packages already live at this version.
-          # Makes the step idempotent so a retry after a partial failure is safe.
-          EXCLUDE=()
-          while IFS= read -r pkg; do
-            name="${pkg%%@*}"
-            ver="${pkg##*@}"
-            if curl -sf "https://crates.io/api/v1/crates/${name}/${ver}" \
-                 -H "User-Agent: corium-publish/1.0" | grep -q '"num"'; then
-              echo "Already published: ${name}@${ver} — skipping"
-              EXCLUDE+=(--exclude "${name}")
-            fi
-          done < <(cargo metadata --no-deps --format-version 1 \
-                     | jq -r '.packages[] | "\(.name)@\(.version)"')
-
-          cargo publish --workspace \
-            --no-verify \
-            "${EXCLUDE[@]}"
+        run: .github/scripts/publish-crates.sh
 
   java-native:
     name: Build Java native jars
@@ -292,38 +284,23 @@ jobs:
       url: https://central.sonatype.com/artifact/dev.corium/corium-client/${{ needs.check.outputs.version }}
     permissions:
       contents: read
+    # The publish itself waits on the Portal, which can take an hour on a bad
+    # night, and may then wait again on a deployment left in flight by a
+    # previous run. Well above that, but far below the six hour default: a job
+    # killed mid-deployment is the state that is awkward to recover from.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.check.outputs.tag }}
 
-      - name: Check for an existing release
-        id: central
-        env:
-          VERSION: ${{ needs.check.outputs.version }}
-        run: |
-          # Makes a resumed release safe: Maven Central rejects a redeploy of a
-          # version it already holds, which would otherwise fail every retry
-          # after the Java client shipped but a later registry did not. A resume
-          # is at least a day later, so the Portal has long since synced to
-          # repo1 by the time this runs.
-          POM_URL="https://repo1.maven.org/maven2/dev/corium/corium-client/${VERSION}/corium-client-${VERSION}.pom"
-          if curl --fail --silent --show-error --output /dev/null "$POM_URL"; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "dev.corium:corium-client $VERSION is already on Maven Central."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/download-artifact@v4
-        if: steps.central.outputs.exists != 'true'
         with:
           pattern: java-native-*
           path: dist
           merge-multiple: true
 
       - uses: actions/setup-java@v4
-        if: steps.central.outputs.exists != 'true'
         with:
           distribution: temurin
           java-version: '17'
@@ -335,17 +312,20 @@ jobs:
           gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
           gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
+      # Skips with success when the version is already on Central, waits out a
+      # deployment the Portal has not finished rather than uploading a second
+      # one on top of it, and retries transport failures. See the script for
+      # why a plain `mvn deploy` cannot be re-run. Both the publish and the
+      # recovery need the Portal token: the script talks to the same API the
+      # publishing plugin does.
       - name: Publish to Maven Central
-        if: steps.central.outputs.exists != 'true'
-        run: >-
-          mvn -f clients/java/pom.xml --batch-mode
-          --activate-profiles release,native
-          -Dcorium.native.jars=${{ github.workspace }}/dist
-          deploy
         env:
+          VERSION: ${{ needs.check.outputs.version }}
+          NATIVE_JARS: ${{ github.workspace }}/dist
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           MAVEN_CENTRAL_TOKEN: ${{ secrets.MAVEN_CENTRAL_TOKEN }}
           MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: .github/scripts/publish-java.sh
 
   clojure-publish:
     name: Publish Clojure client to Clojars

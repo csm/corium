@@ -70,28 +70,14 @@ jobs:
         working-directory: clients/clojure
         run: clojure -T:build jar
 
-      - name: Check for an existing release
-        id: release
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          POM_URL="https://repo.clojars.org/dev/corium/corium-clojure/${VERSION}/corium-clojure-${VERSION}.pom"
-          if curl --fail --silent --show-error --output /dev/null "$POM_URL"; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "dev.corium/corium-clojure $VERSION is already on Clojars."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
+      # Skips with success when Clojars already serves this version, and
+      # retries transport failures. Clojars refuses to redeploy a release, so a
+      # deploy that dies mid-upload has to be resumable rather than repeated —
+      # see the script.
       - name: Publish to Clojars
-        if: steps.release.outputs.exists != 'true'
         working-directory: clients/clojure
         env:
+          VERSION: ${{ inputs.version }}
           CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
           CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
-        run: |
-          if [ -z "$CLOJARS_USERNAME" ] || [ -z "$CLOJARS_PASSWORD" ]; then
-            echo "CLOJARS_USERNAME and CLOJARS_PASSWORD are required." >&2
-            exit 1
-          fi
-          clojure -X:deploy
+        run: ${{ github.workspace }}/.github/scripts/publish-clojars.sh
