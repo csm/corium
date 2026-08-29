@@ -432,6 +432,114 @@ pub trait TransactionLog: Send + Sync {
     }
 }
 
+/// A log whose transactions are numbered from a basis rather than from one.
+///
+/// Every durable log in Corium numbers its records `1, 2, 3, …`, because
+/// every database starts empty. A saga branch does not (ADR-0023): it is
+/// rooted at its parent's basis `t₀`, its first step is `t₀ + 1`, and the
+/// numbers below `t₀` belong to the parent's log, which the branch shares
+/// rather than copies. This wrapper is the whole of that difference — the
+/// records inside are an ordinary contiguous log from one, and callers see
+/// them at `t + basis`.
+///
+/// Deliberately not part of the branch's *storage* format: the inner log is
+/// exactly what any other log is, so every backend, every recovery path, and
+/// every torn-tail truncation works on it unchanged.
+pub struct RootedLog {
+    inner: Arc<dyn TransactionLog>,
+    basis: u64,
+}
+
+impl RootedLog {
+    /// Presents `inner` as a log whose first record is `basis + 1`.
+    #[must_use]
+    pub fn new(inner: Arc<dyn TransactionLog>, basis: u64) -> Self {
+        Self { inner, basis }
+    }
+
+    /// The basis this log is rooted at: one below its first record.
+    #[must_use]
+    pub const fn basis(&self) -> u64 {
+        self.basis
+    }
+
+    /// A record renumbered into the inner log's own space.
+    ///
+    /// A record at or below the basis has no place in this log at all, which
+    /// is a caller error rather than a range to clamp.
+    fn inward(&self, record: &TxRecord) -> Result<TxRecord, LogError> {
+        let t = record
+            .t
+            .checked_sub(self.basis)
+            .filter(|t| *t > 0)
+            .ok_or(LogError::Corrupt)?;
+        Ok(TxRecord {
+            t,
+            tx_instant: record.tx_instant,
+            datoms: record.datoms.clone(),
+        })
+    }
+
+    /// A range in this log's numbering, as a range in the inner log's.
+    fn inward_range(&self, start: u64, end: Option<u64>) -> (u64, Option<u64>) {
+        (
+            start.saturating_sub(self.basis),
+            end.map(|end| end.saturating_sub(self.basis)),
+        )
+    }
+
+    fn outward(&self, mut records: Vec<TxRecord>) -> Vec<TxRecord> {
+        for record in &mut records {
+            // Saturating, like `inward`'s subtraction: neither direction has
+            // an error channel, and a `t` that could overflow here has long
+            // since stopped being a transaction number.
+            record.t = record.t.saturating_add(self.basis);
+        }
+        records
+    }
+}
+
+#[async_trait]
+impl TransactionLog for RootedLog {
+    fn append(&self, record: &TxRecord) -> Result<(), LogError> {
+        self.inner.append(&self.inward(record)?)
+    }
+
+    async fn append_async(&self, record: &TxRecord) -> Result<(), LogError> {
+        self.inner.append_async(&self.inward(record)?).await
+    }
+
+    async fn append_batch_async(&self, records: &[TxRecord]) -> Result<(), LogError> {
+        let inward: Vec<TxRecord> = records
+            .iter()
+            .map(|record| self.inward(record))
+            .collect::<Result<_, _>>()?;
+        self.inner.append_batch_async(&inward).await
+    }
+
+    fn tx_range(&self, start: u64, end: Option<u64>) -> Result<Vec<TxRecord>, LogError> {
+        let (start, end) = self.inward_range(start, end);
+        Ok(self.outward(self.inner.tx_range(start, end)?))
+    }
+
+    async fn tx_range_async(
+        &self,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<TxRecord>, LogError> {
+        let (start, end) = self.inward_range(start, end);
+        Ok(self.outward(self.inner.tx_range_async(start, end).await?))
+    }
+
+    fn replay(&self) -> Result<Vec<TxRecord>, LogError> {
+        Ok(self.outward(self.inner.replay()?))
+    }
+
+    async fn replay_async(&self) -> Result<Vec<TxRecord>, LogError> {
+        Ok(self.outward(self.inner.replay_async().await?))
+    }
+}
+
 /// In-memory log implementation.
 #[derive(Clone, Default)]
 pub struct MemoryLog(Arc<RwLock<Vec<TxRecord>>>);

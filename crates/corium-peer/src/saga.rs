@@ -22,11 +22,16 @@
 //! re-checks all of it under the single-writer path regardless
 //! (`corium_tx::saga`); these checks are for the caller, not for safety.
 //!
-//! Branches are not here yet: this is the registry phase of the delivery
-//! sketch in `docs/design/long-running-transactions.md`, where a saga is a
-//! durable workflow record with no steps of its own. `commit` therefore has
-//! no meaning yet and is deliberately absent — a saga either aborts, expires,
-//! or waits for the merge machinery that will land with branches.
+//! Branches are here: [`Connection::saga_branch`] opens a second connection
+//! to the saga's overlay database, which is where steps are transacted and
+//! where a tier-2 reader queries partial progress. It is an ordinary
+//! [`Connection`] because a branch is an ordinary database value — the whole
+//! read surface applies, and nothing about reading one registers with, locks,
+//! or otherwise affects the saga.
+//!
+//! `commit` is still absent: the merge is the next phase of the delivery
+//! sketch in `docs/design/long-running-transactions.md`, so a saga today
+//! either aborts, expires, or accumulates branch novelty waiting for it.
 
 use corium_core::{EntityId, Keyword};
 use corium_db::saga::{self, Compensation, SagaEntry, SagaStatus};
@@ -413,6 +418,99 @@ pub fn compensation_forms(saga: &SagaEntry, record: &CompensationRecord) -> Vec<
     forms
 }
 
+/// A connection to a saga's branch: where its steps run and what a tier-2
+/// reader reads (ADR-0023).
+///
+/// The branch is a database, and this is a `Connection` to it — so the whole
+/// read surface (Datalog, Pull, SQL, `as-of`, `since`, `history`) applies to
+/// [`SagaBranch::db`] with nothing new to learn, and a step is an ordinary
+/// transaction. What the wrapper adds is vocabulary: a *step* is a
+/// transaction against the branch, and everything read here is provisional
+/// under this saga id until the parent's registry says `:committed`.
+///
+/// Reading a branch registers nothing, locks nothing, and has no effect on
+/// the saga. A reader who never asks for one is unaffected by every saga in
+/// flight.
+pub struct SagaBranch {
+    connection: Connection,
+    saga: u128,
+    basis_t: u64,
+}
+
+impl std::fmt::Debug for SagaBranch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SagaBranch")
+            .field("saga", &format_saga_id(self.saga))
+            .field("db", &self.connection.db_name())
+            .field("basis_t", &self.basis_t)
+            .finish()
+    }
+}
+
+impl SagaBranch {
+    /// The saga this branch belongs to.
+    #[must_use]
+    pub const fn saga_id(&self) -> u128 {
+        self.saga
+    }
+
+    /// The parent basis `t₀` the branch is rooted at.
+    ///
+    /// Below it the branch answers exactly what the parent answers, because
+    /// it is the same history; above it, the branch's own steps.
+    #[must_use]
+    pub const fn basis_t(&self) -> u64 {
+        self.basis_t
+    }
+
+    /// The branch's current value, without waiting on the transactor.
+    #[must_use]
+    pub fn db(&self) -> Db {
+        self.connection.db()
+    }
+
+    /// The branch's value at the newest basis this connection can reach.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] when the sync fails.
+    pub async fn sync(&self) -> Result<Db, PeerError> {
+        self.connection.sync().await
+    }
+
+    /// The connection underneath, for everything a connection does.
+    #[must_use]
+    pub const fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Transacts one step against the branch.
+    ///
+    /// A step is an ordinary transaction — tempids, upsert, `:db/cas`,
+    /// database functions, tx metadata — validated against the branch and
+    /// durable in its log before this returns. It is refused if it would
+    /// break the saga's declaration: allocations come from the leased id
+    /// blocks, and a reserved saga writes and references only what it
+    /// reserved.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for a rejected step or transport failure. A saga
+    /// that has already finished refuses steps, which is the error a caller
+    /// resuming stale work will see.
+    pub async fn step(&self, forms: Vec<Edn>) -> Result<TxResult, PeerError> {
+        self.connection.transact(forms).await
+    }
+
+    /// The branch's own transactions: one record per step, in order.
+    ///
+    /// The parent's history below `t₀` is deliberately excluded — it is the
+    /// parent's, and this is the step grain the design promises auditors.
+    #[must_use]
+    pub fn steps(&self) -> Vec<corium_log::TxRecord> {
+        self.connection.tx_range(self.basis_t + 1, None)
+    }
+}
+
 /// What a completed lifecycle transition leaves behind.
 #[derive(Clone, Debug)]
 pub struct SagaResult {
@@ -556,6 +654,38 @@ impl Connection {
         let entry = entry_of(&db, id)?;
         let tx = self.transact(compensation_forms(&entry, record)).await?;
         finished(id, tx)
+    }
+
+    /// Connects to the branch of saga `id` — the tier-2 read surface, and
+    /// where steps are transacted.
+    ///
+    /// The branch is served over the ordinary database machinery under a name
+    /// derived from the saga id, so this is a second [`Connection`] with this
+    /// one's endpoints, credentials, and keys. The saga is checked here first
+    /// so "that saga aborted last week" is reported as itself rather than as
+    /// a failure to reach a database nobody named.
+    ///
+    /// # Errors
+    /// Returns [`PeerError::Saga`] when the saga is unknown, is no longer
+    /// open, or its entry carries no opening basis; otherwise whatever the
+    /// connection fails with.
+    pub async fn saga_branch(&self, id: u128) -> Result<SagaBranch, PeerError> {
+        let entry = self.expect_open(id, "read the branch of").await?;
+        let basis_t = entry
+            .basis_t
+            .and_then(|basis| u64::try_from(basis).ok())
+            .ok_or_else(|| {
+                PeerError::Saga(format!(
+                    "saga {} has no opening basis; it has no branch",
+                    format_saga_id(id)
+                ))
+            })?;
+        let connection = Self::connect(self.config().for_saga(id)).await?;
+        Ok(SagaBranch {
+            connection,
+            saga: id,
+            basis_t,
+        })
     }
 
     /// The registry entry for `id` at the newest basis this connection can

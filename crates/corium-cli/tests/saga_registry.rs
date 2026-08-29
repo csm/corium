@@ -1,8 +1,9 @@
 //! End-to-end coverage of `corium saga` against a live transactor.
 //!
-//! The whole registry surface an operator touches is here — open, list,
-//! status, extend, abort — run as the real binary against a real database, so
-//! the output an operator reads and a script parses is what is asserted.
+//! The whole surface an operator touches is here — open, list, status,
+//! extend, abort, and the branch commands `step` and `log` — run as the real
+//! binary against a real database, so the output an operator reads and a
+//! script parses is what is asserted.
 
 use std::net::TcpListener;
 use std::path::Path;
@@ -187,4 +188,66 @@ async fn saga_opens_lists_extends_and_aborts() {
     );
     assert_ne!(missing.code, 0);
     assert!(missing.stderr.contains("no saga"), "{}", missing.stderr);
+}
+
+// The branch commands: a step is an ordinary transaction against the saga's
+// overlay, and `log` is the step grain the parent's log deliberately does not
+// carry.
+#[tokio::test(flavor = "multi_thread")]
+async fn saga_steps_land_on_the_branch_and_show_up_in_its_log() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transactor = TransactorProc::spawn(dir.path());
+    let mut admin = transactor.wait_ready().await;
+    admin
+        .create_database(
+            "orders",
+            &corium_query::edn::read_all(
+                "{:db/ident :order/note
+                  :db/valueType :db.type/string
+                  :db/cardinality :db.cardinality/one}",
+            )
+            .expect("schema EDN"),
+        )
+        .await
+        .expect("create database");
+    let endpoint = transactor.endpoint();
+
+    let opened = saga(&endpoint, &["open", "orders", "--owner", "alice"]).succeeded();
+    let id = saga_id(&opened);
+
+    let stepped = saga(
+        &endpoint,
+        &[
+            "step",
+            "orders",
+            &id,
+            "[{:db/id \"note\" :order/note \"drafted\"}]",
+        ],
+    )
+    .succeeded();
+    assert!(stepped.contains(&format!(":saga \"{id}\"")), "{stepped}");
+    assert!(stepped.contains(":tempids 1"), "{stepped}");
+
+    let logged = saga(&endpoint, &["log", "orders", &id, "--datoms"]).succeeded();
+    assert_eq!(logged.lines().count(), 1, "{logged}");
+    assert!(logged.contains(":datoms "), "{logged}");
+
+    // The parent's log is untouched: the step is the branch's, and canonical
+    // state has no idea it happened.
+    let status = saga(&endpoint, &["status", "orders", &id]).succeeded();
+    assert!(status.contains(":merged-tx nil"), "{status}");
+
+    // Once the saga is aborted the branch takes no more steps.
+    saga(&endpoint, &["abort", "orders", &id]).succeeded();
+    let refused = saga(
+        &endpoint,
+        &[
+            "step",
+            "orders",
+            &id,
+            "[{:db/id \"note\" :order/note \"late\"}]",
+        ],
+    );
+    assert_ne!(refused.code, 0);
+    assert!(refused.stderr.contains("aborted"), "{}", refused.stderr);
 }

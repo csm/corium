@@ -12,12 +12,13 @@ corium db fork <src> <dst> [--as-of t]     # point-in-time fork (writable sandbo
 corium db stats <uri>                      # datom counts, index sizes, basis
 corium schema update <uri> --schema <file> # plan; --apply requires its digest
 corium saga open|list|status|extend|abort <uri> ...  # long-running transactions
+corium saga step|log <uri> <id> ...        # transact against / read a saga branch
 corium gc <uri> [--window 72h]             # segment garbage collection
 corium backup <uri> <dest>                 # see below
 corium restore <src> <uri>
 corium log <uri> --from t1 --to t2         # dump tx-range as EDN
-corium console <uri>                       # interactive query console
-corium sql <uri>                           # interactive read-only SQL shell
+corium console <uri> [--saga <id>]         # interactive query console
+corium sql <uri> [--saga <id>]             # interactive read-only SQL shell
 corium tui <uri>                           # full-screen dashboard (queries + metrics)
 ```
 
@@ -29,8 +30,14 @@ transactions](long-running-transactions.md): `saga open` records durable,
 expiring work in flight (with its owner, advisory footprint, and checked
 reservations), `list`/`status` read the registry — which is ordinary data, also
 projected as `corium_sys.sagas` — and `extend`/`abort` are the transitions an
-owner makes. `commit` and `log` arrive with branches; until then a saga is a
-workflow record with a compensation ledger, not a place to put steps.
+owner makes. `saga step` transacts against the saga's *branch* — the overlay
+database its partial progress lives in — and `saga log` prints that branch's
+step history, which the parent's log deliberately does not carry. Reading a
+branch needs nothing special either: `corium console <db> --saga <id>` points
+the console at it and the full query surface applies, with the standing
+caveat that everything read from a branch is provisional under that saga id
+until the registry says it committed. `commit` — the merge — is still to
+come.
 
 Schema updates are plan-first and basis-fenced. The command compares a
 normalized desired file with the installed schema, measures affected data, and

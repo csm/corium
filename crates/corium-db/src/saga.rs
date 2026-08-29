@@ -40,6 +40,51 @@ pub const STATUS_NAMESPACE: &str = "db.saga.status";
 /// Namespace shared by the compensation-ledger status values.
 pub const COMPENSATION_STATUS_NAMESPACE: &str = "db.saga.compensation.status";
 
+/// How many entity ids a branch is leased in one block.
+///
+/// Sequences are 42 bits wide per partition, so a block this size is a
+/// rounding error in the space and comfortably more novelty than a saga is
+/// expected to create; the point of leasing generously is that a branch never
+/// has to interrupt a step to ask for more. Blocks belonging to sagas that
+/// never merged are simply abandoned — a hole in a sequence, which the
+/// allocator has always been free to leave.
+pub const DEFAULT_ID_BLOCK: i64 = 1 << 20;
+
+/// Separator between a parent database's name and its saga branches.
+///
+/// A dot is not legal in a database name, which is the point: the branch
+/// namespace cannot collide with a database somebody creates, so a branch is
+/// never listed, never stood by for, and never created by name.
+/// What separates a parent database's name from the saga id in a branch
+/// name. Public so a store scan can build the prefix branches share.
+pub const BRANCH_INFIX: &str = ".saga.";
+
+/// The name a saga's branch is hosted under.
+///
+/// Branch naming lives beside the registry because it is derived from it: a
+/// saga's id names its branch, and every surface that can read the registry
+/// can address the branch without being told where it is.
+#[must_use]
+pub fn branch_name(parent: &str, saga: u128) -> String {
+    format!("{parent}{BRANCH_INFIX}{saga:032x}")
+}
+
+/// The parent database and saga id a branch name carries.
+#[must_use]
+pub fn parse_branch_name(name: &str) -> Option<(&str, u128)> {
+    let (parent, id) = name.rsplit_once(BRANCH_INFIX)?;
+    if parent.is_empty() || id.len() != 32 {
+        return None;
+    }
+    Some((parent, u128::from_str_radix(id, 16).ok()?))
+}
+
+/// Whether `name` names a saga branch rather than a database.
+#[must_use]
+pub fn is_branch_name(name: &str) -> bool {
+    parse_branch_name(name).is_some()
+}
+
 /// Lifecycle state of a saga.
 ///
 /// The three terminal states are distinct on purpose: `:aborted` is a
@@ -142,17 +187,29 @@ pub struct IdGrant {
 }
 
 impl IdGrant {
+    /// One past the last sequence in the block, when it is fully recorded.
+    #[must_use]
+    pub fn end(&self) -> Option<i64> {
+        self.start
+            .zip(self.length)
+            .and_then(|(start, length)| start.checked_add(length))
+    }
+
     /// Whether `sequence` in `partition` falls inside this block.
     #[must_use]
     pub fn contains(&self, partition: i64, sequence: i64) -> bool {
-        let (Some(grant_partition), Some(start), Some(length)) =
-            (self.partition, self.start, self.length)
-        else {
+        self.partition == Some(partition)
+            && self.start.is_some_and(|start| sequence >= start)
+            && self.end().is_some_and(|end| sequence < end)
+    }
+
+    /// Whether `entity` falls inside this block.
+    #[must_use]
+    pub fn holds(&self, entity: EntityId) -> bool {
+        let Ok(sequence) = i64::try_from(entity.sequence()) else {
             return false;
         };
-        grant_partition == partition
-            && sequence >= start
-            && start.checked_add(length).is_some_and(|end| sequence < end)
+        self.contains(i64::from(entity.partition()), sequence)
     }
 }
 
@@ -384,6 +441,57 @@ pub fn declaring(db: &Db, entity: EntityId) -> Vec<SagaEntry> {
         .into_iter()
         .filter(|saga| saga.footprint.contains(&entity) || saga.reserves.contains(&entity))
         .collect()
+}
+
+/// Every entity-id block the registry records, whatever the saga's state.
+///
+/// The allocator reads this and not just the open sagas' blocks, because a
+/// block that has been leased is spent: a committed saga's ids are live
+/// entities, and an abandoned one's are a hole the allocator must step over
+/// rather than a range it may reissue.
+#[must_use]
+pub fn grants(db: &Db) -> Vec<IdGrant> {
+    let mut entities: Vec<EntityId> = db
+        .datoms_for_attribute(bootstrap::SAGA_GRANT_START)
+        .map(|datom| datom.e)
+        .collect();
+    entities.sort_unstable();
+    entities.dedup();
+    entities
+        .into_iter()
+        .map(|entity| grant_at(db, entity))
+        .collect()
+}
+
+/// The blocks leased to sagas that are still open — the ranges an ordinary
+/// parent transaction may not name an entity in.
+///
+/// The restriction lifts when the saga finishes, and it must: a committed
+/// saga's ids are ordinary entities in the parent afterwards, and writing
+/// them is ordinary work.
+#[must_use]
+pub fn live_grants(db: &Db) -> Vec<IdGrant> {
+    open_entries(db)
+        .into_iter()
+        .flat_map(|entry| entry.grants)
+        .collect()
+}
+
+/// The first sequence in `partition` no leased block covers.
+///
+/// This is the floor the parent's allocator resumes from after a restart.
+/// Nothing in the parent's datoms records a leased-but-unused block, so an
+/// allocator that trusted only the ids it can see would hand out the very
+/// range it promised a branch.
+#[must_use]
+pub fn grant_ceiling(db: &Db, partition: u32) -> u64 {
+    grants(db)
+        .into_iter()
+        .filter(|grant| grant.partition == Some(i64::from(partition)))
+        .filter_map(|grant| grant.end())
+        .map(|end| u64::try_from(end).unwrap_or(0))
+        .max()
+        .unwrap_or(0)
 }
 
 fn grant_at(db: &Db, entity: EntityId) -> IdGrant {
@@ -618,6 +726,22 @@ mod tests {
             ],
         );
         assert_eq!(overdue_entries(&db, 0), entries(&db));
+    }
+
+    #[test]
+    fn a_branch_name_carries_its_parent_and_saga() {
+        let name = branch_name("orders", 0x1234);
+        assert_eq!(name, "orders.saga.00000000000000000000000000001234");
+        assert_eq!(parse_branch_name(&name), Some(("orders", 0x1234)));
+        assert!(is_branch_name(&name));
+        // A database name is never a branch name: dots are not legal in one.
+        assert_eq!(parse_branch_name("orders"), None);
+        assert_eq!(parse_branch_name("orders.saga.short"), None);
+        assert_eq!(
+            parse_branch_name(".saga.00000000000000000000000000001234"),
+            None
+        );
+        assert!(!is_branch_name("orders_saga_1234"));
     }
 
     #[test]

@@ -24,7 +24,9 @@
 //!   `:committed` — the flip and the record are one append or neither;
 //! * entity-id grants are the parent allocator's leases. A transaction that
 //!   could mint them could hand itself ids the allocator still believes are
-//!   free.
+//!   free — and, for the same reason, no transaction may write an entity
+//!   inside a block already leased to an open saga, nor point ordinary data
+//!   at one.
 //!
 //! Everything else about a registry entry — description, footprint,
 //! reservations on an unsealed saga, conflict reports, compensation
@@ -37,7 +39,7 @@
 
 use std::collections::BTreeSet;
 
-use corium_core::{AttrId, Datom, EntityId};
+use corium_core::{AttrId, Datom, EntityId, Value};
 use corium_db::saga::{self, SagaStatus};
 use corium_db::{Db, bootstrap};
 use thiserror::Error;
@@ -91,6 +93,9 @@ pub enum SagaViolation {
     /// Entity-id grants were written by an ordinary transaction.
     #[error("entity-id grants are leased by the transactor, not written as transaction data")]
     GrantNotLeased,
+    /// A transaction named an entity inside a block leased to an open saga.
+    #[error("entity {0:?} is inside an entity-id block leased to an open saga")]
+    GrantedId(EntityId),
 }
 
 /// Checks the registry writes in `datoms` against the pre-transaction `db`.
@@ -105,6 +110,7 @@ pub fn validate(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
     {
         return Err(SagaViolation::GrantNotLeased);
     }
+    validate_granted_ids(db, datoms)?;
     let mut entities: BTreeSet<EntityId> = BTreeSet::new();
     for datom in datoms {
         if saga::is_saga_attribute(datom.a) {
@@ -113,6 +119,62 @@ pub fn validate(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
     }
     for entity in entities {
         validate_entity(db, entity, datoms)?;
+    }
+    Ok(())
+}
+
+/// Refuses a transaction that names an id inside a live grant.
+///
+/// A transaction may name any entity id directly, which is the one way an
+/// ordinary parent write could land on top of a branch's unspent allocations
+/// — the branch's ids are promised, not yet used, so nothing in the parent's
+/// datoms would collide to reveal it. This is allocator integrity rather than
+/// a lock: leased id space names no user-visible entity, and the refusal ends
+/// with the saga, because a committed saga's ids are then ordinary entities.
+///
+/// Both positions are checked, but the ref position only for ordinary data.
+/// A user ref naming a granted id would attach parent data to an entity the
+/// branch has not created yet — and, at merge, to whichever entity the branch
+/// happened to give that id. A registry ref is the opposite kind of thing:
+/// the reservation set and the footprint are declarations *about* entities,
+/// naming what a saga will operate on, so they graft nothing onto anything
+/// and a saga may perfectly well name ids it was itself leased. Refusing
+/// those would refuse a saga its own bookkeeping.
+///
+/// The one transaction that may write inside a block is the one that commits
+/// the saga holding it, which is the merge.
+fn validate_granted_ids(db: &Db, datoms: &[Datom]) -> Result<(), SagaViolation> {
+    let grants: Vec<_> = saga::open_entries(db)
+        .into_iter()
+        // A saga this transaction *commits* is not an open saga to the datoms
+        // beside the flip. This is the merge: the transaction that commits a
+        // saga carries its branch novelty, ids and all, and lands both as one
+        // append, after which those ids are ordinary parent entities.
+        //
+        // Only `:committed`. An abort or an expiry ends the saga without
+        // merging anything, and the branch is retained and readable
+        // afterwards — so ids written into the block by the aborting
+        // transaction would alias entities the branch still shows under the
+        // same ids, with no merge to reconcile the two.
+        .filter(|entry| {
+            saga::asserted_status(db, entry.entity, datoms)
+                .is_none_or(|status| status != SagaStatus::Committed)
+        })
+        .flat_map(|entry| entry.grants)
+        .collect();
+    if grants.is_empty() {
+        return Ok(());
+    }
+    for datom in datoms {
+        let referenced = match &datom.v {
+            Value::Ref(entity) if !saga::is_registry_attribute(datom.a) => Some(*entity),
+            _ => None,
+        };
+        for entity in [Some(datom.e), referenced].into_iter().flatten() {
+            if grants.iter().any(|grant| grant.holds(entity)) {
+                return Err(SagaViolation::GrantedId(entity));
+            }
+        }
     }
     Ok(())
 }

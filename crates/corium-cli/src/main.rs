@@ -770,6 +770,11 @@ enum Command {
     Console {
         /// Database name.
         db: String,
+        /// Point the console at an open saga's branch instead of the
+        /// database itself: partial progress, queryable with the full
+        /// surface, provisional until the registry says the saga committed.
+        #[arg(long, value_name = "ID")]
+        saga: Option<String>,
         #[command(flatten)]
         client: ClientFlags,
     },
@@ -794,6 +799,9 @@ enum Command {
         /// Execute SQL from a file and exit.
         #[arg(short = 'f', long, conflicts_with = "command")]
         file: Option<PathBuf>,
+        /// Run against an open saga's branch instead of the database itself.
+        #[arg(long, value_name = "ID")]
+        saga: Option<String>,
         #[command(flatten)]
         client: ClientFlags,
     },
@@ -1526,12 +1534,20 @@ async fn run_command(command: Command) -> Result<(), String> {
             );
             Ok(())
         }
-        Command::Console { db, client } => {
+        Command::Console { db, saga, client } => {
             let config = client.connect_config(db).await?;
             let connection = Connection::connect(config)
                 .await
                 .map_err(|error| format!("cannot connect to transactor: {error}"))?;
-            console::run(&connection).await
+            match saga {
+                // A branch is a database value like any other, so the console
+                // needs nothing but a connection pointed at it.
+                Some(id) => {
+                    let branch = crate::saga::branch(&connection, &id).await?;
+                    console::run(branch.connection()).await
+                }
+                None => console::run(&connection).await,
+            }
         }
         Command::Tui {
             db,
@@ -1552,13 +1568,20 @@ async fn run_command(command: Command) -> Result<(), String> {
             db,
             command,
             file,
+            saga,
             client,
         } => {
             let config = client.connect_config(db).await?;
             let connection = Connection::connect(config)
                 .await
                 .map_err(|error| format!("cannot connect to transactor: {error}"))?;
-            sql::run(&connection, command.as_deref(), file.as_deref()).await
+            match saga {
+                Some(id) => {
+                    let branch = crate::saga::branch(&connection, &id).await?;
+                    sql::run(branch.connection(), command.as_deref(), file.as_deref()).await
+                }
+                None => sql::run(&connection, command.as_deref(), file.as_deref()).await,
+            }
         }
         Command::Log {
             data_dir,

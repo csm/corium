@@ -273,8 +273,8 @@ Engine and API:
   change and hard deletion remain rejected. See
   [schema-migrations.md](design/schema-migrations.md) and
   [ADR-0020](adr/0020-planned-schema-migrations.md).
-- **Long-running transactions (sagas).** *(Registry implemented; branches,
-  merge, and the expiry sweep specified.)* A saga is a database
+- **Long-running transactions (sagas).** *(Registry and branches implemented;
+  merge and the expiry sweep specified.)* A saga is a database
   branch plus a registry entry: steps run as ordinary durable transactions on
   a lightweight overlay branch of the database, and the whole branch merges
   into the parent as one conflict-checked commit or aborts without ever
@@ -282,10 +282,14 @@ Engine and API:
   in-flight work discoverable with plain Datalog; branch `Db` values give
   opt-in readers the full query surface over partial progress; leased
   entity-id blocks keep ids stable across the merge; mandatory expiry keeps
-  abandoned branches from pinning segments. What ships today is the registry:
+  abandoned branches from pinning segments. What ships today is the registry —
   the vocabulary, the lifecycle transitions the writer holds to legal moves,
-  the peer API, `corium_sys.sagas`, and the `corium saga` commands, which make
-  a saga a durable, expiring workflow record with a compensation ledger. See
+  the peer API, `corium_sys.sagas`, and the `corium saga` commands — plus
+  branches: opening a saga leases it an id block, its branch is hosted beside
+  the parent as an overlay database, steps are ordinary transactions held to
+  the saga's reservations, and tier-2 readers query it through an ordinary
+  connection (`corium saga step|log`, `corium console --saga`). Merging that
+  novelty back is the next phase. See
   [long-running-transactions.md](design/long-running-transactions.md) and
   [ADR-0023](adr/0023-saga-branch-transactions.md).
 - Fulltext (`tantivy`) and tuple value types; excision (design reserved in

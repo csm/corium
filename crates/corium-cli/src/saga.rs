@@ -7,11 +7,11 @@
 //! effects are available to any client that transacts the same forms, and
 //! `SELECT … FROM corium_sys.sagas` answers the read-only questions from SQL.
 //!
-//! Two subcommands the design names are deliberately absent until branches
-//! land: `commit`, which is the merge, and `log`, which is the branch's step
-//! history. A saga with no branch is still useful — a durable, expiring
-//! workflow record with a compensation ledger — and that is what this
-//! delivers.
+//! `step` and `log` work on the saga's branch — the overlay database its
+//! partial progress lives in — which is an ordinary connection under a name
+//! derived from the saga id, so `corium console <db> --saga <id>` gets the
+//! whole read surface over it for free. One subcommand the design names is
+//! still absent: `commit`, which is the merge.
 
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +21,9 @@ use corium_core::{EntityId, Keyword};
 use corium_db::Db;
 use corium_db::saga::{SagaEntry, SagaStatus};
 use corium_peer::Connection;
-use corium_peer::saga::{SagaOptions, format_saga_id, parse_saga_id, registry_installed};
+use corium_peer::saga::{
+    SagaBranch, SagaOptions, format_saga_id, parse_saga_id, registry_installed,
+};
 use corium_query::edn::{Edn, read_all};
 
 use crate::{ClientFlags, instant, parse_duration};
@@ -39,6 +41,10 @@ pub(crate) enum SagaCommand {
     Extend(ExtendArgs),
     /// Abort an open saga, optionally recording a compensating transaction.
     Abort(AbortArgs),
+    /// Transact one step against an open saga's branch.
+    Step(StepArgs),
+    /// Print an open saga's step history, newest step last.
+    Log(LogArgs),
 }
 
 /// How long a saga lives when the caller does not say.
@@ -145,6 +151,37 @@ pub(crate) struct AbortArgs {
     client: ClientFlags,
 }
 
+/// Arguments of `corium saga step`.
+#[derive(Args)]
+pub(crate) struct StepArgs {
+    /// Database name.
+    db: String,
+    /// Saga id.
+    id: String,
+    /// Transaction forms to apply to the branch, or `-` to read them from
+    /// standard input. A step is an ordinary transaction: it may create
+    /// entities (from the block the saga was leased), write pre-existing
+    /// ones, and carry transaction metadata.
+    #[arg(value_name = "EDN")]
+    tx_data: String,
+    #[command(flatten)]
+    client: ClientFlags,
+}
+
+/// Arguments of `corium saga log`.
+#[derive(Args)]
+pub(crate) struct LogArgs {
+    /// Database name.
+    db: String,
+    /// Saga id.
+    id: String,
+    /// Print how many datoms each step carried as well as its number.
+    #[arg(long)]
+    datoms: bool,
+    #[command(flatten)]
+    client: ClientFlags,
+}
+
 /// Runs one `corium saga` command.
 ///
 /// # Errors
@@ -157,8 +194,24 @@ pub(crate) async fn run(command: SagaCommand) -> Result<ExitCode, String> {
         SagaCommand::Status(args) => status(args).await,
         SagaCommand::Extend(args) => extend(args).await,
         SagaCommand::Abort(args) => abort(args).await,
+        SagaCommand::Step(args) => step(args).await,
+        SagaCommand::Log(args) => log(args).await,
     }
     .map(|()| ExitCode::SUCCESS)
+}
+
+/// Connects to the branch of the saga `id` names, for a caller that already
+/// has a connection to the parent.
+///
+/// Shared with `corium console --saga`, because pointing the console at a
+/// branch is the same act as pointing anything else at one: the branch is a
+/// database value, and this is a connection to it.
+pub(crate) async fn branch(connection: &Connection, id: &str) -> Result<SagaBranch, String> {
+    let id = parse_saga_id(id).ok_or_else(|| format!("invalid saga id {id:?}"))?;
+    connection
+        .saga_branch(id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn connect(db: String, client: &ClientFlags) -> Result<Connection, String> {
@@ -273,6 +326,73 @@ async fn abort(args: AbortArgs) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     println!("{}", render(&aborted.entry));
+    Ok(())
+}
+
+async fn step(args: StepArgs) -> Result<(), String> {
+    let connection = connect(args.db.clone(), &args.client).await?;
+    let text = if args.tx_data == "-" {
+        std::io::read_to_string(std::io::stdin())
+            .map_err(|error| format!("cannot read transaction data: {error}"))?
+    } else {
+        args.tx_data.clone()
+    };
+    let forms = tx_forms(&text)?;
+    let branch = branch(&connection, &args.id).await?;
+    let applied = branch
+        .step(forms)
+        .await
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{{:saga {:?} :t {} :basis-before {} :tempids {}}}",
+        format_saga_id(branch.saga_id()),
+        applied.basis_t,
+        applied.basis_before,
+        applied.tempids.len()
+    );
+    Ok(())
+}
+
+/// Reads transaction data written either as a sequence of forms or as one
+/// bracketed vector of them, since both are how people write it.
+///
+/// The ambiguity is only apparent: a bare `[:db/add …]` form starts with a
+/// keyword, while a vector *of* forms starts with a map or a vector.
+fn tx_forms(text: &str) -> Result<Vec<Edn>, String> {
+    let read = read_all(text).map_err(|error| format!("transaction data is not EDN: {error}"))?;
+    if let [Edn::Vector(items) | Edn::List(items)] = read.as_slice()
+        && matches!(
+            items.first(),
+            Some(Edn::Map(_) | Edn::Vector(_) | Edn::List(_))
+        )
+    {
+        return Ok(items.clone());
+    }
+    Ok(read)
+}
+
+async fn log(args: LogArgs) -> Result<(), String> {
+    let connection = connect(args.db.clone(), &args.client).await?;
+    let branch = branch(&connection, &args.id).await?;
+    branch.sync().await.map_err(|error| error.to_string())?;
+    // Only the branch's own transactions: the history below `t₀` is the
+    // parent's, and `corium log` already prints that.
+    for record in branch.steps() {
+        if args.datoms {
+            println!(
+                "{{:t {} :instant {} :datoms {}}}",
+                record.t,
+                instant::format_instant(record.tx_instant),
+                record.datoms.len()
+            );
+        } else {
+            println!(
+                "{{:t {} :instant {}}}",
+                record.t,
+                instant::format_instant(record.tx_instant)
+            );
+        }
+    }
     Ok(())
 }
 

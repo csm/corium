@@ -12,10 +12,36 @@ use corium_tx::{EntityRef, TxError, TxItem, TxOp, prepare};
 /// A database with the engine vocabulary installed and every saga status
 /// keyword interned, as the transactor's boundary interns them before
 /// preparing a transaction that names one.
+/// An ordinary user attribute, so a test can write data that is not schema
+/// vocabulary and not registry vocabulary.
+const NOTE: EntityId = EntityId::new(Partition::Db as u32, 5_000);
+
+/// An ordinary user ref attribute, for the difference between pointing at an
+/// entity as data and naming it in a declaration.
+const NOTE_REF: EntityId = EntityId::new(Partition::Db as u32, 5_001);
+
 fn fixture() -> Db {
     let mut schema = Schema::default();
     let mut idents = Idents::default();
     bootstrap::install(&mut schema, &mut idents);
+    schema.insert(corium_core::Attribute {
+        id: NOTE,
+        value_type: corium_core::ValueType::Str,
+        cardinality: corium_core::Cardinality::One,
+        unique: None,
+        is_component: false,
+        indexed: false,
+        no_history: false,
+    });
+    schema.insert(corium_core::Attribute {
+        id: NOTE_REF,
+        value_type: corium_core::ValueType::Ref,
+        cardinality: corium_core::Cardinality::One,
+        unique: None,
+        is_component: false,
+        indexed: false,
+        no_history: false,
+    });
     let mut interner = KeywordInterner::default();
     for status in [
         SagaStatus::Open,
@@ -368,6 +394,158 @@ fn entity_id_grants_are_not_transaction_data() {
     )
     .expect_err("grants are leased, not asserted");
     assert!(matches!(violation(error), SagaViolation::GrantNotLeased));
+}
+
+/// Grants are minted by the transactor, not by transaction data, so a test
+/// that needs a live grant has to write one the way the allocator does:
+/// straight into the database value.
+fn with_grant(db: &Db, saga: EntityId, start: u64, length: u64) -> (Db, EntityId) {
+    let grant = EntityId::new(Partition::User as u32, 5_000);
+    let datom = |e: EntityId, a: EntityId, v: Value| corium_core::Datom {
+        e,
+        a,
+        v,
+        tx: tx(2),
+        added: true,
+    };
+    let db = db.with_transaction(
+        2,
+        &[
+            datom(saga, bootstrap::SAGA_ID_GRANTS, Value::Ref(grant)),
+            datom(
+                grant,
+                bootstrap::SAGA_GRANT_PARTITION,
+                Value::Long(i64::from(Partition::User as u32)),
+            ),
+            datom(
+                grant,
+                bootstrap::SAGA_GRANT_START,
+                Value::Long(i64::try_from(start).expect("a start")),
+            ),
+            datom(
+                grant,
+                bootstrap::SAGA_GRANT_LENGTH,
+                Value::Long(i64::try_from(length).expect("a length")),
+            ),
+        ],
+    );
+    (db, EntityId::new(Partition::User as u32, start + 3))
+}
+
+#[test]
+fn an_open_sagas_leased_ids_are_refused_to_everyone_else() {
+    let db = fixture();
+    let (db, saga) = opened(&db, 1);
+    let (db, leased) = with_grant(&db, saga, 8_000, 1_000);
+
+    // Naming a leased id directly is the one way a parent write could land
+    // on top of allocations the branch has been promised but not yet spent.
+    let error = prepare(
+        &db,
+        vec![add_to(leased, NOTE, Value::Str(Arc::from("mine")))],
+        tx(3),
+        1_000,
+    )
+    .expect_err("leased ids are the allocator's promise");
+    assert!(matches!(violation(error), SagaViolation::GrantedId(e) if e == leased));
+
+    // So is referencing one from ordinary data: a ref value would attach
+    // parent data to an entity the branch has not created yet.
+    let error = prepare(
+        &db,
+        vec![add_to(
+            EntityId::new(Partition::User as u32, 1_100),
+            NOTE_REF,
+            Value::Ref(leased),
+        )],
+        tx(3),
+        1_000,
+    )
+    .expect_err("a ref into a leased block is the same write");
+    assert!(matches!(violation(error), SagaViolation::GrantedId(e) if e == leased));
+
+    // An id outside the block is nobody's business but the writer's.
+    let outside = EntityId::new(Partition::User as u32, 9_000);
+    prepare(
+        &db,
+        vec![add_to(outside, NOTE, Value::Str(Arc::from("fine")))],
+        tx(3),
+        1_000,
+    )
+    .expect("ids outside every block are ordinary");
+}
+
+#[test]
+fn a_saga_may_declare_ids_it_was_leased() {
+    let db = fixture();
+    let (db, saga) = opened(&db, 1);
+    let (db, leased) = with_grant(&db, saga, 8_000, 1_000);
+    // The reservation set and the footprint name entities, they do not write
+    // them — and a block is carved off the allocator's counter, so the ids
+    // just above it are exactly the ones a caller declares when it means "the
+    // entities this saga will deal with". Refusing these would refuse a saga
+    // its own bookkeeping.
+    prepare(
+        &db,
+        vec![
+            add_to(saga, bootstrap::SAGA_RESERVES, Value::Ref(leased)),
+            add_to(saga, bootstrap::SAGA_FOOTPRINT, Value::Ref(leased)),
+        ],
+        tx(3),
+        1_000,
+    )
+    .expect("a declaration is not a write");
+}
+
+#[test]
+fn the_transaction_that_commits_a_saga_may_write_its_block() {
+    let db = fixture();
+    let (db, saga) = opened(&db, 1);
+    let (db, leased) = with_grant(&db, saga, 8_000, 1_000);
+    // This is the merge: branch novelty and the flip to `:committed` in one
+    // append. The refusal above protects unspent leases, and this lease is
+    // spent by the time the transaction ends.
+    prepare(
+        &db,
+        vec![
+            add_to(
+                saga,
+                bootstrap::SAGA_STATUS,
+                status(&db, &SagaStatus::Committed),
+            ),
+            add_to(saga, bootstrap::SAGA_MERGED_TX, Value::Ref(tx(3))),
+            add_to(leased, NOTE, Value::Str(Arc::from("merged"))),
+        ],
+        tx(3),
+        1_000,
+    )
+    .expect("the merge carries the branch's own ids");
+}
+
+#[test]
+fn aborting_a_saga_does_not_open_its_block() {
+    let db = fixture();
+    let (db, saga) = opened(&db, 1);
+    let (db, leased) = with_grant(&db, saga, 8_000, 1_000);
+    // An abort ends the saga without merging anything, and the branch stays
+    // readable afterwards — so a write into the block in the same append
+    // would alias an entity the branch still shows under that id, with no
+    // merge to reconcile the two.
+    let error = prepare(
+        &db,
+        vec![
+            add_to(
+                saga,
+                bootstrap::SAGA_STATUS,
+                status(&db, &SagaStatus::Aborted),
+            ),
+            add_to(leased, NOTE, Value::Str(Arc::from("aliased"))),
+        ],
+        tx(3),
+        1_000,
+    )
+    .expect_err("only the merge writes a leased block");
+    assert!(matches!(violation(error), SagaViolation::GrantedId(e) if e == leased));
 }
 
 #[test]
