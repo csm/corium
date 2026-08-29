@@ -29,13 +29,21 @@
 //! read surface applies, and nothing about reading one registers with, locks,
 //! or otherwise affects the saga.
 //!
-//! `commit` is still absent: the merge is the next phase of the delivery
-//! sketch in `docs/design/long-running-transactions.md`, so a saga today
-//! either aborts, expires, or accumulates branch novelty waiting for it.
+//! Commit is the one transition that is *not* a transaction a client could
+//! have written: [`Connection::saga_commit`] asks the transactor to merge, and
+//! the transactor composes the transaction itself. It has to. The merge
+//! carries the branch's whole net effect, ids from the block the parent leased
+//! this saga, and the flip to `:committed`, and those three only make sense
+//! together — the scan that admits them runs inside the single-writer path
+//! against a value no client can hold still. So the request carries what only
+//! the owner knows (guards and resolutions), and the answer is either the
+//! merge or the report explaining why not.
 
 use corium_core::{EntityId, Keyword};
 use corium_db::saga::{self, Compensation, SagaEntry, SagaStatus};
 use corium_db::{Db, bootstrap};
+use corium_protocol::codec;
+use corium_protocol::pb;
 use corium_query::edn::Edn;
 
 use crate::{Connection, PeerError, TxResult};
@@ -223,16 +231,13 @@ pub fn new_saga_id() -> Result<u128, PeerError> {
 /// hex digits, no dashes.
 #[must_use]
 pub fn format_saga_id(id: u128) -> String {
-    format!("{id:032x}")
+    saga::format_id(id)
 }
 
 /// Parses a saga id, with or without the conventional dashes.
 #[must_use]
 pub fn parse_saga_id(text: &str) -> Option<u128> {
-    let compact: String = text.chars().filter(|c| *c != '-').collect();
-    (compact.len() == 32)
-        .then(|| u128::from_str_radix(&compact, 16).ok())
-        .flatten()
+    saga::parse_id(text)
 }
 
 fn uuid_value(id: u128) -> Edn {
@@ -416,6 +421,75 @@ pub fn compensation_forms(saga: &SagaEntry, record: &CompensationRecord) -> Vec<
         ));
     }
     forms
+}
+
+/// What one merge attempt came to.
+///
+/// A refused merge is an ordinary answer, not an error: the parent moved, the
+/// report says how, and the saga is still open with its branch intact. Only
+/// something that makes the question unanswerable — an unknown saga, novelty
+/// the parent's current schema rejects — comes back as a [`PeerError`].
+#[derive(Clone, Debug)]
+pub enum MergeOutcome {
+    /// The branch merged, as one parent transaction.
+    Committed(MergeReport),
+    /// The parent has drifted, or a declared guard no longer holds.
+    Conflict(ConflictReport),
+}
+
+impl MergeOutcome {
+    /// The merge, if it happened.
+    #[must_use]
+    pub const fn merged(&self) -> Option<&MergeReport> {
+        match self {
+            Self::Committed(report) => Some(report),
+            Self::Conflict(_) => None,
+        }
+    }
+
+    /// The conflict report, if the merge was refused.
+    #[must_use]
+    pub const fn conflict(&self) -> Option<&ConflictReport> {
+        match self {
+            Self::Conflict(report) => Some(report),
+            Self::Committed(_) => None,
+        }
+    }
+}
+
+/// What a merge that landed did.
+#[derive(Clone, Debug)]
+pub struct MergeReport {
+    /// The parent's basis before the merge.
+    pub basis_before: u64,
+    /// The merge transaction's `t` — the single basis at which every one of
+    /// the saga's effects became canonical.
+    pub basis_t: u64,
+    /// The merge transaction's `:db/txInstant`.
+    pub tx_instant: i64,
+    /// Branch transactions squashed into it.
+    pub steps: u64,
+    /// Net datoms it applied. Zero when a retry found the saga already
+    /// committed — that answer comes from the registry, which records the
+    /// merge transaction and the step count but not the datom count.
+    pub datoms: u64,
+}
+
+/// Why a merge was refused, as the registry now records it.
+///
+/// `report` is the EDN the transactor also wrote to
+/// `:db.saga/conflict-report`, so a process that was not the one asking can
+/// read the same document out of the registry.
+#[derive(Clone, Debug)]
+pub struct ConflictReport {
+    /// The parent's basis after the report was recorded.
+    pub basis_t: u64,
+    /// Branch transactions the merge would have squashed.
+    pub steps: u64,
+    /// Net datoms it would have applied.
+    pub datoms: u64,
+    /// The EDN report: each colliding unit with both sides' values.
+    pub report: String,
 }
 
 /// A connection to a saga's branch: where its steps run and what a tier-2
@@ -636,6 +710,77 @@ impl Connection {
         finished(id, tx)
     }
 
+    /// Commits a saga: merges its branch into the parent as one transaction.
+    ///
+    /// `guards` are read dependencies to check against the parent's current
+    /// value, beyond whatever the branch's steps declared as `:db.saga/guard`
+    /// metadata along the way; the transactor evaluates the union. A guard is
+    /// either `[:db/cas <entity> <attribute> <value>]` — the compare half of a
+    /// compare-and-swap, with `nil` for "holds nothing" — or
+    /// `{:guard <query>}`, a Datalog query that must return a row (add
+    /// `:expect :none` for one that must not).
+    ///
+    /// `resolutions` answer a previous attempt's conflict report, each fenced
+    /// to the parent-side value that report showed:
+    /// `{:e <entity> :a <attribute> :parent <value> :take :parent}` drops the
+    /// branch's write, and `:take :branch` overrides — which only a
+    /// write–write conflict on a cardinality-one pair admits. Drift beyond the
+    /// resolved set is a fresh conflict, never silently absorbed, so a stale
+    /// resolution refuses the merge rather than quietly applying.
+    ///
+    /// # Errors
+    /// Returns [`PeerError::Saga`] when the saga is unknown or has already
+    /// aborted or expired, and otherwise whatever the merge fails with. A
+    /// merge the parent refuses is [`MergeOutcome::Conflict`], not an error.
+    pub async fn saga_commit(
+        &self,
+        id: u128,
+        guards: Vec<Edn>,
+        resolutions: Vec<Edn>,
+    ) -> Result<MergeOutcome, PeerError> {
+        let entry = entry_of(&self.sync().await?, id)?;
+        // An already-committed saga is not an error: the transactor answers a
+        // retry with the merge it finds, which is what makes a commit whose
+        // acknowledgement was lost safe to repeat.
+        if let Some(status @ (SagaStatus::Aborted | SagaStatus::Expired)) = &entry.status {
+            return Err(PeerError::Saga(format!(
+                "cannot commit saga {}: it is {status}",
+                format_saga_id(id)
+            )));
+        }
+        let response = self
+            .saga_commit_raw(pb::SagaCommitRequest {
+                db: self.db_name().to_owned(),
+                protocol_version: corium_protocol::PROTOCOL_VERSION,
+                saga: format_saga_id(id),
+                guards: codec::encode_edn(&Edn::Vector(guards)),
+                resolutions: codec::encode_edn(&Edn::Vector(resolutions)),
+            })
+            .await?;
+        // Whatever happened, it happened in the parent's log: catch this
+        // connection up so the caller reads a value that includes it.
+        self.sync_to(response.basis_t).await?;
+        if response.committed {
+            return Ok(MergeOutcome::Committed(MergeReport {
+                basis_before: response.basis_before,
+                basis_t: response.basis_t,
+                tx_instant: response.tx_instant,
+                steps: response.steps,
+                datoms: response.datoms,
+            }));
+        }
+        let report = match codec::decode_edn(&response.conflict_report)? {
+            Edn::Str(report) => report,
+            other => other.to_string(),
+        };
+        Ok(MergeOutcome::Conflict(ConflictReport {
+            basis_t: response.basis_t,
+            steps: response.steps,
+            datoms: response.datoms,
+            report,
+        }))
+    }
+
     /// Records an external-compensation ledger entry.
     ///
     /// The ledger is the one part of a saga that keeps being written after it
@@ -661,16 +806,30 @@ impl Connection {
     ///
     /// The branch is served over the ordinary database machinery under a name
     /// derived from the saga id, so this is a second [`Connection`] with this
-    /// one's endpoints, credentials, and keys. The saga is checked here first
-    /// so "that saga aborted last week" is reported as itself rather than as
-    /// a failure to reach a database nobody named.
+    /// one's endpoints, credentials, and keys. The saga is looked up here
+    /// first so "there is no such saga" is reported as itself rather than as a
+    /// failure to reach a database nobody named.
+    ///
+    /// A *committed* saga's branch still opens, for as long as retention keeps
+    /// it: it holds the step grain the parent's single squashed commit does
+    /// not, which is where the design points auditors. It is read-only in the
+    /// only way that matters — the transactor refuses steps the moment the
+    /// saga is no longer open. A saga that aborted or expired has no branch to
+    /// open at all: ending it that way is what discards the overlay.
     ///
     /// # Errors
-    /// Returns [`PeerError::Saga`] when the saga is unknown, is no longer
-    /// open, or its entry carries no opening basis; otherwise whatever the
-    /// connection fails with.
+    /// Returns [`PeerError::Saga`] when the saga is unknown, has aborted or
+    /// expired, or its entry carries no opening basis; otherwise whatever the
+    /// connection fails with, which after a merge includes retention having
+    /// discarded the branch.
     pub async fn saga_branch(&self, id: u128) -> Result<SagaBranch, PeerError> {
-        let entry = self.expect_open(id, "read the branch of").await?;
+        let entry = entry_of(&self.sync().await?, id)?;
+        if let Some(status @ (SagaStatus::Aborted | SagaStatus::Expired)) = &entry.status {
+            return Err(PeerError::Saga(format!(
+                "cannot read the branch of saga {}: it is {status}, so its branch is gone",
+                format_saga_id(id)
+            )));
+        }
         let basis_t = entry
             .basis_t
             .and_then(|basis| u64::try_from(basis).ok())

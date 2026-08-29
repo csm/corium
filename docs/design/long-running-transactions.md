@@ -534,10 +534,23 @@ future work; it is a different promise and must be asked for by name.)
    **cardinality-many assertions union.** Parent and branch each asserting
    different values on the same many-cardinality `(e, a)` merge to the
    union — that is what a set-valued attribute means — and both asserting
-   the *same* `(e, a, v)` is idempotent. Only the exact-triple races above
-   (parent retracted a triple the branch asserts, or the reverse) conflict.
-   A saga that needs "nobody else added to this set" is asserting a read
-   dependency, and declares it as a guard.
+   the *same* `(e, a, v)` is idempotent. A saga that needs "nobody else
+   added to this set" is asserting a read dependency, and declares it as a
+   guard.
+
+   *As implemented:* the exact-triple race this section reserved for
+   cardinality-many — the parent retracting a triple the branch asserts, or
+   the reverse — turns out not to exist once both sides are compared as net
+   effects from the shared state at `t₀`, and the scan does not look for
+   it. A member the branch adds is one that state did not hold, so the
+   parent had nothing there to remove; a member the branch removes is one
+   that state did hold, which the parent either still holds (the retraction
+   applies) or has already removed (both sides agree it should go). The
+   race is visible only against the parent's *change log*, where churn that
+   ends where it began — a member added and taken back — reads as a
+   collision with nothing behind it for an owner to answer. Set members
+   still carry their own resolution scope, because uniqueness and
+   dangling-ref conflicts land on individual facts.
 3. **Guard evaluation**: guards are `:db/cas`-shaped preconditions and
    boolean guard queries evaluated against the parent's current value —
    how a saga makes its *read* dependencies explicit. The engine does not
@@ -856,7 +869,10 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
   sizing, on-abort compensation); `Saga::reserve(...)` to extend an
   unsealed reservation set; `Saga::transact(...)` / `Saga::db()`
   (ordinary `Db` value of the branch); `Saga::commit(guards, resolutions)
-  → Result<MergeReport, ConflictReport>`; `Saga::abort()` /
+  → Result<MergeReport, ConflictReport>` — *as implemented:*
+  `Connection::saga_commit(id, guards, resolutions) → MergeOutcome`, whose
+  two variants are the report and the refusal, because a refused merge is an
+  answer rather than a failure; `Saga::abort()` /
   `Saga::abort_with(tx_data)` (call-time compensation replacing the
   registered form); `Saga::extend(expiry)`;
   `Connection::saga_resume(db, id)`; `Connection::saga_view(db, id) → Db`
@@ -875,8 +891,13 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
   (`open --on-abort <fn-ident|edn>`, `abort --compensate <edn>`;
   `status` includes the compensation ledger); `corium console <db>
   --saga <id>` to point a console at a branch; `corium saga log <id>`
-  for step history. *As implemented:* all of these except `commit`, plus
+  for step history. *As implemented:* all of these, plus
   `corium saga step <db> <id> <edn|->`, which transacts one step.
+  `corium saga commit` is the one subcommand with an outcome rather than a
+  transaction receipt: it takes repeatable `--guard` and `--resolve` EDN
+  forms, prints the merge report, and on a refusal prints the conflict
+  report and exits non-zero, so a script can tell the two apart without
+  parsing.
 - **SQL.** A `corium_sys.sagas` system relation over the registry (id, status,
   basis, owner, expiry, description) and a `corium_sys.saga_compensations`
   relation over the ledger, beside the existing system
@@ -963,8 +984,25 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
    deferred to the phase that owns abort and expiry: applying a compensation
    atomically with the flip means the transactor, not the client, composing
    that transaction.
-3. **Merge** — squash, conflict scan, guards, resolutions, the atomic
-   commit-and-flip; conflict reports.
+3. **Merge** *(done)* — squash, conflict scan, guards, resolutions, the
+   atomic commit-and-flip; conflict reports. Three details the implementation
+   settled:
+
+   * *A conflict is a unit an owner can answer, not a datom.* The squash
+     already collapses a run's writes to their net effect, so a
+     cardinality-one `(e, a)` the branch moved is one conflict carrying both
+     sides' values — never a retraction and an assertion to be answered
+     separately, which is what the datom-level reading would have produced.
+   * *The branch's naming is translated into the parent's at merge, not
+     merged into it.* The branch copied the parent's naming when it opened
+     (phase 2), so a keyword either side minted since can wear the same id
+     for different words. Novelty is re-interned through the parent's
+     interner by name before it is validated; a branch-minted keyword the
+     parent has never seen is interned there by the merge transaction.
+   * *A conflict report is registry state with a lifetime.* It is written
+     when a merge is refused and cleared by the merge that succeeds, so a
+     process reading `:db.saga/conflict-report` never finds a report
+     describing an attempt that has since been answered.
 4. **Expiry sweep + retention** — operator-service job with in-transactor
    fallback; branch GC.
 5. **Protocol/thin-client surfaces and SQL polish.**

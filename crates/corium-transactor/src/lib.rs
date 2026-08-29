@@ -7,6 +7,7 @@ pub mod backup;
 pub mod branch;
 pub mod keys;
 pub mod lease;
+pub mod merge;
 pub mod metrics;
 pub mod node;
 pub mod server;

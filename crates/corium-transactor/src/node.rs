@@ -1738,15 +1738,6 @@ impl TransactorNode {
         let entry = corium_db::saga::entry(&parent_state.db(), saga).ok_or_else(|| {
             NodeError::BadRequest(format!("no saga {saga:032x} in {parent}'s registry"))
         })?;
-        if !entry.is_open() {
-            return Err(NodeError::BadRequest(format!(
-                "saga {saga:032x} is {}; it has no live branch",
-                entry
-                    .status
-                    .as_ref()
-                    .map_or_else(|| "statusless".to_owned(), ToString::to_string)
-            )));
-        }
         let basis_t = entry
             .basis_t
             .and_then(|basis| u64::try_from(basis).ok())
@@ -1772,6 +1763,23 @@ impl TransactorNode {
         // parent has never seen, and the branch's own log records cannot be
         // decoded without them.
         let stored_meta = self.store.get_root(&meta_root_name(name)).await?;
+        // A branch outlives its saga. After a merge it is the step-grain audit
+        // annex the design points auditors at — who did what, when, in which
+        // order — and after an abort it is the record of what the workflow had
+        // done outside the database and must now unwind. Both are readable
+        // until retention deletes the branch, and once it has, saying so is
+        // better than standing up an empty overlay that answers as if the saga
+        // had never taken a step. Steps stop the moment the saga does
+        // regardless; that refusal lives in [`Branch::step_rules`].
+        if !entry.is_open() && stored_meta.is_none() {
+            return Err(NodeError::BadRequest(format!(
+                "saga {saga:032x} is {}, and its branch has been discarded",
+                entry
+                    .status
+                    .as_ref()
+                    .map_or_else(|| "statusless".to_owned(), ToString::to_string)
+            )));
+        }
         let (schema, idents, interner) = if let Some(meta) = stored_meta {
             codec::decode_metadata(&meta)?
         } else {
@@ -1928,6 +1936,377 @@ impl TransactorNode {
         self.log_backend.delete_all(&name).await?;
         self.store.delete_root(&meta_root_name(&name)).await?;
         Ok(hosted.is_some() || had_log)
+    }
+
+    /// Merges saga `saga`'s branch into `parent` as one transaction — the
+    /// commit of ADR-0023.
+    ///
+    /// This is where a saga stops being isolated, and it is deliberately the
+    /// only place that happens. The branch's accumulated novelty is squashed
+    /// to its net effect, scanned against what the parent has done since `t₀`,
+    /// checked against the read dependencies the saga declared, and then
+    /// applied — the datoms, the flip to `:committed`, and the merge's own
+    /// record — as a single append. One log record: atomicity is structural
+    /// rather than a protocol, and a retry after a crash finds the saga
+    /// already `:committed` and says so.
+    ///
+    /// What it does *not* do is re-run the branch's transaction data. The
+    /// saga's owner ran those steps against branch state and watched what came
+    /// back, possibly acted outside the database on the strength of it, and
+    /// possibly had a person review it; re-evaluating tx functions or `:db/cas`
+    /// forms against a parent that has moved could commit something nobody
+    /// observed. Effects are replayed, and where the parent has moved in a way
+    /// that matters the merge fails loudly with a conflict report the owner can
+    /// answer.
+    ///
+    /// A refused merge is not a failure of this call: it writes the report to
+    /// `:db.saga/conflict-report`, leaves the saga `:open` and the branch
+    /// untouched, and reports `committed: false`. Only something that makes the
+    /// merge unanswerable — an unknown saga, a fenced node, a branch whose
+    /// novelty no longer validates against the parent's schema — is an error.
+    ///
+    /// # Errors
+    /// Returns [`NodeError::BadRequest`] when the saga is unknown, is not open
+    /// and not already committed, or when a guard or resolution cannot be read;
+    /// [`NodeError::Transact`] when the squashed novelty does not validate
+    /// against the parent's current schema; and the usual lease, store, and log
+    /// failures otherwise.
+    #[allow(clippy::too_many_lines)]
+    pub async fn saga_commit(
+        &self,
+        parent: &str,
+        saga: u128,
+        guards: &[Edn],
+        resolutions: &[Edn],
+    ) -> Result<pb::SagaCommitResponse, NodeError> {
+        use corium_db::saga::SagaStatus;
+        use corium_tx::merge::{self, MergeInput};
+
+        if is_branch_name(parent) {
+            return Err(NodeError::BadRequest(format!(
+                "{parent} is itself a saga branch; sagas do not nest"
+            )));
+        }
+        let parent_state = self.db_state(parent).await?;
+        // Opening the branch first is what makes a resumed or crashed saga
+        // commit like any other: the overlay is a deterministic function of
+        // the registry entry, so "the branch nobody has touched since the
+        // restart" and "the branch that has been hosted all week" are the same
+        // branch here.
+        let branch_state = self.saga_branch(parent, saga).await?;
+        // Freeze the branch before reading it. A step landing between the
+        // squash and the append would be novelty the merge did not carry and
+        // the flip then refuses to let anyone carry — work silently stranded.
+        // Branch first, parent second: a step reads the parent's registry
+        // without holding its commit lock, so no other order exists to invert.
+        let _steps = branch_state.commit.lock().await;
+        let _commit = parent_state.commit.lock().await;
+        if let Some(error) = parent_state.keys_fenced_error() {
+            return Err(error);
+        }
+
+        let mut cursor = parent_state.transactor.batch_cursor();
+        let db = cursor.db().clone();
+        let basis_before = db.basis_t();
+        let entry = corium_db::saga::entry(&db, saga).ok_or_else(|| {
+            NodeError::BadRequest(format!("no saga {saga:032x} in {parent}'s registry"))
+        })?;
+        match &entry.status {
+            Some(SagaStatus::Open) => {}
+            // The idempotent retry. A commit that appended and then lost the
+            // acknowledgement — to a crash, a partition, a client that gave up
+            // — is a commit that happened, and the second attempt reports the
+            // merge it finds rather than trying to make another.
+            Some(SagaStatus::Committed) => {
+                return Ok(pb::SagaCommitResponse {
+                    committed: true,
+                    basis_before,
+                    basis_t: entry
+                        .merged_tx
+                        .map_or(basis_before, corium_core::EntityId::sequence),
+                    tx_instant: entry
+                        .merged_tx
+                        .and_then(|tx| db.tx_instant(tx.sequence()))
+                        .unwrap_or_default(),
+                    steps: u64::try_from(entry.steps.unwrap_or_default()).unwrap_or_default(),
+                    datoms: 0,
+                    conflict_report: Vec::new(),
+                });
+            }
+            Some(status) => {
+                return Err(NodeError::BadRequest(format!(
+                    "cannot commit saga {saga:032x}: it is {status}"
+                )));
+            }
+            None => {
+                return Err(NodeError::BadRequest(format!(
+                    "cannot commit saga {saga:032x}: its registry entry has no status"
+                )));
+            }
+        }
+        let basis_t = entry
+            .basis_t
+            .and_then(|basis| u64::try_from(basis).ok())
+            .ok_or_else(|| {
+                NodeError::BadRequest(format!("saga {saga:032x} has no opening basis"))
+            })?;
+
+        // Both sides of the merge, folded the same way. The branch's novelty
+        // is every datom its own log holds above `t₀`, which is exactly the
+        // suffix of its recorded value; the parent's drift comes from its log,
+        // because a parent that has published an index since `t₀` no longer
+        // carries its novelty as a transaction-ordered tail in memory.
+        let branch_db = branch_state.db();
+        let branch_novelty = merge::squash(branch_db.recorded_since(basis_t));
+        let drift = {
+            let records = parent_state
+                .log
+                .tx_range_async(basis_t + 1, None)
+                .await
+                .map_err(NodeError::Log)?;
+            merge::squash(records.iter().flat_map(|record| record.datoms.iter()))
+        };
+
+        // A branch mints keyword names in a naming of its own, so the values
+        // it is about to make canonical have to be re-named into the parent's
+        // before anything reads or writes them. Into a private copy: nothing
+        // is published unless the merge commits.
+        let mut interner = {
+            let naming = parent_state
+                .naming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            naming.interner.clone()
+        };
+        let named_before = interner.len();
+        let novelty = merge::translate(&branch_novelty, branch_db.interner(), &mut interner)
+            .map_err(|error| NodeError::BadRequest(error.to_string()))?;
+        // The parent's value as the merge must read it: its own data, under a
+        // naming that can resolve the branch's words.
+        let idents = db.idents().clone();
+        let against = db.clone().with_naming(idents, interner.clone());
+
+        let conflicts = merge::scan(&MergeInput {
+            parent: &against,
+            branch: &novelty,
+            drift: &drift,
+        });
+        let resolutions = crate::merge::parse_resolutions(&against, resolutions)
+            .map_err(NodeError::BadRequest)?;
+        let resolved = merge::resolve(conflicts, &resolutions);
+
+        // Guards are the saga's read dependencies, and the engine tracks none
+        // of them on its own. Both sources are evaluated: what the committer
+        // declares now, and what the steps declared along the way.
+        let mut failed = Vec::new();
+        let declared = crate::merge::branch_guards(&branch_db, basis_t)
+            .into_iter()
+            .chain(
+                guards
+                    .iter()
+                    .map(|form| crate::merge::Guard::requested(form.to_string())),
+            );
+        for guard in declared {
+            if let Err(why) = crate::merge::evaluate(&against, &guard) {
+                failed.push((guard, why));
+            }
+        }
+
+        if !resolved.outstanding.is_empty() || !resolved.rejected.is_empty() || !failed.is_empty() {
+            let report = crate::merge::report(
+                &against,
+                &entry,
+                &novelty,
+                &resolved.outstanding,
+                &failed,
+                &resolved.rejected,
+            );
+            // The report is the merge's only parent effect when it refuses:
+            // the saga stays `:open`, the branch is untouched, and the owner
+            // has a document to answer. It carries no new names, so it commits
+            // against the naming the parent already publishes.
+            let items = vec![corium_tx::TxItem::Op(corium_tx::TxOp::Add(
+                corium_tx::EntityRef::Id(entry.entity),
+                corium_db::bootstrap::SAGA_CONFLICT_REPORT,
+                corium_core::Value::Str(report.clone().into()),
+            ))];
+            let prepared = cursor
+                .prepare(items, now_unix_ms())
+                .map_err(|error| NodeError::Transact(error.into()))?;
+            let basis_t = self
+                .append_one(&parent_state, cursor, prepared, None)
+                .await?;
+            return Ok(pb::SagaCommitResponse {
+                committed: false,
+                basis_before,
+                basis_t,
+                tx_instant: 0,
+                steps: novelty.steps,
+                datoms: u64::try_from(novelty.len()).unwrap_or(u64::MAX),
+                conflict_report: codec::encode_edn(&Edn::Str(report)),
+            });
+        }
+
+        let merged = merge::apply(&novelty, &resolved, &against);
+        let steps = i64::try_from(merged.steps).unwrap_or(i64::MAX);
+        let applied = u64::try_from(merged.len()).unwrap_or(u64::MAX);
+        // `:db.saga.status/committed` is a value like any other, and a database
+        // whose sagas have only ever opened and aborted has never interned it.
+        let committed = interner.intern(SagaStatus::Committed.keyword());
+        let mut items = crate::merge::novelty_items(&merged);
+        items.push(corium_tx::TxItem::Op(corium_tx::TxOp::Add(
+            corium_tx::EntityRef::Id(entry.entity),
+            corium_db::bootstrap::SAGA_STATUS,
+            corium_core::Value::Keyword(committed),
+        )));
+        items.push(corium_tx::TxItem::Op(corium_tx::TxOp::AddRef(
+            corium_tx::EntityRef::Id(entry.entity),
+            corium_db::bootstrap::SAGA_MERGED_TX,
+            corium_tx::EntityRef::Temp(corium_tx::TX_TEMPID.to_owned()),
+        )));
+        items.push(corium_tx::TxItem::Op(corium_tx::TxOp::Add(
+            corium_tx::EntityRef::Id(entry.entity),
+            corium_db::bootstrap::SAGA_STEPS,
+            corium_core::Value::Long(steps),
+        )));
+        // The label a tier-2 reader maps "what I saw" onto "what landed" with,
+        // without a second lookup: the merge transaction says which saga it is.
+        items.push(corium_tx::TxItem::Op(corium_tx::TxOp::Add(
+            corium_tx::EntityRef::Temp(corium_tx::TX_TEMPID.to_owned()),
+            corium_db::bootstrap::SAGA_TX_ID,
+            corium_core::Value::Uuid(saga),
+        )));
+        // A report from an earlier attempt described a merge that did not
+        // happen; leaving it on a committed saga would describe this one.
+        if let Some(stale) = &entry.conflict_report {
+            items.push(corium_tx::TxItem::Op(corium_tx::TxOp::Retract(
+                corium_tx::EntityRef::Id(entry.entity),
+                corium_db::bootstrap::SAGA_CONFLICT_REPORT,
+                corium_core::Value::Str(stale.clone().into()),
+            )));
+        }
+
+        // Validation reads keyword values — the status it is about to write
+        // among them — through the interner of the value being prepared
+        // against, so the names go on before `prepare`, not after.
+        cursor.intern_naming(interner.clone());
+        let prepared = cursor
+            .prepare(items, now_unix_ms())
+            .map_err(|error| NodeError::Transact(error.into()))?;
+        let tx_instant = prepared.record.tx_instant;
+        let minted = (interner.len() > named_before).then(|| interner.clone());
+        let basis_t = self
+            .append_one(&parent_state, cursor, prepared, minted)
+            .await?;
+        tracing::info!(
+            db = parent,
+            saga = format!("{saga:032x}"),
+            steps,
+            datoms = applied,
+            t = basis_t,
+            "saga merged"
+        );
+        Ok(pb::SagaCommitResponse {
+            committed: true,
+            basis_before,
+            basis_t,
+            tx_instant,
+            steps: merged.steps,
+            datoms: applied,
+            conflict_report: Vec::new(),
+        })
+    }
+
+    /// Makes one transactor-composed transaction durable and live, returning
+    /// its `t`.
+    ///
+    /// The order is the one every write path here follows and for the same
+    /// reasons: new keyword names are published to the metadata root before
+    /// the datoms that reference them, because recovery decodes the log
+    /// against that root; publishing it is an unfenced write, so ownership is
+    /// re-checked first; the record is appended, which is the commit point;
+    /// the value is installed while the commit lock is still held, so the live
+    /// value never lags the durable log; and the post-append fence gates only
+    /// the acknowledgement and the peer stream.
+    async fn append_one(
+        &self,
+        state: &Arc<DbState>,
+        cursor: crate::BatchCursor,
+        prepared: Prepared,
+        minted: Option<KeywordInterner>,
+    ) -> Result<u64, NodeError> {
+        let interner = if let Some(interner) = &minted {
+            interner.clone()
+        } else {
+            let naming = state
+                .naming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            naming.interner.clone()
+        };
+        let (schema, idents) = {
+            let after = prepared.db_after();
+            (after.schema().clone(), after.idents().clone())
+        };
+        if minted.is_some() {
+            if let Err(error) = state.check_lease(self.store.as_ref()).await {
+                if matches!(error, NodeError::Deposed(_)) {
+                    self.depose(state, "write lease lost before metadata publish");
+                }
+                return Err(error);
+            }
+            let meta = codec::encode_metadata(&schema, &idents, &interner);
+            loop {
+                let cas = match self.store.get_root(&meta_root_name(&state.name)).await {
+                    Ok(current) => {
+                        self.store
+                            .cas_root(&meta_root_name(&state.name), current.as_deref(), &meta)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match cas {
+                    Ok(()) => break,
+                    Err(StoreError::CasFailed { .. }) => {}
+                    Err(error) => return Err(NodeError::Store(error)),
+                }
+            }
+        }
+        let record = prepared.record.clone();
+        state.log.append_batch_async(&[record]).await?;
+        let reports = state.transactor.install_batch(cursor, vec![prepared]);
+        if minted.is_some() {
+            state
+                .transactor
+                .update_naming(idents.clone(), interner.clone());
+            let mut naming = state
+                .naming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            naming.schema = schema;
+            naming.idents = idents;
+            naming.interner = interner.clone();
+        }
+        if let Err(error) = state.check_lease(self.store.as_ref()).await {
+            if matches!(error, NodeError::Deposed(_)) {
+                self.depose(state, "write lease lost after durable append");
+            }
+            return Err(error);
+        }
+        let mut basis_t = 0;
+        for report in reports {
+            basis_t = report.db_after.basis_t();
+            let datoms = codec::encode_datoms(&report.tx.datoms, &interner)?;
+            let _ = state
+                .broadcast
+                .send(pb::subscribe_item::Item::Report(pb::TxReport {
+                    t: basis_t,
+                    tx_instant: report.tx_instant,
+                    datoms,
+                }));
+        }
+        let _ = state.basis.send(basis_t);
+        Ok(basis_t)
     }
 
     /// Every branch of `parent` with durable state, hosted or not.

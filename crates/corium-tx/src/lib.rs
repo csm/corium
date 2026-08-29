@@ -1,6 +1,7 @@
 //! Pure transaction expansion, entity resolution, and validation.
 
 pub mod branch;
+pub mod merge;
 pub mod saga;
 
 use std::collections::{BTreeMap, BTreeSet};

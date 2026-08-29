@@ -1,4 +1,5 @@
-//! `corium saga`: open, list, inspect, extend, and abort sagas (ADR-0023).
+//! `corium saga`: open, list, inspect, extend, commit, and abort sagas
+//! (ADR-0023).
 //!
 //! Every one of these is an ordinary transaction against the parent database's
 //! registry, so this module is a thin front for
@@ -10,8 +11,14 @@
 //! `step` and `log` work on the saga's branch — the overlay database its
 //! partial progress lives in — which is an ordinary connection under a name
 //! derived from the saga id, so `corium console <db> --saga <id>` gets the
-//! whole read surface over it for free. One subcommand the design names is
-//! still absent: `commit`, which is the merge.
+//! whole read surface over it for free.
+//!
+//! `commit` is the exception to "thin front for a transaction": a merge is
+//! composed inside the transactor, so this sends the request and prints what
+//! came back. A refused merge is not a crashed command — it prints the
+//! conflict report and exits non-zero, so a script can tell "the parent moved"
+//! from "the database is unreachable", and a person has the document they need
+//! in order to answer.
 
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +29,7 @@ use corium_db::Db;
 use corium_db::saga::{SagaEntry, SagaStatus};
 use corium_peer::Connection;
 use corium_peer::saga::{
-    SagaBranch, SagaOptions, format_saga_id, parse_saga_id, registry_installed,
+    MergeOutcome, SagaBranch, SagaOptions, format_saga_id, parse_saga_id, registry_installed,
 };
 use corium_query::edn::{Edn, read_all};
 
@@ -39,6 +46,8 @@ pub(crate) enum SagaCommand {
     Status(StatusArgs),
     /// Move an open saga's deadline further out.
     Extend(ExtendArgs),
+    /// Merge an open saga's branch into the parent as one transaction.
+    Commit(CommitArgs),
     /// Abort an open saga, optionally recording a compensating transaction.
     Abort(AbortArgs),
     /// Transact one step against an open saga's branch.
@@ -134,6 +143,37 @@ pub(crate) struct ExtendArgs {
     client: ClientFlags,
 }
 
+/// Arguments of `corium saga commit`.
+#[derive(Args)]
+pub(crate) struct CommitArgs {
+    /// Database name.
+    db: String,
+    /// Saga id.
+    id: String,
+    /// A read dependency to check against the parent before merging
+    /// (repeatable): either `[:db/cas <entity> <attribute> <value>]`, the
+    /// compare half of a compare-and-swap, or `{:guard <query>}`, a Datalog
+    /// query that must return a row — `{:guard <query> :expect :none}` for one
+    /// that must not. Guards the branch's steps declared as `:db.saga/guard`
+    /// metadata are checked as well; these are the ones only the committer
+    /// knows about.
+    #[arg(long = "guard", value_name = "EDN")]
+    guard: Vec<String>,
+    /// An answer to one conflict from the last report (repeatable):
+    /// `{:e <entity> :a <attribute> :parent <value> :take :parent}` drops the
+    /// branch's write and `:take :branch` overrides it, which only a
+    /// write-write conflict on a cardinality-one attribute admits. Copy `:v`
+    /// across too when the report carries one: it names the single fact a
+    /// conflict on a cardinality-many attribute is about. `:parent` is the
+    /// value the report showed and is what fences the answer: if the parent
+    /// has moved again, the merge refuses rather than absorbing the
+    /// difference.
+    #[arg(long = "resolve", value_name = "EDN")]
+    resolve: Vec<String>,
+    #[command(flatten)]
+    client: ClientFlags,
+}
+
 /// Arguments of `corium saga abort`.
 #[derive(Args)]
 pub(crate) struct AbortArgs {
@@ -188,6 +228,12 @@ pub(crate) struct LogArgs {
 /// Returns the message to print on failure; the registry's own refusals
 /// ("cannot abort saga …: it is committed") come through unchanged.
 pub(crate) async fn run(command: SagaCommand) -> Result<ExitCode, String> {
+    // `commit` is the one subcommand with an outcome rather than just a
+    // result: a merge the parent refuses is a legitimate answer that a script
+    // must be able to see in the exit code.
+    if let SagaCommand::Commit(args) = command {
+        return commit(args).await;
+    }
     match command {
         SagaCommand::Open(args) => open(args).await,
         SagaCommand::List(args) => list(args).await,
@@ -196,6 +242,7 @@ pub(crate) async fn run(command: SagaCommand) -> Result<ExitCode, String> {
         SagaCommand::Abort(args) => abort(args).await,
         SagaCommand::Step(args) => step(args).await,
         SagaCommand::Log(args) => log(args).await,
+        SagaCommand::Commit(_) => unreachable!("handled above"),
     }
     .map(|()| ExitCode::SUCCESS)
 }
@@ -310,6 +357,59 @@ async fn extend(args: ExtendArgs) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     println!("{}", render(&extended.entry));
     Ok(())
+}
+
+async fn commit(args: CommitArgs) -> Result<ExitCode, String> {
+    let connection = connect(args.db.clone(), &args.client).await?;
+    let id = parse_saga_id(&args.id).ok_or_else(|| format!("invalid saga id {:?}", args.id))?;
+    let guards = forms_of(&args.guard, "--guard")?;
+    let resolutions = forms_of(&args.resolve, "--resolve")?;
+    let outcome = connection
+        .saga_commit(id, guards, resolutions)
+        .await
+        .map_err(|error| error.to_string())?;
+    match outcome {
+        MergeOutcome::Committed(report) => {
+            println!(
+                "{{:saga {:?} :committed true :t {} :basis-before {} :steps {} :datoms {}}}",
+                format_saga_id(id),
+                report.basis_t,
+                report.basis_before,
+                report.steps,
+                report.datoms,
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        MergeOutcome::Conflict(report) => {
+            println!(
+                "{{:saga {:?} :committed false :t {} :steps {} :datoms {}}}",
+                format_saga_id(id),
+                report.basis_t,
+                report.steps,
+                report.datoms,
+            );
+            println!("{}", report.report);
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Reads one EDN form per repeated flag, so `--guard` twice is two guards
+/// rather than one form somebody has to bracket by hand.
+fn forms_of(texts: &[String], flag: &str) -> Result<Vec<Edn>, String> {
+    texts
+        .iter()
+        .map(|text| {
+            let forms = read_all(text).map_err(|error| format!("{flag} is not EDN: {error}"))?;
+            match forms.as_slice() {
+                [form] => Ok(form.clone()),
+                other => Err(format!(
+                    "{flag} takes one form, not {} (repeat the flag)",
+                    other.len()
+                )),
+            }
+        })
+        .collect()
 }
 
 async fn abort(args: AbortArgs) -> Result<(), String> {

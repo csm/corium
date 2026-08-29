@@ -59,6 +59,29 @@ pub const DEFAULT_ID_BLOCK: i64 = 1 << 20;
 /// name. Public so a store scan can build the prefix branches share.
 pub const BRANCH_INFIX: &str = ".saga.";
 
+/// Renders a saga id the way every corium surface spells one: 32 lowercase
+/// hex digits, no dashes.
+///
+/// It lives here, beside the registry, because a saga id is not any one
+/// surface's notation: the CLI prints it, a branch name embeds it, the
+/// transactor logs it, and SQL projects it, and a database whose id spelling
+/// depended on which crate did the printing would be a database whose sagas
+/// are hard to grep for.
+#[must_use]
+pub fn format_id(id: u128) -> String {
+    format!("{id:032x}")
+}
+
+/// Parses a saga id, with or without the conventional UUID dashes.
+#[must_use]
+pub fn parse_id(text: &str) -> Option<u128> {
+    let compact: String = text.chars().filter(|c| *c != '-').collect();
+    if compact.len() != 32 {
+        return None;
+    }
+    u128::from_str_radix(&compact, 16).ok()
+}
+
 /// The name a saga's branch is hosted under.
 ///
 /// Branch naming lives beside the registry because it is derived from it: a
@@ -66,7 +89,7 @@ pub const BRANCH_INFIX: &str = ".saga.";
 /// can address the branch without being told where it is.
 #[must_use]
 pub fn branch_name(parent: &str, saga: u128) -> String {
-    format!("{parent}{BRANCH_INFIX}{saga:032x}")
+    format!("{parent}{BRANCH_INFIX}{}", format_id(saga))
 }
 
 /// The parent database and saga id a branch name carries.

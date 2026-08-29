@@ -8,6 +8,7 @@ use corium_protocol::codec;
 use corium_protocol::pb;
 use corium_protocol::pb::catalog_server::{Catalog, CatalogServer};
 use corium_protocol::pb::transactor_server::{Transactor, TransactorServer};
+use corium_query::edn::Edn;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -231,6 +232,29 @@ impl Transactor for TransactorSvc {
             .map_err(|error| to_status(&error))
     }
 
+    async fn saga_commit(
+        &self,
+        request: Request<pb::SagaCommitRequest>,
+    ) -> Result<Response<pb::SagaCommitResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        check_version(request.protocol_version)?;
+        // A merge is a write on the parent, authorized as one. The branch is
+        // not authorized separately: it is the same data under the same
+        // policy, and the transaction that lands is the parent's.
+        authorize_write(&self.0, &self.1, &principal, &request.db).await?;
+        let saga = corium_db::saga::parse_id(&request.saga).ok_or_else(|| {
+            Status::invalid_argument(format!("invalid saga id {:?}", request.saga))
+        })?;
+        let guards = decode_forms(&request.guards, "guards")?;
+        let resolutions = decode_forms(&request.resolutions, "resolutions")?;
+        self.0
+            .saga_commit(&request.db, saga, &guards, &resolutions)
+            .await
+            .map(Response::new)
+            .map_err(|error| to_status(&error))
+    }
+
     type SubscribeStream = ItemStream;
 
     async fn subscribe(
@@ -298,6 +322,22 @@ impl Transactor for TransactorSvc {
             .map(Response::new)
             .map_err(|error| to_status(&error))
     }
+}
+
+/// Reads a composite-encoded EDN vector of forms from a request field.
+///
+/// An absent field is an empty vector rather than an error: a commit with no
+/// guards and no resolutions is the ordinary first attempt.
+fn decode_forms(encoded: &[u8], field: &str) -> Result<Vec<Edn>, Status> {
+    if encoded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let decoded = corium_protocol::codec::decode_edn(encoded)
+        .map_err(|error| Status::invalid_argument(format!("{field}: {error}")))?;
+    decoded
+        .as_seq()
+        .map(<[Edn]>::to_vec)
+        .ok_or_else(|| Status::invalid_argument(format!("{field} must be a vector of forms")))
 }
 
 fn check_version(version: u32) -> Result<(), Status> {
