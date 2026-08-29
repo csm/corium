@@ -238,6 +238,31 @@ fn coerce(value: Value, value_type: ValueType) -> Value {
     }
 }
 
+/// Resolves an entity-position form: an id, an `#eid` tag, an ident, a lookup
+/// ref, or a tempid string.
+///
+/// Public because entity positions turn up outside transaction data proper —
+/// a saga's merge guards and conflict resolutions name entities the same way
+/// transaction forms do, and spelling them a second way would be one more
+/// dialect for a caller to get wrong.
+///
+/// # Errors
+/// Returns [`TxFormError::BadEntity`] when the form is not an entity position,
+/// and [`TxFormError::UnknownAttribute`] when a lookup ref names an attribute
+/// this database does not have.
+pub fn tx_entity(db: &Db, form: &Edn) -> Result<EntityRef, TxFormError> {
+    entity_ref(db, form)
+}
+
+/// Resolves an attribute-position keyword to its entity.
+///
+/// # Errors
+/// Returns [`TxFormError`] when the form is not a keyword or names an
+/// attribute this database does not have.
+pub fn tx_attribute(db: &Db, form: &Edn) -> Result<EntityId, TxFormError> {
+    attr_of(db, form)
+}
+
 /// Converts a value-position form for `attr`, resolving reference values.
 ///
 /// # Errors

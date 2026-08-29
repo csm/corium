@@ -643,6 +643,30 @@ impl Connection {
         Ok(client.transact(request).await?.into_inner())
     }
 
+    /// Submits a saga merge, returning the transactor's raw answer.
+    ///
+    /// The merge is the one write a client cannot compose for itself
+    /// (`corium_peer::saga`), so it has an RPC of its own; this is that RPC
+    /// with nothing added, for the peer server's proxy path and for
+    /// [`Connection::saga_commit`], which is the method to use.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] for a refused merge or transport failure. A merge
+    /// the parent's current state will not admit comes back as a successful
+    /// response carrying a conflict report, not as an error.
+    pub async fn saga_commit_raw(
+        &self,
+        request: pb::SagaCommitRequest,
+    ) -> Result<pb::SagaCommitResponse, PeerError> {
+        let mut client = self
+            .inner
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok(client.saga_commit(request).await?.into_inner())
+    }
+
     /// Waits until the local basis reaches the transactor's current basis.
     ///
     /// # Errors

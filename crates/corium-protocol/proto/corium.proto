@@ -133,8 +133,48 @@ message StatusResponse {
 // Transactor service (peers -> transactor)
 // ---------------------------------------------------------------------------
 
+// Commits a saga: squashes its branch's novelty into one parent transaction
+// (see docs/design/long-running-transactions.md). The merge is a write on the
+// parent database, so it is authorized and fenced exactly as `Transact` is.
+message SagaCommitRequest {
+  string db = 1;
+  uint32 protocol_version = 2;
+  // The saga's id as every corium surface spells one: 32 lowercase hex
+  // digits, dashes optional.
+  string saga = 3;
+  // Composite-encoded EDN vector of guards to evaluate against the parent,
+  // beyond those the branch's steps declared as `:db.saga/guard` metadata.
+  bytes guards = 4;
+  // Composite-encoded EDN vector of per-conflict resolutions, each fenced to
+  // the parent-side value the conflict report showed.
+  bytes resolutions = 5;
+}
+
+message SagaCommitResponse {
+  // False when the merge was refused; `conflict_report` says what collided.
+  bool committed = 1;
+  // Parent basis before the merge.
+  uint64 basis_before = 2;
+  // The merge transaction's `t`. On refusal it is the transaction that
+  // recorded the conflict report, which is the refusal's only parent effect.
+  uint64 basis_t = 3;
+  // The merge transaction's `:db/txInstant`; zero on refusal, where no merge
+  // transaction exists to have one.
+  int64 tx_instant = 4;
+  // Branch transactions squashed into the merge.
+  uint64 steps = 5;
+  // Net datoms the merge applied, or would have applied. Zero on a retry that
+  // found the saga already committed: the merge is in the parent's log, which
+  // is where a caller who needs the count after the fact reads it.
+  uint64 datoms = 6;
+  // Composite-encoded EDN conflict report; empty when the merge committed.
+  bytes conflict_report = 7;
+}
+
 service Transactor {
   rpc Transact(TransactRequest) returns (TransactResponse);
+  // Merge a saga's branch into its parent as one validated transaction.
+  rpc SagaCommit(SagaCommitRequest) returns (SagaCommitResponse);
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeItem);
   rpc Sync(SyncRequest) returns (SyncResponse);
   rpc Status(StatusRequest) returns (StatusResponse);

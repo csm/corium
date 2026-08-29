@@ -129,6 +129,18 @@ pub const UPDATE_ACK: AttrId = EntityId::new(Partition::Db as u32, 96);
 /// why this final field is not adjacent to the other compensation fields.
 pub const SAGA_COMPENSATION_ERROR: AttrId = EntityId::new(Partition::Db as u32, 97);
 
+/// Entity id of `:db.saga/tx-id`, the saga label a merge — or an abort
+/// carrying a compensation — asserts on its own transaction entity.
+///
+/// It is not `:db.saga/id`. That attribute is `:db.unique/identity`: the uuid
+/// names exactly one entity, the registry entry, for the life of the database,
+/// and asserting it on a transaction entity as well would either collide or
+/// upsert the transaction *into* the saga. So the label carrying the same uuid
+/// is an attribute of its own, indexed and not unique, and
+/// `[?tx :db.saga/tx-id ?id]` is the query the design writes as
+/// `[?tx :db.saga/id ?saga]`.
+pub const SAGA_TX_ID: AttrId = EntityId::new(Partition::Db as u32, 98);
+
 /// The `:db/txInstant` keyword.
 #[must_use]
 pub fn tx_instant_ident() -> Keyword {
@@ -310,6 +322,13 @@ pub fn attributes() -> Vec<(Keyword, Attribute)> {
             Attribute {
                 cardinality: Cardinality::Many,
                 ..simple(SAGA_GUARD, ValueType::Str)
+            },
+        ),
+        (
+            Keyword::new(Some("db.saga"), "tx-id"),
+            Attribute {
+                indexed: true,
+                ..simple(SAGA_TX_ID, ValueType::Uuid)
             },
         ),
         (
