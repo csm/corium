@@ -276,7 +276,7 @@ async fn drift_comes_back_as_a_report_the_caller_answers() {
     let MergeOutcome::Committed(report) = &outcome else {
         panic!("expected a merge, got {outcome:?}");
     };
-    assert!(report.steps == 1);
+    assert_eq!(report.steps, 1);
     let db = connection.db();
     assert_eq!(
         string_of(&db, order, "status").as_deref(),
