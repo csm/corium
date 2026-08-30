@@ -293,6 +293,12 @@ pub struct SagaEntry {
     pub on_abort_fn: Option<EntityId>,
     /// Why a system-time compensation did not land.
     pub on_abort_error: Option<String>,
+    /// Milliseconds this saga's branch is kept after it finishes, overriding
+    /// the database's retention policy.
+    pub retain_for: Option<i64>,
+    /// `:db/txInstant` of the transaction that finished the saga, absent
+    /// while it is open.
+    pub finished_at: Option<i64>,
     /// External-compensation ledger, ordered by entity id.
     pub compensations: Vec<Compensation>,
 }
@@ -304,6 +310,12 @@ impl SagaEntry {
         matches!(self.status, Some(SagaStatus::Open))
     }
 
+    /// Whether the saga has finished, whichever way it finished.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.status.as_ref().is_some_and(SagaStatus::is_terminal)
+    }
+
     /// Whether an open saga's deadline has passed at `now` (epoch millis).
     ///
     /// An open saga with no deadline is overdue at any instant: expiry is
@@ -312,6 +324,37 @@ impl SagaEntry {
     #[must_use]
     pub fn is_overdue(&self, now: i64) -> bool {
         self.is_open() && self.expires_at.is_none_or(|expires_at| expires_at <= now)
+    }
+
+    /// When this saga's branch may be deleted, given the database's default
+    /// retention in milliseconds.
+    ///
+    /// The window runs from the transition that finished the saga, not from
+    /// its deadline: a saga that expires the instant its owner stops
+    /// heartbeating and one that expires a week later both owe the owner the
+    /// same grace period to salvage from. An open saga has no deadline here
+    /// at all — its branch is live, not retained.
+    ///
+    /// Absent when the saga is finished but the value has no recorded
+    /// instant, which is a transition written before this field existed or
+    /// read through a view that does not hold it. The sweep treats that as
+    /// "not yet", because deleting a branch on a missing timestamp is the one
+    /// mistake retention exists to prevent.
+    #[must_use]
+    pub fn retention_deadline(&self, default_ms: i64) -> Option<i64> {
+        if !self.is_finished() {
+            return None;
+        }
+        let window = self.retain_for.unwrap_or(default_ms).max(0);
+        self.finished_at
+            .map(|finished_at| finished_at.saturating_add(window))
+    }
+
+    /// Whether this saga's branch has outlived its retention window at `now`.
+    #[must_use]
+    pub fn is_retention_expired(&self, now: i64, default_ms: i64) -> bool {
+        self.retention_deadline(default_ms)
+            .is_some_and(|deadline| deadline <= now)
     }
 }
 
@@ -347,6 +390,7 @@ pub fn is_saga_attribute(a: AttrId) -> bool {
             | bootstrap::SAGA_ON_ABORT_FN
             | bootstrap::SAGA_ON_ABORT_ERROR
             | bootstrap::SAGA_COMPENSATIONS
+            | bootstrap::SAGA_RETAIN_FOR
     )
 }
 
@@ -414,6 +458,8 @@ pub fn entry_at(db: &Db, entity: EntityId) -> Option<SagaEntry> {
         on_abort_tx: field(db, entity, bootstrap::SAGA_ON_ABORT_TX, text),
         on_abort_fn: field(db, entity, bootstrap::SAGA_ON_ABORT_FN, reference),
         on_abort_error: field(db, entity, bootstrap::SAGA_ON_ABORT_ERROR, text),
+        retain_for: field(db, entity, bootstrap::SAGA_RETAIN_FOR, long),
+        finished_at: finished_at(db, entity),
         compensations: refs(db, entity, bootstrap::SAGA_COMPENSATIONS)
             .into_iter()
             .map(|entry| compensation_at(db, entry))
@@ -515,6 +561,42 @@ pub fn grant_ceiling(db: &Db, partition: u32) -> u64 {
         .map(|end| u64::try_from(end).unwrap_or(0))
         .max()
         .unwrap_or(0)
+}
+
+/// The `:db/txInstant` of the transaction that gave `entity` a terminal
+/// status.
+///
+/// The registry records *that* a saga finished, never *when*: the flip is one
+/// `:db.saga/status` assertion, and the instant it landed at is already in the
+/// database — on the transaction entity, where every other transaction's
+/// instant is. Reading it here rather than writing a second timestamp into the
+/// registry keeps the transitions composable by hand, which is the property
+/// the whole vocabulary is built on.
+fn finished_at(db: &Db, entity: EntityId) -> Option<i64> {
+    let prefix = crate::key_prefix(
+        corium_core::IndexOrder::Eavt,
+        Some(entity),
+        Some(bootstrap::SAGA_STATUS),
+        None,
+    );
+    let status = db
+        .datoms_prefix(corium_core::IndexOrder::Eavt, &prefix)
+        .next()?;
+    let terminal = keyword(db, &status.v)
+        .is_some_and(|keyword| SagaStatus::from_keyword(&keyword).is_terminal());
+    if !terminal {
+        return None;
+    }
+    field(db, status.tx, bootstrap::TX_INSTANT, instant)
+}
+
+/// Every finished saga, ordered by saga entity — the retention sweep's input.
+#[must_use]
+pub fn finished_entries(db: &Db) -> Vec<SagaEntry> {
+    entries(db)
+        .into_iter()
+        .filter(SagaEntry::is_finished)
+        .collect()
 }
 
 fn grant_at(db: &Db, entity: EntityId) -> IdGrant {

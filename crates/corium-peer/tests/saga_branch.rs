@@ -7,7 +7,7 @@ use std::time::Duration;
 use corium_core::{Keyword, Value};
 use corium_db::Db;
 use corium_peer::saga::SagaOptions;
-use corium_peer::{Admin, ConnectConfig, Connection, PeerError};
+use corium_peer::{Admin, ConnectConfig, Connection};
 use corium_protocol::authz::Guard;
 use corium_query::edn::{Edn, read_all};
 use corium_transactor::node::{NodeConfig, TransactorNode};
@@ -166,8 +166,11 @@ async fn a_branch_is_an_ordinary_connection_to_partial_progress() {
     assert_eq!(steps[0].t, branch.basis_t() + 1);
 }
 
+/// An aborted saga's branch is retained, not destroyed with the flip: it is
+/// the record of what the workflow did outside the database and still has to
+/// unwind. What it stops being is a branch to *work* on.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_finished_saga_has_no_branch_to_open() {
+async fn an_aborted_sagas_branch_is_readable_but_takes_no_more_steps() {
     let (endpoint, _stop, _dir) = start_transactor().await;
     let connection = connect(&endpoint, "orders").await;
     let opened = connection
@@ -175,11 +178,29 @@ async fn a_finished_saga_has_no_branch_to_open() {
         .await
         .expect("the saga opens");
     let saga = opened.entry.id;
-    connection.saga_abort(saga).await.expect("abort");
-
-    let error = connection
+    let branch = connection
         .saga_branch(saga)
         .await
-        .expect_err("an aborted saga is not a branch to work on");
-    assert!(matches!(error, PeerError::Saga(_)), "unexpected: {error}");
+        .expect("the branch opens");
+    branch
+        .step(forms("{:db/id \"order\" :order/status \"draft\"}"))
+        .await
+        .expect("a step lands");
+
+    let aborted = connection.saga_abort(saga).await.expect("abort");
+    assert!(!aborted.compensated);
+    assert!(aborted.on_abort_error.is_none());
+
+    let branch = connection
+        .saga_branch(saga)
+        .await
+        .expect("a retained branch still opens");
+    branch.sync().await.expect("sync");
+    assert_eq!(branch.steps().len(), 1, "the step history is still there");
+
+    let error = branch
+        .step(forms("{:db/id \"order\" :order/status \"placed\"}"))
+        .await
+        .expect_err("an aborted saga takes no more steps");
+    assert!(error.to_string().contains("aborted"), "unexpected: {error}");
 }

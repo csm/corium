@@ -1,5 +1,5 @@
-//! `corium saga`: open, list, inspect, extend, commit, and abort sagas
-//! (ADR-0023).
+//! `corium saga`: open, list, inspect, extend, commit, abort, and expire
+//! sagas (ADR-0023).
 //!
 //! Every one of these is an ordinary transaction against the parent database's
 //! registry, so this module is a thin front for
@@ -50,6 +50,9 @@ pub(crate) enum SagaCommand {
     Commit(CommitArgs),
     /// Abort an open saga, optionally recording a compensating transaction.
     Abort(AbortArgs),
+    /// Expire an open saga by hand, as the sweep would when its deadline
+    /// passes.
+    Expire(ExpireArgs),
     /// Transact one step against an open saga's branch.
     Step(StepArgs),
     /// Print an open saga's step history, newest step last.
@@ -96,6 +99,12 @@ pub(crate) struct OpenArgs {
     /// EDN transaction data, or the ident of a `:db/fn` entity to invoke.
     #[arg(long = "on-abort", value_name = "EDN|IDENT")]
     on_abort: Option<String>,
+    /// How long this saga's branch is kept after it finishes, for example
+    /// `30d`, instead of for the database's default retention. The window is
+    /// what a returning owner salvages an expired saga from and what an
+    /// auditor reads a committed one's step history in.
+    #[arg(long = "retain-for", value_name = "DURATION")]
+    retain_for: Option<String>,
     /// Open under this saga id instead of a freshly minted one.
     #[arg(long)]
     id: Option<String>,
@@ -191,6 +200,17 @@ pub(crate) struct AbortArgs {
     client: ClientFlags,
 }
 
+/// Arguments of `corium saga expire`.
+#[derive(Args)]
+pub(crate) struct ExpireArgs {
+    /// Database name.
+    db: String,
+    /// Saga id.
+    id: String,
+    #[command(flatten)]
+    client: ClientFlags,
+}
+
 /// Arguments of `corium saga step`.
 #[derive(Args)]
 pub(crate) struct StepArgs {
@@ -240,6 +260,7 @@ pub(crate) async fn run(command: SagaCommand) -> Result<ExitCode, String> {
         SagaCommand::Status(args) => status(args).await,
         SagaCommand::Extend(args) => extend(args).await,
         SagaCommand::Abort(args) => abort(args).await,
+        SagaCommand::Expire(args) => expire(args).await,
         SagaCommand::Step(args) => step(args).await,
         SagaCommand::Log(args) => log(args).await,
         SagaCommand::Commit(_) => unreachable!("handled above"),
@@ -283,6 +304,10 @@ async fn open(args: OpenArgs) -> Result<(), String> {
     }
     for text in &args.reserve {
         options.reserves.push(entity_of(&db, text)?);
+    }
+    if let Some(text) = &args.retain_for {
+        let window = parse_duration(text)?;
+        options.retain_for = Some(i64::try_from(window.as_millis()).unwrap_or(i64::MAX));
     }
     if let Some(id) = &args.id {
         options.id = Some(parse_saga_id(id).ok_or_else(|| format!("invalid saga id {id:?}"))?);
@@ -416,17 +441,42 @@ async fn abort(args: AbortArgs) -> Result<(), String> {
     let connection = connect(args.db.clone(), &args.client).await?;
     let id = parse_saga_id(&args.id).ok_or_else(|| format!("invalid saga id {:?}", args.id))?;
     let compensation: Vec<Edn> = match &args.compensate {
-        Some(text) => {
-            read_all(text).map_err(|error| format!("--compensate is not EDN: {error}"))?
-        }
+        Some(text) => tx_forms(text).map_err(|error| format!("--compensate: {error}"))?,
         None => Vec::new(),
     };
-    let aborted = connection
-        .saga_abort_with(id, compensation)
+    // No `--compensate` leaves whatever the saga registered at open in place;
+    // one replaces it, and `--compensate ''` deliberately drops it.
+    let aborted = match args.compensate {
+        Some(_) => connection.saga_abort_with(id, compensation).await,
+        None => connection.saga_abort(id).await,
+    }
+    .map_err(|error| error.to_string())?;
+    println!("{}", render_finish(&aborted));
+    Ok(())
+}
+
+async fn expire(args: ExpireArgs) -> Result<(), String> {
+    let connection = connect(args.db.clone(), &args.client).await?;
+    let id = parse_saga_id(&args.id).ok_or_else(|| format!("invalid saga id {:?}", args.id))?;
+    let expired = connection
+        .saga_expire(id)
         .await
         .map_err(|error| error.to_string())?;
-    println!("{}", render(&aborted.entry));
+    println!("{}", render_finish(&expired));
     Ok(())
+}
+
+/// A finished saga's entry plus what became of its compensation, which is the
+/// question `abort` and `expire` are asked next.
+fn render_finish(result: &corium_peer::saga::FinishResult) -> String {
+    let mut rendered = render(&result.entry);
+    rendered.pop();
+    format!(
+        "{rendered} :t {} :compensated {} :on-abort-error {}}}",
+        result.basis_t,
+        result.compensated,
+        optional_string(result.on_abort_error.as_deref()),
+    )
 }
 
 async fn step(args: StepArgs) -> Result<(), String> {
@@ -455,20 +505,9 @@ async fn step(args: StepArgs) -> Result<(), String> {
 
 /// Reads transaction data written either as a sequence of forms or as one
 /// bracketed vector of them, since both are how people write it.
-///
-/// The ambiguity is only apparent: a bare `[:db/add …]` form starts with a
-/// keyword, while a vector *of* forms starts with a map or a vector.
 fn tx_forms(text: &str) -> Result<Vec<Edn>, String> {
     let read = read_all(text).map_err(|error| format!("transaction data is not EDN: {error}"))?;
-    if let [Edn::Vector(items) | Edn::List(items)] = read.as_slice()
-        && matches!(
-            items.first(),
-            Some(Edn::Map(_) | Edn::Vector(_) | Edn::List(_))
-        )
-    {
-        return Ok(items.clone());
-    }
-    Ok(read)
+    Ok(corium_forms::txforms::tx_data_forms(&read))
 }
 
 async fn log(args: LogArgs) -> Result<(), String> {
@@ -593,7 +632,8 @@ fn render_full(entry: &SagaEntry) -> String {
     rendered.pop();
     format!(
         "{rendered} :description {} :merged-tx {} :steps {} :conflict-report {} \
-         :on-abort-tx {} :on-abort-fn {} :on-abort-error {}}}",
+         :on-abort-tx {} :on-abort-fn {} :on-abort-error {} :retain-for {} \
+         :finished-at {}}}",
         optional_string(entry.description.as_deref()),
         entry
             .merged_tx
@@ -605,6 +645,8 @@ fn render_full(entry: &SagaEntry) -> String {
             .on_abort_fn
             .map_or_else(|| "nil".to_owned(), |e| e.raw().to_string()),
         optional_string(entry.on_abort_error.as_deref()),
+        optional_long(entry.retain_for),
+        optional_instant(entry.finished_at),
     )
 }
 
@@ -673,6 +715,8 @@ mod tests {
             on_abort_tx: None,
             on_abort_fn: None,
             on_abort_error: None,
+            retain_for: None,
+            finished_at: None,
             compensations: Vec::new(),
         };
         let rendered = render(&entry);
@@ -689,7 +733,7 @@ mod tests {
             "{rendered}"
         );
         let full = render_full(&entry);
-        assert!(full.ends_with(":on-abort-error nil}"), "{full}");
+        assert!(full.ends_with(":finished-at nil}"), "{full}");
         assert!(full.contains(":description \"repair\""), "{full}");
     }
 }

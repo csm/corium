@@ -667,6 +667,31 @@ impl Connection {
         Ok(client.saga_commit(request).await?.into_inner())
     }
 
+    /// Submits a saga abort or expiry, returning the transactor's raw answer.
+    ///
+    /// The flip on its own is ordinary transaction data, and stays that way;
+    /// what needs an RPC is the *compensation* riding with it, since a
+    /// registered `:db.saga/on-abort-fn` is invoked with the branch value no
+    /// client holds. This is that RPC with nothing added, for the peer
+    /// server's proxy path and for [`Connection::saga_abort`] and
+    /// [`Connection::saga_expire`], which are the methods to use.
+    ///
+    /// # Errors
+    /// Returns [`PeerError`] when the saga is unknown or not open, when an
+    /// abort's compensation does not validate, or on transport failure.
+    pub async fn saga_finish_raw(
+        &self,
+        request: pb::SagaFinishRequest,
+    ) -> Result<pb::SagaFinishResponse, PeerError> {
+        let mut client = self
+            .inner
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Ok(client.saga_finish(request).await?.into_inner())
+    }
+
     /// Waits until the local basis reaches the transactor's current basis.
     ///
     /// # Errors

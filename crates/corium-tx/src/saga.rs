@@ -297,6 +297,7 @@ fn name_of(a: AttrId) -> &'static str {
         bootstrap::SAGA_ON_ABORT_FN => ":db.saga/on-abort-fn",
         bootstrap::SAGA_ON_ABORT_ERROR => ":db.saga/on-abort-error",
         bootstrap::SAGA_COMPENSATIONS => ":db.saga/compensations",
+        bootstrap::SAGA_RETAIN_FOR => ":db.saga/retain-for",
         _ => "a saga registry attribute",
     }
 }

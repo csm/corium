@@ -175,11 +175,37 @@ async fn saga_opens_lists_extends_and_aborts() {
         aborted.contains(":status :db.saga.status/aborted"),
         "{aborted}"
     );
+    // Ending a saga says what became of its compensation, which is the
+    // question asked next.
+    assert!(aborted.contains(":compensated false"), "{aborted}");
+    assert!(aborted.contains(":on-abort-error nil"), "{aborted}");
+    // The transition is dated, and the branch's retention window runs from it.
+    let finished = saga(&endpoint, &["status", "orders", &id]).succeeded();
+    assert!(!finished.contains(":finished-at nil"), "{finished}");
 
     // A second abort reports what the registry says, and fails.
     let again = saga(&endpoint, &["abort", "orders", &id]);
     assert_ne!(again.code, 0);
     assert!(again.stderr.contains("aborted"), "{}", again.stderr);
+
+    // Expiring is the sweep's transition, and it is distinct from aborting:
+    // the returning owner can tell "the system ended this" from "I did".
+    let second = saga(
+        &endpoint,
+        &["open", "orders", "--owner", "alice", "--retain-for", "30d"],
+    )
+    .succeeded();
+    let second_id = saga_id(&second);
+    let retention = saga(&endpoint, &["status", "orders", &second_id]).succeeded();
+    assert!(
+        retention.contains(&format!(":retain-for {}", 30_i64 * 86_400_000)),
+        "{retention}"
+    );
+    let expired = saga(&endpoint, &["expire", "orders", &second_id]).succeeded();
+    assert!(
+        expired.contains(":status :db.saga.status/expired"),
+        "{expired}"
+    );
 
     // An id that is not in the registry is an error with the id in it.
     let missing = saga(

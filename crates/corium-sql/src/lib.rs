@@ -934,7 +934,8 @@ mod tests {
         let session = SqlSession::new(&saga_fixture()).expect("session");
         let rows = session
             .query(
-                "SELECT id, status, basis_t, owner, description, sealed, compensations \
+                "SELECT id, status, basis_t, owner, description, sealed, compensations, \
+                        retain_for, finished_at \
                  FROM corium_sys.sagas",
             )
             .await
@@ -952,6 +953,10 @@ mod tests {
                 SqlValue::Text("quarterly reconciliation".into()),
                 SqlValue::Boolean(false),
                 SqlValue::Unsigned(1),
+                // An open saga has no retention override and has not finished,
+                // so its branch has no deletion date to show.
+                SqlValue::Null,
+                SqlValue::Null,
             ]]
         );
     }

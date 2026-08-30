@@ -5,6 +5,7 @@ pub mod authz;
 pub mod backend;
 pub mod backup;
 pub mod branch;
+pub mod expiry;
 pub mod keys;
 pub mod lease;
 pub mod merge;

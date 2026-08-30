@@ -664,6 +664,12 @@ fn sagas_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {
         Field::new("conflict_report", DataType::Utf8, true),
         Field::new("on_abort_error", DataType::Utf8, true),
         Field::new("compensations", DataType::UInt64, false),
+        Field::new("retain_for", DataType::Int64, true),
+        Field::new(
+            "finished_at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+            true,
+        ),
     ];
     let rows: Vec<Vec<ScalarValue>> = saga::entries(db)
         .into_iter()
@@ -684,6 +690,8 @@ fn sagas_table(db: &Db) -> Result<Arc<dyn TableProvider>, SqlError> {
                 ScalarValue::Utf8(entry.conflict_report.clone()),
                 ScalarValue::Utf8(entry.on_abort_error.clone()),
                 ScalarValue::UInt64(Some(entry.compensations.len() as u64)),
+                ScalarValue::Int64(entry.retain_for),
+                ScalarValue::TimestampMillisecond(entry.finished_at, Some("UTC".into())),
             ]
         })
         .collect();

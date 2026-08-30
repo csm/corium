@@ -619,6 +619,15 @@ enum Command {
         /// Retain unreachable blobs for at least this long.
         #[arg(long, default_value = "72h")]
         gc_window: String,
+        /// Saga sweep interval — how often overdue sagas are expired and
+        /// branches past retention discarded (for example `1m`); `off`
+        /// disables it, which leaves expiry to an operator.
+        #[arg(long, default_value = "1m")]
+        saga_sweep_interval: String,
+        /// Keep a finished saga's branch for at least this long, unless the
+        /// saga overrides it with `:db.saga/retain-for`.
+        #[arg(long, default_value = "72h")]
+        saga_retention: String,
         /// Fuel budget per database-function invocation (execution credits).
         #[arg(long, default_value_t = 1_000_000)]
         db_fn_fuel: u64,
@@ -1064,6 +1073,8 @@ async fn run_command(command: Command) -> Result<(), String> {
             metrics_listen,
             gc_interval,
             gc_window,
+            saga_sweep_interval,
+            saga_retention,
             db_fn_fuel,
             db_fn_memory_bytes,
             keys,
@@ -1160,6 +1171,12 @@ async fn run_command(command: Command) -> Result<(), String> {
                 Some(parse_duration(&gc_interval)?)
             };
             config.gc_retention = parse_duration(&gc_window)?;
+            config.saga_sweep_interval = if saga_sweep_interval == "off" {
+                None
+            } else {
+                Some(parse_duration(&saga_sweep_interval)?)
+            };
+            config.saga_retention = parse_duration(&saga_retention)?;
             config.keyring = keys.keyring()?;
             // The built-in `cljrs-tx` runtime is wired by `NodeConfig::new`
             // when the `cljrs` feature is on; apply the flag budgets here.
