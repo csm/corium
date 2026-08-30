@@ -5,7 +5,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use corium_crypt::{KeyId, StaticKeyring};
+use corium_crypt::testing::InMemoryKms;
+use corium_crypt::{KeyId, KmsKeyring, StaticKeyring};
 use corium_protocol::codec;
 use corium_query::edn::read_one;
 use corium_store::{KeyManifest, RootStore, StorageKeyState, keys_root_name};
@@ -553,4 +554,95 @@ async fn a_rewrap_this_node_cannot_load_warns_without_refusing_writes() {
     // a silent divergence from what the operator asked for.
     let status = node.key_status("secrets").await.expect("status");
     assert!(status.keys_unavailable && !status.keys_fenced);
+}
+
+/// A node whose keys resolve through `service` instead of the filesystem.
+///
+/// The service holds the KEK the way a real one does — nothing hands it out —
+/// so a database that opens here opens because wrapping and unwrapping really
+/// happened remotely, not because the process could read a file.
+fn kms_config(data_dir: &Path, service: &Arc<InMemoryKms>, id: &KeyId) -> NodeConfig {
+    let mut config = NodeConfig::new(data_dir.to_path_buf());
+    config.gc_interval = None;
+    config.keyring = Some(Arc::new(KmsKeyring::new(
+        Arc::clone(service) as Arc<dyn corium_crypt::KmsClient>,
+        [id.clone()],
+    )));
+    config
+}
+
+#[tokio::test]
+async fn a_database_opens_under_a_key_that_never_leaves_its_key_service() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let data_dir = dir.path().join("data");
+    let kek = KeyId::new("awskms:arn:aws:kms:us-west-2:111122223333:key/2f1c").expect("key id");
+
+    let service = Arc::new(InMemoryKms::new(29));
+    let node = TransactorNode::open(kms_config(&data_dir, &service, &kek))
+        .await
+        .expect("node");
+    assert!(
+        node.create_db("secrets", &schema(), Some(kek.clone()))
+            .await
+            .expect("create")
+    );
+    node.transact(
+        "secrets",
+        &encoded(&format!("[{{:db/id \"n\" :note/text \"{SENTINEL}\"}}]")),
+    )
+    .await
+    .expect("transact");
+    node.request_index("secrets").await.expect("publish");
+    assert!(service.calls() > 0, "the key service was never asked");
+
+    let durable = durable_bytes(&data_dir);
+    assert!(
+        !contains_sentinel(&durable),
+        "the sentinel reached storage in the clear"
+    );
+    // The KEK is the service's key. Nothing durable may contain it — the
+    // manifest holds a data key wrapped under it, and that is all.
+    assert!(
+        !durable
+            .windows(32)
+            .any(|window| window == [29_u8; 32].as_slice()),
+        "the key-encryption key reached storage"
+    );
+    assert_eq!(
+        node.key_status("secrets")
+            .await
+            .expect("status")
+            .manifest
+            .expect("encrypted")
+            .kek,
+        kek
+    );
+    drop(node);
+
+    // Another process holding the same grant — a separate client over the same
+    // service key — opens the database and reads it.
+    let node = TransactorNode::open(kms_config(&data_dir, &Arc::new(InMemoryKms::new(29)), &kek))
+        .await
+        .expect("reopen through the key service");
+    assert!(
+        format!(
+            "{:?}",
+            node.db_state("secrets")
+                .await
+                .expect("hosted")
+                .db()
+                .datoms()
+        )
+        .contains(SENTINEL)
+    );
+    drop(node);
+
+    // A service holding different material is not that grant, and the failure
+    // names the key rather than surfacing as a decode error.
+    let Err(error) =
+        TransactorNode::open(kms_config(&data_dir, &Arc::new(InMemoryKms::new(30)), &kek)).await
+    else {
+        panic!("the wrong key must not open the database")
+    };
+    assert!(error.to_string().contains(kek.as_str()), "{error}");
 }

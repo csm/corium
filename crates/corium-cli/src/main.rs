@@ -20,7 +20,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use corium_authz::{AuthzConfig, BreakGlass, SystemDbAuthorizer};
 use corium_core::KeywordInterner;
-use corium_crypt::{KeyId, Keyring, StaticKeyring};
+use corium_crypt::{CompositeKeyring, KeyId, Keyring, StaticKeyring};
 use corium_peer::server::PeerServerConfig;
 use corium_peer::{
     Admin, ConnectConfig, Connection, DiscoveredPeerStorage, IndexPolicySettings,
@@ -235,7 +235,18 @@ struct KeyFlags {
 impl KeyFlags {
     /// Resolves every named key now, so a misconfigured process fails at
     /// startup naming the key rather than at its first read.
-    fn keyring(&self) -> Result<Option<Arc<dyn Keyring>>, String> {
+    ///
+    /// Locally readable identities (`file:`, `env:`) and key-service ones
+    /// (`awskms:`) are resolved by different keyrings and composed, because one
+    /// process routinely holds both: a storage key from a file and a
+    /// protection-class key from a KMS is the deployment
+    /// [`docs/design/encryption.md`] describes. Resolution of a KMS identity is
+    /// its client's configuration, not a call — a keyring caches material as it
+    /// resolves it, so an unreachable service is reported by the first
+    /// operation that needs it rather than by every later one.
+    ///
+    /// [`docs/design/encryption.md`]: ../../docs/design/encryption.md
+    async fn keyring(&self) -> Result<Option<Arc<dyn Keyring>>, String> {
         if self.storage_keys.is_empty() {
             return Ok(None);
         }
@@ -245,9 +256,68 @@ impl KeyFlags {
             .map(|id| KeyId::new(id.clone()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-        let keyring = StaticKeyring::resolve(ids).map_err(|error| error.to_string())?;
-        Ok(Some(Arc::new(keyring)))
+        let (remote, local): (Vec<KeyId>, Vec<KeyId>) = ids
+            .into_iter()
+            .partition(|id| matches!(id.scheme(), Some((scheme, _)) if is_key_service(scheme)));
+
+        let mut rings: Vec<Arc<dyn Keyring>> = Vec::new();
+        if !local.is_empty() {
+            rings.push(Arc::new(
+                StaticKeyring::resolve(local).map_err(|error| error.to_string())?,
+            ));
+        }
+        if !remote.is_empty() {
+            rings.push(key_service_keyring(remote).await?);
+        }
+        Ok(Some(if rings.len() == 1 {
+            rings.remove(0)
+        } else {
+            Arc::new(CompositeKeyring::new(rings))
+        }))
     }
+}
+
+/// Whether a key identity's scheme names a key-management service.
+///
+/// Schemes this build cannot resolve are still recognized here, so a
+/// `gcpkms:` identity fails saying the build lacks that service rather than
+/// being read as a file path.
+fn is_key_service(scheme: &str) -> bool {
+    matches!(scheme, "awskms" | "gcpkms" | "vault")
+}
+
+/// Builds the keyring serving every key-service identity this process names.
+///
+/// AWS KMS is the only service with a client today; a second one composes
+/// here, one ring per service, exactly as local and remote keys compose above.
+async fn key_service_keyring(ids: Vec<KeyId>) -> Result<Arc<dyn Keyring>, String> {
+    for id in &ids {
+        if !matches!(id.scheme(), Some(("awskms", _))) {
+            return Err(format!(
+                "key {id} names a key service this build cannot resolve"
+            ));
+        }
+    }
+    aws_kms_keyring(ids).await
+}
+
+/// Serves `ids` through AWS KMS.
+#[cfg(feature = "aws-kms")]
+async fn aws_kms_keyring(ids: Vec<KeyId>) -> Result<Arc<dyn Keyring>, String> {
+    // Boxed: loading the ambient AWS configuration is a large future, and this
+    // is reached from the one `run_command` future every subcommand shares.
+    let client = Arc::new(Box::pin(corium_crypt::aws::AwsKmsClient::from_env()).await);
+    Ok(Arc::new(corium_crypt::KmsKeyring::new(client, ids)))
+}
+
+/// Reports that this build has no AWS KMS client linked in.
+#[cfg(not(feature = "aws-kms"))]
+#[allow(clippy::unused_async)]
+async fn aws_kms_keyring(ids: Vec<KeyId>) -> Result<Arc<dyn Keyring>, String> {
+    Err(format!(
+        "key {} names AWS KMS; build corium with --features aws-kms to resolve it",
+        ids.first().map_or_else(String::new, KeyId::to_string)
+    ))
 }
 
 /// Server-side TLS/auth flags.
@@ -1160,7 +1230,7 @@ async fn run_command(command: Command) -> Result<(), String> {
                 Some(parse_duration(&gc_interval)?)
             };
             config.gc_retention = parse_duration(&gc_window)?;
-            config.keyring = keys.keyring()?;
+            config.keyring = keys.keyring().await?;
             // The built-in `cljrs-tx` runtime is wired by `NodeConfig::new`
             // when the `cljrs` feature is on; apply the flag budgets here.
             #[cfg(feature = "cljrs")]
@@ -1270,7 +1340,7 @@ async fn run_command(command: Command) -> Result<(), String> {
                 return Err("segment cache requires --peer-bootstrap".into());
             }
             let mut config = client.connect_config_cache(db, cache).await?;
-            if let Some(keyring) = keys.keyring()? {
+            if let Some(keyring) = keys.keyring().await? {
                 config = config.with_keyring(keyring);
             }
             let connection = Arc::new(
@@ -1398,7 +1468,7 @@ async fn run_command(command: Command) -> Result<(), String> {
                 client,
                 databases,
                 allow_writes,
-                keys.keyring()?,
+                keys.keyring().await?,
             ));
             let pg_config = corium_pgwire::PgWireConfig {
                 password,
@@ -1474,7 +1544,7 @@ async fn run_command(command: Command) -> Result<(), String> {
             destination,
             keys,
         } => {
-            let keyring = keys.keyring()?;
+            let keyring = keys.keyring().await?;
             let tls = if ca.is_none() && tls_domain.is_none() {
                 None
             } else {
@@ -1516,7 +1586,7 @@ async fn run_command(command: Command) -> Result<(), String> {
             as_db,
             keys,
         } => {
-            let keyring = keys.keyring()?;
+            let keyring = keys.keyring().await?;
             let report =
                 corium_transactor::backup::restore(source, data_dir, &as_db, keyring.as_ref())
                     .await
@@ -2062,7 +2132,7 @@ async fn log_cipher(
     else {
         return Ok(None);
     };
-    let Some(keyring) = keys.keyring()? else {
+    let Some(keyring) = keys.keyring().await? else {
         return Err(format!(
             "database {db:?} is encrypted under key {}; pass --storage-key naming it",
             manifest.kek
@@ -2126,7 +2196,7 @@ async fn offline_gc(
     keys: &KeyFlags,
     retention: Duration,
 ) -> Result<corium_store::GcReport, String> {
-    let keyring = keys.keyring()?;
+    let keyring = keys.keyring().await?;
     let mut marked = std::collections::HashSet::new();
     for root_name in store
         .list_roots("db:")
@@ -2523,6 +2593,67 @@ fn format_value(value: &corium_core::Value, interner: &KeywordInterner) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_flags(keys: &[&str]) -> KeyFlags {
+        KeyFlags {
+            storage_keys: keys.iter().map(|key| (*key).to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn locally_readable_storage_keys_resolve_at_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = dir.path().join("storage.key");
+        let class = dir.path().join("pii.key");
+        std::fs::write(&storage, [3_u8; 32]).expect("write storage key");
+        std::fs::write(&class, [4_u8; 32]).expect("write class key");
+
+        let keyring = key_flags(&[
+            &format!("file:{}", storage.display()),
+            &format!("file:{}", class.display()),
+        ])
+        .keyring()
+        .await
+        .expect("both keys resolve")
+        .expect("a keyring");
+        assert_eq!(keyring.key_ids().len(), 2);
+
+        // No keys at all is not an error; it is an unencrypted deployment.
+        assert!(key_flags(&[]).keyring().await.expect("no keys").is_none());
+        // A key that cannot be read fails here, at startup, naming itself.
+        let Err(error) = key_flags(&["file:/nonexistent/corium/storage.key"])
+            .keyring()
+            .await
+        else {
+            panic!("an unreadable key must fail at startup")
+        };
+        assert!(error.contains("storage.key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_key_service_this_build_cannot_reach_is_named_not_guessed_at() {
+        // Every KMS scheme is recognized, so none of them is ever mistaken for
+        // a relative path by the file-backed resolver.
+        assert!(is_key_service("awskms") && is_key_service("gcpkms") && is_key_service("vault"));
+        assert!(!is_key_service("file") && !is_key_service("env"));
+
+        // `gcpkms:` and `vault:` have no backend in any build yet; `awskms:`
+        // has one only behind its feature. Either way the failure names the
+        // service, rather than reporting a missing file.
+        let mut unreachable = vec!["gcpkms", "vault"];
+        if cfg!(not(feature = "aws-kms")) {
+            unreachable.push("awskms");
+        }
+        for scheme in unreachable {
+            let Err(error) = key_flags(&[&format!("{scheme}:corium/pii")])
+                .keyring()
+                .await
+            else {
+                panic!("this build resolves no {scheme} key service")
+            };
+            assert!(error.contains(scheme), "{error}");
+        }
+    }
 
     #[test]
     fn transactor_edn_config_loads_storage_and_read_only_settings() {

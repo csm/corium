@@ -15,6 +15,16 @@ use async_trait::async_trait;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "aws-kms")]
+pub mod aws;
+mod composite;
+pub mod kms;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+pub use composite::CompositeKeyring;
+pub use kms::{KmsClient, KmsError, KmsKeyring};
+
 /// Magic prefix for an encrypted content-addressed blob.
 pub const BLOB_MAGIC: &[u8; 8] = b"CORIUMB1";
 
@@ -192,6 +202,18 @@ pub enum KeyError {
          file: and env: are always available"
     )]
     UnsupportedScheme(KeyId),
+    /// The key service holding this identity could not serve the request.
+    ///
+    /// Material this process already resolved keeps working; what fails is
+    /// work that needs the service, which is the distinction an operator has
+    /// to be able to make from the message alone.
+    #[error("key {id} could not be resolved through its key service: {reason}")]
+    Kms {
+        /// Key identity that failed to resolve.
+        id: KeyId,
+        /// What the key service reported. Never quotes key material.
+        reason: String,
+    },
     /// The identity's source could not be read.
     ///
     /// The reason never quotes the material, only where it was looked for.

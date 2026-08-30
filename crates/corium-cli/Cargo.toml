@@ -22,6 +22,9 @@ postgres = ["corium-transactor/postgres"]
 turso = ["corium-transactor/turso"]
 # Enables the S3 storage backend for `corium transactor --store s3`.
 s3 = ["corium-transactor/s3", "dep:aws-credential-types", "dep:corium-store-s3"]
+# Resolves `awskms:` key identities through AWS KMS, for every command that
+# takes `--storage-key`.
+aws-kms = ["corium-crypt/aws-kms"]
 # OIDC/JWT bearer-token authentication for the transactor and peer server.
 # `oidc` verifies tokens against a JWKS supplied with `--oidc-jwks-file`;
 # `oidc-discovery` also fetches the issuer's JWKS over HTTP (`--oidc-issuer`).

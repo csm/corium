@@ -189,8 +189,19 @@ attribute that has ever been protected is permanently ineligible for
 `:db/index` and `:db/unique`. Re-sealing or opening the values already stored
 is separate rewrite work that does not exist yet, as are entity scope, the
 per-principal key policy on the peer server, and the class rotation and shred
-commands. Backups of an encrypted database and KMS-backed keyrings remain to
-finish layer 1.
+commands.
+
+Layer 1 is complete with keys in a key-management service. A key identity
+resolves through `file:`, `env:`, or — in a build with the `aws-kms` feature —
+`awskms:`, and a process composes sources, so a storage key on disk and a
+protection-class key in KMS are one `--storage-key` flag each. A storage data
+key is wrapped and unwrapped inside the service, with the key identity and epoch
+in the encryption context; a class key, which has to exist in the peer to seal
+values, is instead *derived* by asking the service to MAC a context naming the
+class and its epoch, which keeps sealing deterministic across peers while the
+KMS key itself never leaves. Resolved material is cached, so a KMS outage
+degrades to "no new epochs" rather than an outage. `gcpkms:` and `vault:`
+clients against the same `KmsClient` seam are the remaining key sources.
 
 Schema itself is now basis-versioned data
 ([docs/design/schema-migrations.md](docs/design/schema-migrations.md),

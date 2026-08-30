@@ -3,12 +3,16 @@
 Status: **layer 1 implemented; layer 2 implemented for protection declared at
 database creation.** The storage-encryption primitives, the blob-store
 decorator, log-record payload encryption, the `keys:<db>` key manifest (with
-storage format 4), backup format 2, and the process wiring — `--storage-key` on
+storage format 4), backup format 2, the process wiring — `--storage-key` on
 the transactor, peer server, offline commands, and `corium backup|restore`;
-`corium db create --storage-key`; `corium keys status|rotate|rewrap` — are
-implemented. Remaining in layer 1: KMS-backed keyrings (a key identity resolves
-through `file:` or `env:` today; `awskms:`, `gcpkms:`, and `vault:` are
-recognized as key sources and rejected as unresolvable).
+`corium db create --storage-key`; `corium keys status|rotate|rewrap` — and
+KMS-backed keyrings are implemented. A key identity resolves through `file:`,
+`env:`, or `awskms:` (behind the `aws-kms` build feature), and one process
+composes sources: a storage key from a file and a class key from a KMS is one
+`--storage-key` flag each. `gcpkms:` and `vault:` are recognized as key
+services and rejected as unresolvable until their clients land — the
+[`KmsClient`](../../crates/corium-crypt/src/kms.rs) seam is what they plug
+into.
 
 Layer 2 is implemented end to end for the shape of protection Corium's schema
 can express today. A class declared in the create-time schema
@@ -178,9 +182,47 @@ pub trait Keyring: Send + Sync {
 Shipped implementations, mirroring how `TokenVerifier`/OIDC already stage a
 seam and its concrete backend: `StaticKeyring` (files, environment variables,
 in-memory test keys) in the base crate; `KmsKeyring` over a small `KmsClient`
-trait behind feature flags (`aws-kms`, `gcp-kms`, `vault`). `CompositeKeyring`
-tries a list in order so one process can take its storage key from a file and
-its class keys from KMS.
+trait, with AWS KMS behind the `aws-kms` feature and GCP KMS and Vault left as
+clients to write against the same trait. `CompositeKeyring` routes each
+identity to the ring that claims it, so one process takes its storage key from
+a file and its class keys from a KMS — and a key that is misconfigured fails
+naming its own source rather than falling through to an unrelated one.
+
+`KmsClient` is narrower than `Keyring`, because a key service does only what a
+key service can do:
+
+```rust
+#[async_trait]
+pub trait KmsClient: Send + Sync + Debug {
+    async fn current_epoch(&self, key: &KeyId) -> Result<u32, KmsError>;
+    /// Wrap/unwrap happen inside the service; only ciphertext crosses back.
+    async fn wrap(&self, key: &KeyId, epoch: u32, dek: &[u8]) -> Result<Vec<u8>, KmsError>;
+    async fn unwrap(&self, key: &KeyId, epoch: u32, wrapped: &[u8]) -> Result<SecretKey, KmsError>;
+    /// A keyed MAC over a context: the only way remote material becomes local.
+    async fn derive(&self, key: &KeyId, context: &[u8]) -> Result<SecretKey, KmsError>;
+}
+```
+
+The split follows the two asymmetric uses in
+[Keys and keyrings](#keys-and-keyrings). A **storage DEK** is stored wrapped, so
+wrapping and unwrapping stay remote and the KEK never enters the process; on AWS
+those are `Encrypt`/`Decrypt`, with the key identity and epoch in the encryption
+context, so KMS itself refuses a data key replayed under another epoch. A
+**class key** must be *local*, because sealing a value is a computation on the
+peer holding it, so it is derived: `KmsKeyring` MACs the context
+`"corium/kms-derived-key" ‖ id ‖ epoch` under the remote key — `GenerateMac`
+with an `HMAC_256` key on AWS — and uses the tag as the class key. HMAC is a
+PRF, so this is deterministic (peers holding the same grant seal identically),
+one-way (the class key never discloses the KMS key), and per-epoch, which makes
+`corium keys rotate --class` a change of context rather than a new KMS key to
+distribute. It also means a symmetric encryption key can back a KEK but never a
+class — its material cannot leave, and KMS says so.
+
+`KmsKeyring` caches what it resolves, which is what makes the
+[failure table](#operating-it)'s "KMS unreachable" row true: material already
+resolved keeps serving with no call at all, and only work needing material this
+process has never held fails, reporting the service rather than the key.
+`KeyError::Kms` carries that distinction to the operator.
 
 Primitives:
 

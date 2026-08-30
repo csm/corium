@@ -575,8 +575,9 @@ unencrypted forever; migrating one is a backup and restore into a new database.
 
 A key identity is a URI. `file:/etc/corium/storage.key` and `env:CORIUM_KEK`
 resolve locally and hold 32 raw bytes or 64 hexadecimal characters (surrounding
-whitespace is ignored). KMS identities (`awskms:`, `gcpkms:`, `vault:`) are
-recognized but not yet resolvable.
+whitespace is ignored). `awskms:<key>` resolves through AWS KMS in a build with
+the `aws-kms` feature (see [Keys in a KMS](#keys-in-a-kms)); `gcpkms:` and
+`vault:` are recognized as key services and rejected as unresolvable.
 
 ```sh
 # A KEK. Keep it off the machine holding the data if you can.
@@ -613,6 +614,54 @@ budget — log records use a random 96-bit nonce, so an epoch must seal well und
 `rewrap` re-encrypts the data keys under a new KEK and touches no stored object.
 The transactor must be able to resolve both KEKs at once, so start it with both
 `--storage-key` flags, re-wrap, then drop the old one.
+
+### Keys in a KMS
+
+A file-backed KEK is a file an operator can read. Build with `--features
+aws-kms` and the same flag takes an AWS KMS identity instead, so the key stays
+in KMS and every use of it is a CloudTrail record:
+
+```sh
+cargo build -p corium-cli --features aws-kms   # or: cargo install --features aws-kms
+
+# A symmetric encryption key wraps the storage data keys.
+corium db create people --schema schema.toml \
+  --storage-key awskms:arn:aws:kms:us-west-2:111122223333:key/2f1c…
+corium transactor --data-dir /srv/corium \
+  --storage-key awskms:arn:aws:kms:us-west-2:111122223333:key/2f1c…
+
+# One process, two sources: storage key on disk, class key in KMS.
+corium peer-server --db people --peer-bootstrap \
+  --storage-key file:/etc/corium/storage.key \
+  --storage-key awskms:alias/corium-pii
+```
+
+The identity after `awskms:` is anything AWS accepts — a key ARN, an alias ARN,
+`alias/<name>`, or a bare key id. A key ARN names its own region, so one process
+reaches keys in several regions; everything else uses the ambient AWS region.
+Credentials, region, and endpoint come from the standard AWS environment, the
+same as the S3 storage backend.
+
+Which kind of KMS key to create depends on what it is for:
+
+| Use | AWS key type | Operations |
+|---|---|---|
+| Storage KEK (`db create --storage-key`, `keys rewrap --kek`) | symmetric encryption (`SYMMETRIC_DEFAULT`) | `kms:Encrypt`, `kms:Decrypt` |
+| Protection-class key (`:db.protect/key`) | HMAC (`HMAC_256`) | `kms:GenerateMac` |
+
+A class key has to exist *in the peer* to seal and open values, so it is derived
+rather than fetched: Corium asks KMS to MAC a context naming the class key
+identity and its epoch, and uses the tag. The KMS key itself never leaves, and a
+class rotation is a new epoch in that context rather than a new key to
+distribute. That is also why a symmetric encryption key cannot back a class: it
+can wrap data keys, but nothing derived from it can leave KMS.
+
+A KMS outage is not an outage. Keys already resolved keep serving from the
+process's cache — reads, writes, and index publication continue — and only work
+needing material this process has never held fails, with a message naming the
+key service rather than the key. `corium keys status` reports
+`:keys-unavailable true` while that lasts, the same as any other key change this
+node cannot load.
 
 ### When a node cannot load a key change
 

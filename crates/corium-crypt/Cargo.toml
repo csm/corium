@@ -7,10 +7,19 @@ rust-version.workspace = true
 homepage.workspace = true
 description = "Cryptographic primitives and key resolution for Corium"
 
+[features]
+# AWS KMS as a key source: `awskms:` identities resolve through Encrypt,
+# Decrypt, and GenerateMac instead of a local file.
+aws-kms = ["dep:aws-config", "dep:aws-sdk-kms"]
+# An in-process key service for tests wiring a keyring end to end.
+testing = []
+
 [dependencies]
 aes-gcm = "0.10"
 aes-gcm-siv = "0.11"
 async-trait = "0.1"
+aws-config = { version = "1", optional = true }
+aws-sdk-kms = { version = "1.99", optional = true }
 blake3 = "1"
 getrandom = "0.3"
 thiserror = "2"
