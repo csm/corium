@@ -297,6 +297,27 @@ pub fn tx_value(
         .ok_or_else(|| TxFormError::BadValue(form.to_string()))
 }
 
+/// Reads transaction data written either as a sequence of forms or as one
+/// bracketed vector of them, since both are how people write it.
+///
+/// The ambiguity is only apparent: a bare `[:db/add …]` form starts with a
+/// keyword, while a vector *of* forms starts with a map or a vector. It
+/// matters wherever transaction data arrives as text a person wrote — a CLI
+/// flag, a `:db.saga/on-abort-tx` registration — rather than as a structure a
+/// program built.
+#[must_use]
+pub fn tx_data_forms(read: &[Edn]) -> Vec<Edn> {
+    if let [Edn::Vector(items) | Edn::List(items)] = read
+        && matches!(
+            items.first(),
+            Some(Edn::Map(_) | Edn::Vector(_) | Edn::List(_))
+        )
+    {
+        return items.clone();
+    }
+    read.to_vec()
+}
+
 /// Converts wire EDN transaction forms into engine transaction items.
 ///
 /// New keyword values are interned into `interner` (the caller persists the

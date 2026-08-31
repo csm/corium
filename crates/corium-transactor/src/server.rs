@@ -255,6 +255,40 @@ impl Transactor for TransactorSvc {
             .map_err(|error| to_status(&error))
     }
 
+    async fn saga_finish(
+        &self,
+        request: Request<pb::SagaFinishRequest>,
+    ) -> Result<Response<pb::SagaFinishResponse>, Status> {
+        let principal = authz::principal(&request);
+        let request = request.into_inner();
+        check_version(request.protocol_version)?;
+        // Ending a saga writes the parent: the flip, and whatever compensation
+        // rides with it. Authorized as the write it is.
+        authorize_write(&self.0, &self.1, &principal, &request.db).await?;
+        let saga = corium_db::saga::parse_id(&request.saga).ok_or_else(|| {
+            Status::invalid_argument(format!("invalid saga id {:?}", request.saga))
+        })?;
+        let status = corium_db::saga::SagaStatus::from_keyword(&corium_core::Keyword::new(
+            Some(corium_db::saga::STATUS_NAMESPACE),
+            request
+                .status
+                .trim_start_matches(':')
+                .rsplit('/')
+                .next()
+                .unwrap_or(&request.status),
+        ));
+        let intent = if request.replace_compensation {
+            crate::expiry::Intent::Replace(decode_forms(&request.compensation, "compensation")?)
+        } else {
+            crate::expiry::Intent::Registered
+        };
+        self.0
+            .saga_finish(&request.db, saga, &status, intent)
+            .await
+            .map(Response::new)
+            .map_err(|error| to_status(&error))
+    }
+
     type SubscribeStream = ItemStream;
 
     async fn subscribe(

@@ -15,6 +15,16 @@
 //! argument, and the read-only `corium.api` host functions (`q`, `pull`,
 //! `entity`, `datoms`, `as-of`, `since`, `history`, `basis-t`) interpret the
 //! token against the real database value they close over.
+//!
+//! A token names *which* database it stands for, so a caller can put more
+//! than one in scope. Ordinarily there is only one — the db-in-transaction —
+//! and the name is absent. The saga compensation of ADR-0023 is the case that
+//! needs two: `:db.saga/on-abort-fn` is invoked with the parent's current
+//! value as its `db` argument and the saga's branch as a second, so the
+//! function can author a failure record *about* what the branch did. Extra
+//! databases are read-only, exactly as the primary one is, and a token naming
+//! a database the caller did not put in scope is an error rather than a
+//! silent fall back to the primary.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -121,7 +131,25 @@ impl DbFnExpander {
     /// Returns [`DbFnError`] when a function fails, exceeds its budget, or
     /// recursion exceeds the depth limit.
     pub fn expand(&self, db: &Db, forms: Vec<Edn>) -> Result<Vec<Edn>, DbFnError> {
-        let host = read_api(db);
+        self.expand_with(db, &[], forms)
+    }
+
+    /// Expands `forms` against `db` with `named` databases in scope beside it.
+    ///
+    /// Each entry is reachable from a function as a token carrying that name
+    /// — [`named_db_token`] builds one — and is read-only like the primary.
+    ///
+    /// # Errors
+    /// As [`Self::expand`]; a token naming a database not in `named` fails
+    /// the invocation rather than reading the primary one.
+    pub fn expand_with(
+        &self,
+        db: &Db,
+        named: &[(&str, &Db)],
+        forms: Vec<Edn>,
+    ) -> Result<Vec<Edn>, DbFnError> {
+        let bases = Bases::new(db, named);
+        let host = read_api(&bases);
         self.expand_at(db, &host, forms, self.max_depth)
     }
 
@@ -217,6 +245,15 @@ impl TxFnExpander for DbFnExpander {
     fn expand(&self, db: &Db, forms: Vec<Edn>) -> Result<Vec<Edn>, String> {
         Self::expand(self, db, forms).map_err(|error| error.to_string())
     }
+
+    fn expand_with(
+        &self,
+        db: &Db,
+        named: &[(&str, &Db)],
+        forms: Vec<Edn>,
+    ) -> Result<Vec<Edn>, String> {
+        Self::expand_with(self, db, named, forms).map_err(|error| error.to_string())
+    }
 }
 
 /// Recognizes a database-function invocation form, returning its source and
@@ -264,6 +301,9 @@ const TOKEN_BASIS: &str = "basis-t";
 const TOKEN_AS_OF: &str = "as-of";
 const TOKEN_SINCE: &str = "since";
 const TOKEN_HISTORY: &str = "history";
+/// Which database in scope the token stands for; absent is the
+/// db-in-transaction.
+const TOKEN_OF: &str = "of";
 
 fn token_key(name: &str) -> SerializedValue {
     SerializedValue::Keyword {
@@ -283,16 +323,18 @@ fn is_keyword(value: &SerializedValue, namespace: Option<&str>, name: &str) -> b
     )
 }
 
-/// The time view a token requests, applied to the closed-over database.
-#[derive(Clone, Copy, Default)]
+/// The time view a token requests, and which database it requests it of.
+#[derive(Clone, Default)]
 struct TokenView {
     as_of: Option<u64>,
     since: Option<u64>,
     history: bool,
+    /// The name of the database in scope, or `None` for the primary one.
+    of: Option<String>,
 }
 
 impl TokenView {
-    fn apply(self, db: &Db) -> Db {
+    fn apply(&self, db: &Db) -> Db {
         let mut view = db.clone();
         if let Some(t) = self.as_of {
             view = view.as_of(t);
@@ -306,7 +348,7 @@ impl TokenView {
         view
     }
 
-    fn token(self, db: &Db) -> SerializedValue {
+    fn token(&self, db: &Db) -> SerializedValue {
         let optional_t = |t: Option<u64>| {
             t.map_or(SerializedValue::Nil, |t| {
                 SerializedValue::Long(i64::try_from(t).unwrap_or(i64::MAX))
@@ -323,7 +365,56 @@ impl TokenView {
                 token_key(TOKEN_HISTORY),
                 SerializedValue::Bool(self.history),
             ),
+            (
+                token_key(TOKEN_OF),
+                self.of.as_ref().map_or(SerializedValue::Nil, |name| {
+                    SerializedValue::Str(name.clone())
+                }),
+            ),
         ])
+    }
+}
+
+/// The databases a function may read: the one whose transaction is being
+/// prepared, plus whatever the caller put in scope beside it.
+///
+/// Extras are a short association list rather than a map because there is
+/// almost never more than one, and a caller that puts a name in scope twice
+/// gets the first — the same "a contradiction is not a question with two
+/// answers" rule the registry read model follows.
+#[derive(Clone)]
+struct Bases {
+    primary: Db,
+    named: Vec<(String, Db)>,
+}
+
+impl Bases {
+    fn new(primary: &Db, named: &[(&str, &Db)]) -> Self {
+        Self {
+            primary: primary.clone(),
+            named: named
+                .iter()
+                .map(|(name, db)| ((*name).to_owned(), (*db).clone()))
+                .collect(),
+        }
+    }
+
+    /// The database a token names, before its time view is applied.
+    fn base(&self, view: &TokenView) -> Result<&Db, String> {
+        let Some(name) = &view.of else {
+            return Ok(&self.primary);
+        };
+        self.named
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, db)| db)
+            .ok_or_else(|| format!("no database named {name:?} is in scope"))
+    }
+
+    /// The value a token stands for: the database it names, in the time view
+    /// it requests.
+    fn resolve(&self, view: &TokenView) -> Result<Db, String> {
+        self.base(view).map(|db| view.apply(db))
     }
 }
 
@@ -358,14 +449,19 @@ fn token_view(value: &SerializedValue) -> Option<TokenView> {
         as_of: t_of(TOKEN_AS_OF),
         since: t_of(TOKEN_SINCE),
         history: matches!(field(TOKEN_HISTORY), Some(SerializedValue::Bool(true))),
+        of: match field(TOKEN_OF) {
+            Some(SerializedValue::Str(name)) => Some(name.clone()),
+            _ => None,
+        },
     })
 }
 
 // ── Read-only `corium.api` host functions ────────────────────────────────────
 
-/// Builds the read-only `corium.api` host surface over `db`.
+/// Builds the read-only `corium.api` host surface over every database in
+/// scope.
 #[allow(clippy::too_many_lines)]
-fn read_api(db: &Db) -> HostApi {
+fn read_api(bases: &Bases) -> HostApi {
     let mut host = HostApi::new();
     let arity = |args: &[SerializedValue], want: usize, what: &str| {
         if args.len() == want {
@@ -374,13 +470,13 @@ fn read_api(db: &Db) -> HostApi {
             Err(format!("{what} takes {want} arguments, got {}", args.len()))
         }
     };
-    let view_arg = |db: &Db, value: &SerializedValue, what: &str| {
-        token_view(value)
-            .map(|view| view.apply(db))
-            .ok_or_else(|| format!("{what} takes a database as its first argument"))
+    let view_arg = |bases: &Bases, value: &SerializedValue, what: &str| {
+        let view = token_view(value)
+            .ok_or_else(|| format!("{what} takes a database as its first argument"))?;
+        bases.resolve(&view)
     };
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define("corium.api", "q", move |args: &[SerializedValue]| {
         if args.len() < 2 {
             return Err("q takes a query and at least one input".into());
@@ -391,7 +487,7 @@ fn read_api(db: &Db) -> HostApi {
         let inputs: Vec<Result<Db, Edn>> = args[1..]
             .iter()
             .map(|arg| match token_view(arg) {
-                Some(view) => Ok(Ok(view.apply(&base))),
+                Some(view) => base.resolve(&view).map(Ok),
                 None => sv_to_edn(arg).map(Err),
             })
             .collect::<Result<_, _>>()?;
@@ -406,7 +502,7 @@ fn read_api(db: &Db) -> HostApi {
         Ok(edn_to_sv(&result))
     });
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define("corium.api", "pull", move |args: &[SerializedValue]| {
         arity(args, 3, "pull")?;
         let db = view_arg(&base, &args[0], "pull")?;
@@ -416,7 +512,7 @@ fn read_api(db: &Db) -> HostApi {
         Ok(edn_to_sv(&result))
     });
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define("corium.api", "entity", move |args: &[SerializedValue]| {
         arity(args, 2, "entity")?;
         let db = view_arg(&base, &args[0], "entity")?;
@@ -454,7 +550,7 @@ fn read_api(db: &Db) -> HostApi {
         Ok(edn_to_sv(&Edn::Map(pairs)))
     });
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define("corium.api", "datoms", move |args: &[SerializedValue]| {
         arity(args, 2, "datoms")?;
         let db = view_arg(&base, &args[0], "datoms")?;
@@ -473,25 +569,25 @@ fn read_api(db: &Db) -> HostApi {
         Ok(edn_to_sv(&Edn::Vector(items)))
     });
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define("corium.api", "as-of", move |args: &[SerializedValue]| {
         arity(args, 2, "as-of")?;
         let mut view =
             token_view(&args[0]).ok_or("as-of takes a database as its first argument")?;
         view.as_of = Some(t_arg(&args[1])?);
-        Ok(view.token(&base))
+        Ok(view.token(base.base(&view)?))
     });
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define("corium.api", "since", move |args: &[SerializedValue]| {
         arity(args, 2, "since")?;
         let mut view =
             token_view(&args[0]).ok_or("since takes a database as its first argument")?;
         view.since = Some(t_arg(&args[1])?);
-        Ok(view.token(&base))
+        Ok(view.token(base.base(&view)?))
     });
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define(
         "corium.api",
         "history",
@@ -500,19 +596,19 @@ fn read_api(db: &Db) -> HostApi {
             let mut view =
                 token_view(&args[0]).ok_or("history takes a database as its argument")?;
             view.history = true;
-            Ok(view.token(&base))
+            Ok(view.token(base.base(&view)?))
         },
     );
 
-    let base = db.clone();
+    let base = bases.clone();
     host.define(
         "corium.api",
         "basis-t",
         move |args: &[SerializedValue]| {
             arity(args, 1, "basis-t")?;
-            token_view(&args[0]).ok_or("basis-t takes a database as its argument")?;
+            let view = token_view(&args[0]).ok_or("basis-t takes a database as its argument")?;
             Ok(SerializedValue::Long(
-                i64::try_from(base.basis_t()).unwrap_or(i64::MAX),
+                i64::try_from(base.base(&view)?.basis_t()).unwrap_or(i64::MAX),
             ))
         },
     );
@@ -758,4 +854,62 @@ fn meta_tag(meta: &SerializedValue) -> Option<String> {
             _ => None,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corium_db::bootstrap;
+
+    fn empty() -> Db {
+        let mut schema = corium_core::Schema::default();
+        bootstrap::install_schema(&mut schema);
+        Db::new(schema)
+    }
+
+    /// The token EDN a caller builds and the token map a function reads are
+    /// two halves of one shape, and they live in different modules. This is
+    /// what holds them together.
+    #[test]
+    fn a_named_token_round_trips_from_edn_to_a_view() {
+        let token = crate::expiry::named_db_token("branch", 42);
+        let view = token_view(&edn_to_sv(&token)).expect("a token");
+        assert_eq!(view.of.as_deref(), Some("branch"));
+        assert!(view.as_of.is_none() && view.since.is_none() && !view.history);
+    }
+
+    /// The db-in-transaction is unnamed, so an ordinary function sees exactly
+    /// what it saw before named databases existed.
+    #[test]
+    fn the_primary_token_names_nothing() {
+        let db = empty();
+        let view = token_view(&db_token(&db)).expect("a token");
+        assert!(view.of.is_none());
+        assert_eq!(
+            Bases::new(&db, &[])
+                .base(&view)
+                .expect("resolves")
+                .basis_t(),
+            db.basis_t()
+        );
+    }
+
+    /// A token naming a database the caller did not put in scope is an error,
+    /// not a silent read of the primary one: a compensation that read the
+    /// parent where it meant to read the branch would author the wrong
+    /// failure record.
+    #[test]
+    fn a_token_naming_a_database_out_of_scope_is_refused() {
+        let db = empty();
+        let view =
+            token_view(&edn_to_sv(&crate::expiry::named_db_token("branch", 1))).expect("a token");
+        let error = Bases::new(&db, &[])
+            .base(&view)
+            .expect_err("nothing is in scope under that name");
+        assert!(error.contains("branch"), "unhelpful: {error}");
+        assert!(
+            Bases::new(&db, &[("branch", &db)]).base(&view).is_ok(),
+            "and it resolves once it is"
+        );
+    }
 }

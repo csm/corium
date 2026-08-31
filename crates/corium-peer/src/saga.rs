@@ -84,6 +84,9 @@ pub struct SagaOptions {
     pub on_abort_tx: Option<String>,
     /// A `:db/fn` entity invoked as the compensating transaction instead.
     pub on_abort_fn: Option<EntityId>,
+    /// Milliseconds this saga's branch is kept after it finishes, overriding
+    /// the database's retention policy.
+    pub retain_for: Option<i64>,
 }
 
 impl SagaOptions {
@@ -100,6 +103,7 @@ impl SagaOptions {
             sealed: false,
             on_abort_tx: None,
             on_abort_fn: None,
+            retain_for: None,
         }
     }
 
@@ -150,6 +154,19 @@ impl SagaOptions {
     #[must_use]
     pub fn compensating_by(mut self, db_fn: EntityId) -> Self {
         self.on_abort_fn = Some(db_fn);
+        self
+    }
+
+    /// Keeps this saga's branch `millis` past the transition that finishes
+    /// it, instead of for the database's default retention.
+    ///
+    /// The window is what a returning owner salvages an expired saga from and
+    /// what an auditor reads the step grain of a committed one in, so a
+    /// workload whose audit or salvage needs differ from the database's says
+    /// so here. Zero asks for the branch to go as soon as the saga finishes.
+    #[must_use]
+    pub fn retaining_for(mut self, millis: i64) -> Self {
+        self.retain_for = Some(millis);
         self
     }
 }
@@ -324,6 +341,9 @@ pub fn open_forms(id: u128, basis_t: i64, options: &SagaOptions) -> Vec<Edn> {
     }
     if let Some(db_fn) = options.on_abort_fn {
         forms.push(add(saga(), "db.saga/on-abort-fn", entity_value(db_fn)));
+    }
+    if let Some(millis) = options.retain_for {
+        forms.push(add(saga(), "db.saga/retain-for", Edn::Long(millis)));
     }
     forms
 }
@@ -594,6 +614,29 @@ pub struct SagaResult {
     pub tx: TxResult,
 }
 
+/// What ending a saga — aborting or expiring it — left behind.
+///
+/// It is not a [`SagaResult`] because the transaction is composed in the
+/// transactor rather than here, so there is no tempid map to report: what
+/// there is instead is whether the compensation landed, which is the question
+/// an orchestrator asks next.
+#[derive(Clone, Debug)]
+pub struct FinishResult {
+    /// The registry entry as of the transition.
+    pub entry: SagaEntry,
+    /// Parent basis before the transition.
+    pub basis_before: u64,
+    /// The transition's `t`.
+    pub basis_t: u64,
+    /// The transition's `:db/txInstant`.
+    pub tx_instant: i64,
+    /// Whether compensation datoms landed in the same transaction.
+    pub compensated: bool,
+    /// Why a registered compensation did not land, when one did not. Also in
+    /// `:db.saga/on-abort-error`, where it outlives this call.
+    pub on_abort_error: Option<String>,
+}
+
 impl Connection {
     /// Opens a saga, returning its registry entry.
     ///
@@ -653,61 +696,107 @@ impl Connection {
         finished(id, tx)
     }
 
-    /// Aborts an open saga, with no trace in canonical state.
+    /// Aborts an open saga, applying whatever compensation it registered at
+    /// open.
     ///
-    /// # Errors
-    /// Returns [`PeerError::Saga`] when the saga is unknown or already
-    /// finished, and otherwise whatever the transaction fails with.
-    pub async fn saga_abort(&self, id: u128) -> Result<SagaResult, PeerError> {
-        self.saga_abort_with(id, Vec::new()).await
-    }
-
-    /// Aborts an open saga, applying `compensation` in the same transaction.
-    ///
-    /// The compensating transaction is fresh transaction data, validated like
-    /// any other and landing atomically with the flip: a deliberately
-    /// authored failure record, never a partial landing of saga novelty. It
-    /// replaces whatever compensation the saga registered at open.
+    /// With no registered compensation this is the design's default abort and
+    /// leaves no trace in canonical state: one status transaction, the branch
+    /// retained through its window and then discarded, nothing else.
     ///
     /// # Errors
     /// Returns [`PeerError::Saga`] when the saga is unknown or already
     /// finished, and otherwise whatever the transaction fails with — a
-    /// compensation that does not validate fails the abort and leaves the
-    /// saga open, which is the point of applying it in the same transaction.
+    /// registered compensation that does not validate fails the abort and
+    /// leaves the saga open, which is the point of applying it in the same
+    /// transaction.
+    pub async fn saga_abort(&self, id: u128) -> Result<FinishResult, PeerError> {
+        self.saga_finish(id, &SagaStatus::Aborted, None).await
+    }
+
+    /// Aborts an open saga, applying `compensation` in the same transaction
+    /// *instead of* whatever it registered at open.
+    ///
+    /// The compensating transaction is fresh transaction data, validated like
+    /// any other and landing atomically with the flip: a deliberately
+    /// authored failure record, never a partial landing of saga novelty. An
+    /// empty vector means "abort with nothing", which is how a caller
+    /// deliberately drops a registered compensation.
+    ///
+    /// # Errors
+    /// As [`Connection::saga_abort`].
     pub async fn saga_abort_with(
         &self,
         id: u128,
         compensation: Vec<Edn>,
-    ) -> Result<SagaResult, PeerError> {
-        self.expect_open(id, "abort").await?;
-        let forms = finish_forms(id, &SagaStatus::Aborted, compensation);
-        let tx = self.transact(forms).await?;
-        finished(id, tx)
+    ) -> Result<FinishResult, PeerError> {
+        self.saga_finish(id, &SagaStatus::Aborted, Some(compensation))
+            .await
     }
 
-    /// Expires an overdue saga, recording `on_abort_error` when a registered
-    /// compensation could not be applied.
+    /// Expires an open saga, applying whatever compensation it registered.
     ///
-    /// This is the transition the expiry sweep performs; it is here because
-    /// the sweep is an ordinary client of the registry, and because a
-    /// returning owner must be able to tell "the system ended this" from "I
-    /// ended this" whoever wrote the transition.
+    /// This is the transition the expiry sweep performs, exposed because an
+    /// operator sometimes has to perform it by hand — a saga whose owner is
+    /// known not to be coming back should not have to wait out its deadline.
+    /// It is distinct from an abort so that a returning owner can tell "the
+    /// system ended this" from "I ended this", whoever wrote the transition.
+    ///
+    /// Unlike an abort, a compensation that does not validate does not fail
+    /// this: liveness outranks, so the saga expires without it and the reason
+    /// lands in `:db.saga/on-abort-error`, which the result also carries.
     ///
     /// # Errors
     /// Returns [`PeerError::Saga`] when the saga is unknown or already
     /// finished, and otherwise whatever the transaction fails with.
-    pub async fn saga_expire(
+    pub async fn saga_expire(&self, id: u128) -> Result<FinishResult, PeerError> {
+        self.saga_finish(id, &SagaStatus::Expired, None).await
+    }
+
+    /// Ends an open saga, composing the flip and its compensation in the
+    /// transactor.
+    ///
+    /// The flip alone is ordinary transaction data — [`finish_forms`] builds
+    /// it, and a client that wants no compensation may transact it directly.
+    /// What is here instead of there is a *registered* compensation: a
+    /// `:db.saga/on-abort-fn` is invoked with the parent's current value and
+    /// the branch value, and no client holds the second one.
+    async fn saga_finish(
         &self,
         id: u128,
-        on_abort_error: Option<String>,
-    ) -> Result<SagaResult, PeerError> {
-        self.expect_open(id, "expire").await?;
-        let also = on_abort_error
-            .map(|error| vec![add(saga_ref(id), "db.saga/on-abort-error", Edn::Str(error))])
-            .unwrap_or_default();
-        let forms = finish_forms(id, &SagaStatus::Expired, also);
-        let tx = self.transact(forms).await?;
-        finished(id, tx)
+        status: &SagaStatus,
+        compensation: Option<Vec<Edn>>,
+    ) -> Result<FinishResult, PeerError> {
+        self.expect_open(
+            id,
+            if matches!(status, SagaStatus::Expired) {
+                "expire"
+            } else {
+                "abort"
+            },
+        )
+        .await?;
+        let replace = compensation.is_some();
+        let response = self
+            .saga_finish_raw(pb::SagaFinishRequest {
+                db: self.db_name().to_owned(),
+                protocol_version: corium_protocol::PROTOCOL_VERSION,
+                saga: format_saga_id(id),
+                status: status.name().to_owned(),
+                compensation: codec::encode_edn(&Edn::Vector(compensation.unwrap_or_default())),
+                replace_compensation: replace,
+            })
+            .await?;
+        // The transition is in the parent's log: catch this connection up so
+        // the entry below is the one the transaction left behind.
+        self.sync_to(response.basis_t).await?;
+        Ok(FinishResult {
+            entry: entry_of(&self.db(), id)?,
+            basis_before: response.basis_before,
+            basis_t: response.basis_t,
+            tx_instant: response.tx_instant,
+            compensated: response.compensated,
+            on_abort_error: Some(response.on_abort_error).filter(|error| !error.is_empty()),
+        })
     }
 
     /// Commits a saga: merges its branch into the parent as one transaction.
@@ -810,26 +899,22 @@ impl Connection {
     /// first so "there is no such saga" is reported as itself rather than as a
     /// failure to reach a database nobody named.
     ///
-    /// A *committed* saga's branch still opens, for as long as retention keeps
-    /// it: it holds the step grain the parent's single squashed commit does
-    /// not, which is where the design points auditors. It is read-only in the
-    /// only way that matters — the transactor refuses steps the moment the
-    /// saga is no longer open. A saga that aborted or expired has no branch to
-    /// open at all: ending it that way is what discards the overlay.
+    /// A *finished* saga's branch still opens, for as long as retention keeps
+    /// it. That is the whole point of the retention window: a committed
+    /// saga's branch holds the step grain its single squashed parent commit
+    /// does not, and an aborted or expired one is the record of what the
+    /// workflow did outside the database and must now unwind. Either is
+    /// read-only in the only way that matters — the transactor refuses steps
+    /// the moment the saga is no longer open — and either is gone once the
+    /// sweep has discarded it, which is reported as itself.
     ///
     /// # Errors
-    /// Returns [`PeerError::Saga`] when the saga is unknown, has aborted or
-    /// expired, or its entry carries no opening basis; otherwise whatever the
-    /// connection fails with, which after a merge includes retention having
-    /// discarded the branch.
+    /// Returns [`PeerError::Saga`] when the saga is unknown or its entry
+    /// carries no opening basis; otherwise whatever the connection fails
+    /// with, which for a finished saga includes retention having discarded
+    /// the branch.
     pub async fn saga_branch(&self, id: u128) -> Result<SagaBranch, PeerError> {
         let entry = entry_of(&self.sync().await?, id)?;
-        if let Some(status @ (SagaStatus::Aborted | SagaStatus::Expired)) = &entry.status {
-            return Err(PeerError::Saga(format!(
-                "cannot read the branch of saga {}: it is {status}, so its branch is gone",
-                format_saga_id(id)
-            )));
-        }
         let basis_t = entry
             .basis_t
             .and_then(|basis| u64::try_from(basis).ok())

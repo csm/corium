@@ -141,6 +141,15 @@ pub const SAGA_COMPENSATION_ERROR: AttrId = EntityId::new(Partition::Db as u32, 
 /// `[?tx :db.saga/id ?saga]`.
 pub const SAGA_TX_ID: AttrId = EntityId::new(Partition::Db as u32, 98);
 
+/// Entity id of `:db.saga/retain-for`, the per-saga branch-retention
+/// override.
+///
+/// Milliseconds a finished saga's branch is kept before the sweep deletes it,
+/// declared at open for a workload whose audit or salvage needs differ from
+/// the database's policy. Absent, the node's retention default applies; zero
+/// asks for the branch to go as soon as the saga finishes.
+pub const SAGA_RETAIN_FOR: AttrId = EntityId::new(Partition::Db as u32, 99);
+
 /// The `:db/txInstant` keyword.
 #[must_use]
 pub fn tx_instant_ident() -> Keyword {
@@ -396,6 +405,10 @@ pub fn attributes() -> Vec<(Keyword, Attribute)> {
         (
             Keyword::new(Some("db.saga.compensation"), "error"),
             simple(SAGA_COMPENSATION_ERROR, ValueType::Str),
+        ),
+        (
+            Keyword::new(Some("db.saga"), "retain-for"),
+            simple(SAGA_RETAIN_FOR, ValueType::Long),
         ),
     ]
 }

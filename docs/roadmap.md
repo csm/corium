@@ -273,8 +273,8 @@ Engine and API:
   change and hard deletion remain rejected. See
   [schema-migrations.md](design/schema-migrations.md) and
   [ADR-0020](adr/0020-planned-schema-migrations.md).
-- **Long-running transactions (sagas).** *(Registry, branches, and merge
-  implemented; the expiry sweep specified.)* A saga is a database
+- **Long-running transactions (sagas).** *(Implemented; protocol and SQL
+  polish outstanding.)* A saga is a database
   branch plus a registry entry: steps run as ordinary durable transactions on
   a lightweight overlay branch of the database, and the whole branch merges
   into the parent as one conflict-checked commit or aborts without ever
@@ -293,8 +293,14 @@ Engine and API:
   against everything the parent did meanwhile, checks the guards the request
   and the branch's own steps declared, and lands the novelty and the registry
   flip as one parent transaction, or refuses with an EDN conflict report the
-  committer answers with `--resolve`. The expiry sweep and branch retention
-  are the next phase. See
+  committer answers with `--resolve` — plus the way a saga ends when nobody
+  ends it: the transactor composes a registered compensation (static tx data,
+  or a `:db/fn` invoked with the parent *and* branch values) and applies it
+  atomically with the flip, a background sweep expires overdue sagas and
+  reclaims branches at the end of their retention window, and a database that
+  finds open sagas whose branches are not its own — a restore, a fork —
+  expires them when it is first hosted. Thin-client protocol surfaces and SQL
+  polish are the next phase. See
   [long-running-transactions.md](design/long-running-transactions.md) and
   [ADR-0023](adr/0023-saga-branch-transactions.md).
 - Fulltext (`tantivy`) and tuple value types; excision (design reserved in

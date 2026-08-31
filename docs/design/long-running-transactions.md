@@ -1,21 +1,28 @@
 # Long-Running Transactions (Sagas)
 
-Status: **registry and branches implemented; merge and the expiry sweep are
-still specification.** Phases 1 and 2 of the [delivery
-sketch](#delivery-sketch) are in the tree: the `:db.saga/*` vocabulary, the
-lifecycle transitions and the rules the transactor holds them to
-([`corium_tx::saga`](../../crates/corium-tx/src/saga.rs)), the read model
-([`corium_db::saga`](../../crates/corium-db/src/saga.rs)), the peer API
-([`corium_peer::saga`](../../crates/corium-peer/src/saga.rs)),
+Status: **implemented, less the thin-client and SQL polish of phase 5.**
+Phases 1 to 4 of the [delivery sketch](#delivery-sketch) are in the tree: the
+`:db.saga/*` vocabulary, the lifecycle transitions and the rules the transactor
+holds them to ([`corium_tx::saga`](../../crates/corium-tx/src/saga.rs)), the
+read model ([`corium_db::saga`](../../crates/corium-db/src/saga.rs)), the peer
+API ([`corium_peer::saga`](../../crates/corium-peer/src/saga.rs)),
 `corium_sys.sagas`, and `corium saga`; then id-block leasing in the allocator,
 the branch overlay and its pipeline
 ([`corium_transactor::branch`](../../crates/corium-transactor/src/branch.rs),
 [`corium_tx::branch`](../../crates/corium-tx/src/branch.rs)), step transacting,
-and tier-2 reads. So a saga today is a durable, expiring workflow record whose
-partial progress is real, queryable, and isolated — what is missing is the way
-back: merge, guards, and conflict reports, plus the expiry sweep that reclaims
-branches. [ADR-0023](../adr/0023-saga-branch-transactions.md) records the
-decision.
+and tier-2 reads; then the merge — squash, conflict scan, guards, resolutions,
+and the atomic commit-and-flip
+([`corium_tx::merge`](../../crates/corium-tx/src/merge.rs),
+[`corium_transactor::merge`](../../crates/corium-transactor/src/merge.rs)); and
+now the way a saga ends when nobody ends it
+([`corium_transactor::expiry`](../../crates/corium-transactor/src/expiry.rs)):
+compensation composed inside the transactor and applied atomically with the
+flip, the sweep that expires overdue sagas, the liveness invariant that expires
+the entries a restore or a fork inherits, and the retention window that keeps a
+finished saga's branch readable and then reclaims it. So a saga is now the
+whole loop — open, step, and either merge or end — and what is left is the
+protocol and SQL polish of phase 5.
+[ADR-0023](../adr/0023-saga-branch-transactions.md) records the decision.
 
 A saga is a durable unit of work that spans many transactions and an
 arbitrary amount of wall-clock time, and that either lands in the database
@@ -207,6 +214,7 @@ with it is the branch; see the liveness invariant under
 | `:db.saga/on-abort-tx` | string (EDN) | one | compensation: static tx data applied atomically with the abort/expiry flip (see [Compensation](#the-compensating-transaction)) |
 | `:db.saga/on-abort-fn` | ref | one | compensation: a `:db/fn` entity invoked at abort/expiry with the parent and branch values; at most one of `/on-abort-tx`, `/on-abort-fn` |
 | `:db.saga/on-abort-error` | string (EDN) | one | why a system-time compensation did not land: validation failure at expiry, or the branchless-expiry skip |
+| `:db.saga/retain-for` | long | one | per-saga branch-retention override in milliseconds, measured from the transition that finishes the saga; absent, the database's policy applies |
 | `:db.saga/compensations` | ref (component) | many | external-compensation ledger entries (`:db.saga.compensation/key`, `/status`, `/detail`, `/completed-at`, `/error`) — written by the orchestrator, never executed by the engine |
 | `:db.saga/guard` | string (EDN) | many | *step tx metadata, used in the branch*: a guard declared by the step that established the read dependency (see [Merge](#merge)) |
 
@@ -656,6 +664,22 @@ includes its edges.
 | Transactor failover | Registry, branch log, and grants are durable storage state; the new lease holder sees all of it — nothing lived only in memory |
 | Restore, fork, or replica finds `:open` registry entries with no branch | The saga is expired on first open — see the liveness invariant below |
 
+*As implemented:* the sweep is a background duty of the transactor hosting
+the database, on the node's `--saga-sweep-interval` (`off` disables it,
+which hands expiry to an operator). Each pass expires what is overdue and
+discards what retention has released; a pass never stops at its first
+failure, because an abandoned saga the sweep cannot end is a leak and the
+sagas behind it in the scan are not to blame for it. The liveness pass
+below runs once, when the node starts hosting the database, rather than on
+every tick: "is this branch this database's?" is a question about where the
+registry came from, and it has the same answer every time afterwards. It
+runs whatever the interval says, including `off`: expiring on a deadline is
+a policy an operator may take over, but refusing to adopt sagas that were
+never this database's is an invariant, and a fork is exactly as wrong about
+them either way.
+`corium saga expire` performs the same transition by hand, for a saga whose
+owner is known not to be coming back.
+
 **A saga is live only where its branch lives.** The registry travels with
 the parent's data — backup, restore, `db fork`, replication — but the
 branch does not: backups do not capture saga branches (v1), and a fork
@@ -692,6 +716,47 @@ expired branches are kept before deletion — with a per-saga override at
 open for workloads whose audit or salvage needs differ. The operator
 service administers it like any schedule; the in-transactor fallback
 applies the per-database default.
+
+*As implemented:* three details the implementation settled, each of them a
+question the specification above did not have to answer and a running sweep
+does.
+
+* *The window runs from the transition, and the registry already records
+  when that was.* A finished saga's status assertion is a datom like any
+  other, so its transaction's `:db/txInstant` is the moment the saga ended;
+  retention is that instant plus the window, and nothing needs a second
+  timestamp written into the registry. The per-saga override is therefore a
+  *duration* (`:db.saga/retain-for`, milliseconds) rather than a deadline —
+  at open, when it is declared, nobody knows when the saga will finish. A
+  finished saga whose instant cannot be read is never reclaimed: deleting a
+  branch on a missing timestamp is the one mistake retention exists to
+  prevent.
+* *An aborted branch is retained too, not discarded with the flip.* The
+  specification says retention covers "committed and expired" branches, but
+  the compensation section asks the orchestrator to read a branch after an
+  abort to find out which external actions still need unwinding — so all
+  three terminal states keep their branch for the window. What ends at the
+  flip is *writing*: a branch stops taking steps the moment its saga does.
+* *A branch's durable existence begins with its registry entry.* Branches
+  are still built on demand, but the transactor writes a branch's metadata
+  root — its naming dictionary, which is all a branch needs to exist — in
+  the same breath as the transaction that opens the saga. That is what the
+  liveness invariant below needs in order to read absence as "this database
+  never had this branch" rather than "nobody has stepped yet", and it keeps
+  phase 1's promise that a saga with no steps is a useful workflow record:
+  a restart does not expire one.
+
+  The corollary is that *reading* a branch must never create one. Building
+  an overlay on demand for a saga with no root would write the very root
+  whose absence the invariant reads, and a database would quietly adopt a
+  saga it merely inherited the registry entry of — so an open saga with no
+  root is reported as having no branch rather than given a fresh one. The
+  same follows for ending it: an abort or expiry that reaches an inherited
+  entry — before the liveness pass has run, or after it failed — skips the
+  compensation exactly as the pass would, because the timeline that
+  actually ran the saga is applying its own. Every route to a branch is
+  therefore safe on an inherited entry, which is what makes it sound for
+  the pass to run in the background rather than gating the first request.
 
 **Concurrent sagas** compose without new rules: each has its own branch
 and disjoint id grants; merges serialize through the parent's writer;
@@ -806,6 +871,21 @@ layer a durable home rather than a competing mechanism:
   compensations *outward*; the database side needs none, because the
   database side never happened.
 
+*As implemented:* the compensation is composed inside the transactor, which
+is what phase 2 deferred to the phase that owns abort and expiry. Two things
+follow from putting it there. A `:db/fn` compensation is invoked with the
+parent's current value as its `db` argument and the branch as a second — the
+`:db/fn` runtime grew named database tokens for it, so `(fn [db branch] …)`
+reads both — which is the whole reason to register a function rather than
+static data: the failure record is *about* what the branch did. And the two
+transitions differ in exactly one place, which is the place the design cares
+about: an abort has its owner present, so a compensation that does not
+validate fails the abort and leaves the saga `:open` to be fixed; an expiry
+has nobody present, so the same failure is recorded in
+`:db.saga/on-abort-error` and the saga expires without it. `abort
+--compensate` *replaces* the registration rather than adding to it, and an
+empty replacement is how a caller deliberately drops it.
+
 *Reverse* progress gets the same treatment as forward progress. Driving
 compensations outward is itself long-running, crash-prone work, and
 without a home for its state every orchestrator invents the same
@@ -874,7 +954,12 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
   two variants are the report and the refusal, because a refused merge is an
   answer rather than a failure; `Saga::abort()` /
   `Saga::abort_with(tx_data)` (call-time compensation replacing the
-  registered form); `Saga::extend(expiry)`;
+  registered form) — *as implemented:* `Connection::saga_abort(id)`,
+  `saga_abort_with(id, tx_data)`, and `saga_expire(id)`, each returning a
+  `FinishResult` that says whether the compensation landed and, if not, why;
+  they go through a `SagaFinish` RPC rather than a plain transaction, because
+  a registered `:db.saga/on-abort-fn` needs the branch value no client holds;
+  `Saga::extend(expiry)`;
   `Connection::saga_resume(db, id)`; `Connection::saga_view(db, id) → Db`
   for tier-2 readers. Registry queries are just queries, and the
   external-compensation ledger is written with ordinary transactions —
@@ -892,7 +977,13 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
   `status` includes the compensation ledger); `corium console <db>
   --saga <id>` to point a console at a branch; `corium saga log <id>`
   for step history. *As implemented:* all of these, plus
-  `corium saga step <db> <id> <edn|->`, which transacts one step.
+  `corium saga step <db> <id> <edn|->`, which transacts one step;
+  `corium saga expire <db> <id>`, the sweep's transition by hand; and
+  `open --retain-for <duration>` for the per-saga retention override.
+  `abort` and `expire` print what became of the compensation
+  (`:compensated`, `:on-abort-error`) beside the entry, and `status` shows
+  `:retain-for` and `:finished-at`, from which the branch's deletion date
+  follows.
   `corium saga commit` is the one subcommand with an outcome rather than a
   transaction receipt: it takes repeatable `--guard` and `--resolve` EDN
   forms, prints the merge report, and on a refusal prints the conflict
@@ -901,7 +992,8 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
 - **SQL.** A `corium_sys.sagas` system relation over the registry (id, status,
   basis, owner, expiry, description) and a `corium_sys.saga_compensations`
   relation over the ledger, beside the existing system
-  relations; branch reads via the console/session db-view selection.
+  relations (*as implemented:* the saga row also carries `retain_for` and
+  `finished_at`, the two halves of when its branch is reclaimed); branch reads via the console/session db-view selection.
   Mapping pgwire interactive `BEGIN`/`COMMIT` onto sagas is explicitly out
   of scope for v1 (ADR-0015's guarded autocommit stands); it is an
   obvious later customer.
@@ -1003,8 +1095,40 @@ plan/apply lifecycle; `alter-schema` against a branch is refused outright).
      when a merge is refused and cleared by the merge that succeeds, so a
      process reading `:db.saga/conflict-report` never finds a report
      describing an attempt that has since been answered.
-4. **Expiry sweep + retention** — operator-service job with in-transactor
-   fallback; branch GC.
+4. **Expiry sweep + retention** *(done)* — the compensating transaction
+   composed and applied inside the transactor, the sweep that expires overdue
+   sagas, the liveness invariant, and branch GC at the end of the retention
+   window. The operator-service job of ADR-0019 does not exist yet; what
+   ships is the in-transactor fallback the design puts underneath it, which
+   is a fallback in *scheduling* only — the duties are the same, and the data
+   plane depends on nothing outside the transactor to stay bounded. Three
+   details the implementation settled:
+
+   * *The liveness invariant needs a signal it can trust, so a branch begins
+     with its registry entry.* "Expire any `:open` saga whose branch does not
+     exist" cannot be read off absence alone while branches are built on
+     demand: a saga opened and not yet stepped would look exactly like one a
+     fork inherited, and expiring it would take back phase 1's promise that a
+     saga with no steps is a useful workflow record. So the transaction that
+     opens a saga also writes its branch's metadata root — the naming
+     dictionary that is all a branch needs to exist — and absence then means
+     what the invariant reads it as. The pass runs when a node starts hosting
+     a database, not on every sweep, because the question has the same answer
+     every time afterwards.
+   * *A compensation function needs two databases, so the `:db/fn` runtime
+     grew names for them.* The token a function receives as its `db` argument
+     is pure data; it now carries the name of the database in scope it stands
+     for, and the expander takes a set of named databases rather than one. A
+     compensation is invoked as `(fn [db branch] …)`, and a token naming a
+     database the caller did not put in scope is an error rather than a quiet
+     read of the primary one — a compensation that read the parent where it
+     meant to read the branch would author the wrong failure record.
+   * *Retention is measured from the transition, which the registry already
+     records.* A finished saga's status assertion carries a transaction, and
+     that transaction carries `:db/txInstant`; the window is that instant
+     plus the policy (or `:db.saga/retain-for`), so no second timestamp is
+     written. The override is a duration rather than a deadline because it is
+     declared at open, when nobody knows when the saga will finish.
 5. **Protocol/thin-client surfaces and SQL polish.**
 
 Each phase leaves the system consistent and shippable; nothing in the data

@@ -171,10 +171,50 @@ message SagaCommitResponse {
   bytes conflict_report = 7;
 }
 
+// Ends an open saga: aborts or expires it, applying whatever compensating
+// transaction it registered atomically with the status flip (see
+// docs/design/long-running-transactions.md). The flip alone is ordinary
+// transaction data; what needs the transactor is the compensation, since a
+// registered `:db.saga/on-abort-fn` is invoked with the branch value no client
+// holds.
+message SagaFinishRequest {
+  string db = 1;
+  uint32 protocol_version = 2;
+  // The saga's id: 32 lowercase hex digits, dashes optional.
+  string saga = 3;
+  // The terminal status to write: "aborted" or "expired", spelled as the bare
+  // name or as the whole `:db.saga.status/...` keyword.
+  string status = 4;
+  // Composite-encoded EDN vector of transaction forms replacing whatever the
+  // saga registered at open. Read only when `replace_compensation` is set, so
+  // an empty vector can mean "end it with nothing" rather than "use the
+  // registered one".
+  bytes compensation = 5;
+  bool replace_compensation = 6;
+}
+
+message SagaFinishResponse {
+  // Parent basis before the transition.
+  uint64 basis_before = 1;
+  // The transition's `t`.
+  uint64 basis_t = 2;
+  // The transition's `:db/txInstant`.
+  int64 tx_instant = 3;
+  // The status written, as a whole keyword.
+  string status = 4;
+  // Whether compensation datoms landed in the same transaction.
+  bool compensated = 5;
+  // Why a registered compensation did not land, when one did not; also
+  // written to `:db.saga/on-abort-error`. Empty when nothing was skipped.
+  string on_abort_error = 6;
+}
+
 service Transactor {
   rpc Transact(TransactRequest) returns (TransactResponse);
   // Merge a saga's branch into its parent as one validated transaction.
   rpc SagaCommit(SagaCommitRequest) returns (SagaCommitResponse);
+  // Abort or expire a saga, applying its registered compensation atomically.
+  rpc SagaFinish(SagaFinishRequest) returns (SagaFinishResponse);
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeItem);
   rpc Sync(SyncRequest) returns (SyncResponse);
   rpc Status(StatusRequest) returns (StatusResponse);

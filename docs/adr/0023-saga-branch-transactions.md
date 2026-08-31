@@ -1,11 +1,14 @@
 # ADR-0023: Long-running transactions as branch-and-merge sagas
 
-**Status:** Accepted (2026-08-25); the registry and branch phases are
-implemented — the `:db.saga/*` vocabulary, its lifecycle transitions and the
-rules the writer holds them to, the peer API, `corium_sys.sagas`, and
-`corium saga`; then id-block leasing in the allocator, the branch overlay and
-its step pipeline, and the tier-2 read surfaces — while merge and the expiry
-sweep remain specification. Design:
+**Status:** Accepted (2026-08-25); implemented but for the thin-client and
+SQL polish of the delivery sketch's last phase — the `:db.saga/*` vocabulary,
+its lifecycle transitions and the rules the writer holds them to, the peer
+API, `corium_sys.sagas`, and `corium saga`; id-block leasing in the allocator,
+the branch overlay and its step pipeline, and the tier-2 read surfaces; the
+merge, with its conflict scan, guards, resolutions, and atomic
+commit-and-flip; and the way a saga ends when nobody ends it — compensation
+composed in the transactor and applied atomically with the flip, the expiry
+sweep, the liveness invariant, and branch retention. Design:
 [`docs/design/long-running-transactions.md`](../design/long-running-transactions.md).
 Builds on [ADR-0016](0016-transaction-time-as-data.md) (transaction
 metadata), follows the plan/apply pattern of
@@ -120,12 +123,24 @@ A saga is a database branch plus a registry entry in the parent database.
   deadline; an operator-service sweep (in-transactor fallback) expires
   overdue sagas and reclaims branches after a grace window, so abandoned
   sagas cannot pin `t₀`-era segments forever. `:expired` is distinct from
-  `:aborted`.
+  `:aborted`. The retention window runs from the transition that finished
+  the saga — a per-database policy, with a per-saga `:db.saga/retain-for`
+  override declared at open — and it covers all three terminal states: a
+  committed saga's branch is the step-grain annex, an aborted or expired
+  one's is what the orchestrator reads to find what still needs unwinding
+  outside the database.
 - **A saga is live only where its branch lives.** Registry datoms travel
   with backup, restore, fork, and replication; branches do not (v1
   backups exclude them, forks never copy them). Any database that finds
   `:open` registry entries with no branch — a restored parent, a fork
-  taken mid-saga — expires them on first open.
+  taken mid-saga — expires them on first open, whether or not the periodic
+  sweep is enabled. So that absence means that and not "not stepped yet", a
+  branch's durable existence begins with its registry entry: the
+  transaction opening a saga writes the branch's metadata root, and the
+  overlay itself is still built on demand — but only ever from a root
+  already written, since building one on demand would forge the invariant's
+  own signal. An abort or expiry reaching an inherited entry before the
+  pass does skips the compensation for the same reason.
 - **Compensation is explicit, and split by boundary.** Abort's default
   stays total — one status transaction, branch discarded. A saga may
   register a **compensating transaction** (static EDN tx data, or a
@@ -139,7 +154,9 @@ A saga is a database branch plus a registry entry in the parent database.
   it for a crashed owner; liveness outranks — a compensation failing at
   expiry is recorded (`:db.saga/on-abort-error`) and the saga expires
   without it, and a branchless expiry (restore, fork) skips it so
-  diverged timelines never double-apply a failure record.
+  diverged timelines never double-apply a failure record. The transactor,
+  not the client, composes that transaction, because the function form is
+  invoked with two database values and no client holds the second.
 - **External effects stay a layer above, with a durable ledger.** The
   branch makes the *database* side atomic; workflows with outside side
   effects use the registry as durable orchestrator state and the retained
@@ -184,7 +201,11 @@ external compensations, and any pgwire `BEGIN` mapping.
   migration planning should report open sagas as advisory impact.
 - An open branch pins parent segments at `t₀` and holds id grants; GC
   pressure and grant consumption are bounded by mandatory expiry rather
-  than by trusting owners.
+  than by trusting owners. The bound is only as good as the sweep, so a
+  node with sweeping disabled owes the duty to an operator; and because
+  the window is measured from the finishing transition rather than from
+  the deadline, a saga that expires late still gets the full grace period
+  its owner would have had.
 - Tier-2 reads cost at most three merge layers — published parent root
   `≤ t₀`, the frozen parent gap `(index-basis, t₀]`, the branch tail —
   never `N + 1`: no view unions branches, and branch index publication
@@ -219,6 +240,15 @@ external compensations, and any pgwire `BEGIN` mapping.
   engine still never executes an external compensation, and retention may
   end early for a fully-resolved ledger but is never extended by a
   pending one.
+- Compensating *functions* made the `:db/fn` runtime multi-database:
+  a token now names which database in scope it stands for, and the
+  expander takes a set rather than one value. That is a small widening of
+  a deliberately narrow sandbox surface — the databases remain read-only,
+  a token naming one out of scope is an error rather than a fall back to
+  the primary, and no existing function sees any difference — but it is
+  the first place a `:db/fn` reads outside the value its transaction is
+  being prepared against, and future sandbox work has to keep that in
+  view.
 - Every surface grows a saga face: bootstrap vocabulary, peer API,
   protocol, CLI, console, a `corium_sys.sagas` SQL relation, authz applied
   to branch views (ADR-0021 unchanged), operator-service sweep job.

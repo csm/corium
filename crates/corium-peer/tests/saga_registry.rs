@@ -9,6 +9,7 @@ use corium_db::saga::SagaStatus;
 use corium_peer::saga::{CompensationRecord, SagaOptions, compensation_for, format_saga_id};
 use corium_peer::{Admin, ConnectConfig, Connection, PeerError};
 use corium_protocol::authz::Guard;
+use corium_query::edn::read_all;
 use corium_transactor::node::{NodeConfig, TransactorNode};
 
 fn free_port() -> u16 {
@@ -57,7 +58,18 @@ async fn start_transactor() -> (String, tokio::sync::oneshot::Sender<()>, tempfi
 
 async fn connect(endpoint: &str, db: &str) -> Connection {
     let mut admin = Admin::connect(endpoint, None, None).await.expect("admin");
-    admin.create_database(db, &[]).await.expect("create db");
+    admin
+        .create_database(
+            db,
+            &read_all(
+                "{:db/ident :note/text
+                  :db/valueType :db.type/string
+                  :db/cardinality :db.cardinality/one}",
+            )
+            .expect("test schema"),
+        )
+        .await
+        .expect("create db");
     Connection::connect(ConnectConfig::new(endpoint, db))
         .await
         .expect("connect")
@@ -144,6 +156,73 @@ async fn a_saga_opens_extends_reserves_and_aborts() {
         }
         other => panic!("expected a saga error, got {other:?}"),
     }
+}
+
+/// Expiring by hand is the sweep's transition, exposed: a returning owner
+/// must be able to tell "the system ended this" from "I ended this", whoever
+/// wrote the flip.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_can_expire_a_saga_the_way_the_sweep_would() {
+    let (endpoint, _stop, _dir) = start_transactor().await;
+    let connection = connect(&endpoint, "abandoned").await;
+    let id = connection
+        .saga_open(&SagaOptions::new("alice", 4_000_000_000_000))
+        .await
+        .expect("the saga opens")
+        .entry
+        .id;
+
+    let expired = connection.saga_expire(id).await.expect("the saga expires");
+    assert_eq!(expired.entry.status, Some(SagaStatus::Expired));
+    assert!(!expired.compensated);
+    assert!(expired.on_abort_error.is_none());
+    assert!(expired.entry.finished_at.is_some());
+
+    let error = connection
+        .saga_expire(id)
+        .await
+        .expect_err("an expired saga cannot expire again");
+    assert!(matches!(error, PeerError::Saga(_)), "unexpected: {error}");
+}
+
+/// A registered compensation is applied by the transactor at abort time, and
+/// a returning reader sees it labelled with the saga that wrote it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registered_compensation_is_applied_by_the_abort() {
+    let (endpoint, _stop, _dir) = start_transactor().await;
+    let connection = connect(&endpoint, "compensating").await;
+    let opened = connection
+        .saga_open(
+            &SagaOptions::new("alice", 4_000_000_000_000)
+                .compensating_with("[[:db/add \"failure\" :note/text \"the supplier said no\"]]")
+                .retaining_for(0),
+        )
+        .await
+        .expect("the saga opens");
+    assert_eq!(opened.entry.retain_for, Some(0));
+
+    let aborted = connection
+        .saga_abort(opened.entry.id)
+        .await
+        .expect("the abort lands");
+    assert_eq!(aborted.entry.status, Some(SagaStatus::Aborted));
+    assert!(aborted.compensated, "the registered compensation applied");
+    assert!(aborted.on_abort_error.is_none());
+
+    // `abort_with` replaces the registration rather than adding to it, and an
+    // empty replacement is how a caller deliberately drops it.
+    let other = connection
+        .saga_open(
+            &SagaOptions::new("alice", 4_000_000_000_000)
+                .compensating_with("[[:db/add \"failure\" :note/text \"never applied\"]]"),
+        )
+        .await
+        .expect("a second saga opens");
+    let aborted = connection
+        .saga_abort_with(other.entry.id, Vec::new())
+        .await
+        .expect("the abort lands");
+    assert!(!aborted.compensated, "the registration was replaced");
 }
 
 #[tokio::test(flavor = "multi_thread")]
