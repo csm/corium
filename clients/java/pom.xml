@@ -6,7 +6,7 @@
 
   <groupId>dev.corium</groupId>
   <artifactId>corium-java</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.90</version>
   <packaging>pom</packaging>
   <name>Corium Java client parent</name>
   <description>Aggregator for the Corium Java client and its storage plugins</description>
