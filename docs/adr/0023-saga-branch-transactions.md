@@ -133,10 +133,14 @@ A saga is a database branch plus a registry entry in the parent database.
   with backup, restore, fork, and replication; branches do not (v1
   backups exclude them, forks never copy them). Any database that finds
   `:open` registry entries with no branch — a restored parent, a fork
-  taken mid-saga — expires them on first open. So that absence means that
-  and not "not stepped yet", a branch's durable existence begins with its
-  registry entry: the transaction opening a saga writes the branch's
-  metadata root, and the overlay itself is still built on demand.
+  taken mid-saga — expires them on first open, whether or not the periodic
+  sweep is enabled. So that absence means that and not "not stepped yet", a
+  branch's durable existence begins with its registry entry: the
+  transaction opening a saga writes the branch's metadata root, and the
+  overlay itself is still built on demand — but only ever from a root
+  already written, since building one on demand would forge the invariant's
+  own signal. An abort or expiry reaching an inherited entry before the
+  pass does skips the compensation for the same reason.
 - **Compensation is explicit, and split by boundary.** Abort's default
   stays total — one status transaction, branch discarded. A saga may
   register a **compensating transaction** (static EDN tx data, or a

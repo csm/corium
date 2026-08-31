@@ -111,6 +111,28 @@ async fn parent_db(node: &TransactorNode) -> corium_db::Db {
     node.db_state("main").await.expect("state").db()
 }
 
+/// Waits for `db`'s entry for `SAGA` to reach `want`.
+///
+/// The liveness pass runs in the background when a database is first hosted,
+/// so a test that also drives a transition by hand is racing it. Both routes
+/// are correct and reach the same state; what matters is the state.
+async fn await_status(node: &TransactorNode, db: &str, want: &SagaStatus) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let value = node.db_state(db).await.expect("state").db();
+        let status = saga::entry(&value, SAGA).and_then(|entry| entry.status);
+        drop(value);
+        if status.as_ref() == Some(want) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{db}'s saga never reached {want} (it is {status:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// A deadline far enough out that nothing expires by accident.
 const FOREVER: i64 = 99_999_999_999_999;
 
@@ -460,15 +482,15 @@ async fn a_fork_expires_the_open_sagas_it_inherits() {
     node.saga_branch("main", SAGA).await.expect("branch");
 
     node.fork_db("main", "copy", 0).await.expect("fork");
-    let expired = node
-        .expire_branchless_sagas("copy")
+    // Hosting the fork starts the pass; calling it again is idempotent, and
+    // either route ends the entry the same way.
+    node.expire_branchless_sagas("copy")
         .await
         .expect("the liveness pass");
-    assert_eq!(expired, vec![SAGA]);
+    await_status(&node, "copy", &SagaStatus::Expired).await;
 
     let copy = node.db_state("copy").await.expect("state").db();
     let inherited = saga::entry(&copy, SAGA).expect("the fork inherited the entry");
-    assert_eq!(inherited.status, Some(SagaStatus::Expired));
     let recorded = inherited.on_abort_error.expect("the skip is recorded");
     assert!(recorded.contains("branch"), "unhelpful: {recorded}");
     let failure = copy
@@ -528,4 +550,135 @@ async fn a_restart_keeps_an_open_saga_that_never_took_a_step() {
         entry(&parent_db(&node).await).status,
         Some(SagaStatus::Open)
     );
+}
+
+/// The liveness pass is the ordinary way an inherited entry ends, but it is
+/// not the only way one can be reached: a sweep tick, a `corium saga expire`,
+/// or an abort by hand can all get there first. None of them may apply the
+/// compensation, because the timeline that actually ran the saga is applying
+/// its own — and none of them may stand up a branch, because absence is the
+/// signal the invariant reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_an_inherited_saga_by_hand_still_skips_the_compensation() {
+    for status in [SagaStatus::Aborted, SagaStatus::Expired] {
+        let (node, _dir) = node().await;
+        let ids = transact(&node, "main", "[{:db/id \"o\" :order/status :placed}]").await;
+        let order = ids["o"];
+        open_saga(
+            &node,
+            FOREVER,
+            &format!(
+                "[:db/add \"s\" :db.saga/on-abort-tx
+                  \"[[:db/add #eid {order} :order/failure \\\"never twice\\\"]]\"]"
+            ),
+        )
+        .await;
+        node.fork_db("main", "copy", 0).await.expect("fork");
+
+        // Straight to the transition. The background pass may have expired the
+        // entry already, in which case this refuses as a finished saga — what
+        // must never happen either way is the compensation landing.
+        if let Ok(response) = node
+            .saga_finish("copy", SAGA, &status, Intent::Registered)
+            .await
+        {
+            assert!(
+                !response.compensated,
+                "{status} applied a compensation on a timeline that never ran the saga"
+            );
+            assert!(
+                response.on_abort_error.contains("no branch"),
+                "unhelpful: {}",
+                response.on_abort_error
+            );
+        }
+
+        let copy = node.db_state("copy").await.expect("state").db();
+        let failure = copy
+            .idents()
+            .entid(&corium_core::Keyword::new(Some("order"), "failure"))
+            .expect(":order/failure is installed");
+        assert!(
+            copy.values(corium_core::EntityId::from_raw(order), failure)
+                .is_empty()
+        );
+        assert!(
+            !node.branch_exists("copy", SAGA).await.expect("store read"),
+            "and it did not stand up the branch it just declined to read"
+        );
+    }
+}
+
+/// Reading a branch is not a way to acquire one. A client that opens a branch
+/// on an entry this database only inherited would otherwise write the very
+/// metadata root whose absence the liveness invariant reads, convincing the
+/// database for good that the saga is its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn opening_an_inherited_sagas_branch_does_not_create_it() {
+    let (node, _dir) = node().await;
+    open_saga(&node, FOREVER, "").await;
+    node.fork_db("main", "copy", 0).await.expect("fork");
+
+    // Hosting the fork starts the liveness pass, so this open may land before
+    // or after it. Both orders must refuse, and — the point of the test —
+    // neither may leave a metadata root behind, because that root is the
+    // signal the invariant reads.
+    match node.saga_branch("copy", SAGA).await {
+        Err(error) => assert!(
+            error.to_string().contains("no branch") || error.to_string().contains("discarded"),
+            "unhelpful: {error}"
+        ),
+        Ok(_) => panic!("a branch this database never had must not open"),
+    }
+    assert!(
+        !node.branch_exists("copy", SAGA).await.expect("store read"),
+        "a refused open leaves the invariant's signal intact"
+    );
+
+    // Which is what keeps the pass correct whenever it runs.
+    node.expire_branchless_sagas("copy")
+        .await
+        .expect("the liveness pass");
+    await_status(&node, "copy", &SagaStatus::Expired).await;
+    assert!(!node.branch_exists("copy", SAGA).await.expect("store read"));
+}
+
+/// The recurring sweep is a policy an operator may take over; refusing to
+/// adopt sagas that were never this database's is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_liveness_pass_runs_even_with_the_sweep_disabled() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let node = node_at(dir.path()).await;
+    assert!(
+        node.create_db("main", &schema(), None)
+            .await
+            .expect("create")
+    );
+    open_saga(&node, FOREVER, "").await;
+    node.fork_db("main", "copy", 0).await.expect("fork");
+    node.release_leases().await;
+    drop(node);
+
+    // This suite's config sets `saga_sweep_interval` to `None` throughout,
+    // which is exactly the operator's `--saga-sweep-interval off`.
+    let node = node_at(dir.path()).await;
+    node.db_state("copy").await.expect("host the fork");
+
+    await_status(&node, "copy", &SagaStatus::Expired).await;
+}
+
+/// A stepless branch is only a metadata root, and discarding one is work the
+/// sweep's report has to own up to.
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_reports_discarding_a_branch_that_never_took_a_step() {
+    let (node, _dir) = node().await;
+    open_saga(&node, FOREVER, "[:db/add \"s\" :db.saga/retain-for 0]").await;
+    assert!(node.branch_exists("main", SAGA).await.expect("store read"));
+    node.saga_finish("main", SAGA, &SagaStatus::Aborted, Intent::Registered)
+        .await
+        .expect("abort");
+
+    let report = node.saga_sweep("main").await.expect("a sweep");
+    assert_eq!(report.discarded, vec![SAGA]);
+    assert!(!node.branch_exists("main", SAGA).await.expect("store read"));
 }

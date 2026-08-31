@@ -33,6 +33,16 @@ use crate::lease::{self, Lease, LeaseError};
 use crate::metrics::Metrics;
 use crate::{DbRoot, EmbeddedTransactor, Prepared, TransactError, db_root_name};
 
+/// Why a saga ended without its compensation: this database holds the
+/// registry entry but never held the branch.
+///
+/// One string because two callers state the same fact — the liveness pass
+/// that expires inherited entries, and any abort or expiry that reaches such
+/// an entry before it does — and it is read by whoever comes back to ask why
+/// the failure record they registered never landed.
+const BRANCHLESS: &str = "this database has no branch for the saga — a restore, a fork, or a \
+     replica of the timeline it ran on — so no compensation was applied";
+
 /// Expands user database-function invocations in boundary EDN transaction
 /// forms before native conversion. The built-in implementation is
 /// [`crate::txfn::DbFnExpander`] on the bounded `cljrs-tx` runtime (feature
@@ -1302,21 +1312,28 @@ impl TransactorNode {
     /// released — which the operator service will take over when ADR-0019's
     /// job scheduler exists, and which stays here regardless so the data plane
     /// depends on nothing outside the transactor to stay bounded.
+    ///
+    /// `--saga-sweep-interval off` disables the recurring duty only. Expiring
+    /// on a deadline is a *policy* an operator may reasonably take over;
+    /// refusing to adopt sagas that were never this database's is an
+    /// *invariant*, and a fork or a restore is exactly as wrong about them
+    /// with the schedule off as with it on.
     fn spawn_saga_sweep(self: &Arc<Self>, state: &Arc<DbState>) {
-        let Some(interval) = self.config.saga_sweep_interval else {
-            return;
-        };
         // A branch has no registry of its own; its parent's sweep covers it.
         if state.branch.is_some() {
             return;
         }
+        let interval = self.config.saga_sweep_interval;
         let node = Arc::clone(self);
         let db = Arc::clone(state);
         tokio::spawn(async move {
             let name = db.name.clone();
-            if let Err(error) = node.expire_branchless_sagas(&name).await {
+            if let Err(error) = node.expire_branchless_sagas_on(&db).await {
                 tracing::warn!(db = %name, %error, "cannot check saga branches for {name}");
             }
+            let Some(interval) = interval else {
+                return;
+            };
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // `interval` ticks immediately; scheduled duties wait a full one.
@@ -1859,33 +1876,38 @@ impl TransactorNode {
         // parent has never seen, and the branch's own log records cannot be
         // decoded without them.
         let stored_meta = self.store.get_root(&meta_root_name(name)).await?;
-        // A branch outlives its saga. After a merge it is the step-grain audit
-        // annex the design points auditors at — who did what, when, in which
-        // order — and after an abort it is the record of what the workflow had
-        // done outside the database and must now unwind. Both are readable
-        // until retention deletes the branch, and once it has, saying so is
-        // better than standing up an empty overlay that answers as if the saga
-        // had never taken a step. Steps stop the moment the saga does
-        // regardless; that refusal lives in [`Branch::step_rules`].
-        if !entry.is_open() && stored_meta.is_none() {
-            return Err(NodeError::BadRequest(format!(
-                "saga {saga:032x} is {}, and its branch has been discarded",
-                entry
-                    .status
-                    .as_ref()
-                    .map_or_else(|| "statusless".to_owned(), ToString::to_string)
-            )));
-        }
-        let (schema, idents, interner) = if let Some(meta) = stored_meta {
-            codec::decode_metadata(&meta)?
-        } else {
-            let (schema, idents, interner) = parent_state.naming_snapshot();
-            let meta = codec::encode_metadata(&schema, &idents, &interner);
-            self.store
-                .cas_root(&meta_root_name(name), None, &meta)
-                .await?;
-            (schema, idents, interner)
+        // No root, no branch — and building one here rather than saying so
+        // would be worse than an unhelpful answer, because absence is a
+        // *signal*: it is what tells the liveness invariant that a saga's
+        // branch was never this database's. A phantom overlay stood up at
+        // `t₀` would write the very root whose absence the invariant reads,
+        // permanently convincing this database that a saga it merely
+        // inherited is its own. So the branch is built only from a root
+        // something already wrote: the opening transaction, on the timeline
+        // that actually ran the saga.
+        //
+        // A branch outlives its saga, which is why the open case is a real
+        // one and not just a guard. After a merge the branch is the
+        // step-grain audit annex the design points auditors at — who did
+        // what, when, in which order — and after an abort it is the record of
+        // what the workflow had done outside the database and must now
+        // unwind. Both are readable until retention deletes the branch. Steps
+        // stop the moment the saga does regardless; that refusal lives in
+        // [`Branch::step_rules`].
+        let Some(meta) = stored_meta else {
+            return Err(NodeError::BadRequest(if entry.is_open() {
+                format!("saga {saga:032x} has no branch in {parent}: {BRANCHLESS}")
+            } else {
+                format!(
+                    "saga {saga:032x} is {}, and its branch has been discarded",
+                    entry
+                        .status
+                        .as_ref()
+                        .map_or_else(|| "statusless".to_owned(), ToString::to_string)
+                )
+            }));
         };
+        let (schema, idents, interner) = codec::decode_metadata(&meta)?;
         let base = self
             .branch_base(&parent_state, basis_t, &schema, &idents, &interner)
             .await?;
@@ -2030,8 +2052,14 @@ impl TransactorNode {
         }
         let had_log = self.log_backend.exists(&name).await;
         self.log_backend.delete_all(&name).await?;
-        self.store.delete_root(&meta_root_name(&name)).await?;
-        Ok(hosted.is_some() || had_log)
+        // The root counts as state discarded, not just the log: a saga that
+        // opened and never stepped has only a root, and reporting that pass
+        // as "nothing to do" would hide the deletion from the sweep's report
+        // — and from an operator reading it to find out what was reclaimed.
+        let root = meta_root_name(&name);
+        let had_root = self.store.get_root(&root).await?.is_some();
+        self.store.delete_root(&root).await?;
+        Ok(hosted.is_some() || had_log || had_root)
     }
 
     /// Whether saga `saga`'s branch has durable state in this database's
@@ -2111,7 +2139,6 @@ impl TransactorNode {
     /// [`NodeError::Transact`] when the transaction does not validate (an
     /// abort with a bad compensation, or either transition refused by the
     /// registry rules); and the usual lease, store, and log failures.
-    #[allow(clippy::too_many_lines)]
     pub async fn saga_finish(
         &self,
         parent: &str,
@@ -2119,33 +2146,78 @@ impl TransactorNode {
         status: &corium_db::saga::SagaStatus,
         intent: crate::expiry::Intent,
     ) -> Result<pb::SagaFinishResponse, NodeError> {
-        use corium_db::saga::SagaStatus;
-
         if is_branch_name(parent) {
             return Err(NodeError::BadRequest(format!(
                 "{parent} is itself a saga branch; sagas do not nest"
             )));
         }
+        let parent_state = self.db_state(parent).await?;
+        self.saga_finish_on(&parent_state, saga, status, intent)
+            .await
+    }
+
+    /// [`Self::saga_finish`] against a database the caller already holds.
+    ///
+    /// The distinction matters at startup: a database's maintenance is
+    /// spawned while the database is still being hosted, so a task that
+    /// re-resolved it by name would be told the database is unknown — and the
+    /// liveness pass would quietly not run.
+    ///
+    /// # Errors
+    /// As [`Self::saga_finish`].
+    #[allow(clippy::too_many_lines)]
+    async fn saga_finish_on(
+        &self,
+        parent_state: &Arc<DbState>,
+        saga: u128,
+        status: &corium_db::saga::SagaStatus,
+        intent: crate::expiry::Intent,
+    ) -> Result<pb::SagaFinishResponse, NodeError> {
+        use corium_db::saga::SagaStatus;
+
+        let parent = parent_state.name();
         let expiring = match status {
             SagaStatus::Aborted => false,
             SagaStatus::Expired => true,
             other => {
                 return Err(NodeError::BadRequest(format!(
-                    "a saga is ended :db.saga.status/aborted or :db.saga.status/expired,                      not {other}"
+                    "a saga is ended :db.saga.status/aborted or \
+                     :db.saga.status/expired, not {other}"
                 )));
             }
         };
-        let parent_state = self.db_state(parent).await?;
+        // A registered compensation is skipped outright when the branch was
+        // never this database's, whichever transition is ending the saga.
+        //
+        // The liveness pass of [`Self::expire_branchless_sagas`] is the
+        // ordinary way an inherited entry ends, and it already asks; this is
+        // the same question asked again because it is not the only way. A
+        // sweep tick, a `corium saga expire`, or an abort by hand can all
+        // reach an inherited entry first — before the pass has run, or after
+        // it failed — and none of them may apply the failure record, because
+        // the timeline that actually ran the saga is applying its own. That
+        // is the double-apply ADR-0023 forbids, and it is the reason the
+        // skip's reason is a shared string rather than the pass's private
+        // one.
+        //
+        // The store's error is propagated rather than guessed either way:
+        // compensating twice and dropping a compensation are both wrong, and
+        // a sweep that fails this pass simply retries on the next.
+        let intent = if matches!(intent, crate::expiry::Intent::Registered)
+            && !self.branch_exists(parent, saga).await?
+        {
+            crate::expiry::Intent::Skip(BRANCHLESS)
+        } else {
+            intent
+        };
         // The branch, when this transition could need to read one. Only a
         // registered compensation can: a replacement is the caller's own tx
-        // data, and a skip is the branchless expiry, which by definition has
-        // no branch — building an overlay there would write branch state for a
-        // saga this database was only ever handed the registry entry of.
+        // data, and a skip has nothing to read.
         //
-        // When it is opened, failing to open it is an absence rather than an
-        // error: a saga whose branch is gone — a restored or forked parent, a
-        // retention window already closed — is exactly the case the skip in
-        // [`crate::expiry::compose`] exists for.
+        // Failing to open one that the check above just found is a narrow
+        // race — retention discarding the branch in between — and it is an
+        // absence like any other, which is what [`crate::expiry::compose`]
+        // already knows how to say.
         let branch_state = if matches!(intent, crate::expiry::Intent::Registered) {
             match self.saga_branch(parent, saga).await {
                 Ok(state) => Some(state),
@@ -2205,7 +2277,7 @@ impl TransactorNode {
         };
 
         let attempt = Self::finish_attempt(
-            &parent_state,
+            parent_state,
             &mut cursor,
             &entry,
             status,
@@ -2228,7 +2300,7 @@ impl TransactorNode {
                 );
                 cursor = parent_state.transactor.batch_cursor();
                 Self::finish_attempt(
-                    &parent_state,
+                    parent_state,
                     &mut cursor,
                     &entry,
                     status,
@@ -2241,7 +2313,7 @@ impl TransactorNode {
         let tx_instant = prepared.record.tx_instant;
         let minted = (interner.len() > named_before).then(|| interner.clone());
         let basis_t = self
-            .append_one(&parent_state, cursor, prepared, minted)
+            .append_one(parent_state, cursor, prepared, minted)
             .await?;
         tracing::info!(
             db = parent,
@@ -2340,9 +2412,28 @@ impl TransactorNode {
     /// which is why nothing is expired on a failed read: a transient outage
     /// must not end a week of work.
     pub async fn expire_branchless_sagas(&self, parent: &str) -> Result<Vec<u128>, NodeError> {
+        let state = self.db_state(parent).await?;
+        self.expire_branchless_sagas_on(&state).await
+    }
+
+    /// [`Self::expire_branchless_sagas`] against a database the caller already
+    /// holds.
+    ///
+    /// This is the form the pass actually runs in. Maintenance is spawned
+    /// while the database is still being hosted, so re-resolving it by name
+    /// would race the registration and lose: the pass would be told the
+    /// database is unknown, warn, and never run — leaving exactly the
+    /// inherited entries it exists to expire.
+    ///
+    /// # Errors
+    /// As [`Self::expire_branchless_sagas`].
+    async fn expire_branchless_sagas_on(
+        &self,
+        state: &Arc<DbState>,
+    ) -> Result<Vec<u128>, NodeError> {
         use corium_db::saga::SagaStatus;
 
-        let state = self.db_state(parent).await?;
+        let parent = state.name();
         let open: Vec<u128> = corium_db::saga::open_entries(&state.db())
             .into_iter()
             .map(|entry| entry.id)
@@ -2353,13 +2444,11 @@ impl TransactorNode {
                 continue;
             }
             match self
-                .saga_finish(
-                    parent,
+                .saga_finish_on(
+                    state,
                     saga,
                     &SagaStatus::Expired,
-                    crate::expiry::Intent::Skip(
-                        "this database has no branch for the saga — a restore, a fork, or a                          replica of the timeline it ran on — so no compensation was applied",
-                    ),
+                    crate::expiry::Intent::Skip(BRANCHLESS),
                 )
                 .await
             {
@@ -3901,10 +3990,19 @@ impl TransactorNode {
         }
         for saga in opened {
             if let Err(error) = self.ensure_branch_meta(state, saga).await {
-                // The branch is still creatable on demand — its construction
-                // is a deterministic function of the registry entry — so this
-                // costs the saga nothing until the liveness pass runs, which
-                // is why it warns rather than failing a committed transaction.
+                // It warns because the transaction is already durable: the
+                // saga is open whatever happens next, and there is nothing
+                // left to fail.
+                //
+                // What it costs is the saga. The root is the branch's
+                // existence, so without it the first step or read is refused
+                // and the next liveness pass expires the entry — correctly,
+                // by its own rule, because absence is the only signal it has.
+                // That is a loud, immediate failure rather than a silent one,
+                // which is the trade taken deliberately: the alternative is a
+                // sweep that re-creates missing roots, and such a sweep would
+                // re-create them for *inherited* entries too and quietly
+                // adopt sagas this database never ran.
                 tracing::warn!(
                     db = %state.name,
                     saga = format!("{saga:032x}"),

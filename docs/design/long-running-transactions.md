@@ -672,7 +672,11 @@ failure, because an abandoned saga the sweep cannot end is a leak and the
 sagas behind it in the scan are not to blame for it. The liveness pass
 below runs once, when the node starts hosting the database, rather than on
 every tick: "is this branch this database's?" is a question about where the
-registry came from, and it has the same answer every time afterwards.
+registry came from, and it has the same answer every time afterwards. It
+runs whatever the interval says, including `off`: expiring on a deadline is
+a policy an operator may take over, but refusing to adopt sagas that were
+never this database's is an invariant, and a fork is exactly as wrong about
+them either way.
 `corium saga expire` performs the same transition by hand, for a saga whose
 owner is known not to be coming back.
 
@@ -741,6 +745,18 @@ does.
   never had this branch" rather than "nobody has stepped yet", and it keeps
   phase 1's promise that a saga with no steps is a useful workflow record:
   a restart does not expire one.
+
+  The corollary is that *reading* a branch must never create one. Building
+  an overlay on demand for a saga with no root would write the very root
+  whose absence the invariant reads, and a database would quietly adopt a
+  saga it merely inherited the registry entry of — so an open saga with no
+  root is reported as having no branch rather than given a fresh one. The
+  same follows for ending it: an abort or expiry that reaches an inherited
+  entry — before the liveness pass has run, or after it failed — skips the
+  compensation exactly as the pass would, because the timeline that
+  actually ran the saga is applying its own. Every route to a branch is
+  therefore safe on an inherited entry, which is what makes it sound for
+  the pass to run in the background rather than gating the first request.
 
 **Concurrent sagas** compose without new rules: each has its own branch
 and disjoint id grants; merges serialize through the parent's writer;
